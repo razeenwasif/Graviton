@@ -1,0 +1,5 @@
+# The guest agent is a static Linux binary linked with Rust's bundled lld and
+# self-contained musl, so no cross toolchain is needed on the Mac.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]

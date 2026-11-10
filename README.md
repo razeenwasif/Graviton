@@ -4,9 +4,10 @@ Native containers for macOS: a Rust engine that runs each Linux container in
 its own lightweight VM (Apple Virtualization.framework), a `grav` CLI, and
 SwiftUI apps for macOS and iOS.
 
-> Status: **scaffold**. The daemon, CLI, wire protocol and both apps work
-> end to end against sample data. Booting VMs and pulling images are the next
-> milestones.
+> Status: **milestone 1 done**. Graviton boots a Linux guest VM on
+> Virtualization.framework and runs commands in it through the agent (~0.3 s
+> to agent ready). The daemon, CLI and both apps still show sample containers;
+> pulling and running images is milestone 2.
 
 ## Layout
 
@@ -14,8 +15,8 @@ SwiftUI apps for macOS and iOS.
 crates/
   graviton-proto   Wire types (control API + guest agent channel), JSON lines
   graviton-core    Image references, engine store, well-known paths
-  graviton-vmm     VM config + Hypervisor trait; Virtualization.framework backend (stub)
-  graviton-agent   PID 1 inside each guest VM (Linux only)
+  graviton-vmm     VM config + Hypervisor trait; Virtualization.framework backend
+  graviton-agent   PID 1 inside each guest VM: mounts, vsock modules, exec over vsock
   gravitond        Engine daemon, serves the control API on a Unix socket
   grav             CLI client
 apps/
@@ -23,6 +24,9 @@ apps/
   GravitonKit/     Shared Swift package: models, socket client, demo engine, theme, components
   Mac/             macOS app (Containers, Logs, Images + Pull sheet)
   iOS/             iOS companion (Containers, Detail, Logs)
+scripts/
+  build-guest.sh   Guest kernel (Alpine linux-virt) + initramfs with the agent as /init
+  dev-gravitond.sh Build gravitond, sign it with the virtualization entitlement, run it
 design/
   icon.svg, icon-macos.svg, make-icons.sh   App icon source → asset catalogs
 ```
@@ -37,6 +41,18 @@ cargo run -p gravitond          # serves sample containers on the default socket
 cargo run -p grav -- ps -a      # in another terminal
 cargo run -p grav -- logs api-gateway -n 5
 ```
+
+Boot a guest VM and run a command in it (milestone 1):
+
+```bash
+scripts/build-guest.sh                         # once: kernel + initramfs
+scripts/dev-gravitond.sh boot-check            # runs `uname -a` in the guest
+scripts/dev-gravitond.sh boot-check --cpus 4 --memory 1024 -- /bin/sh -c 'nproc; free -m'
+```
+
+Virtualization.framework requires the `com.apple.security.virtualization`
+entitlement, so gravitond must be signed (the script does it ad hoc). The guest
+console is written to `~/Library/Application Support/Graviton/vms/boot-check/console.log`.
 
 Socket: `$GRAVITON_SOCKET`, else `~/Library/Application Support/Graviton/gravitond.sock`.
 
@@ -71,9 +87,9 @@ and both sides have tests pinning the JSON shape.
 
 ## Roadmap
 
-1. **Boot a VM**: Virtualization.framework backend in `graviton-vmm` (via
-   `objc2-virtualization`), kernel + initramfs, agent says `ready` over vsock.
-   gravitond needs the `com.apple.security.virtualization` entitlement.
+1. ~~**Boot a VM**~~ (done): Virtualization.framework backend via
+   `objc2-virtualization`, Alpine kernel + initramfs, agent answers over vsock
+   and runs commands, clean power-off. `gravitond boot-check` exercises it.
 2. **Run an image**: registry client, content-addressed layer store, rootfs
    assembly, `grav pull` / `grav run`. Enables Run and Pull in the apps.
 3. **Daemon features**: NAT networking, port forwarding, volumes, persistent

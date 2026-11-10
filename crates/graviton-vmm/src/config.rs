@@ -31,6 +31,8 @@ pub struct VmConfig {
     pub cmdline: String,
     pub network: NetworkMode,
     pub shares: Vec<SharedDirectory>,
+    /// Where to write the guest console (hvc0). Defaults to a temp file.
+    pub console_log: Option<PathBuf>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -57,6 +59,7 @@ impl VmConfig {
             cmdline: "console=hvc0 quiet panic=-1".into(),
             network: NetworkMode::Nat,
             shares: Vec::new(),
+            console_log: None,
         }
     }
 

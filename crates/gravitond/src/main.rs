@@ -3,11 +3,13 @@
 //! Listens on a Unix socket and serves the newline-delimited JSON control API
 //! defined in `graviton-proto`. Clients are the `grav` CLI and Graviton.app.
 
+mod boot_check;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use graviton_core::{Store, paths};
 use graviton_proto::{PROTOCOL_VERSION, Request, Response, decode_line, encode_line};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -21,14 +23,29 @@ struct Args {
     #[arg(long)]
     socket: Option<PathBuf>,
 
-    /// Serve sample containers instead of an empty engine (until the VMM lands).
+    /// Serve sample containers instead of an empty engine (until containers run in VMs).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     demo: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Boot a guest VM, run one command in it through the agent, and power it off.
+    BootCheck(boot_check::BootCheckArgs),
+}
+
+fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(Command::BootCheck(check)) = args.command {
+        return boot_check::run(check);
+    }
+    tokio::runtime::Runtime::new()?.block_on(serve_forever(args))
+}
+
+async fn serve_forever(args: Args) -> Result<()> {
     let socket = args.socket.unwrap_or_else(paths::socket_path);
 
     if let Some(dir) = socket.parent() {

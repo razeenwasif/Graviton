@@ -30,3 +30,16 @@ pub fn blobs_dir() -> PathBuf {
 pub fn containers_dir() -> PathBuf {
     support_dir().join("containers")
 }
+
+/// Guest kernel and initramfs (written by `scripts/build-guest.sh`).
+/// `$GRAVITON_GUEST_DIR` overrides it.
+pub fn guest_dir() -> PathBuf {
+    std::env::var_os("GRAVITON_GUEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| support_dir().join("guest"))
+}
+
+/// Per-VM runtime files (console logs).
+pub fn vms_dir() -> PathBuf {
+    support_dir().join("vms")
+}
