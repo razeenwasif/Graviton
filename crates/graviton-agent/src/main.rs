@@ -16,6 +16,8 @@
 //! Build it for the guest with `scripts/build-guest.sh`.
 
 #[cfg(target_os = "linux")]
+mod build;
+#[cfg(target_os = "linux")]
 mod container;
 #[cfg(target_os = "linux")]
 mod files;
@@ -165,6 +167,34 @@ pub(crate) mod linux {
                     Ok(contents) => send(&writer, &AgentEvent::File(contents)),
                     Err(err) => send(&writer, &AgentEvent::Error { message: err.to_string() }),
                 },
+                Ok(AgentRequest::Snapshot { container }) => match crate::build::snapshot(&container) {
+                    Ok(()) => send(&writer, &AgentEvent::Done),
+                    Err(err) => send(&writer, &AgentEvent::Error { message: format!("snapshot: {err}") }),
+                },
+                Ok(AgentRequest::Commit { container, name }) => match crate::build::commit(&container, &name) {
+                    Ok(layer) => send(&writer, &AgentEvent::Committed(layer)),
+                    Err(err) => send(&writer, &AgentEvent::Error { message: format!("writing the layer: {err}") }),
+                },
+                Ok(AgentRequest::Mkdir { container, path }) => match crate::build::mkdir(&container, &path) {
+                    Ok(()) => send(&writer, &AgentEvent::Done),
+                    Err(err) => send(&writer, &AgentEvent::Error { message: err.to_string() }),
+                },
+                Ok(AgentRequest::Copy { container, sources, dest, cwd, from_container, chown, extract, ignore }) => {
+                    let req = crate::build::CopyRequest {
+                        container: &container,
+                        sources: &sources,
+                        dest: &dest,
+                        cwd: &cwd,
+                        from_container: from_container.as_deref(),
+                        chown: chown.as_deref(),
+                        extract,
+                        ignore: &ignore,
+                    };
+                    match crate::build::copy(&req) {
+                        Ok(files) => send(&writer, &AgentEvent::Copied { files }),
+                        Err(err) => send(&writer, &AgentEvent::Error { message: err.to_string() }),
+                    }
+                }
                 Ok(AgentRequest::Shutdown) => power_off(),
                 Err(err) => send(&writer, &AgentEvent::Error { message: format!("bad request: {err}") }),
             }

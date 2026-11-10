@@ -7,10 +7,12 @@
 
 mod blobs;
 mod config;
+pub mod dockerfile;
 mod index;
 mod registry;
 
 pub use blobs::{BlobStore, Digest};
+pub use dockerfile::Dockerfile;
 pub use config::{ImageConfig, RuntimeConfig};
 pub use index::{ImageIndex, LocalImage, Layer};
 pub use registry::{Progress, Registry};

@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+pub mod build;
+
 /// Bumped whenever a breaking change is made to the control API.
 pub const PROTOCOL_VERSION: u32 = 2;
 
@@ -163,6 +165,28 @@ pub struct PairedDevice {
     pub last_seen: Option<u64>,
 }
 
+/// What `grav build` asks for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildSpec {
+    /// Absolute path of the build context (a folder on the Mac).
+    pub context: String,
+    /// The Dockerfile: relative to the context, or absolute. Default `Dockerfile`.
+    #[serde(default)]
+    pub dockerfile: Option<String>,
+    /// Name for the image, e.g. `myapp` or `myapp:1.0`. Default: the context folder's name.
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// `KEY=value` for the Dockerfile's ARGs.
+    #[serde(default)]
+    pub build_args: Vec<String>,
+    /// Build only up to this stage (`FROM … AS name`).
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Rebuild every step instead of reusing cached layers.
+    #[serde(default)]
+    pub no_cache: bool,
+}
+
 /// What `grav exec` asks for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecSpec {
@@ -311,6 +335,9 @@ pub enum Request {
     Restart { id: String },
     /// Pull an image from its registry; answers `Image` when done.
     Pull { reference: String },
+    /// Build an image from a Dockerfile. The daemon answers with `BuildLog`
+    /// lines as it goes, then `Image` (or `Error`).
+    Build(BuildSpec),
     /// Create a container and start it in its own VM; answers `Container` once started.
     Run(RunSpec),
     /// Remove a stopped container.
@@ -351,6 +378,7 @@ pub enum Response {
     Container(ContainerSummary),
     Image(ImageSummary),
     Removed { id: String },
+    BuildLog { line: String },
     ExecOutput { stream: LogStream, data: Vec<u8> },
     ExecExited { code: i32 },
     Attached,
@@ -424,6 +452,35 @@ pub enum AgentRequest {
     ListDir { container: String, path: String },
     /// Read up to `limit` bytes from the start of a file in the container.
     ReadFile { container: String, path: String, limit: u64 },
+    /// Remember the state of a container's files, for the next `commit`.
+    Snapshot { container: String },
+    /// Write what changed since the snapshot as a gzipped layer tar named
+    /// `name` in the `out` share, then snapshot again.
+    Commit { container: String, name: String },
+    /// Copy files into a container (Dockerfile COPY/ADD). Sources are paths or
+    /// patterns relative to the build context (`context` share), or to another
+    /// container's root when `from_container` is set.
+    Copy {
+        container: String,
+        sources: Vec<String>,
+        dest: String,
+        /// Working directory for a relative `dest`.
+        #[serde(default)]
+        cwd: String,
+        #[serde(default)]
+        from_container: Option<String>,
+        /// `user[:group]`; files are owned by root otherwise.
+        #[serde(default)]
+        chown: Option<String>,
+        /// ADD: unpack local tar archives instead of copying them.
+        #[serde(default)]
+        extract: bool,
+        /// .dockerignore patterns (context copies only).
+        #[serde(default)]
+        ignore: Vec<String>,
+    },
+    /// Create a directory (and its parents) in a container (WORKDIR).
+    Mkdir { container: String, path: String },
     Shutdown,
 }
 
@@ -446,7 +503,27 @@ pub enum AgentEvent {
     Stats(GuestStats),
     Dir(DirectoryListing),
     File(FileContents),
+    /// A step finished that has nothing else to report (snapshot, mkdir).
+    Done,
+    /// `copy` placed this many files.
+    Copied { files: u64 },
+    /// `commit`'s layer; `file` is `None` when nothing changed.
+    Committed(LayerInfo),
     Error { message: String },
+}
+
+/// A layer the agent wrote to the `out` share.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerInfo {
+    /// File name in the `out` share; `None` for an empty change.
+    pub file: Option<String>,
+    /// sha256 of the gzipped tar.
+    pub digest: String,
+    /// sha256 of the uncompressed tar (the image config's diff_id).
+    pub diff_id: String,
+    pub size: u64,
+    /// Files, folders and whiteouts in it.
+    pub entries: u64,
 }
 
 /// Raw counters from the guest's /proc; gravitond turns them into rates.

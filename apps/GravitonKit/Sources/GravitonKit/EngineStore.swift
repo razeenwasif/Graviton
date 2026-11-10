@@ -142,6 +142,29 @@ public final class EngineStore {
         return container
     }
 
+    /// Builds read a folder on this Mac, so they need the local gravitond.
+    public var canBuild: Bool { connection == .live && live is SocketEngine }
+
+    /// Build an image; the stream carries log lines, then the image. The image list refreshes at the end.
+    public func build(_ spec: BuildSpec) -> AsyncThrowingStream<BuildEvent, Error> {
+        guard canBuild, let engine = live as? SocketEngine else {
+            return AsyncThrowingStream { $0.finish(throwing: EngineError.daemon("Builds need gravitond running on this Mac.")) }
+        }
+        let upstream = engine.build(spec)
+        return AsyncThrowingStream { continuation in
+            let task = Task { @MainActor [weak self] in
+                do {
+                    for try await event in upstream { continuation.yield(event) }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+                await self?.refresh()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     public func remove(_ c: Container) async {
         do {
             _ = try await service.remove(id: c.id)

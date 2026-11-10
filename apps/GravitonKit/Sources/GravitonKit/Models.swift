@@ -309,3 +309,32 @@ public struct ExecSpec: Codable, Hashable, Sendable {
         self.env = env
     }
 }
+
+/// What `grav build` asks for (mirrors `BuildSpec` in `graviton-proto`).
+public struct BuildSpec: Codable, Hashable, Sendable {
+    /// Absolute path of the build context.
+    public var context: String
+    /// Relative to the context, or absolute; default `Dockerfile`.
+    public var dockerfile: String?
+    /// `name` or `name:tag`; default: the folder's name.
+    public var tag: String?
+    /// `KEY=value` for ARGs.
+    public var buildArgs: [String]
+    public var target: String?
+    public var noCache: Bool
+
+    public init(context: String, dockerfile: String? = nil, tag: String? = nil, buildArgs: [String] = [], target: String? = nil, noCache: Bool = false) {
+        self.context = context
+        self.dockerfile = dockerfile
+        self.tag = tag
+        self.buildArgs = buildArgs
+        self.target = target
+        self.noCache = noCache
+    }
+}
+
+/// Progress from a build.
+public enum BuildEvent: Sendable, Equatable {
+    case log(String)
+    case built(ImageInfo)
+}

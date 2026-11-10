@@ -12,6 +12,7 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case restart(id: String)
     case pull(reference: String)
     case run(RunSpec)
+    case build(BuildSpec)
     case remove(id: String)
     case exec(ExecSpec)
     case stats(id: String)
@@ -44,6 +45,7 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .restart: "restart"
         case .pull: "pull"
         case .run: "run"
+        case .build: "build"
         case .remove: "remove"
         case .exec: "exec"
         case .stats: "stats"
@@ -73,6 +75,7 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case let .exec(spec): try c.encode(spec, forKey: .params)
         case let .pull(reference): try c.encode(PullParams(reference: reference), forKey: .params)
         case let .run(spec): try c.encode(spec, forKey: .params)
+        case let .build(spec): try c.encode(spec, forKey: .params)
         }
     }
 }
@@ -87,6 +90,7 @@ public enum EngineResponse: Decodable, Sendable {
     case container(Container)
     case image(ImageInfo)
     case removed(id: String)
+    case buildLog(String)
     case attached
     case stats(ContainerStats)
     case files(DirectoryListing)
@@ -105,6 +109,7 @@ public enum EngineResponse: Decodable, Sendable {
     private struct Host: Decodable { let host: String }
     private struct Pong: Decodable { let `protocol`: UInt32 }
     private struct ErrorData: Decodable { let message: String }
+    private struct BuildLine: Decodable { let line: String }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
@@ -119,6 +124,7 @@ public enum EngineResponse: Decodable, Sendable {
         case "image": self = .image(try c.decode(ImageInfo.self, forKey: .data))
         case "removed": self = .removed(id: try c.decode(Removed.self, forKey: .data).id)
         case "attached": self = .attached
+        case "build_log": self = .buildLog(try c.decode(BuildLine.self, forKey: .data).line)
         case "stats": self = .stats(try c.decode(ContainerStats.self, forKey: .data))
         case "files": self = .files(try c.decode(DirectoryListing.self, forKey: .data))
         case "file": self = .file(try c.decode(FileContents.self, forKey: .data))

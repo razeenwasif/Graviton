@@ -102,6 +102,11 @@ fn mount_blobs() -> io::Result<()> {
         .map_err(|e| io::Error::other(format!("mounting the image store: {e}")))
 }
 
+/// Unpack a tar (gzipped or not) into `dir` (ADD of a local archive).
+pub fn unpack_into(archive: &Path, dir: &Path) -> io::Result<u64> {
+    unpack_layer(archive, dir)
+}
+
 fn unpack_layer(blob: &Path, root: &Path) -> io::Result<u64> {
     let mut file = File::open(blob)?;
     let mut magic = [0u8; 4];

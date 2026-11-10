@@ -127,6 +127,44 @@ public final class SocketEngine: EngineService {
         return try await Task.detached { try SocketTerminal(path: path, spec: spec) }.value
     }
 
+    /// Build an image from a Dockerfile; the stream carries the log, then the image.
+    public func build(_ spec: BuildSpec) -> AsyncThrowingStream<BuildEvent, Error> {
+        let path = self.path
+        return AsyncThrowingStream { continuation in
+            let thread = Thread {
+                do {
+                    let fd = try Self.connect(path: path)
+                    defer { close(fd) }
+                    try Self.writeAll(fd, Array(try Wire.line(.build(spec))))
+                    var buffer = Data()
+                    var chunk = [UInt8](repeating: 0, count: 64 * 1024)
+                    while true {
+                        while let nl = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                            let line = buffer[buffer.startIndex..<nl]
+                            buffer.removeSubrange(buffer.startIndex...nl)
+                            switch try Wire.decoder.decode(EngineResponse.self, from: Data(line)) {
+                            case let .buildLog(text): continuation.yield(.log(text))
+                            case let .image(image):
+                                continuation.yield(.built(image))
+                                continuation.finish()
+                                return
+                            case let .error(message): throw EngineError.daemon(message)
+                            default: throw EngineError.unexpectedResponse
+                            }
+                        }
+                        let n = read(fd, &chunk, chunk.count)
+                        guard n > 0 else { throw EngineError.io("gravitond closed the connection") }
+                        buffer.append(contentsOf: chunk[0..<n])
+                    }
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            thread.name = "graviton-build"
+            thread.start()
+        }
+    }
+
     /// A one-time code for pairing a phone (gravitond must run with --remote).
     public func pairBegin() async throws -> PairingInfo {
         guard case let .pairing(info) = try await call(.pairBegin) else { throw EngineError.unexpectedResponse }

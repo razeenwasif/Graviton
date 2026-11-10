@@ -98,8 +98,8 @@ struct StatsHistory {
 
 pub struct Engine {
     pub store: Arc<Mutex<Store>>,
-    blobs: BlobStore,
-    index: Mutex<ImageIndex>,
+    pub(crate) blobs: BlobStore,
+    pub(crate) index: Mutex<ImageIndex>,
     specs: Mutex<HashMap<String, ContainerSpec>>,
     running: Mutex<HashMap<String, Running>>,
     stats: Mutex<HashMap<String, StatsHistory>>,
@@ -165,6 +165,8 @@ impl Engine {
                     interrupted.push(c.id.clone());
                 }
                 c.ip_address = None;
+                c.cpu_percent = None;
+                c.memory_bytes = None;
                 let id = c.id.clone();
                 if store.insert(c).is_ok() {
                     store.set_logs(&id, read_log(&log_path(&id)));
@@ -216,7 +218,7 @@ impl Engine {
         Ok(image.summary(self.used_by(&image.reference)))
     }
 
-    fn image_for(&self, reference: &str) -> Result<LocalImage> {
+    pub(crate) fn image_for(&self, reference: &str) -> Result<LocalImage> {
         if let Some(img) = self.index.lock().unwrap().get(reference) {
             return Ok(img.clone());
         }
@@ -229,7 +231,7 @@ impl Engine {
         specs.values().filter(|s| s.image.reference == reference).count() as u32
     }
 
-    fn refresh_images(&self) {
+    pub(crate) fn refresh_images(&self) {
         let summaries: Vec<ImageSummary> = {
             let index = self.index.lock().unwrap();
             index.images().map(|i| i.summary(self.used_by(&i.reference))).collect()
@@ -846,7 +848,7 @@ fn read_log(path: &Path) -> Vec<LogLine> {
 }
 
 /// Read one JSON line byte by byte, so nothing after it is consumed.
-fn read_event_unbuffered(conn: &mut File) -> Result<AgentEvent> {
+pub(crate) fn read_event_unbuffered(conn: &mut File) -> Result<AgentEvent> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
@@ -863,17 +865,17 @@ fn read_event_unbuffered(conn: &mut File) -> Result<AgentEvent> {
     }
 }
 
-struct Events {
+pub(crate) struct Events {
     reader: BufReader<File>,
     line: String,
 }
 
 impl Events {
-    fn new(reader: BufReader<File>) -> Self {
+    pub(crate) fn new(reader: BufReader<File>) -> Self {
         Self { reader, line: String::new() }
     }
 
-    fn next(&mut self) -> Result<AgentEvent> {
+    pub(crate) fn next(&mut self) -> Result<AgentEvent> {
         self.line.clear();
         if self.reader.read_line(&mut self.line)? == 0 {
             bail!("the guest agent closed the connection (the VM may have stopped)");
@@ -884,10 +886,10 @@ impl Events {
 
 /// Splits a byte stream into lines for the log.
 #[derive(Default)]
-struct LineBuffer(Vec<u8>);
+pub(crate) struct LineBuffer(Vec<u8>);
 
 impl LineBuffer {
-    fn push(&mut self, data: &[u8]) -> Vec<String> {
+    pub(crate) fn push(&mut self, data: &[u8]) -> Vec<String> {
         self.0.extend_from_slice(data);
         let mut lines = Vec::new();
         while let Some(pos) = self.0.iter().position(|&b| b == b'\n') {
@@ -901,7 +903,7 @@ impl LineBuffer {
         lines
     }
 
-    fn finish(&mut self) -> Option<String> {
+    pub(crate) fn finish(&mut self) -> Option<String> {
         (!self.0.is_empty()).then(|| String::from_utf8_lossy(&std::mem::take(&mut self.0)).trim_end_matches('\r').to_string())
     }
 }
@@ -927,14 +929,14 @@ fn send(agent: &Arc<Mutex<File>>, request: &AgentRequest) -> Result<()> {
     agent.lock().unwrap().write_all(&encode_line(request)).context("writing to the guest agent")
 }
 
-fn new_id() -> String {
+pub(crate) fn new_id() -> String {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let a = RandomState::new().hash_one(nanos);
     let b = RandomState::new().hash_one(a);
     format!("{:016x}", a ^ b.rotate_left(17))[..12].to_string()
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 

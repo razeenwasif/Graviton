@@ -381,6 +381,7 @@ dependencies = [
  "graviton-proto",
  "libc",
  "serde_json",
+ "sha2",
  "tar",
 ]
 
@@ -441,6 +442,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-rustls",
 ]

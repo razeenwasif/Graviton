@@ -4,6 +4,7 @@ import SwiftUI
 struct ImagesScreen: View {
     @Environment(EngineStore.self) private var store
     @State private var showPull = false
+    @State private var showBuild = false
     @State private var runImage: ImageInfo?
 
     private var totalSize: UInt64 { store.images.map(\.sizeBytes).reduce(0, +) }
@@ -23,9 +24,8 @@ struct ImagesScreen: View {
         .navigationSubtitle("\(store.images.count) images · \(Format.bytes(totalSize)) on disk")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                Button("Build…") {}
-                    .disabled(true)
-                    .help("Image builds arrive with milestone 5")
+                Button("Build…") { showBuild = true }
+                    .help(store.canBuild ? "Build an image from a folder with a Dockerfile" : "Start gravitond on this Mac to build images")
                 Button {
                     showPull = true
                 } label: {
@@ -36,6 +36,7 @@ struct ImagesScreen: View {
             }
         }
         .sheet(isPresented: $showPull) { PullImageSheet() }
+        .sheet(isPresented: $showBuild) { BuildImageSheet() }
         .sheet(item: $runImage) { image in
             RunContainerSheet(initialImage: "\(image.repository):\(image.tag)")
         }

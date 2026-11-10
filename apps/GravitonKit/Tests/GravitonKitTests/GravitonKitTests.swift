@@ -155,3 +155,22 @@ import Testing
         #expect(code == 4)
     }
 }
+
+@Suite struct BuildTests {
+    @Test func encodesBuildLikeRust() throws {
+        let spec = BuildSpec(context: "/Users/me/app", tag: "app:1", buildArgs: ["PY=3.12"], noCache: true)
+        let line = String(decoding: try Wire.line(.build(spec)), as: UTF8.self)
+        #expect(line == #"{"method":"build","params":{"build_args":["PY=3.12"],"context":"/Users/me/app","no_cache":true,"tag":"app:1"}}"# + "\n")
+        guard case let .buildLog(text) = try Wire.decoder.decode(EngineResponse.self, from: Data(#"{"type":"build_log","data":{"line":"Step 1/3 : FROM alpine"}}"#.utf8)) else {
+            Issue.record("not a build log"); return
+        }
+        #expect(text == "Step 1/3 : FROM alpine")
+    }
+
+    @MainActor @Test func demoDataCannotBuild() async {
+        let store = EngineStore(useDaemon: false)
+        await store.refresh()
+        #expect(!store.canBuild)
+        await #expect(throws: EngineError.self) { for try await _ in store.build(BuildSpec(context: "/tmp")) {} }
+    }
+}

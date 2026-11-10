@@ -11,8 +11,10 @@ SwiftUI apps for macOS and iOS.
 > the exit code), and containers and logs saved across restarts. The Mac app
 > pulls, runs and removes them, and shows each one's live CPU, memory and
 > network charts, processes, files and configuration, with a shell in a
-> Terminal tab. The iPhone app pairs with a Mac over TLS to show and control
-> its containers, and opens shells in them too.
+> Terminal tab. `grav build` (and Build… in the Mac app) builds images from
+> Dockerfiles, multi-stage included, with a layer cache. The iPhone app pairs
+> with a Mac over TLS to show and control its containers, and opens shells in
+> them too.
 
 ## Layout
 
@@ -20,9 +22,9 @@ SwiftUI apps for macOS and iOS.
 crates/
   graviton-proto   Wire types (control API + guest agent channel), JSON lines
   graviton-core    Image references, engine store, well-known paths
-  graviton-image   Registry client, content-addressed blob store, local image index
+  graviton-image   Registry client, blob store, local image index, Dockerfile parser
   graviton-vmm     VM config + Hypervisor trait; Virtualization.framework backend
-  graviton-agent   PID 1 inside each guest VM: unpacks images, runs containers, talks vsock
+  graviton-agent   PID 1 inside each guest VM: unpacks images, runs containers, writes build layers
   gravitond        Engine daemon: control API on a Unix socket, one VM per container
   grav             CLI client
 apps/
@@ -139,6 +141,24 @@ carries binary frames both ways: a kind byte (0 data, 1 resize, 2 end of input,
 3 exit code), a big-endian u32 length and the payload. gravitond passes them
 between the client and the guest agent untouched, over the Unix socket or TLS.
 
+Build images from Dockerfiles:
+
+```bash
+cargo run -p grav -- build -t myapp .              # ./Dockerfile; the image is myapp:latest
+cargo run -p grav -- build -f docker/Dockerfile --build-arg PY=3.12 --target deps .
+cargo run -p grav -- run myapp
+```
+
+Supported: FROM (multi-stage, `AS name`, ARGs in FROM), RUN, COPY and ADD
+(local files and tarballs, wildcards, `--from` a stage or image, `--chown`),
+CMD, ENTRYPOINT, SHELL, ENV, ARG, WORKDIR, USER, EXPOSE, LABEL, VOLUME,
+STOPSIGNAL and `.dockerignore`. `RUN --mount=type=cache` runs without the
+cache. Not yet: heredocs, ONBUILD, `ADD <url>`, `--chmod` and secret or bind
+mounts. Each step's layer is cached by the step and the files it copies, so a
+rebuild with nothing changed takes no time and gives the same image; steps
+that miss run in a builder VM (4 vCPU, 4 GiB) with the context shared
+read-only, and the agent writes each step's changes as a layer.
+
 Inside a running container:
 
 ```bash
@@ -168,4 +188,5 @@ cargo run -p grav -- inspect web      # how it was configured, as JSON
 5. **Polish**: framed terminals with resize and exit codes, Stats, Files,
    Inspect and Terminal tabs, and a shell on the iPhone (done; terminals are
    drawn by [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm), MIT);
-   image builds; app sandbox + XPC; signing and notarisation.
+   image builds with `grav build` and the Mac app's Build sheet (done); app
+   sandbox + XPC; signing and notarisation.

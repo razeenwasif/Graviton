@@ -11,7 +11,7 @@ use graviton_core::{ImageReference, paths};
 use std::sync::{Arc, Mutex};
 
 use graviton_proto::frame::{Decoder, Frame};
-use graviton_proto::{ContainerStatus, ContainerSummary, ExecSpec, FileKind, LogStream, Request, Response, RunSpec, decode_line, encode_line};
+use graviton_proto::{BuildSpec, ContainerStatus, ContainerSummary, ExecSpec, FileKind, LogStream, Request, Response, RunSpec, decode_line, encode_line};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Native containers for macOS")]
@@ -80,6 +80,27 @@ enum Command {
         /// Command (replaces the image's default command).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+    /// Build an image from a Dockerfile (in its own VM; no Docker needed).
+    Build {
+        /// Name the image (NAME or NAME:TAG); default: the folder's name.
+        #[arg(short, long)]
+        tag: Option<String>,
+        /// The Dockerfile, relative to the folder (default: Dockerfile).
+        #[arg(short, long)]
+        file: Option<String>,
+        /// Set an ARG (KEY=value); repeatable.
+        #[arg(long = "build-arg")]
+        build_arg: Vec<String>,
+        /// Build up to this stage.
+        #[arg(long)]
+        target: Option<String>,
+        /// Rebuild every step.
+        #[arg(long)]
+        no_cache: bool,
+        /// The build context.
+        #[arg(default_value = ".")]
+        path: PathBuf,
     },
     /// Remove a stopped container.
     Rm { container: String },
@@ -289,6 +310,32 @@ fn run(cli: Cli) -> Result<()> {
             Response::Details(d) => println!("{}", serde_json::to_string_pretty(&d)?),
             other => unexpected(other)?,
         },
+        Command::Build { tag, file, build_arg, target, no_cache, path } => {
+            let context = std::fs::canonicalize(&path).with_context(|| format!("{} doesn't exist", path.display()))?;
+            let dockerfile = match file {
+                // A path given on the command line is relative to where you are.
+                Some(f) => Some(std::fs::canonicalize(&f).with_context(|| format!("{f} doesn't exist"))?.display().to_string()),
+                None => None,
+            };
+            let spec = BuildSpec { context: context.display().to_string(), dockerfile, tag, build_args: build_arg, target, no_cache };
+            client.writer.write_all(&encode_line(&Request::Build(spec)))?;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if client.reader.read_line(&mut line)? == 0 {
+                    bail!("gravitond closed the connection");
+                }
+                match decode_line::<Response>(line.as_bytes())? {
+                    Response::BuildLog { line } => println!("{line}"),
+                    Response::Image(i) => {
+                        println!("{}:{}  {}", i.repository, i.tag, &i.digest[..i.digest.len().min(19)]);
+                        break;
+                    }
+                    Response::Error { message } => bail!(message),
+                    other => return unexpected(other),
+                }
+            }
+        }
         Command::Rm { container } => match client.call(&Request::Remove { id: container })? {
             Response::Removed { id } => println!("{id}"),
             other => unexpected(other)?,

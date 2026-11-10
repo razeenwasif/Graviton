@@ -6,6 +6,7 @@
 //! the sample containers from the design mockups instead.
 
 mod boot_check;
+mod build;
 mod remote;
 mod runtime;
 
@@ -183,6 +184,10 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
             write.write_all(&encode_line(&response)).await?;
             continue;
         }
+        if let (Request::Build(spec), Backend::Engine(engine)) = (&request, &backend) {
+            build_stream(Arc::clone(engine), spec.clone(), &mut write).await?;
+            continue;
+        }
         if let (Request::Exec(spec), Backend::Engine(engine)) = (&request, &backend) {
             if spec.tty {
                 // The connection becomes a raw terminal stream.
@@ -195,6 +200,29 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
         let response = handle(request, &backend).await;
         write.write_all(&encode_line(&response)).await?;
     }
+}
+
+/// `grav build`: stream the build's log lines, then the image.
+async fn build_stream(engine: Arc<Engine>, spec: graviton_proto::BuildSpec, write: &mut (impl tokio::io::AsyncWrite + Unpin)) -> Result<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::task::spawn_blocking(move || {
+        let lines = tx.clone();
+        let result = build::build(&engine, &spec, &mut |line| {
+            eprintln!("build: {line}");
+            let _ = lines.send(Response::BuildLog { line });
+        });
+        let _ = tx.send(match result {
+            Ok(image) => Response::Image(image),
+            Err(err) => Response::Error { message: format!("{err:#}") },
+        });
+    });
+    while let Some(response) = rx.recv().await {
+        if write.write_all(&encode_line(&response)).await.is_err() {
+            break; // the client went away; the build finishes on its own
+        }
+    }
+    let _ = task.await;
+    Ok(())
 }
 
 /// `grav exec` without a TTY: stream output lines, then the exit code.
@@ -282,6 +310,7 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                     Request::ReadFile { id, path } => Response::File(engine.read_file(&id, &path)?),
                     Request::Inspect { id } => Response::Details(Box::new(engine.inspect(&id)?)),
                     Request::Exec(_) => unreachable!("exec is handled by serve()"),
+                    Request::Build(_) => Response::Error { message: "builds run on the Mac itself: use grav build there".into() },
                     Request::PairBegin | Request::ListDevices | Request::RevokeDevice { .. } | Request::Pair { .. } | Request::Auth { .. } => {
                         Response::Error { message: "not available here".into() }
                     }

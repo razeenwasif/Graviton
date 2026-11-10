@@ -66,6 +66,41 @@ struct LiveEngineTests {
         _ = try await engine.remove(id: container.id)
     }
 
+    @Test func buildsAndRunsAnImage() async throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "graviton-live-build-\(Int.random(in: 1000...9999))")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try "FROM alpine\nARG WHO=nobody\nCOPY hello.txt /greeting\nRUN echo \"$WHO\" >> /greeting\nCMD [\"cat\", \"/greeting\"]\n".write(to: dir.appending(path: "Dockerfile"), atomically: true, encoding: .utf8)
+        try "hello from a swift build\n".write(to: dir.appending(path: "hello.txt"), atomically: true, encoding: .utf8)
+
+        let engine = SocketEngine()
+        var log: [String] = []
+        var built: ImageInfo?
+        for try await event in engine.build(BuildSpec(context: dir.path, tag: "swift-live-build:1", buildArgs: ["WHO=swift"])) {
+            switch event {
+            case let .log(line): log.append(line)
+            case let .built(image): built = image
+            }
+        }
+        #expect(log.contains { $0.hasPrefix("Step 4/5 : RUN") })
+        #expect(built?.repository == "swift-live-build")
+
+        var container = try await engine.run(RunSpec(image: "swift-live-build:1", memoryMib: 256))
+        let deadline = Date.now.addingTimeInterval(30)
+        while container.status != .exited, Date.now < deadline {
+            try await Task.sleep(for: .milliseconds(100))
+            container = try await engine.containers().first { $0.id == container.id } ?? container
+        }
+        let messages = try await engine.logs(id: container.id, tail: nil).map(\.message)
+        #expect(messages.contains("hello from a swift build"))
+        #expect(messages.contains("swift"))
+        _ = try await engine.remove(id: container.id)
+
+        // A bad Dockerfile line comes back as the daemon's error.
+        try "FROM alpine\nRUN false\n".write(to: dir.appending(path: "Dockerfile"), atomically: true, encoding: .utf8)
+        await #expect(throws: EngineError.self) { for try await _ in engine.build(BuildSpec(context: dir.path, tag: "swift-live-build:bad")) {} }
+    }
+
     @Test func reportsDaemonErrors() async throws {
         await #expect(throws: EngineError.daemon("no such container: definitely-not-here")) {
             try await SocketEngine().remove(id: "definitely-not-here")
