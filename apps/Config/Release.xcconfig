@@ -1,0 +1,17 @@
+// Developer ID signing for the Mac app's Release configuration (used when you
+// archive in Xcode; scripts/release.sh signs the same way from the command line).
+//
+// Your team ID goes in Signing.local.xcconfig next to this file, which git
+// ignores. Copy Signing.local.xcconfig.example to start.
+
+#include? "Signing.local.xcconfig"
+
+DEVELOPMENT_TEAM = $(GRAVITON_TEAM_ID)
+CODE_SIGN_STYLE = Manual
+CODE_SIGN_IDENTITY = Developer ID Application
+ENABLE_HARDENED_RUNTIME = YES
+OTHER_CODE_SIGN_FLAGS = --timestamp
+CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO
+
+// Virtualization.framework with arm64 guests: Apple silicon only.
+ARCHS = arm64

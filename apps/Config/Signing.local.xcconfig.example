@@ -1,0 +1,4 @@
+// Copy to Signing.local.xcconfig (ignored by git) and fill in your team.
+// Your team ID is on developer.apple.com under Membership, or in parentheses
+// after your name in `security find-identity -v -p codesigning`.
+GRAVITON_TEAM_ID = ABCDE12345

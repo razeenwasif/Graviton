@@ -34,18 +34,24 @@ targets:
     dependencies:
       - package: GravitonKit
       - package: SwiftTerm
+    # Debug signs ad hoc; Release signs with Developer ID (Config/Release.xcconfig).
+    configFiles:
+      Release: Config/Release.xcconfig
     settings:
       base:
         PRODUCT_NAME: Graviton
         PRODUCT_BUNDLE_IDENTIFIER: dev.graviton.mac
-        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_ENTITLEMENTS: Mac/Graviton.entitlements
         ENABLE_HARDENED_RUNTIME: YES
         # The app talks to gravitond's Unix socket in ~/Library/Application Support,
-        # so it isn't sandboxed yet. Revisit with an XPC service before distribution.
+        # so it isn't sandboxed yet (see the README's Releasing section).
         ENABLE_APP_SANDBOX: NO
         INFOPLIST_KEY_CFBundleDisplayName: Graviton
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
+      configs:
+        Debug:
+          CODE_SIGN_IDENTITY: "-"
 
   GravitonIOS:
     type: application

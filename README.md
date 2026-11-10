@@ -124,6 +124,54 @@ swift test --package-path apps/GravitonKit
 GRAVITON_LIVE=1 swift test --package-path apps/GravitonKit   # also drives a running gravitond
 ```
 
+## Releasing
+
+`scripts/release.sh` builds a distributable Graviton.app: the app with
+`gravitond`, `grav` and the guest kernel and initramfs inside it, signed
+inside out with the hardened runtime (gravitond keeps its virtualization
+entitlement), notarised, stapled, and packaged as a zip and a disk image in
+`dist/`.
+
+One-time setup, with your Apple Developer account:
+
+1. A **Developer ID Application** certificate in your login keychain: Xcode >
+   Settings > Accounts > Manage Certificates > + (the account holder may need
+   to create it). An Apple Development certificate isn't enough.
+2. Your team ID in `apps/Config/Signing.local.xcconfig` (ignored by git):
+
+   ```bash
+   cp apps/Config/Signing.local.xcconfig.example apps/Config/Signing.local.xcconfig
+   ```
+
+3. A notarytool profile in your keychain. It asks for an app-specific
+   password (appleid.apple.com > Sign-In and Security) and keeps it there:
+
+   ```bash
+   xcrun notarytool store-credentials graviton-notary --apple-id YOUR_APPLE_ID --team-id YOUR_TEAM_ID
+   ```
+
+Then:
+
+```bash
+scripts/release.sh                # sign, notarise, staple, package
+scripts/release.sh --no-notarize  # Developer ID signing only
+scripts/release.sh --adhoc        # no certificate: checks the whole pipeline locally
+```
+
+To run the released engine at login: `scripts/install-launch-agent.sh --app
+/Applications/Graviton.app` (add `--remote` for phones). gravitond running
+from the app uses the app's own guest. Archiving GravitonMac in Xcode uses the
+same Developer ID settings (`apps/Config/Release.xcconfig`); Debug builds stay
+ad hoc.
+
+The guest bundles Linux and BusyBox from Alpine (GPL-2.0); the app carries
+`Resources/guest/SOURCES.txt` saying where their source is.
+
+Not sandboxed yet: the app reaches gravitond's socket in `~/Library/Application
+Support/Graviton`, which a sandboxed app can't. Developer ID distribution
+doesn't need the sandbox; the App Store would, with the socket moved to an app
+group container or an XPC service.
+
 ## Protocol
 
 One JSON object per line over the Unix socket:
@@ -188,5 +236,6 @@ cargo run -p grav -- inspect web      # how it was configured, as JSON
 5. **Polish**: framed terminals with resize and exit codes, Stats, Files,
    Inspect and Terminal tabs, and a shell on the iPhone (done; terminals are
    drawn by [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm), MIT);
-   image builds with `grav build` and the Mac app's Build sheet (done); app
-   sandbox + XPC; signing and notarisation.
+   image builds with `grav build` and the Mac app's Build sheet (done);
+   Developer ID signing and notarisation with `scripts/release.sh` (ready;
+   needs your certificate); app sandbox + XPC for the App Store.

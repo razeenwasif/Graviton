@@ -31,15 +31,48 @@ pub fn containers_dir() -> PathBuf {
     support_dir().join("containers")
 }
 
-/// Guest kernel and initramfs (written by `scripts/build-guest.sh`).
-/// `$GRAVITON_GUEST_DIR` overrides it.
+/// Guest kernel and initramfs. `$GRAVITON_GUEST_DIR` wins; then the copy in
+/// Graviton.app when gravitond runs from the app (`Contents/MacOS/gravitond`
+/// next to `Contents/Resources/guest`), so it always matches its agent; then
+/// the one `scripts/build-guest.sh` writes.
 pub fn guest_dir() -> PathBuf {
-    std::env::var_os("GRAVITON_GUEST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| support_dir().join("guest"))
+    if let Some(dir) = std::env::var_os("GRAVITON_GUEST_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(bundled) = std::env::current_exe().ok().and_then(|exe| bundled_guest(&exe)) {
+        return bundled;
+    }
+    support_dir().join("guest")
+}
+
+fn bundled_guest(exe: &std::path::Path) -> Option<PathBuf> {
+    let macos = exe.parent()?;
+    if macos.file_name()? != "MacOS" {
+        return None;
+    }
+    let guest = macos.parent()?.join("Resources/guest");
+    guest.join("vmlinux").is_file().then_some(guest)
 }
 
 /// Per-VM runtime files (console logs).
 pub fn vms_dir() -> PathBuf {
     support_dir().join("vms")
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_guest_inside_an_app() {
+        let app = std::env::temp_dir().join(format!("graviton-paths-{}/Graviton.app/Contents", std::process::id()));
+        std::fs::create_dir_all(app.join("Resources/guest")).unwrap();
+        std::fs::create_dir_all(app.join("MacOS")).unwrap();
+        let exe = app.join("MacOS/gravitond");
+        assert_eq!(bundled_guest(&exe), None); // no kernel yet
+        std::fs::write(app.join("Resources/guest/vmlinux"), b"k").unwrap();
+        assert_eq!(bundled_guest(&exe), Some(app.join("Resources/guest")));
+        assert_eq!(bundled_guest(std::path::Path::new("/usr/local/bin/gravitond")), None);
+        let _ = std::fs::remove_dir_all(app.parent().unwrap().parent().unwrap());
+    }
 }
