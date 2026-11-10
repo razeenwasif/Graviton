@@ -8,7 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use graviton_core::{ImageReference, paths};
-use graviton_proto::{ContainerStatus, ContainerSummary, ExecSpec, LogStream, Request, Response, RunSpec, decode_line, encode_line};
+use std::sync::{Arc, Mutex};
+
+use graviton_proto::frame::{Decoder, Frame};
+use graviton_proto::{ContainerStatus, ContainerSummary, ExecSpec, FileKind, LogStream, Request, Response, RunSpec, decode_line, encode_line};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Native containers for macOS")]
@@ -95,6 +98,20 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
+    /// Show a running container's CPU, memory and network use.
+    Stats { container: String },
+    /// List the processes in a running container.
+    Top { container: String },
+    /// List a folder inside a running container.
+    Ls {
+        container: String,
+        #[arg(default_value = "/")]
+        path: String,
+    },
+    /// Print a file from inside a running container (up to 256 KiB).
+    Cat { container: String, path: String },
+    /// Show how a container is configured, as JSON.
+    Inspect { container: String },
     /// Pair a phone with this Mac (gravitond must run with --remote).
     Pair,
     /// Devices paired with this Mac.
@@ -216,6 +233,62 @@ fn run(cli: Cli) -> Result<()> {
             };
             std::process::exit(code);
         }
+        Command::Stats { container } => match client.call(&Request::Stats { id: container })? {
+            Response::Stats(st) => match st.samples.last() {
+                None => println!("No samples yet (they start once the container runs, every {} s).", st.interval_secs),
+                Some(s) => {
+                    let first = &st.samples[0];
+                    let secs = ((s.timestamp_ms - first.timestamp_ms) / 1000).max(1);
+                    println!("CPU       {:.1}%  ({} vCPU; 100% is one busy CPU)", s.cpu_percent, st.cpus);
+                    println!("Memory    {} / {}", bytes(s.memory_bytes), bytes(s.memory_limit_bytes));
+                    println!("Network   ↓ {}  ↑ {}  in total", bytes(s.net_rx_bytes), bytes(s.net_tx_bytes));
+                    if st.samples.len() > 1 {
+                        let rx = (s.net_rx_bytes - first.net_rx_bytes) / secs;
+                        let tx = (s.net_tx_bytes - first.net_tx_bytes) / secs;
+                        println!("          ↓ {}/s  ↑ {}/s  over the last {}", bytes(rx), bytes(tx), uptime(secs));
+                    }
+                    println!("Processes {}", st.processes.len());
+                }
+            },
+            other => unexpected(other)?,
+        },
+        Command::Top { container } => match client.call(&Request::Stats { id: container })? {
+            Response::Stats(st) => {
+                println!("{:>6} {:>6} {:>5} {:<2} {:>9} {:>9}  COMMAND", "PID", "PPID", "UID", "S", "RSS", "CPU TIME");
+                for p in st.processes {
+                    println!("{:>6} {:>6} {:>5} {:<2} {:>9} {:>9}  {}", p.pid, p.ppid, p.uid, p.state, bytes(p.rss_bytes), format!("{:.1}s", p.cpu_ms as f64 / 1000.0), p.command);
+                }
+            }
+            other => unexpected(other)?,
+        },
+        Command::Ls { container, path } => match client.call(&Request::ListFiles { id: container, path })? {
+            Response::Files(listing) => {
+                for e in listing.entries {
+                    let kind = match e.kind {
+                        FileKind::Directory => 'd',
+                        FileKind::Symlink => 'l',
+                        FileKind::File => '-',
+                        FileKind::Other => '?',
+                    };
+                    let link = e.link_target.map(|t| format!(" -> {t}")).unwrap_or_default();
+                    println!("{kind}{:04o} {:>5}:{:<5} {:>9}  {}{link}", e.mode, e.uid, e.gid, bytes(e.size), e.name);
+                }
+            }
+            other => unexpected(other)?,
+        },
+        Command::Cat { container, path } => match client.call(&Request::ReadFile { id: container, path })? {
+            Response::File(f) => {
+                std::io::stdout().write_all(&f.data)?;
+                if f.truncated {
+                    eprintln!("\ngrav: showed the first {} of {}", bytes(f.data.len() as u64), bytes(f.size));
+                }
+            }
+            other => unexpected(other)?,
+        },
+        Command::Inspect { container } => match client.call(&Request::Inspect { id: container })? {
+            Response::Details(d) => println!("{}", serde_json::to_string_pretty(&d)?),
+            other => unexpected(other)?,
+        },
         Command::Rm { container } => match client.call(&Request::Remove { id: container })? {
             Response::Removed { id } => println!("{id}"),
             other => unexpected(other)?,
@@ -338,18 +411,16 @@ fn exec_stream(client: &mut Client, spec: ExecSpec) -> Result<i32> {
     }
 }
 
-/// `grav exec -t`: put this terminal in raw mode and splice it with the container's.
+/// `grav exec -t`: put this terminal in raw mode and connect it to the
+/// container's; returns the program's exit code.
 fn exec_tty(socket: &std::path::Path, mut spec: ExecSpec, interactive: bool) -> Result<i32> {
     let is_tty = |fd| unsafe { libc::isatty(fd) } == 1;
-    // SAFETY: TIOCGWINSZ fills a winsize; a failure leaves the zeroed default.
-    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0 {
-        spec.rows = size.ws_row;
-        spec.cols = size.ws_col;
+    if let Some((rows, cols)) = window_size() {
+        (spec.rows, spec.cols) = (rows, cols);
     }
     let mut stream = UnixStream::connect(socket).with_context(|| format!("cannot reach gravitond at {}", socket.display()))?;
     stream.write_all(&encode_line(&Request::Exec(spec)))?;
-    // Read the answer byte by byte: what follows it is terminal output.
+    // Read the answer byte by byte: what follows it is terminal frames.
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     while stream.read(&mut byte)? == 1 && byte[0] != b'\n' {
@@ -362,26 +433,82 @@ fn exec_tty(socket: &std::path::Path, mut spec: ExecSpec, interactive: bool) -> 
     }
 
     let raw = if interactive && is_tty(libc::STDIN_FILENO) { RawMode::enable() } else { None };
+    let to_guest = Arc::new(Mutex::new(stream.try_clone()?));
+    let send = |w: &Arc<Mutex<UnixStream>>, f: Frame| w.lock().map(|mut s| s.write_all(&f.encode()).is_ok()).unwrap_or(false);
     if interactive {
-        let mut to_guest = stream.try_clone()?;
+        let w = Arc::clone(&to_guest);
         std::thread::spawn(move || {
-            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut to_guest);
-            let _ = to_guest.shutdown(std::net::Shutdown::Write);
+            let mut stdin = std::io::stdin().lock();
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if !send(&w, Frame::Data(buf[..n].to_vec())) {
+                            return;
+                        }
+                    }
+                }
+            }
+            send(&w, Frame::Eof);
         });
     }
+    if is_tty(libc::STDOUT_FILENO) {
+        // Follow window resizes (polling keeps this free of signal handlers).
+        let w = Arc::clone(&to_guest);
+        std::thread::spawn(move || {
+            let mut last = window_size();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let now = window_size();
+                if now != last {
+                    last = now;
+                    if let Some((rows, cols)) = now {
+                        if !send(&w, Frame::Resize { rows, cols }) {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     let mut out = std::io::stdout();
+    let mut decoder = Decoder::default();
     let mut buf = [0u8; 16 * 1024];
-    loop {
+    let mut code = None;
+    'read: loop {
         match stream.read(&mut buf) {
             Ok(0) | Err(_) => break,
-            Ok(n) => {
-                out.write_all(&buf[..n])?;
-                out.flush()?;
+            Ok(n) => decoder.push(&buf[..n]),
+        }
+        loop {
+            match decoder.next_frame() {
+                Ok(Some(Frame::Data(bytes))) => {
+                    out.write_all(&bytes)?;
+                    out.flush()?;
+                }
+                Ok(Some(Frame::Exit(c))) => {
+                    code = Some(c);
+                    break 'read;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(err) => {
+                    drop(raw);
+                    bail!(err);
+                }
             }
         }
     }
     drop(raw);
-    Ok(0)
+    code.ok_or_else(|| anyhow::anyhow!("the terminal session ended without an exit code (did the container stop?)"))
+}
+
+fn window_size() -> Option<(u16, u16)> {
+    // SAFETY: TIOCGWINSZ fills a winsize we own.
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    (unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0 && size.ws_row > 0).then_some((size.ws_row, size.ws_col))
 }
 
 /// Raw terminal mode for the life of the value.

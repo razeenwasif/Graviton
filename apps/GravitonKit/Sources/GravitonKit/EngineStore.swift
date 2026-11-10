@@ -152,6 +152,13 @@ public final class EngineStore {
         }
     }
 
+    // Panels call these directly and show errors in place.
+    public func stats(for id: String) async throws -> ContainerStats { try await service.stats(id: id) }
+    public func listFiles(in id: String, path: String) async throws -> DirectoryListing { try await service.listFiles(id: id, path: path) }
+    public func readFile(in id: String, path: String) async throws -> FileContents { try await service.readFile(id: id, path: path) }
+    public func inspect(_ id: String) async throws -> ContainerDetails { try await service.inspect(id: id) }
+    public func openTerminal(_ spec: ExecSpec) async throws -> any TerminalSession { try await service.openTerminal(spec) }
+
     public func start(_ c: Container) async { await lifecycle { try await $0.start(id: c.id) } }
     public func stop(_ c: Container) async { await lifecycle { try await $0.stop(id: c.id) } }
     public func restart(_ c: Container) async { await lifecycle { try await $0.restart(id: c.id) } }

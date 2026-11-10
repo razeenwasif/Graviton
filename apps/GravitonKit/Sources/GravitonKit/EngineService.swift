@@ -37,6 +37,14 @@ public protocol EngineService: Sendable {
     func run(_ spec: RunSpec) async throws -> Container
     /// Remove a stopped container; returns its id.
     func remove(id: String) async throws -> String
+    /// Recent CPU, memory and network samples and the processes of a running container.
+    func stats(id: String) async throws -> ContainerStats
+    func listFiles(id: String, path: String) async throws -> DirectoryListing
+    /// The start of a file (up to 256 KiB).
+    func readFile(id: String, path: String) async throws -> FileContents
+    func inspect(id: String) async throws -> ContainerDetails
+    /// Start a program on a terminal in a running container.
+    func openTerminal(_ spec: ExecSpec) async throws -> any TerminalSession
 }
 
 // MARK: - Socket engine
@@ -94,6 +102,31 @@ public final class SocketEngine: EngineService {
         return removed
     }
 
+    public func stats(id: String) async throws -> ContainerStats {
+        guard case let .stats(stats) = try await call(.stats(id: id)) else { throw EngineError.unexpectedResponse }
+        return stats
+    }
+
+    public func listFiles(id: String, path: String) async throws -> DirectoryListing {
+        guard case let .files(listing) = try await call(.listFiles(id: id, path: path), timeout: 15) else { throw EngineError.unexpectedResponse }
+        return listing
+    }
+
+    public func readFile(id: String, path: String) async throws -> FileContents {
+        guard case let .file(contents) = try await call(.readFile(id: id, path: path), timeout: 15) else { throw EngineError.unexpectedResponse }
+        return contents
+    }
+
+    public func inspect(id: String) async throws -> ContainerDetails {
+        guard case let .details(details) = try await call(.inspect(id: id)) else { throw EngineError.unexpectedResponse }
+        return details
+    }
+
+    public func openTerminal(_ spec: ExecSpec) async throws -> any TerminalSession {
+        let path = self.path
+        return try await Task.detached { try SocketTerminal(path: path, spec: spec) }.value
+    }
+
     /// A one-time code for pairing a phone (gravitond must run with --remote).
     public func pairBegin() async throws -> PairingInfo {
         guard case let .pairing(info) = try await call(.pairBegin) else { throw EngineError.unexpectedResponse }
@@ -126,44 +159,13 @@ public final class SocketEngine: EngineService {
 
     /// Blocking connect → write one line → read one line.
     static func roundTrip(path: String, payload: Data, timeout: Int) throws -> Data {
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw EngineError.io(String(cString: strerror(errno))) }
+        let fd = try connect(path: path)
         defer { close(fd) }
-
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let capacity = MemoryLayout.size(ofValue: addr.sun_path)
-        guard path.utf8.count < capacity else { throw EngineError.pathTooLong }
-        withUnsafeMutablePointer(to: &addr.sun_path) { raw in
-            raw.withMemoryRebound(to: CChar.self, capacity: capacity) { _ = strncpy($0, path, capacity - 1) }
-        }
-        #if canImport(Darwin)
-        addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-        #endif
-
-        let connected = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        guard connected == 0 else { throw EngineError.unreachable(String(cString: strerror(errno))) }
 
         var limit = timeval(tv_sec: timeout, tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &limit, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &limit, socklen_t(MemoryLayout<timeval>.size))
-        #if canImport(Darwin)
-        var noSigPipe: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
-        #endif
-
-        try payload.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
-            var offset = 0
-            while offset < buf.count {
-                let n = write(fd, buf.baseAddress! + offset, buf.count - offset)
-                guard n > 0 else { throw EngineError.io(String(cString: strerror(errno))) }
-                offset += n
-            }
-        }
+        try writeAll(fd, Array(payload))
 
         var reply = Data()
         var chunk = [UInt8](repeating: 0, count: 64 * 1024)
@@ -175,6 +177,51 @@ public final class SocketEngine: EngineService {
         }
         guard !reply.isEmpty else { throw EngineError.io("gravitond closed the connection") }
         return reply
+    }
+
+    static func writeAll(_ fd: Int32, _ bytes: [UInt8]) throws {
+        try bytes.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+            var offset = 0
+            while offset < buf.count {
+                let n = write(fd, buf.baseAddress! + offset, buf.count - offset)
+                guard n > 0 else { throw EngineError.io(String(cString: strerror(errno))) }
+                offset += n
+            }
+        }
+    }
+
+    /// A connected Unix socket to gravitond (no timeouts; SIGPIPE off).
+    static func connect(path: String) throws -> Int32 {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw EngineError.io(String(cString: strerror(errno))) }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let capacity = MemoryLayout.size(ofValue: addr.sun_path)
+        guard path.utf8.count < capacity else {
+            close(fd)
+            throw EngineError.pathTooLong
+        }
+        withUnsafeMutablePointer(to: &addr.sun_path) { raw in
+            raw.withMemoryRebound(to: CChar.self, capacity: capacity) { _ = strncpy($0, path, capacity - 1) }
+        }
+        #if canImport(Darwin)
+        addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        #endif
+
+        let connected = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connected == 0 else {
+            let why = String(cString: strerror(errno))
+            close(fd)
+            throw EngineError.unreachable(why)
+        }
+        var noSigPipe: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        return fd
     }
 }
 

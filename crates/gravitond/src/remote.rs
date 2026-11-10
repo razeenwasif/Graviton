@@ -257,10 +257,10 @@ impl Remote {
                 }
                 (Request::Exec(spec), crate::Backend::Engine(engine)) => {
                     if spec.tty {
-                        write.write_all(&encode_line(&Response::Error { message: "terminals aren't available remotely yet".into() })).await?;
-                    } else {
-                        crate::exec_stream(Arc::clone(engine), spec.clone(), &mut write).await?;
+                        // The connection becomes a terminal session.
+                        return crate::exec_tty(Arc::clone(engine), spec.clone(), lines.into_inner(), write).await;
                     }
+                    crate::exec_stream(Arc::clone(engine), spec.clone(), &mut write).await?;
                 }
                 _ => {
                     let response = crate::handle(request, &backend).await;

@@ -7,6 +7,7 @@ struct GravitonIOSApp: App {
     @State private var store = EngineStore(useDaemon: false)
     @State private var hosts = HostStore()
     @State private var browser = HostBrowser()
+    @State private var shells = ShellSessions()
     @State private var pairTarget: PairingTarget?
     @State private var tab = 0
 
@@ -39,6 +40,7 @@ struct GravitonIOSApp: App {
             .environment(store)
             .environment(hosts)
             .environment(browser)
+            .environment(shells)
             .preferredColorScheme(.dark)
             .tint(G.accent)
             .task { await store.run() }

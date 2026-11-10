@@ -30,7 +30,14 @@ struct ContainerDetailView: View {
                             ActionTileLabel(title: "Logs", symbol: "text.alignleft", tint: G.text)
                         }
                         .buttonStyle(.plain)
-                        ActionTile(title: "Shell", symbol: "terminal", enabled: false) {}
+                        NavigationLink {
+                            MobileShellView(container: c)
+                        } label: {
+                            ActionTileLabel(title: "Shell", symbol: "terminal", tint: G.text)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!c.isRunning)
+                        .opacity(c.isRunning ? 1 : 0.45)
                     }
 
                     VStack(alignment: .leading, spacing: 10) {

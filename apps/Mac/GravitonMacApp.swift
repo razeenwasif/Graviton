@@ -4,11 +4,13 @@ import SwiftUI
 @main
 struct GravitonMacApp: App {
     @State private var store = EngineStore(useDaemon: true)
+    @State private var shells = ShellSessions()
 
     var body: some Scene {
         WindowGroup("Graviton") {
             RootView()
                 .environment(store)
+                .environment(shells)
                 .preferredColorScheme(.dark)
                 .tint(G.accent)
                 .frame(minWidth: 980, minHeight: 620)

@@ -4,12 +4,15 @@ Native containers for macOS: a Rust engine that runs each Linux container in
 its own lightweight VM (Apple Virtualization.framework), a `grav` CLI, and
 SwiftUI apps for macOS and iOS.
 
-> Status: **milestone 3 done**. Containers run from real images, each in its
-> own VM (`grav run alpine` takes about half a second end to end), with NAT
-> networking, published ports, folder and named volumes, `grav exec` (including
-> `-it` shells), and containers and logs saved across restarts. The Mac app
-> pulls, runs and removes them, and the iPhone app pairs with a Mac over TLS
-> to show and control its containers.
+> Status: **milestone 4 done, milestone 5 under way**. Containers run from real
+> images, each in its own VM (`grav run alpine` takes about half a second end
+> to end), with NAT networking, published ports, folder and named volumes,
+> `grav exec` (including `-it` shells that follow window resizes and return
+> the exit code), and containers and logs saved across restarts. The Mac app
+> pulls, runs and removes them, and shows each one's live CPU, memory and
+> network charts, processes, files and configuration, with a shell in a
+> Terminal tab. The iPhone app pairs with a Mac over TLS to show and control
+> its containers, and opens shells in them too.
 
 ## Layout
 
@@ -25,8 +28,9 @@ crates/
 apps/
   project.yml      XcodeGen spec → Graviton.xcodeproj (generated, not committed)
   GravitonKit/     Shared Swift package: models, socket client, demo engine, theme, components
-  Mac/             macOS app (Containers, Run sheet, Logs, Images + Pull sheet)
-  iOS/             iOS companion (Containers, Detail, Logs)
+  Shared/          Swift shared by both apps: shell sessions drawn by SwiftTerm
+  Mac/             macOS app (Containers, Run sheet, Logs, Terminal, Stats, Files, Inspect, Images + Pull sheet)
+  iOS/             iOS companion (Containers, Detail, Logs, Shell, Hosts)
 scripts/
   build-guest.sh   Guest kernel (Alpine linux-virt) + initramfs with the agent as /init
   dev-gravitond.sh Build gravitond, sign it with the virtualization entitlement, run it
@@ -101,9 +105,14 @@ Apps:
 cd apps && xcodegen generate && open Graviton.xcodeproj
 ```
 
+SwiftTerm runs a small build plugin that records its version: Xcode asks you
+to trust it once; `xcodebuild` needs `-skipPackagePluginValidation`. It's
+pinned to 1.11.2, the last release that draws with CoreText; later releases
+need Xcode's Metal toolchain.
+
 The macOS app connects to gravitond when it's running and falls back to demo
-data otherwise (the sidebar card says which). The iOS app always uses demo
-data until remote hosts land.
+data otherwise (the sidebar card says which). The iOS app shows demo data
+until you pair it with a Mac.
 
 Tests:
 
@@ -125,6 +134,21 @@ One JSON object per line over the Unix socket:
 `graviton-proto` is the source of truth; `GravitonKit/Wire.swift` mirrors it
 and both sides have tests pinning the JSON shape.
 
+A terminal (`exec` with `"tty": true`) answers `attached`, then the connection
+carries binary frames both ways: a kind byte (0 data, 1 resize, 2 end of input,
+3 exit code), a big-endian u32 length and the payload. gravitond passes them
+between the client and the guest agent untouched, over the Unix socket or TLS.
+
+Inside a running container:
+
+```bash
+cargo run -p grav -- stats web        # CPU, memory, network (sampled every 2 s, 5 min kept)
+cargo run -p grav -- top web          # its processes
+cargo run -p grav -- ls web /etc      # list a folder (volumes included)
+cargo run -p grav -- cat web /etc/os-release
+cargo run -p grav -- inspect web      # how it was configured, as JSON
+```
+
 ## Roadmap
 
 1. ~~**Boot a VM**~~ (done): Virtualization.framework backend via
@@ -141,5 +165,7 @@ and both sides have tests pinning the JSON shape.
 4. ~~**Remote hosts**~~ (done): `gravitond --remote` serves TLS with a
    self-signed certificate and Bonjour; `grav pair` codes and links; the iPhone
    app discovers, pairs, pins the fingerprint and switches between Macs.
-5. **Polish**: exec + interactive terminals, Files/Stats/Inspect tabs, image
-   builds, app sandbox + XPC, signing and notarisation.
+5. **Polish**: framed terminals with resize and exit codes, Stats, Files,
+   Inspect and Terminal tabs, and a shell on the iPhone (done; terminals are
+   drawn by [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm), MIT);
+   image builds; app sandbox + XPC; signing and notarisation.

@@ -70,11 +70,11 @@ public actor DemoEngine: EngineService {
         }]
     }
 
-    public func ping() -> UInt32 { 1 }
+    public func ping() -> UInt32 { 2 }
 
     public func engineInfo() -> EngineInfo {
         let used = list.compactMap(\.memoryBytes).reduce(0, +) + 1_900 * 1024 * 1024
-        return EngineInfo(version: "0.1.0", protocol: 1, kernel: "Linux 6.12 (demo)", arch: "arm64", cpus: 4,
+        return EngineInfo(version: "0.1.0", protocol: 2, kernel: "Linux 6.12 (demo)", arch: "arm64", cpus: 4,
                           memoryBytes: 8 << 30, memoryUsedBytes: used, diskBytes: 64 << 30, diskUsedBytes: 6963 << 20)
     }
 
@@ -142,6 +142,112 @@ public actor DemoEngine: EngineService {
         let removed = list.remove(at: i)
         logLines[removed.id] = nil
         return removed.id
+    }
+
+    // MARK: Stats, files, details and terminals (made up, but plausible)
+
+    private var statHistory: [String: [StatSample]] = [:]
+
+    public func stats(id: String) throws -> ContainerStats {
+        let c = list[try resolve(id)]
+        guard c.isRunning else { return ContainerStats(id: c.id, cpus: 2, intervalSecs: 2, samples: statHistory[c.id] ?? [], processes: []) }
+        var samples = statHistory[c.id] ?? []
+        let now = UInt64(Date.now.timeIntervalSince1970 * 1000)
+        if samples.isEmpty {
+            // Backfill five minutes so the charts have something to show.
+            var cpu = c.cpuPercent ?? 5, mem = Double(c.memoryBytes ?? 64 << 20), rx = 48_000_000.0, tx = 9_000_000.0
+            for i in 0..<150 {
+                cpu = max(0.2, min(180, cpu + Double.random(in: -1...1) * max(cpu, 1) / 5))
+                mem = max(16e6, mem + Double.random(in: -2...2.2) * 1e6)
+                rx += Double.random(in: 4e3...90e3); tx += Double.random(in: 1e3...30e3)
+                samples.append(StatSample(timestampMs: now - UInt64(149 - i) * 2000, cpuPercent: cpu, memoryBytes: UInt64(mem),
+                                          memoryLimitBytes: c.memoryLimitBytes ?? 1 << 30, netRxBytes: UInt64(rx), netTxBytes: UInt64(tx)))
+            }
+        } else if let last = samples.last, now - last.timestampMs >= 2000 {
+            samples.append(StatSample(timestampMs: now, cpuPercent: c.cpuPercent ?? last.cpuPercent, memoryBytes: c.memoryBytes ?? last.memoryBytes,
+                                      memoryLimitBytes: last.memoryLimitBytes, netRxBytes: last.netRxBytes + UInt64.random(in: 4_000...90_000),
+                                      netTxBytes: last.netTxBytes + UInt64.random(in: 1_000...30_000)))
+            samples = Array(samples.suffix(150))
+        }
+        statHistory[c.id] = samples
+        let mib: UInt64 = 1 << 20
+        let main: (String, UInt64) = switch c.name {
+        case "postgres": ("postgres -c shared_buffers=128MB", 96)
+        case "redis-cache": ("redis-server *:6379", 9)
+        case "web": ("node /srv/server.js", 182)
+        default: ("/app/bin/api --config /app/config.toml", 148)
+        }
+        let processes = [
+            ContainerProcess(pid: 412, ppid: 1, uid: 0, state: "S", command: main.0, rssBytes: main.1 * mib, cpuMs: 1_843_000),
+            ContainerProcess(pid: 431, ppid: 412, uid: 0, state: "S", command: main.0.split(separator: " ")[0] + " (worker)", rssBytes: main.1 / 3 * mib, cpuMs: 402_000),
+            ContainerProcess(pid: 433, ppid: 412, uid: 0, state: "R", command: main.0.split(separator: " ")[0] + " (worker)", rssBytes: main.1 / 3 * mib, cpuMs: 397_000),
+        ]
+        return ContainerStats(id: c.id, cpus: 2, intervalSecs: 2, samples: samples, processes: processes)
+    }
+
+    public func listFiles(id: String, path: String) throws -> DirectoryListing {
+        let c = list[try resolve(id)]
+        guard c.isRunning else { throw EngineError.daemon("container \(c.name) isn't running") }
+        let t = Int64(Date.now.timeIntervalSince1970) - 86_400 * 3
+        func d(_ n: String) -> FileEntry { FileEntry(name: n, kind: .directory, size: 4096, mode: 0o755, uid: 0, gid: 0, modified: t, linkTarget: nil) }
+        func f(_ n: String, _ size: UInt64, _ mode: UInt32 = 0o644) -> FileEntry { FileEntry(name: n, kind: .file, size: size, mode: mode, uid: 0, gid: 0, modified: t + 3600, linkTarget: nil) }
+        func l(_ n: String, _ to: String) -> FileEntry { FileEntry(name: n, kind: .symlink, size: UInt64(to.count), mode: 0o777, uid: 0, gid: 0, modified: t, linkTarget: to) }
+        let tree: [String: [FileEntry]] = [
+            "/": [d("app"), d("bin"), d("dev"), d("etc"), d("home"), d("lib"), d("proc"), d("root"), d("sbin"), d("tmp"), d("usr"), d("var")],
+            "/app": [d("bin"), d("migrations"), f("config.toml", 1_284), f("README.md", 2_310), f("VERSION", 6)],
+            "/app/bin": [f("api", 18_874_368, 0o755), f("healthcheck", 1_203_712, 0o755)],
+            "/app/migrations": [f("0001_init.sql", 4_120), f("0002_inventory.sql", 1_877), f("0003_orders.sql", 2_990)],
+            "/etc": [d("apk"), d("ssl"), f("group", 682), f("hostname", UInt64(c.name.count + 1)), f("hosts", 120), f("os-release", 191), f("passwd", 1_172), f("resolv.conf", 28), l("mtab", "../proc/mounts")],
+            "/bin": [f("busybox", 808_712, 0o755), l("sh", "/bin/busybox"), l("ls", "/bin/busybox"), l("cat", "/bin/busybox")],
+        ]
+        let key = path == "" ? "/" : path
+        return DirectoryListing(path: key, entries: tree[key] ?? [])
+    }
+
+    public func readFile(id: String, path: String) throws -> FileContents {
+        let c = list[try resolve(id)]
+        let files: [String: String] = [
+            "/app/config.toml": "[server]\nlisten = \"0.0.0.0:80\"\nworkers = 4\n\n[database]\nurl = \"postgres://postgres:5432/storefront\"\npool = 16\n\n[cache]\nurl = \"redis://redis-cache:6379\"\nttl_secs = 300\n",
+            "/app/README.md": "# storefront api\n\nServes /v1/products, /v1/cart and /v1/checkout.\n",
+            "/app/VERSION": "0.4.2\n",
+            "/etc/hostname": c.name + "\n",
+            "/etc/hosts": "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n\(c.ipAddress ?? "127.0.1.1")\t\(c.name)\n",
+            "/etc/os-release": "NAME=\"Alpine Linux\"\nID=alpine\nVERSION_ID=3.22.2\nPRETTY_NAME=\"Alpine Linux v3.22\"\n",
+            "/etc/resolv.conf": "nameserver 192.168.64.1\n",
+            "/app/migrations/0001_init.sql": "CREATE TABLE products (\n  id bigserial PRIMARY KEY,\n  name text NOT NULL,\n  price_cents integer NOT NULL\n);\n",
+        ]
+        if let text = files[path] {
+            let data = Array(text.utf8)
+            return FileContents(path: path, size: UInt64(data.count), data: data, truncated: false)
+        }
+        if path.hasPrefix("/app/bin/") || path == "/bin/busybox" {
+            let data: [UInt8] = [0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0] + Array(repeating: 0, count: 248)
+            return FileContents(path: path, size: 18_874_368, data: data, truncated: true)
+        }
+        throw EngineError.daemon("\(path): No such file or directory")
+    }
+
+    public func inspect(id: String) throws -> ContainerDetails {
+        let c = list[try resolve(id)]
+        let command: [String] = switch c.name {
+        case "postgres": ["docker-entrypoint.sh", "postgres"]
+        case "redis-cache": ["docker-entrypoint.sh", "redis-server"]
+        case "web": ["node", "/srv/server.js"]
+        case "minio": ["minio", "server", "/data", "--console-address", ":9001"]
+        default: ["/app/bin/api", "--config", "/app/config.toml"]
+        }
+        let image = imageList.first { $0.reference.hasSuffix(c.image) || "\($0.repository):\($0.tag)" == c.image }
+        return ContainerDetails(container: c, imageReference: image?.reference ?? c.image, imageDigest: image?.digest ?? "sha256:…",
+                                command: command, env: ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "APP_ENV=development", "LOG_LEVEL=info"],
+                                workingDir: c.name == "web" ? "/srv" : "/app", user: c.name == "postgres" ? "postgres" : nil,
+                                hostname: c.name, cpus: 2, memoryMib: (c.memoryLimitBytes ?? 1 << 30) >> 20,
+                                kernel: "Linux 6.12 (demo)", vmDir: "~/Library/Application Support/Graviton/vms/\(c.id)")
+    }
+
+    public func openTerminal(_ spec: ExecSpec) throws -> any TerminalSession {
+        let c = list[try resolve(spec.id)]
+        guard c.isRunning else { throw EngineError.daemon("container \(c.name) isn't running") }
+        return DemoTerminal(container: c.name)
     }
 
     private func resolve(_ key: String) throws -> Int {

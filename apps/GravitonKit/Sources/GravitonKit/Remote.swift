@@ -177,6 +177,25 @@ final class LineConnection: @unchecked Sendable {
         }
     }
 
+    /// The next bytes from the Mac, starting with anything `readLine` read past.
+    func receive() async throws -> Data {
+        if !buffer.isEmpty {
+            defer { buffer = Data() }
+            return buffer
+        }
+        while true {
+            let chunk: Data = try await withCheckedThrowingContinuation { continuation in
+                connection.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { data, _, isComplete, error in
+                    if let error { continuation.resume(throwing: EngineError.io(error.localizedDescription)) }
+                    else if let data, !data.isEmpty { continuation.resume(returning: data) }
+                    else if isComplete { continuation.resume(throwing: EngineError.io("the Mac closed the connection")) }
+                    else { continuation.resume(returning: Data()) }
+                }
+            }
+            if !chunk.isEmpty { return chunk }
+        }
+    }
+
     func call(_ request: EngineRequest) async throws -> EngineResponse {
         try await send(Wire.line(request))
         let response = try Wire.decoder.decode(EngineResponse.self, from: try await readLine())
@@ -337,6 +356,31 @@ public actor RemoteEngine: EngineService {
     public func remove(id: String) async throws -> String {
         guard case let .removed(removed) = try await call(.remove(id: id)) else { throw EngineError.unexpectedResponse }
         return removed
+    }
+
+    public func stats(id: String) async throws -> ContainerStats {
+        guard case let .stats(stats) = try await call(.stats(id: id)) else { throw EngineError.unexpectedResponse }
+        return stats
+    }
+
+    public func listFiles(id: String, path: String) async throws -> DirectoryListing {
+        guard case let .files(listing) = try await call(.listFiles(id: id, path: path)) else { throw EngineError.unexpectedResponse }
+        return listing
+    }
+
+    public func readFile(id: String, path: String) async throws -> FileContents {
+        guard case let .file(contents) = try await call(.readFile(id: id, path: path)) else { throw EngineError.unexpectedResponse }
+        return contents
+    }
+
+    public func inspect(id: String) async throws -> ContainerDetails {
+        guard case let .details(details) = try await call(.inspect(id: id)) else { throw EngineError.unexpectedResponse }
+        return details
+    }
+
+    /// Terminals get a connection of their own, so they don't hold up other requests.
+    public func openTerminal(_ spec: ExecSpec) async throws -> any TerminalSession {
+        try await RemoteTerminal.open(host: host, token: token, spec: spec)
     }
 
     private func container(_ request: EngineRequest) async throws -> Container {

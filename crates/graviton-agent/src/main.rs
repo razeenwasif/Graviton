@@ -9,14 +9,20 @@
 //!
 //! `prepare` unpacks an image into a container root filesystem; `exec` with a
 //! container runs the process inside it (see `container.rs`). Without one it
-//! runs directly in the guest, which `gravitond boot-check` uses.
+//! runs directly in the guest, which `gravitond boot-check` uses. `stats`
+//! reports the guest's resource counters (`stats.rs`); `list_dir` and
+//! `read_file` browse the container's files (`files.rs`).
 //!
 //! Build it for the guest with `scripts/build-guest.sh`.
 
 #[cfg(target_os = "linux")]
 mod container;
 #[cfg(target_os = "linux")]
+mod files;
+#[cfg(target_os = "linux")]
 mod net;
+#[cfg(target_os = "linux")]
+mod stats;
 #[cfg(target_os = "linux")]
 mod tty;
 
@@ -150,6 +156,15 @@ pub(crate) mod linux {
                 Ok(AgentRequest::Stdin { .. }) => {
                     send(&writer, &AgentEvent::Error { message: "stdin is only forwarded for TTY sessions".into() });
                 }
+                Ok(AgentRequest::Stats { processes }) => send(&writer, &AgentEvent::Stats(crate::stats::collect(processes))),
+                Ok(AgentRequest::ListDir { container, path }) => match crate::files::list(&container, &path) {
+                    Ok(listing) => send(&writer, &AgentEvent::Dir(listing)),
+                    Err(err) => send(&writer, &AgentEvent::Error { message: err.to_string() }),
+                },
+                Ok(AgentRequest::ReadFile { container, path, limit }) => match crate::files::read(&container, &path, limit.min(4 << 20)) {
+                    Ok(contents) => send(&writer, &AgentEvent::File(contents)),
+                    Err(err) => send(&writer, &AgentEvent::Error { message: err.to_string() }),
+                },
                 Ok(AgentRequest::Shutdown) => power_off(),
                 Err(err) => send(&writer, &AgentEvent::Error { message: format!("bad request: {err}") }),
             }

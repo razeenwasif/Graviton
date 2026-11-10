@@ -32,6 +32,40 @@ struct LiveEngineTests {
         #expect(try await engine.containers().contains { $0.id == container.id } == false)
     }
 
+    @Test func terminalStatsFilesInspect() async throws {
+        let engine = SocketEngine()
+        let name = "swift-term-\(Int.random(in: 1000...9999))"
+        let container = try await engine.run(RunSpec(image: "alpine", name: name, command: ["sleep", "300"], memoryMib: 256))
+
+        let session = try await engine.openTerminal(ExecSpec(id: container.id, command: ["sh"], rows: 30, cols: 100))
+        session.resize(rows: 33, cols: 101)
+        try await Task.sleep(for: .milliseconds(300))
+        session.send(Array("stty size; exit 6\r".utf8))
+        var screen = ""
+        var code: Int32?
+        for await event in session.events {
+            if case let .output(b) = event { screen += String(decoding: b, as: UTF8.self) }
+            if case let .exited(c) = event { code = c }
+        }
+        #expect(screen.contains("33 101"))
+        #expect(code == 6)
+
+        let listing = try await engine.listFiles(id: container.id, path: "/etc")
+        #expect(listing.entries.contains { $0.name == "hostname" })
+        let hostname = try await engine.readFile(id: container.id, path: "/etc/hostname")
+        #expect(hostname.text == name + "\n")
+        let details = try await engine.inspect(id: container.id)
+        #expect(details.command == ["sleep", "300"])
+
+        try await Task.sleep(for: .seconds(5))
+        let stats = try await engine.stats(id: container.id)
+        #expect(!stats.samples.isEmpty)
+        #expect(stats.processes.contains { $0.command == "sleep 300" })
+
+        _ = try await engine.stop(id: container.id)
+        _ = try await engine.remove(id: container.id)
+    }
+
     @Test func reportsDaemonErrors() async throws {
         await #expect(throws: EngineError.daemon("no such container: definitely-not-here")) {
             try await SocketEngine().remove(id: "definitely-not-here")
@@ -57,13 +91,28 @@ struct LiveRemoteTests {
         #expect(paired.host.name == info.host)
 
         let remote = RemoteEngine(host: paired.host, token: paired.token)
-        #expect(try await remote.ping() == 1)
+        #expect(try await remote.ping() == 2)
         async let containers = remote.containers()
         async let images = remote.images()
         async let engine = remote.engineInfo()
         let (c, i, e) = try await (containers, images, engine)
-        #expect(e.protocol == 1)
-        _ = (c, i)
+        #expect(e.protocol == 2)
+        _ = i
+
+        // A shell over TLS, if anything is running to open one in.
+        if let running = c.first(where: \.isRunning) {
+            let session = try await remote.openTerminal(ExecSpec(id: running.id, command: ["sh", "-c", "echo over-tls; exit 9"]))
+            var screen = ""
+            var code: Int32?
+            for await event in session.events {
+                if case let .output(b) = event { screen += String(decoding: b, as: UTF8.self) }
+                if case let .exited(x) = event { code = x }
+            }
+            #expect(screen.contains("over-tls"))
+            #expect(code == 9)
+            // The request connection is unaffected.
+            #expect(try await remote.ping() == 2)
+        }
 
         try await local.revokeDevice(id: paired.host.deviceID)
         let revoked = RemoteEngine(host: paired.host, token: paired.token)

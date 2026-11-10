@@ -100,3 +100,58 @@ import Testing
         #expect(try await engine.remove(id: "worker") == "e4c5d6f7a8b9")
     }
 }
+
+@Suite struct TerminalTests {
+    @Test func framesMatchRust() throws {
+        // Same bytes as graviton-proto's `terminal_frames` test.
+        #expect(TerminalFrame.data(Array("ls\r".utf8)).encoded == [0, 0, 0, 0, 3, 0x6c, 0x73, 0x0d])
+        #expect(TerminalFrame.resize(rows: 40, cols: 120).encoded == [1, 0, 0, 0, 4, 0, 40, 0, 120])
+        let frames: [TerminalFrame] = [.data([1, 2]), .resize(rows: 50, cols: 160), .eof, .exit(-3)]
+        var decoder = TerminalFrame.Decoder()
+        var got: [TerminalFrame] = []
+        for byte in frames.flatMap(\.encoded) {
+            decoder.push([byte])
+            while let f = try decoder.next() { got.append(f) }
+        }
+        #expect(got == frames)
+        var bad = TerminalFrame.Decoder()
+        bad.push([9, 0, 0, 0, 0])
+        #expect(throws: EngineError.self) { try bad.next() }
+    }
+
+    @Test func encodesNewRequests() throws {
+        let line = { (r: EngineRequest) in String(decoding: try Wire.line(r), as: UTF8.self) }
+        #expect(try line(.listFiles(id: "web", path: "/etc")) == #"{"method":"list_files","params":{"id":"web","path":"/etc"}}"# + "\n")
+        #expect(try line(.stats(id: "web")) == #"{"method":"stats","params":{"id":"web"}}"# + "\n")
+        #expect(try line(.exec(ExecSpec(id: "web", command: ["sh"], rows: 30, cols: 100)))
+            == #"{"method":"exec","params":{"cols":100,"command":["sh"],"env":[],"id":"web","rows":30,"tty":true}}"# + "\n")
+    }
+
+    @Test func decodesStatsAndFiles() throws {
+        let stats = #"{"type":"stats","data":{"id":"a","cpus":2,"interval_secs":2,"samples":[{"timestamp_ms":1,"cpu_percent":12.5,"memory_bytes":3,"memory_limit_bytes":4,"net_rx_bytes":5,"net_tx_bytes":6}],"processes":[{"pid":7,"ppid":1,"uid":0,"state":"S","command":"sh","rss_bytes":8,"cpu_ms":9}]}}"#
+        guard case let .stats(s) = try Wire.decoder.decode(EngineResponse.self, from: Data(stats.utf8)) else { Issue.record("not stats"); return }
+        #expect(s.samples.first?.cpuPercent == 12.5)
+        #expect(s.processes.first?.cpuMs == 9)
+        let files = #"{"type":"files","data":{"path":"/","entries":[{"name":"bin","kind":"symlink","size":7,"mode":511,"uid":0,"gid":0,"modified":0,"link_target":"usr/bin"}]}}"#
+        guard case let .files(l) = try Wire.decoder.decode(EngineResponse.self, from: Data(files.utf8)) else { Issue.record("not files"); return }
+        #expect(l.entries.first?.linkTarget == "usr/bin")
+        #expect(l.entries.first?.permissions == "lrwxrwxrwx")
+    }
+
+    @Test func demoShellEchoesAndExits() async throws {
+        let engine = DemoEngine()
+        let session = try await engine.openTerminal(ExecSpec(id: "web", command: ["sh"]))
+        session.send(Array("whoami\rexit 4\r".utf8))
+        var screen = ""
+        var code: Int32?
+        for await event in session.events {
+            switch event {
+            case let .output(bytes): screen += String(decoding: bytes, as: UTF8.self)
+            case let .exited(c): code = c
+            case .failed: break
+            }
+        }
+        #expect(screen.contains("root"))
+        #expect(code == 4)
+    }
+}

@@ -1,3 +1,4 @@
+import AppKit
 import GravitonKit
 import SwiftUI
 
@@ -20,9 +21,8 @@ struct ContainerDetailScreen: View {
                         StatusPill(c, showUptime: true)
                         Spacer()
                         HStack(spacing: 8) {
-                            Button("Open terminal") {}
-                                .disabled(true)
-                                .help("Interactive terminals arrive with milestone 5")
+                            Button("Open terminal") { tab = .terminal }
+                                .disabled(!c.isRunning)
                             if c.isRunning {
                                 Button("Restart") { Task { await store.restart(c) } }
                                 Button("Stop") { Task { await store.stop(c) } }
@@ -44,9 +44,10 @@ struct ContainerDetailScreen: View {
                     switch tab {
                     case .logs: LogsPanel(containerID: c.id)
                     case .overview: OverviewPanel(container: c)
-                    default:
-                        ContentUnavailableView("\(tab.rawValue) is on the roadmap", systemImage: "hammer",
-                                               description: Text("This tab lands once the guest agent is running containers."))
+                    case .terminal: TerminalPanel(container: c)
+                    case .files: FilesPanel(container: c)
+                    case .stats: StatsPanel(container: c)
+                    case .inspect: InspectPanel(container: c)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -195,6 +196,82 @@ struct OverviewPanel: View {
             .frame(maxWidth: 760, alignment: .leading)
             .padding(.horizontal, 28)
             .padding(.vertical, 20)
+        }
+    }
+}
+
+/// A shell in the container. It keeps running while you switch tabs.
+struct TerminalPanel: View {
+    @Environment(EngineStore.self) private var store
+    @Environment(ShellSessions.self) private var shells
+    var container: Container
+    @State private var shell: ShellSession?
+    @State private var copied = false
+
+    var body: some View {
+        Group {
+            if let shell {
+                VStack(alignment: .leading, spacing: 10) {
+                    header(shell)
+                    TerminalHost(session: shell)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .background(G.console)
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(G.border))
+                }
+                .padding(.horizontal, 28)
+                .padding(.vertical, 18)
+            } else if !container.isRunning {
+                ContentUnavailableView("Not running", systemImage: "terminal",
+                                       description: Text("Start \(container.name) to open a shell in it."))
+            } else {
+                ProgressView()
+            }
+        }
+        .task(id: "\(container.id)|\(container.isRunning)") {
+            if container.isRunning || shells.existing(container.id) != nil {
+                shell = shells.shell(for: container.id, store: store)
+            }
+        }
+    }
+
+    private func header(_ shell: ShellSession) -> some View {
+        HStack(spacing: 10) {
+            Circle().fill(dot(shell.phase)).frame(width: 7, height: 7)
+            Text(status(shell)).font(.system(size: 12.5)).foregroundStyle(G.muted).lineLimit(1)
+            Spacer()
+            Button(copied ? "Copied" : "Copy grav command") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString("grav exec -it \(container.name) sh", forType: .string)
+                copied = true
+            }
+            .help("The same shell from Terminal: grav exec -it \(container.name) sh")
+            .fixedSize()
+            if !shell.isLive {
+                Button("New shell") { shell.start(using: store) }
+                    .disabled(!container.isRunning)
+                    .fixedSize()
+            }
+        }
+        .buttonStyle(QuietButtonStyle())
+    }
+
+    private func status(_ shell: ShellSession) -> String {
+        switch shell.phase {
+        case .connecting: "Connecting…"
+        case .running: shell.title ?? "Shell in \(container.name)"
+        case let .exited(code): "Exited (\(code))"
+        case let .failed(why): why
+        }
+    }
+
+    private func dot(_ phase: ShellSession.Phase) -> Color {
+        switch phase {
+        case .running: G.running
+        case .connecting: G.warning
+        case .exited: G.stopped
+        case .failed: G.danger
         }
     }
 }

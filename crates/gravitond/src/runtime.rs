@@ -11,12 +11,13 @@
 //!    network files (DHCP runs meanwhile),
 //! 3. publishes the container's ports on 127.0.0.1, forwarding to the guest,
 //! 4. runs the image's entrypoint and streams its output into the logs,
+//!    while a monitor thread samples its CPU, memory and network use,
 //! 5. records the exit code and powers the VM off.
 //!
 //! Containers, their run settings and their logs are saved under
 //! `~/Library/Application Support/Graviton`, so they survive a restart.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{BuildHasher, RandomState};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -30,9 +31,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use graviton_core::{ImageReference, Store, paths};
 use graviton_image::{BlobStore, ImageIndex, LocalImage, Progress, Registry};
 use graviton_proto::{
-    AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ContainerStatus, ContainerSummary, EngineInfo, ExecSpec, GuestMount,
-    ImageSummary, LogLevel, LogLine, LogStream, Mount, PROTOCOL_VERSION, PortMapping, PortProtocol, Response, RunSpec,
-    decode_line, encode_line,
+    AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ContainerDetails, ContainerStats, ContainerStatus, ContainerSummary,
+    DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats, ImageSummary, LogLevel, LogLine, LogStream,
+    Mount, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RunSpec, StatSample, decode_line, encode_line,
 };
 use graviton_vmm::apple::{AppleHypervisor, AppleVm};
 use graviton_vmm::{NetworkMode, SharedDirectory, VmConfig, VmHandle};
@@ -41,6 +42,12 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_CPUS: u32 = 2;
 const DEFAULT_MEMORY_MIB: u64 = 1024;
 const STOP_GRACE: Duration = Duration::from_secs(10);
+const KERNEL: &str = "Linux 6.12 (Alpine linux-virt)";
+/// How often running containers are sampled, and how many samples are kept (5 minutes).
+const STATS_INTERVAL: Duration = Duration::from_secs(2);
+const STATS_KEPT: usize = 150;
+/// The Files tab previews this much of a file.
+const READ_LIMIT: u64 = 256 * 1024;
 
 /// How to start a container (again).
 #[derive(Clone, Serialize, Deserialize)]
@@ -82,12 +89,20 @@ struct Running {
     forwards: Vec<tokio::task::JoinHandle<()>>,
 }
 
+#[derive(Default)]
+struct StatsHistory {
+    cpus: u32,
+    samples: VecDeque<StatSample>,
+    processes: Vec<ProcessInfo>,
+}
+
 pub struct Engine {
     pub store: Arc<Mutex<Store>>,
     blobs: BlobStore,
     index: Mutex<ImageIndex>,
     specs: Mutex<HashMap<String, ContainerSpec>>,
     running: Mutex<HashMap<String, Running>>,
+    stats: Mutex<HashMap<String, StatsHistory>>,
     rt: tokio::runtime::Handle,
     state_path: PathBuf,
 }
@@ -104,6 +119,7 @@ impl Engine {
             index: Mutex::new(index),
             specs: Mutex::new(HashMap::new()),
             running: Mutex::new(HashMap::new()),
+            stats: Mutex::new(HashMap::new()),
             rt: tokio::runtime::Handle::current(),
             state_path: paths::support_dir().join("containers.json"),
         });
@@ -120,7 +136,7 @@ impl Engine {
         EngineInfo {
             version: env!("CARGO_PKG_VERSION").into(),
             protocol: PROTOCOL_VERSION,
-            kernel: "Linux 6.12 (Alpine linux-virt)".into(),
+            kernel: KERNEL.into(),
             arch: graviton_image::guest_arch().into(),
             cpus: std::thread::available_parallelism().map_or(0, |n| n.get() as u32),
             memory_bytes: host_memory(),
@@ -328,6 +344,7 @@ impl Engine {
     pub fn remove(&self, key: &str) -> Result<String> {
         let removed = self.store.lock().unwrap().remove(key)?;
         self.specs.lock().unwrap().remove(&removed.id);
+        self.stats.lock().unwrap().remove(&removed.id);
         let _ = fs::remove_dir_all(paths::vms_dir().join(&removed.id));
         self.save();
         self.refresh_images();
@@ -376,7 +393,7 @@ impl Engine {
         }
     }
 
-    fn supervise(&self, id: &str, listeners: Vec<(TcpListener, u16)>) {
+    fn supervise(self: &Arc<Self>, id: &str, listeners: Vec<(TcpListener, u16)>) {
         let result = self.run_in_vm(id, listeners);
         let code = match result {
             Ok(code) => code,
@@ -399,11 +416,13 @@ impl Engine {
             c.exit_code = Some(code);
             c.started_at = None;
             c.ip_address = None;
+            c.cpu_percent = None;
+            c.memory_bytes = None;
         });
         self.save();
     }
 
-    fn run_in_vm(&self, id: &str, listeners: Vec<(TcpListener, u16)>) -> Result<i32> {
+    fn run_in_vm(self: &Arc<Self>, id: &str, listeners: Vec<(TcpListener, u16)>) -> Result<i32> {
         let spec = self.specs.lock().unwrap().get(id).cloned().ok_or_else(|| anyhow!("unknown container {id}"))?;
         let name = self.store.lock().unwrap().container(id)?.name.clone();
         let t0 = Instant::now();
@@ -511,6 +530,7 @@ impl Engine {
                         c.ip_address = ip.clone();
                     });
                     self.save();
+                    self.start_monitor(id, Arc::clone(&vm));
                 }
                 AgentEvent::Stdout { data, .. } => {
                     for line in out.push(&data) {
@@ -532,7 +552,7 @@ impl Engine {
                     return Ok(code);
                 }
                 AgentEvent::Error { message } => bail!("{message}"),
-                AgentEvent::Ready { .. } | AgentEvent::Prepared { .. } => {}
+                _ => {}
             }
         }
     }
@@ -552,6 +572,119 @@ impl Engine {
                 });
             }
         }))
+    }
+
+    // -- Stats ------------------------------------------------------------
+
+    /// Sample the container every [`STATS_INTERVAL`] on its own agent
+    /// connection, until its VM stops.
+    fn start_monitor(self: &Arc<Self>, id: &str, vm: Arc<AppleVm>) {
+        let engine = Arc::clone(self);
+        let id = id.to_string();
+        let limit = self.specs.lock().unwrap().get(&id).map_or(0, |s| s.memory_mib << 20);
+        let _ = std::thread::Builder::new().name(format!("stats-{id}")).spawn(move || {
+            let Ok(fd) = vm.connect(AGENT_VSOCK_PORT) else { return };
+            let mut conn = File::from(fd);
+            if !matches!(read_event_unbuffered(&mut conn), Ok(AgentEvent::Ready { .. })) {
+                return;
+            }
+            let mut events = Events::new(BufReader::new(match conn.try_clone() {
+                Ok(c) => c,
+                Err(_) => return,
+            }));
+            engine.stats.lock().unwrap().insert(id.clone(), StatsHistory::default());
+            let mut previous: Option<GuestStats> = None;
+            loop {
+                let still_running = engine.running.lock().unwrap().get(&id).is_some_and(|r| Arc::ptr_eq(&r.vm, &vm));
+                if !still_running || conn.write_all(&encode_line(&AgentRequest::Stats { processes: true })).is_err() {
+                    break;
+                }
+                let Ok(AgentEvent::Stats(now)) = events.next() else { break };
+                if let Some(prev) = &previous {
+                    let sample = sample_between(prev, &now, limit);
+                    engine.store.lock().unwrap().update(&id, |c| {
+                        c.cpu_percent = Some(sample.cpu_percent);
+                        c.memory_bytes = Some(sample.memory_bytes);
+                    });
+                    let mut stats = engine.stats.lock().unwrap();
+                    let history = stats.entry(id.clone()).or_default();
+                    history.cpus = now.cpus;
+                    history.samples.push_back(sample);
+                    while history.samples.len() > STATS_KEPT {
+                        history.samples.pop_front();
+                    }
+                    history.processes = now.processes.clone();
+                }
+                previous = Some(now);
+                std::thread::sleep(STATS_INTERVAL);
+            }
+        });
+    }
+
+    pub fn stats(&self, key: &str) -> Result<ContainerStats> {
+        let id = self.store.lock().unwrap().container(key)?.id.clone();
+        let cpus = self.specs.lock().unwrap().get(&id).map_or(0, |s| s.cpus);
+        let running = self.running.lock().unwrap().contains_key(&id);
+        let stats = self.stats.lock().unwrap();
+        let history = stats.get(&id);
+        Ok(ContainerStats {
+            id,
+            cpus: history.map_or(cpus, |h| h.cpus.max(1)),
+            interval_secs: STATS_INTERVAL.as_secs() as u32,
+            samples: history.map(|h| h.samples.iter().cloned().collect()).unwrap_or_default(),
+            processes: if running { history.map(|h| h.processes.clone()).unwrap_or_default() } else { vec![] },
+        })
+    }
+
+    // -- Files and details --------------------------------------------------
+
+    /// Send one request on a fresh agent connection and return its answer.
+    fn agent_call(&self, key: &str, request: impl FnOnce(String) -> AgentRequest) -> Result<AgentEvent> {
+        let id = self.store.lock().unwrap().container(key)?.id.clone();
+        let vm = self.running.lock().unwrap().get(&id).map(|r| Arc::clone(&r.vm)).ok_or_else(|| anyhow!("container {key} isn't running"))?;
+        let mut conn = File::from(vm.connect(AGENT_VSOCK_PORT)?);
+        match read_event_unbuffered(&mut conn)? {
+            AgentEvent::Ready { .. } => {}
+            other => bail!("expected ready from the agent, got {other:?}"),
+        }
+        conn.write_all(&encode_line(&request(id)))?;
+        match Events::new(BufReader::new(conn)).next()? {
+            AgentEvent::Error { message } => bail!("{message}"),
+            event => Ok(event),
+        }
+    }
+
+    pub fn list_files(&self, key: &str, path: &str) -> Result<DirectoryListing> {
+        match self.agent_call(key, |container| AgentRequest::ListDir { container, path: path.to_string() })? {
+            AgentEvent::Dir(listing) => Ok(listing),
+            other => bail!("expected a folder listing from the agent, got {other:?}"),
+        }
+    }
+
+    pub fn read_file(&self, key: &str, path: &str) -> Result<FileContents> {
+        match self.agent_call(key, |container| AgentRequest::ReadFile { container, path: path.to_string(), limit: READ_LIMIT })? {
+            AgentEvent::File(contents) => Ok(contents),
+            other => bail!("expected a file from the agent, got {other:?}"),
+        }
+    }
+
+    pub fn inspect(&self, key: &str) -> Result<ContainerDetails> {
+        let container = self.store.lock().unwrap().container(key)?.clone();
+        let spec = self.specs.lock().unwrap().get(&container.id).cloned().ok_or_else(|| anyhow!("container {key} has no saved settings"))?;
+        Ok(ContainerDetails {
+            image_reference: spec.image.reference.clone(),
+            image_digest: spec.image.manifest_digest.clone(),
+            command: spec.argv,
+            env: spec.env,
+            working_dir: spec.cwd,
+            user: spec.user,
+            hostname: container.name.clone(),
+            cpus: spec.cpus,
+            memory_mib: spec.memory_mib,
+            kernel: KERNEL.into(),
+            vm_dir: paths::vms_dir().join(&container.id).display().to_string(),
+            container,
+        })
     }
 
     // -- exec -------------------------------------------------------------
@@ -617,7 +750,7 @@ impl Engine {
         }
     }
 
-    /// Start a command on a TTY; the returned stream carries raw terminal bytes.
+    /// Start a command on a TTY; the returned stream carries terminal frames.
     pub fn exec_tty(&self, spec: &ExecSpec) -> Result<OwnedFd> {
         Ok(OwnedFd::from(self.exec_start(spec)?))
     }
@@ -773,6 +906,23 @@ impl LineBuffer {
     }
 }
 
+/// Turn two readings of the guest's counters into one sample.
+fn sample_between(prev: &GuestStats, now: &GuestStats, limit: u64) -> StatSample {
+    let total = now.cpu_total.saturating_sub(prev.cpu_total);
+    let busy = now.cpu_busy.saturating_sub(prev.cpu_busy);
+    let cpus = now.cpus.max(1) as f64;
+    let cpu_percent = if total == 0 { 0.0 } else { busy as f64 / total as f64 * cpus * 100.0 };
+    let memory_limit_bytes = if limit > 0 { limit } else { now.memory_total_bytes };
+    StatSample {
+        timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
+        cpu_percent: (cpu_percent * 10.0).round() / 10.0,
+        memory_bytes: now.memory_total_bytes.saturating_sub(now.memory_available_bytes),
+        memory_limit_bytes,
+        net_rx_bytes: now.net_rx_bytes,
+        net_tx_bytes: now.net_tx_bytes,
+    }
+}
+
 fn send(agent: &Arc<Mutex<File>>, request: &AgentRequest) -> Result<()> {
     agent.lock().unwrap().write_all(&encode_line(request)).context("writing to the guest agent")
 }
@@ -811,6 +961,24 @@ mod tests {
         assert_eq!(b.push(b"tail"), Vec::<String>::new());
         assert_eq!(b.finish().as_deref(), Some("tail"));
         assert_eq!(b.finish(), None);
+    }
+
+    #[test]
+    fn samples_are_rates() {
+        let at = |busy, total, avail| GuestStats {
+            cpus: 2,
+            cpu_busy: busy,
+            cpu_total: total,
+            memory_total_bytes: 1000,
+            memory_available_bytes: avail,
+            net_rx_bytes: 5,
+            net_tx_bytes: 7,
+            processes: vec![],
+        };
+        // Half of all CPU time busy on 2 CPUs is one CPU's worth: 100%.
+        let s = sample_between(&at(100, 1000, 900), &at(300, 1400, 600), 4096);
+        assert_eq!((s.cpu_percent, s.memory_bytes, s.memory_limit_bytes), (100.0, 400, 4096));
+        assert_eq!(sample_between(&at(1, 1, 0), &at(1, 1, 0), 0).cpu_percent, 0.0);
     }
 
     #[test]

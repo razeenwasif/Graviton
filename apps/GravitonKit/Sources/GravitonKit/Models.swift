@@ -182,3 +182,130 @@ public struct PairedDevice: Codable, Hashable, Sendable, Identifiable {
     public var pairedAt: UInt64
     public var lastSeen: UInt64?
 }
+
+// MARK: - Milestone 5: stats, files, details, exec
+
+/// One sample of a container's resource use.
+public struct StatSample: Codable, Hashable, Sendable {
+    /// Unix milliseconds.
+    public var timestampMs: UInt64
+    /// 100 is one CPU fully busy.
+    public var cpuPercent: Double
+    public var memoryBytes: UInt64
+    public var memoryLimitBytes: UInt64
+    /// Totals since the VM booted.
+    public var netRxBytes: UInt64
+    public var netTxBytes: UInt64
+
+    public var date: Date { Date(timeIntervalSince1970: Double(timestampMs) / 1000) }
+}
+
+/// A process inside a container (`ProcessInfo` in `graviton-proto`).
+public struct ContainerProcess: Codable, Hashable, Sendable, Identifiable {
+    public var pid: Int32
+    public var ppid: Int32
+    public var uid: UInt32
+    public var state: String
+    public var command: String
+    public var rssBytes: UInt64
+    /// CPU time used, in milliseconds.
+    public var cpuMs: UInt64
+
+    public var id: Int32 { pid }
+
+    enum CodingKeys: String, CodingKey { case pid, ppid, uid, state, command, rssBytes, cpuMs }
+}
+
+public struct ContainerStats: Codable, Hashable, Sendable {
+    public var id: String
+    public var cpus: UInt32
+    public var intervalSecs: UInt32
+    /// Oldest first.
+    public var samples: [StatSample]
+    public var processes: [ContainerProcess]
+}
+
+public enum FileKind: String, Codable, Hashable, Sendable {
+    case file, directory, symlink, other
+}
+
+public struct FileEntry: Codable, Hashable, Sendable, Identifiable {
+    public var name: String
+    public var kind: FileKind
+    public var size: UInt64
+    public var mode: UInt32
+    public var uid: UInt32
+    public var gid: UInt32
+    /// Unix seconds.
+    public var modified: Int64
+    public var linkTarget: String?
+
+    public var id: String { name }
+    public var isDirectory: Bool { kind == .directory }
+    public var modifiedDate: Date { Date(timeIntervalSince1970: Double(modified)) }
+
+    /// `drwxr-xr-x`-style permissions.
+    public var permissions: String {
+        let type: Character = switch kind {
+        case .directory: "d"
+        case .symlink: "l"
+        case .file: "-"
+        case .other: "?"
+        }
+        let bits = Array("rwxrwxrwx")
+        return String(type) + String((0..<9).map { mode & (0o400 >> UInt32($0)) != 0 ? bits[$0] : "-" })
+    }
+}
+
+public struct DirectoryListing: Codable, Hashable, Sendable {
+    public var path: String
+    public var entries: [FileEntry]
+}
+
+public struct FileContents: Codable, Hashable, Sendable {
+    public var path: String
+    public var size: UInt64
+    public var data: [UInt8]
+    public var truncated: Bool
+
+    /// The text, if the bytes look like UTF-8 text.
+    public var text: String? {
+        guard !data.prefix(8192).contains(0) else { return nil }
+        return String(bytes: data, encoding: .utf8)
+    }
+}
+
+/// How a container is configured (`ContainerDetails` in `graviton-proto`).
+public struct ContainerDetails: Codable, Hashable, Sendable {
+    public var container: Container
+    public var imageReference: String
+    public var imageDigest: String
+    public var command: [String]
+    public var env: [String]
+    public var workingDir: String
+    public var user: String?
+    public var hostname: String
+    public var cpus: UInt32
+    public var memoryMib: UInt64
+    public var kernel: String
+    public var vmDir: String
+}
+
+/// What `grav exec` asks for.
+public struct ExecSpec: Codable, Hashable, Sendable {
+    public var id: String
+    public var command: [String]
+    public var tty: Bool
+    public var rows: UInt16
+    public var cols: UInt16
+    public var env: [String]
+
+    public init(id: String, command: [String], tty: Bool = true, rows: UInt16 = 24, cols: UInt16 = 80, env: [String] = []) {
+        self.id = id
+        self.command = command
+        self.tty = tty
+        self.rows = rows
+        self.cols = cols
+        self.env = env
+    }
+}

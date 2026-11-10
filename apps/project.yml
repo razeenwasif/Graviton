@@ -10,6 +10,11 @@ options:
 packages:
   GravitonKit:
     path: GravitonKit
+  # Terminal emulator for the Terminal tab and the iPhone shell (MIT). 1.11.2 is the
+  # last release that draws with CoreText; later ones need the Metal toolchain.
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm
+    exactVersion: 1.11.2
 
 settings:
   base:
@@ -25,9 +30,10 @@ targets:
   GravitonMac:
     type: application
     platform: macOS
-    sources: [Mac]
+    sources: [Mac, Shared]
     dependencies:
       - package: GravitonKit
+      - package: SwiftTerm
     settings:
       base:
         PRODUCT_NAME: Graviton
@@ -44,9 +50,10 @@ targets:
   GravitonIOS:
     type: application
     platform: iOS
-    sources: [iOS]
+    sources: [iOS, Shared]
     dependencies:
       - package: GravitonKit
+      - package: SwiftTerm
     info:
       path: iOS/Info.plist
       properties:

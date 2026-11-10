@@ -108,7 +108,7 @@ fn talk_to_agent(vm: &dyn VmHandle, command: Vec<String>, t0: Instant) -> Result
             }
             AgentEvent::Exited { code, .. } => break code,
             AgentEvent::Error { message } => bail!("agent: {message}"),
-            AgentEvent::Ready { .. } | AgentEvent::Prepared { .. } => {}
+            _ => {}
         }
     };
     println!("Command exited {code}       {:>6} ms", t0.elapsed().as_millis());

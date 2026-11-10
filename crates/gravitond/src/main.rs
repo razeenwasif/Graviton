@@ -210,13 +210,14 @@ pub(crate) async fn exec_stream(engine: Arc<Engine>, spec: graviton_proto::ExecS
     Ok(())
 }
 
-/// `grav exec -it`: answer `attached`, then splice the client and the guest's terminal.
-async fn exec_tty(
-    engine: Arc<Engine>,
-    spec: graviton_proto::ExecSpec,
-    mut client_in: BufReader<tokio::net::unix::OwnedReadHalf>,
-    mut client_out: tokio::net::unix::OwnedWriteHalf,
-) -> Result<()> {
+/// `grav exec -it` and the apps' terminals: answer `attached`, then splice the
+/// client and the guest's terminal. Both ends speak terminal frames
+/// (`graviton_proto::frame`), which pass through untouched.
+pub(crate) async fn exec_tty<R, W>(engine: Arc<Engine>, spec: graviton_proto::ExecSpec, mut client_in: R, mut client_out: W) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let guest = match tokio::task::spawn_blocking(move || engine.exec_tty(&spec)).await? {
         Ok(fd) => fd,
         Err(err) => {
@@ -261,7 +262,7 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                 Request::Start { id } => result(store.start(&id).map(Response::Container)),
                 Request::Stop { id } => result(store.stop(&id).map(Response::Container)),
                 Request::Restart { id } => result(store.restart(&id).map(Response::Container)),
-                _ => Response::Error { message: "gravitond is serving demo data; restart it without --demo to pull, run and exec".into() },
+                _ => Response::Error { message: "gravitond is serving demo data; restart it without --demo to pull, run, exec and browse files".into() },
             }
         }
         Backend::Engine(engine) => {
@@ -276,6 +277,10 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                     Request::Stop { id } => Response::Container(engine.stop(&id)?),
                     Request::Restart { id } => Response::Container(engine.restart(&id)?),
                     Request::Remove { id } => Response::Removed { id: engine.remove(&id)? },
+                    Request::Stats { id } => Response::Stats(engine.stats(&id)?),
+                    Request::ListFiles { id, path } => Response::Files(engine.list_files(&id, &path)?),
+                    Request::ReadFile { id, path } => Response::File(engine.read_file(&id, &path)?),
+                    Request::Inspect { id } => Response::Details(Box::new(engine.inspect(&id)?)),
                     Request::Exec(_) => unreachable!("exec is handled by serve()"),
                     Request::PairBegin | Request::ListDevices | Request::RevokeDevice { .. } | Request::Pair { .. } | Request::Auth { .. } => {
                         Response::Error { message: "not available here".into() }

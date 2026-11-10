@@ -13,6 +13,11 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case pull(reference: String)
     case run(RunSpec)
     case remove(id: String)
+    case exec(ExecSpec)
+    case stats(id: String)
+    case listFiles(id: String, path: String)
+    case readFile(id: String, path: String)
+    case inspect(id: String)
     case pairBegin
     case listDevices
     case revokeDevice(id: String)
@@ -25,6 +30,7 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     private struct PullParams: Encodable { let reference: String }
     private struct PairParams: Encodable { let code: String; let device: String }
     private struct AuthParams: Encodable { let token: String }
+    private struct PathParams: Encodable { let id: String; let path: String }
 
     public var method: String {
         switch self {
@@ -39,6 +45,11 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .pull: "pull"
         case .run: "run"
         case .remove: "remove"
+        case .exec: "exec"
+        case .stats: "stats"
+        case .listFiles: "list_files"
+        case .readFile: "read_file"
+        case .inspect: "inspect"
         case .pairBegin: "pair_begin"
         case .listDevices: "list_devices"
         case .revokeDevice: "revoke_device"
@@ -56,7 +67,10 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case let .pair(code, device): try c.encode(PairParams(code: code, device: device), forKey: .params)
         case let .auth(token): try c.encode(AuthParams(token: token), forKey: .params)
         case let .logs(id, tail): try c.encode(LogParams(id: id, tail: tail), forKey: .params)
-        case let .start(id), let .stop(id), let .restart(id), let .remove(id): try c.encode(IDParams(id: id), forKey: .params)
+        case let .start(id), let .stop(id), let .restart(id), let .remove(id), let .stats(id), let .inspect(id):
+            try c.encode(IDParams(id: id), forKey: .params)
+        case let .listFiles(id, path), let .readFile(id, path): try c.encode(PathParams(id: id, path: path), forKey: .params)
+        case let .exec(spec): try c.encode(spec, forKey: .params)
         case let .pull(reference): try c.encode(PullParams(reference: reference), forKey: .params)
         case let .run(spec): try c.encode(spec, forKey: .params)
         }
@@ -73,6 +87,11 @@ public enum EngineResponse: Decodable, Sendable {
     case container(Container)
     case image(ImageInfo)
     case removed(id: String)
+    case attached
+    case stats(ContainerStats)
+    case files(DirectoryListing)
+    case file(FileContents)
+    case details(ContainerDetails)
     case pairing(PairingInfo)
     case devices([PairedDevice])
     case revoked(id: String)
@@ -99,6 +118,11 @@ public enum EngineResponse: Decodable, Sendable {
         case "container": self = .container(try c.decode(Container.self, forKey: .data))
         case "image": self = .image(try c.decode(ImageInfo.self, forKey: .data))
         case "removed": self = .removed(id: try c.decode(Removed.self, forKey: .data).id)
+        case "attached": self = .attached
+        case "stats": self = .stats(try c.decode(ContainerStats.self, forKey: .data))
+        case "files": self = .files(try c.decode(DirectoryListing.self, forKey: .data))
+        case "file": self = .file(try c.decode(FileContents.self, forKey: .data))
+        case "details": self = .details(try c.decode(ContainerDetails.self, forKey: .data))
         case "pairing": self = .pairing(try c.decode(PairingInfo.self, forKey: .data))
         case "devices": self = .devices(try c.decode([PairedDevice].self, forKey: .data))
         case "revoked": self = .revoked(id: try c.decode(Removed.self, forKey: .data).id)
