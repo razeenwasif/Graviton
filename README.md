@@ -4,10 +4,10 @@ Native containers for macOS: a Rust engine that runs each Linux container in
 its own lightweight VM (Apple Virtualization.framework), a `grav` CLI, and
 SwiftUI apps for macOS and iOS.
 
-> Status: **milestone 1 done**. Graviton boots a Linux guest VM on
-> Virtualization.framework and runs commands in it through the agent (~0.3 s
-> to agent ready). The daemon, CLI and both apps still show sample containers;
-> pulling and running images is milestone 2.
+> Status: **milestone 2 in progress**. `grav pull` and `grav run` work with
+> real images from Docker Hub and GHCR: each container boots its own VM, the
+> agent unpacks the image and runs it isolated (`grav run alpine` takes about
+> half a second end to end). The apps don't drive pulls and runs yet.
 
 ## Layout
 
@@ -15,9 +15,10 @@ SwiftUI apps for macOS and iOS.
 crates/
   graviton-proto   Wire types (control API + guest agent channel), JSON lines
   graviton-core    Image references, engine store, well-known paths
+  graviton-image   Registry client, content-addressed blob store, local image index
   graviton-vmm     VM config + Hypervisor trait; Virtualization.framework backend
-  graviton-agent   PID 1 inside each guest VM: mounts, vsock modules, exec over vsock
-  gravitond        Engine daemon, serves the control API on a Unix socket
+  graviton-agent   PID 1 inside each guest VM: unpacks images, runs containers, talks vsock
+  gravitond        Engine daemon: control API on a Unix socket, one VM per container
   grav             CLI client
 apps/
   project.yml      XcodeGen spec → Graviton.xcodeproj (generated, not committed)
@@ -37,15 +38,24 @@ periwinkle accent `#7C8CFF`; green, amber and red only for status).
 ## Running it
 
 ```bash
-cargo run -p gravitond          # serves sample containers on the default socket
-cargo run -p grav -- ps -a      # in another terminal
-cargo run -p grav -- logs api-gateway -n 5
+scripts/build-guest.sh                      # once: guest kernel + initramfs
+scripts/dev-gravitond.sh                    # build, sign and run the daemon
+cargo run -p grav -- pull alpine            # in another terminal
+cargo run -p grav -- run alpine cat /etc/os-release
+cargo run -p grav -- run -d --name web python:3.13-slim python3 -m http.server
+cargo run -p grav -- ps -a
+cargo run -p grav -- logs web
+cargo run -p grav -- stop web && cargo run -p grav -- rm web
 ```
 
-Boot a guest VM and run a command in it (milestone 1):
+`grav run` pulls the image if needed, boots a VM (2 vCPU, 1 GiB by default;
+`--cpus`, `--memory`), unpacks the image inside it, runs the entrypoint and
+streams the output; the exit code is the container's. `gravitond --demo`
+serves the sample containers from the design mockups instead.
+
+Boot a bare guest VM and run a command in it (milestone 1's check):
 
 ```bash
-scripts/build-guest.sh                         # once: kernel + initramfs
 scripts/dev-gravitond.sh boot-check            # runs `uname -a` in the guest
 scripts/dev-gravitond.sh boot-check --cpus 4 --memory 1024 -- /bin/sh -c 'nproc; free -m'
 ```
@@ -90,8 +100,11 @@ and both sides have tests pinning the JSON shape.
 1. ~~**Boot a VM**~~ (done): Virtualization.framework backend via
    `objc2-virtualization`, Alpine kernel + initramfs, agent answers over vsock
    and runs commands, clean power-off. `gravitond boot-check` exercises it.
-2. **Run an image**: registry client, content-addressed layer store, rootfs
-   assembly, `grav pull` / `grav run`. Enables Run and Pull in the apps.
+2. **Run an image** (mostly done): registry client (token auth, multi-arch
+   indexes, verified downloads), content-addressed blob store shared into the
+   guest over virtiofs, layers unpacked in the guest with OCI whiteouts, the
+   process run chrooted in new mount/UTS/IPC namespaces as the image's user,
+   `grav pull` / `run` / `stop` / `rm`. Left: Pull and Run in the apps.
 3. **Daemon features**: NAT networking, port forwarding, volumes, persistent
    state, launchd agent.
 4. **Remote hosts**: authenticated TCP/TLS endpoint so the iOS app can pair

@@ -7,10 +7,14 @@
 //! 4. Listen on vsock port [`AGENT_VSOCK_PORT`]; every connection gets a
 //!    `Ready` event, then newline-delimited [`AgentRequest`]s.
 //!
-//! Milestone 1 runs processes directly in the guest. Namespaces, cgroups and
-//! `pivot_root` into the image's rootfs come with milestone 2.
+//! `prepare` unpacks an image into a container root filesystem; `exec` with a
+//! container runs the process inside it (see `container.rs`). Without one it
+//! runs directly in the guest, which `gravitond boot-check` uses.
 //!
 //! Build it for the guest with `scripts/build-guest.sh`.
+
+#[cfg(target_os = "linux")]
+mod container;
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -24,7 +28,7 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
-mod linux {
+pub(crate) mod linux {
     use std::ffi::CString;
     use std::fs::{self, File};
     use std::io::{self, BufRead, BufReader, Read, Write};
@@ -96,7 +100,23 @@ mod linux {
                 continue;
             }
             match decode_line::<AgentRequest>(line.as_bytes()) {
-                Ok(AgentRequest::Exec { argv, env, cwd, tty: _ }) => exec(argv, env, cwd, Arc::clone(&writer)),
+                Ok(AgentRequest::Prepare { container, layers }) => {
+                    let t0 = std::time::Instant::now();
+                    match crate::container::prepare(&container, &layers) {
+                        Ok(files) => send(&writer, &AgentEvent::Prepared { container, files, ms: t0.elapsed().as_millis() as u64 }),
+                        Err(err) => send(&writer, &AgentEvent::Error { message: format!("preparing {container}: {err}") }),
+                    }
+                }
+                Ok(AgentRequest::Exec { argv, env, cwd, tty: _, container, user, hostname }) => {
+                    let cmd = match &container {
+                        Some(id) => crate::container::command(id, &argv, &env, &cwd, user.as_deref(), hostname.as_deref().unwrap_or(id)),
+                        None => plain_command(&argv, &env, &cwd),
+                    };
+                    match cmd {
+                        Ok(cmd) => exec(cmd, argv.first().cloned().unwrap_or_default(), Arc::clone(&writer)),
+                        Err(err) => send(&writer, &AgentEvent::Error { message: format!("exec: {err}") }),
+                    }
+                }
                 Ok(AgentRequest::Signal { pid, signal }) => {
                     // SAFETY: kill(2) with caller-supplied values; errors are reported, not UB.
                     if unsafe { libc::kill(pid, signal) } != 0 {
@@ -113,22 +133,20 @@ mod linux {
         Ok(())
     }
 
-    fn exec(argv: Vec<String>, env: Vec<String>, cwd: String, writer: Writer) {
-        let Some((program, args)) = argv.split_first() else {
-            send(&writer, &AgentEvent::Error { message: "exec: empty argv".into() });
-            return;
-        };
+    fn plain_command(argv: &[String], env: &[String], cwd: &str) -> io::Result<Command> {
+        let (program, args) = argv.split_first().ok_or_else(|| io::Error::other("empty argv"))?;
         let mut cmd = Command::new(program);
-        cmd.args(args)
-            .current_dir(if cwd.is_empty() { "/" } else { &cwd })
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for pair in &env {
+        cmd.args(args).current_dir(if cwd.is_empty() { "/" } else { cwd });
+        for pair in env {
             if let Some((k, v)) = pair.split_once('=') {
                 cmd.env(k, v);
             }
         }
+        Ok(cmd)
+    }
+
+    fn exec(mut cmd: Command, program: String, writer: Writer) {
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(err) => {
@@ -222,9 +240,15 @@ mod linux {
     }
 
     fn mount(source: &str, target: &str, fstype: &str) -> io::Result<()> {
+        mount_with(source, target, fstype, libc::MS_NOSUID, None)
+    }
+
+    pub(crate) fn mount_with(source: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: Option<&str>) -> io::Result<()> {
         let (s, t, f) = (cstr(source)?, cstr(target)?, cstr(fstype)?);
-        // SAFETY: all pointers are valid NUL-terminated strings for the call's duration.
-        let rc = unsafe { libc::mount(s.as_ptr(), t.as_ptr(), f.as_ptr(), libc::MS_NOSUID, std::ptr::null()) };
+        let d = data.map(cstr).transpose()?;
+        let dp = d.as_ref().map_or(std::ptr::null(), |d| d.as_ptr().cast());
+        // SAFETY: all pointers are valid NUL-terminated strings (or null) for the call's duration.
+        let rc = unsafe { libc::mount(s.as_ptr(), t.as_ptr(), f.as_ptr(), flags, dp) };
         if rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EBUSY) {
             Ok(())
         } else {

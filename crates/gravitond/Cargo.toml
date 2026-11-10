@@ -9,7 +9,11 @@ rust-version.workspace = true
 graviton-proto.workspace = true
 graviton-core.workspace = true
 graviton-vmm.workspace = true
+graviton-image.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

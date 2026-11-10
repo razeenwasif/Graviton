@@ -99,7 +99,7 @@ fn talk_to_agent(vm: &dyn VmHandle, command: Vec<String>, t0: Instant) -> Result
     }
 
     println!("$ {}", command.join(" "));
-    writer.write_all(&encode_line(&AgentRequest::Exec { argv: command, env: vec![], cwd: "/".into(), tty: false }))?;
+    writer.write_all(&encode_line(&AgentRequest::Exec { argv: command, env: vec![], cwd: "/".into(), tty: false, container: None, user: None, hostname: None }))?;
     let code = loop {
         match next_event(&mut reader)? {
             AgentEvent::Started { .. } => {}
@@ -108,7 +108,7 @@ fn talk_to_agent(vm: &dyn VmHandle, command: Vec<String>, t0: Instant) -> Result
             }
             AgentEvent::Exited { code, .. } => break code,
             AgentEvent::Error { message } => bail!("agent: {message}"),
-            AgentEvent::Ready { .. } => {}
+            AgentEvent::Ready { .. } | AgentEvent::Prepared { .. } => {}
         }
     };
     println!("Command exited {code}       {:>6} ms", t0.elapsed().as_millis());

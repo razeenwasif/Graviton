@@ -2,11 +2,14 @@
 //!
 //! Listens on a Unix socket and serves the newline-delimited JSON control API
 //! defined in `graviton-proto`. Clients are the `grav` CLI and Graviton.app.
+//! Containers run in their own guest VMs (see `runtime.rs`); `--demo` serves
+//! the sample containers from the design mockups instead.
 
 mod boot_check;
+mod runtime;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -14,7 +17,8 @@ use graviton_core::{Store, paths};
 use graviton_proto::{PROTOCOL_VERSION, Request, Response, decode_line, encode_line};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
+
+use runtime::Engine;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "The Graviton engine daemon")]
@@ -23,8 +27,8 @@ struct Args {
     #[arg(long)]
     socket: Option<PathBuf>,
 
-    /// Serve sample containers instead of an empty engine (until containers run in VMs).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    /// Serve the sample containers from the design mockups instead of real ones.
+    #[arg(long)]
     demo: bool,
 
     #[command(subcommand)]
@@ -35,6 +39,22 @@ struct Args {
 enum Command {
     /// Boot a guest VM, run one command in it through the agent, and power it off.
     BootCheck(boot_check::BootCheckArgs),
+}
+
+/// What answers requests: real VMs, or the sample data.
+#[derive(Clone)]
+enum Backend {
+    Engine(Arc<Engine>),
+    Demo(Arc<Mutex<Store>>),
+}
+
+impl Backend {
+    fn store(&self) -> &Arc<Mutex<Store>> {
+        match self {
+            Backend::Engine(e) => &e.store,
+            Backend::Demo(s) => s,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -59,19 +79,28 @@ async fn serve_forever(args: Args) -> Result<()> {
         tokio::fs::remove_file(&socket).await.ok();
     }
 
+    let backend = if args.demo {
+        Backend::Demo(Arc::new(Mutex::new(Store::demo())))
+    } else {
+        Backend::Engine(Engine::open()?)
+    };
+
     let listener = UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
     restrict_permissions(&socket)?;
-
-    let store = Arc::new(Mutex::new(if args.demo { Store::demo() } else { Store::new() }));
-    eprintln!("gravitond {} listening on {}", env!("CARGO_PKG_VERSION"), socket.display());
+    eprintln!(
+        "gravitond {} listening on {}{}",
+        env!("CARGO_PKG_VERSION"),
+        socket.display(),
+        if args.demo { " (demo data)" } else { "" }
+    );
 
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
-                let store = Arc::clone(&store);
+                let backend = backend.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = serve(stream, store).await {
+                    if let Err(err) = serve(stream, backend).await {
                         eprintln!("connection error: {err:#}");
                     }
                 });
@@ -92,7 +121,7 @@ fn restrict_permissions(path: &std::path::Path) -> Result<()> {
         .with_context(|| format!("chmod {}", path.display()))
 }
 
-async fn serve(stream: UnixStream, store: Arc<Mutex<Store>>) -> Result<()> {
+async fn serve(stream: UnixStream, backend: Backend) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     while let Some(line) = lines.next_line().await? {
@@ -100,7 +129,7 @@ async fn serve(stream: UnixStream, store: Arc<Mutex<Store>>) -> Result<()> {
             continue;
         }
         let response = match decode_line::<Request>(line.as_bytes()) {
-            Ok(request) => handle(request, &mut *store.lock().await),
+            Ok(request) => handle(request, &backend).await,
             Err(err) => Response::Error { message: format!("bad request: {err}") },
         };
         write.write_all(&encode_line(&response)).await?;
@@ -108,34 +137,77 @@ async fn serve(stream: UnixStream, store: Arc<Mutex<Store>>) -> Result<()> {
     Ok(())
 }
 
-fn handle(request: Request, store: &mut Store) -> Response {
-    let result = match request {
-        Request::Ping => return Response::Pong { protocol: PROTOCOL_VERSION },
-        Request::EngineInfo => return Response::Engine(store.engine_info()),
-        Request::ListContainers => return Response::Containers(store.containers().to_vec()),
-        Request::ListImages => return Response::Images(store.images().to_vec()),
-        Request::Logs { id, tail } => store.logs(&id, tail).map(Response::Logs),
-        Request::Start { id } => store.start(&id).map(Response::Container),
-        Request::Stop { id } => store.stop(&id).map(Response::Container),
-        Request::Restart { id } => store.restart(&id).map(Response::Container),
-    };
-    result.unwrap_or_else(|err| Response::Error { message: err.to_string() })
+async fn handle(request: Request, backend: &Backend) -> Response {
+    // Reads answer straight from the store.
+    {
+        let store = backend.store().lock().unwrap();
+        match &request {
+            Request::Ping => return Response::Pong { protocol: PROTOCOL_VERSION },
+            Request::ListContainers => return Response::Containers(store.containers().to_vec()),
+            Request::ListImages => return Response::Images(store.images().to_vec()),
+            Request::Logs { id, tail } => return result(store.logs(id, *tail).map(Response::Logs)),
+            Request::EngineInfo if matches!(backend, Backend::Demo(_)) => return Response::Engine(store.engine_info()),
+            _ => {}
+        }
+    }
+
+    match backend {
+        Backend::Demo(store) => {
+            let mut store = store.lock().unwrap();
+            match request {
+                Request::Start { id } => result(store.start(&id).map(Response::Container)),
+                Request::Stop { id } => result(store.stop(&id).map(Response::Container)),
+                Request::Restart { id } => result(store.restart(&id).map(Response::Container)),
+                _ => Response::Error { message: "gravitond is serving demo data; restart it without --demo to pull and run images".into() },
+            }
+        }
+        Backend::Engine(engine) => {
+            let engine = Arc::clone(engine);
+            // Engine calls block on downloads and VM boots.
+            let outcome = tokio::task::spawn_blocking(move || -> Result<Response> {
+                Ok(match request {
+                    Request::EngineInfo => Response::Engine(engine.engine_info()),
+                    Request::Pull { reference } => Response::Image(engine.pull(&reference)?),
+                    Request::Run(spec) => Response::Container(engine.run(spec)?),
+                    Request::Start { id } => Response::Container(engine.start(&id)?),
+                    Request::Stop { id } => Response::Container(engine.stop(&id)?),
+                    Request::Restart { id } => Response::Container(engine.restart(&id)?),
+                    Request::Remove { id } => Response::Removed { id: engine.remove(&id)? },
+                    _ => unreachable!("reads are answered above"),
+                })
+            })
+            .await;
+            match outcome {
+                Ok(Ok(response)) => response,
+                Ok(Err(err)) => Response::Error { message: format!("{err:#}") },
+                Err(err) => Response::Error { message: format!("internal error: {err}") },
+            }
+        }
+    }
+}
+
+fn result<E: std::fmt::Display>(r: Result<Response, E>) -> Response {
+    r.unwrap_or_else(|err| Response::Error { message: err.to_string() })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn handles_requests() {
-        let mut store = Store::demo();
-        assert_eq!(handle(Request::Ping, &mut store), Response::Pong { protocol: PROTOCOL_VERSION });
-        match handle(Request::Stop { id: "web".into() }, &mut store) {
+    #[tokio::test]
+    async fn demo_backend_handles_requests() {
+        let backend = Backend::Demo(Arc::new(Mutex::new(Store::demo())));
+        assert_eq!(handle(Request::Ping, &backend).await, Response::Pong { protocol: PROTOCOL_VERSION });
+        match handle(Request::Stop { id: "web".into() }, &backend).await {
             Response::Container(c) => assert_eq!(c.name, "web"),
             other => panic!("unexpected {other:?}"),
         }
-        match handle(Request::Stop { id: "ghost".into() }, &mut store) {
+        match handle(Request::Stop { id: "ghost".into() }, &backend).await {
             Response::Error { message } => assert!(message.contains("no such container")),
+            other => panic!("unexpected {other:?}"),
+        }
+        match handle(Request::Pull { reference: "alpine".into() }, &backend).await {
+            Response::Error { message } => assert!(message.contains("demo")),
             other => panic!("unexpected {other:?}"),
         }
     }

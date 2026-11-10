@@ -66,11 +66,14 @@ cp "$agent" "$root/init"
 cp "$busybox_dir/bin/busybox.static" "$root/bin/busybox"
 ln -s busybox "$root/bin/sh"
 
-modules="$kernel_dir/lib/modules/$(ls "$kernel_dir/lib/modules")/kernel/net/vmw_vsock"
+moddir="$kernel_dir/lib/modules/$(ls "$kernel_dir/lib/modules")/kernel"
 : > "$root/lib/modules/order"
-for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do
-  gunzip -c "$modules/$m.ko.gz" > "$root/lib/modules/$m.ko"
-  echo "$m.ko" >> "$root/lib/modules/order"
+# vsock for the agent channel; fuse + virtiofs for the shared image store.
+for m in net/vmw_vsock/vsock net/vmw_vsock/vmw_vsock_virtio_transport_common net/vmw_vsock/vmw_vsock_virtio_transport \
+         fs/fuse/fuse fs/fuse/virtiofs; do
+  name=$(basename "$m")
+  gunzip -c "$moddir/$m.ko.gz" > "$root/lib/modules/$name.ko"
+  echo "$name.ko" >> "$root/lib/modules/order"
 done
 
 (cd "$root" && find . | sort | cpio -o -H newc --quiet) | gzip -9 > "$out/initrd.img"

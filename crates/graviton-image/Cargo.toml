@@ -1,0 +1,15 @@
+[package]
+name = "graviton-image"
+description = "OCI registry client, content-addressed blob store and local image index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+graviton-core.workspace = true
+graviton-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+sha2 = "0.10"

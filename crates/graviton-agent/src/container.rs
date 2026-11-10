@@ -1,0 +1,266 @@
+//! Container root filesystems and isolated processes inside the guest.
+//!
+//! * `prepare` mounts the host's blob store (virtiofs tag `blobs`, read-only),
+//!   puts a tmpfs at `/run/containers/<id>/rootfs`, and unpacks the image's
+//!   layers into it in order, applying OCI whiteouts.
+//! * `command` builds a `Command` that, between fork and exec, enters new
+//!   mount, UTS and IPC namespaces, moves the rootfs to `/` and chroots into
+//!   it (pivot_root can't leave an initramfs), mounts `/proc` and `/sys`,
+//!   sets the hostname and drops to the image's user.
+//!
+//! The VM boundary is the security boundary; these namespaces give the
+//! process the filesystem and identity it expects.
+
+use std::ffi::CString;
+use std::fs::{self, File};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::os::unix::process::CommandExt;
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+
+use flate2::read::GzDecoder;
+
+const BLOBS: &str = "/run/blobs";
+const CONTAINERS: &str = "/run/containers";
+
+pub fn rootfs(id: &str) -> io::Result<PathBuf> {
+    let ok = !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !ok {
+        return Err(io::Error::other(format!("invalid container id `{id}`")));
+    }
+    Ok(Path::new(CONTAINERS).join(id).join("rootfs"))
+}
+
+/// Unpack `layers` (sha256 digests, lowest first) into a fresh rootfs. Returns the entry count.
+pub fn prepare(id: &str, layers: &[String]) -> io::Result<u64> {
+    mount_blobs()?;
+    let root = rootfs(id)?;
+    if root.exists() {
+        let _ = umount(&root);
+        let _ = fs::remove_dir_all(&root);
+    }
+    fs::create_dir_all(&root)?;
+    crate::linux::mount_with("tmpfs", &root.to_string_lossy(), "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, Some("mode=0755,size=90%"))?;
+
+    let mut files = 0;
+    for digest in layers {
+        let hex = digest
+            .strip_prefix("sha256:")
+            .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| io::Error::other(format!("bad layer digest `{digest}`")))?;
+        let blob = Path::new(BLOBS).join("sha256").join(hex);
+        files += unpack_layer(&blob, &root).map_err(|e| io::Error::other(format!("layer {}: {e}", &digest[..19.min(digest.len())])))?;
+    }
+
+    for (dir, mode) in [("proc", 0o555), ("sys", 0o555), ("dev", 0o755), ("tmp", 0o1777), ("etc", 0o755)] {
+        let p = root.join(dir);
+        if !p.exists() {
+            fs::create_dir_all(&p)?;
+            set_mode(&p, mode)?;
+        }
+    }
+    Ok(files)
+}
+
+fn mount_blobs() -> io::Result<()> {
+    if Path::new(BLOBS).join("sha256").is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(BLOBS)?;
+    crate::linux::mount_with("blobs", BLOBS, "virtiofs", libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV, None)
+        .map_err(|e| io::Error::other(format!("mounting the image store: {e}")))
+}
+
+fn unpack_layer(blob: &Path, root: &Path) -> io::Result<u64> {
+    let mut file = File::open(blob)?;
+    let mut magic = [0u8; 4];
+    let n = file.read(&mut magic)?;
+    file.seek(SeekFrom::Start(0))?;
+    let reader: Box<dyn Read> = if n >= 2 && magic[..2] == [0x1f, 0x8b] {
+        Box::new(GzDecoder::new(BufReader::with_capacity(1 << 20, file)))
+    } else if n == 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
+        return Err(io::Error::other("zstd-compressed layers aren't supported yet"));
+    } else {
+        Box::new(BufReader::with_capacity(1 << 20, file))
+    };
+
+    let mut archive = tar::Archive::new(reader);
+    archive.set_preserve_permissions(true);
+    archive.set_preserve_ownerships(true);
+    archive.set_preserve_mtime(true);
+    archive.set_overwrite(true);
+    archive.set_unpack_xattrs(false);
+
+    let mut count = 0;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let Some(rel) = clean(&entry.path()?) else { continue };
+        let name = rel.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let parent = root.join(rel.parent().unwrap_or(Path::new("")));
+
+        if name == ".wh..wh..opq" {
+            // Opaque directory: hide everything lower layers put here.
+            if let Ok(children) = fs::read_dir(&parent) {
+                for child in children.flatten() {
+                    remove_any(&child.path())?;
+                }
+            }
+            continue;
+        }
+        if let Some(hidden) = name.strip_prefix(".wh.") {
+            remove_any(&parent.join(hidden))?;
+            continue;
+        }
+
+        let kind = entry.header().entry_type();
+        if kind.is_character_special() || kind.is_block_special() {
+            continue; // /dev comes from the guest
+        }
+        let dest = root.join(&rel);
+        if let Ok(meta) = fs::symlink_metadata(&dest) {
+            if meta.is_dir() && !kind.is_dir() {
+                fs::remove_dir_all(&dest)?;
+            } else if !meta.is_dir() && kind.is_dir() {
+                fs::remove_file(&dest)?;
+            }
+        }
+        entry.unpack_in(root)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Strip `./` and leading `/`; refuse anything with `..`.
+fn clean(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::Normal(p) => out.push(p),
+            Component::CurDir | Component::RootDir => {}
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    (!out.as_os_str().is_empty()).then_some(out)
+}
+
+fn remove_any(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+fn umount(path: &Path) -> io::Result<()> {
+    let p = CString::new(path.as_os_str().as_encoded_bytes()).map_err(io::Error::other)?;
+    // SAFETY: valid NUL-terminated path.
+    if unsafe { libc::umount2(p.as_ptr(), libc::MNT_DETACH) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+/// Resolve `user[:group]` against the container's /etc/passwd and /etc/group.
+pub fn resolve_user(root: &Path, spec: Option<&str>) -> io::Result<(u32, u32, String)> {
+    let spec = spec.unwrap_or("").trim();
+    let (user, group) = match spec.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (spec, None),
+    };
+    let passwd = fs::read_to_string(root.join("etc/passwd")).unwrap_or_default();
+    let entries: Vec<Vec<&str>> = passwd.lines().map(|l| l.split(':').collect()).filter(|f: &Vec<&str>| f.len() >= 6).collect();
+
+    let (uid, mut gid, home) = if user.is_empty() {
+        (0, 0, "/root".to_string())
+    } else if let Ok(uid) = user.parse::<u32>() {
+        match entries.iter().find(|f| f[2] == user) {
+            Some(f) => (uid, f[3].parse().unwrap_or(uid), f[5].to_string()),
+            None => (uid, uid, "/".to_string()),
+        }
+    } else {
+        let f = entries
+            .iter()
+            .find(|f| f[0] == user)
+            .ok_or_else(|| io::Error::other(format!("user `{user}` not found in the image's /etc/passwd")))?;
+        (f[2].parse().unwrap_or(0), f[3].parse().unwrap_or(0), f[5].to_string())
+    };
+    if let Some(g) = group.filter(|g| !g.is_empty()) {
+        gid = match g.parse::<u32>() {
+            Ok(n) => n,
+            Err(_) => fs::read_to_string(root.join("etc/group"))
+                .unwrap_or_default()
+                .lines()
+                .map(|l| l.split(':').collect::<Vec<_>>())
+                .find(|f| f.len() >= 3 && f[0] == g)
+                .and_then(|f| f[2].parse().ok())
+                .ok_or_else(|| io::Error::other(format!("group `{g}` not found in the image's /etc/group")))?,
+        };
+    }
+    Ok((uid, gid, home))
+}
+
+/// A `Command` that runs `argv` inside container `id`.
+pub fn command(id: &str, argv: &[String], env: &[String], cwd: &str, user: Option<&str>, hostname: &str) -> io::Result<Command> {
+    let root = rootfs(id)?;
+    if !root.join("proc").is_dir() {
+        return Err(io::Error::other(format!("container {id} has no root filesystem (prepare it first)")));
+    }
+    let (uid, gid, home) = resolve_user(&root, user)?;
+    let (program, args) = argv.split_first().ok_or_else(|| io::Error::other("empty command"))?;
+
+    let mut cmd = Command::new(program);
+    cmd.args(args).env_clear();
+    let mut has_home = false;
+    for pair in env {
+        if let Some((k, v)) = pair.split_once('=') {
+            has_home |= k == "HOME";
+            cmd.env(k, v);
+        }
+    }
+    if !has_home {
+        cmd.env("HOME", &home);
+    }
+
+    let c = |s: &str| CString::new(s).map_err(io::Error::other);
+    let root_c = c(&root.to_string_lossy())?;
+    let dev_dst = c(&root.join("dev").to_string_lossy())?;
+    let cwd_c = c(if cwd.is_empty() { "/" } else { cwd })?;
+    let host = hostname.as_bytes().to_vec();
+
+    // SAFETY: the closure runs in the forked child before exec and only makes
+    // raw syscalls on data prepared above (no allocation, no locks).
+    unsafe {
+        cmd.pre_exec(move || enter(&root_c, &dev_dst, &cwd_c, &host, uid, gid));
+    }
+    Ok(cmd)
+}
+
+fn enter(root: &CString, dev_dst: &CString, cwd: &CString, hostname: &[u8], uid: u32, gid: u32) -> io::Result<()> {
+    fn check(rc: libc::c_int) -> io::Result<()> {
+        if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    }
+    let null = std::ptr::null::<libc::c_char>();
+    // SAFETY: plain syscalls with valid NUL-terminated strings owned by the caller.
+    unsafe {
+        check(libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC))?;
+        check(libc::mount(null, c"/".as_ptr(), null, libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()))?;
+        check(libc::mount(c"/dev".as_ptr(), dev_dst.as_ptr(), null, libc::MS_BIND | libc::MS_REC, std::ptr::null()))?;
+        check(libc::chdir(root.as_ptr()))?;
+        check(libc::mount(root.as_ptr(), c"/".as_ptr(), null, libc::MS_MOVE, std::ptr::null()))?;
+        check(libc::chroot(c".".as_ptr()))?;
+        check(libc::chdir(c"/".as_ptr()))?;
+        check(libc::mount(c"proc".as_ptr(), c"/proc".as_ptr(), c"proc".as_ptr(), libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, std::ptr::null()))?;
+        let _ = libc::mount(c"sysfs".as_ptr(), c"/sys".as_ptr(), c"sysfs".as_ptr(), libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, std::ptr::null());
+        if !hostname.is_empty() {
+            check(libc::sethostname(hostname.as_ptr().cast(), hostname.len()))?;
+        }
+        check(libc::setgroups(0, std::ptr::null()))?;
+        check(libc::setgid(gid))?;
+        check(libc::setuid(uid))?;
+        check(libc::chdir(cwd.as_ptr()))?;
+    }
+    Ok(())
+}

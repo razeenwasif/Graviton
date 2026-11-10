@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use graviton_core::{ImageReference, paths};
-use graviton_proto::{ContainerStatus, ContainerSummary, Request, Response, decode_line, encode_line};
+use graviton_proto::{ContainerStatus, ContainerSummary, LogStream, Request, Response, RunSpec, decode_line, encode_line};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Native containers for macOS")]
@@ -48,6 +48,32 @@ enum Command {
     Stop { container: String },
     /// Restart a container.
     Restart { container: String },
+    /// Pull an image from its registry.
+    Pull { reference: String },
+    /// Run a command in a new container (each container gets its own VM).
+    Run {
+        /// Name the container (default: image name plus a short suffix).
+        #[arg(long)]
+        name: Option<String>,
+        /// Set an environment variable (KEY=value); repeatable.
+        #[arg(short, long = "env")]
+        env: Vec<String>,
+        /// vCPUs for the container's VM.
+        #[arg(long)]
+        cpus: Option<u32>,
+        /// Memory for the container's VM, in MiB.
+        #[arg(long)]
+        memory: Option<u64>,
+        /// Start it and return instead of streaming its output.
+        #[arg(short, long)]
+        detach: bool,
+        image: String,
+        /// Command (replaces the image's default command).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Remove a stopped container.
+    Rm { container: String },
     /// Parse and normalise an image reference (no daemon needed).
     Resolve { reference: String },
 }
@@ -79,8 +105,12 @@ fn run(cli: Cli) -> Result<()> {
                 println!("Version:   {}", e.version);
                 println!("Kernel:    {}", e.kernel);
                 println!("Arch:      {} · {} vCPU", e.arch, e.cpus);
-                println!("Memory:    {} / {}", bytes(e.memory_used_bytes), bytes(e.memory_bytes));
-                println!("Disk:      {} / {}", bytes(e.disk_used_bytes), bytes(e.disk_bytes));
+                println!("Memory:    {} in VMs of {} on this Mac", bytes(e.memory_used_bytes), bytes(e.memory_bytes));
+                if e.disk_bytes > 0 {
+                    println!("Disk:      {} / {}", bytes(e.disk_used_bytes), bytes(e.disk_bytes));
+                } else {
+                    println!("Images:    {}", bytes(e.disk_used_bytes));
+                }
             }
             other => unexpected(other)?,
         },
@@ -108,6 +138,44 @@ fn run(cli: Cli) -> Result<()> {
         Command::Start { container } => lifecycle(&mut client, Request::Start { id: container }, "started")?,
         Command::Stop { container } => lifecycle(&mut client, Request::Stop { id: container }, "stopped")?,
         Command::Restart { container } => lifecycle(&mut client, Request::Restart { id: container }, "restarted")?,
+        Command::Pull { reference } => {
+            eprintln!("Pulling {reference}…");
+            match client.call(&Request::Pull { reference })? {
+                Response::Image(i) => println!(
+                    "Pulled {}:{} ({}, {}, {})",
+                    i.repository,
+                    i.tag,
+                    bytes(i.size_bytes),
+                    i.architecture,
+                    &i.digest[..i.digest.len().min(19)]
+                ),
+                other => unexpected(other)?,
+            }
+        }
+        Command::Run { name, env, cpus, memory, detach, image, command } => {
+            let spec = RunSpec {
+                image,
+                name,
+                command: (!command.is_empty()).then_some(command),
+                env,
+                cpus,
+                memory_mib: memory,
+            };
+            let container = match client.call(&Request::Run(spec))? {
+                Response::Container(c) => c,
+                other => return unexpected(other),
+            };
+            if detach {
+                println!("{}", container.id);
+            } else {
+                let code = follow(&mut client, &container.id)?;
+                std::process::exit(code);
+            }
+        }
+        Command::Rm { container } => match client.call(&Request::Remove { id: container })? {
+            Response::Removed { id } => println!("{id}"),
+            other => unexpected(other)?,
+        },
         Command::Resolve { .. } => unreachable!(),
     }
     Ok(())
@@ -146,6 +214,42 @@ fn lifecycle(client: &mut Client, request: Request, verb: &str) -> Result<()> {
             Ok(())
         }
         other => unexpected(other),
+    }
+}
+
+/// Stream a container's output until it exits; returns its exit code.
+fn follow(client: &mut Client, id: &str) -> Result<i32> {
+    let mut seen = 0u64;
+    let mut print_new = |client: &mut Client| -> Result<()> {
+        if let Response::Logs(lines) = client.call(&Request::Logs { id: id.to_string(), tail: None })? {
+            let mut out = std::io::stdout().lock();
+            let from = seen;
+            for l in lines.into_iter().filter(|l| l.seq > from) {
+                seen = l.seq;
+                match l.stream {
+                    LogStream::Stdout => writeln!(out, "{}", l.message)?,
+                    LogStream::Stderr => eprintln!("{}", l.message),
+                    LogStream::System => eprintln!("\x1b[2mgraviton: {}\x1b[0m", l.message),
+                }
+            }
+            out.flush()?;
+        }
+        Ok(())
+    };
+    loop {
+        print_new(client)?;
+        let status = match client.call(&Request::ListContainers)? {
+            Response::Containers(list) => list.into_iter().find(|c| c.id == id),
+            other => return unexpected(other).map(|_| 1),
+        };
+        match status {
+            Some(c) if c.status == ContainerStatus::Exited => {
+                print_new(client)?;
+                return Ok(c.exit_code.unwrap_or(0));
+            }
+            Some(_) => std::thread::sleep(std::time::Duration::from_millis(80)),
+            None => bail!("container {id} disappeared"),
+        }
     }
 }
 

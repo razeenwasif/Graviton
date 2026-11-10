@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use graviton_proto::{
-    ContainerStatus, ContainerSummary, EngineInfo, ImageSummary, LogLevel, LogLine, Mount,
+    ContainerStatus, ContainerSummary, EngineInfo, ImageSummary, LogLevel, LogLine, LogStream, Mount,
     PortMapping, PortProtocol, PROTOCOL_VERSION,
 };
 use thiserror::Error;
@@ -23,7 +23,14 @@ pub enum StoreError {
     Ambiguous(String),
     #[error("container {name} is already {state}")]
     InvalidState { name: String, state: &'static str },
+    #[error("container {0} is running; stop it first")]
+    Running(String),
+    #[error("the name {0} is already in use")]
+    NameTaken(String),
 }
+
+/// Lines kept per container.
+pub const LOG_LIMIT: usize = 10_000;
 
 #[derive(Debug, Default)]
 pub struct Store {
@@ -124,6 +131,54 @@ impl Store {
         self.start(key)
     }
 
+    pub fn name_taken(&self, name: &str) -> bool {
+        self.containers.iter().any(|c| c.name == name)
+    }
+
+    pub fn insert(&mut self, container: ContainerSummary) -> Result<(), StoreError> {
+        if self.name_taken(&container.name) {
+            return Err(StoreError::NameTaken(container.name));
+        }
+        self.containers.push(container);
+        Ok(())
+    }
+
+    /// Apply `f` to the container with this exact id.
+    pub fn update(&mut self, id: &str, f: impl FnOnce(&mut ContainerSummary)) -> Option<ContainerSummary> {
+        let c = self.containers.iter_mut().find(|c| c.id == id)?;
+        f(c);
+        Some(c.clone())
+    }
+
+    pub fn push_log(&mut self, id: &str, level: LogLevel, stream: LogStream, message: impl Into<String>) {
+        let lines = self.logs.entry(id.to_string()).or_default();
+        let seq = lines.last().map_or(1, |l| l.seq + 1);
+        let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        lines.push(LogLine { seq, timestamp_ms, level, message: message.into(), stream });
+        if lines.len() > LOG_LIMIT {
+            lines.drain(..lines.len() - LOG_LIMIT);
+        }
+    }
+
+    /// Remove a container that isn't running.
+    pub fn remove(&mut self, key: &str) -> Result<ContainerSummary, StoreError> {
+        let i = self.resolve(key)?;
+        if matches!(self.containers[i].status, ContainerStatus::Running | ContainerStatus::Paused) {
+            return Err(StoreError::Running(self.containers[i].name.clone()));
+        }
+        let c = self.containers.remove(i);
+        self.logs.remove(&c.id);
+        Ok(c)
+    }
+
+    pub fn set_images(&mut self, images: Vec<ImageSummary>) {
+        self.images = images;
+    }
+
+    pub fn set_engine(&mut self, engine: EngineInfo) {
+        self.engine = Some(engine);
+    }
+
     /// Sample data matching the design mockups.
     pub fn demo() -> Self {
         let now = now_secs();
@@ -215,6 +270,7 @@ impl Store {
                     timestamp_ms: t0 + i as u64 * 1_350,
                     level: *level,
                     message: (*msg).into(),
+                    stream: LogStream::Stdout,
                 })
                 .collect(),
         );
@@ -258,6 +314,23 @@ mod tests {
         assert_eq!(started.status, ContainerStatus::Running);
         assert!(started.started_at.is_some());
         assert_eq!(s.restart("worker").unwrap().status, ContainerStatus::Running);
+    }
+
+    #[test]
+    fn insert_log_remove() {
+        let mut s = Store::new();
+        let mut c = Store::demo().containers()[4].clone(); // exited "worker"
+        s.insert(c.clone()).unwrap();
+        assert_eq!(s.insert(c.clone()), Err(StoreError::NameTaken("worker".into())));
+        s.push_log(&c.id, LogLevel::Info, LogStream::Stdout, "hello");
+        s.push_log(&c.id, LogLevel::Info, LogStream::Stderr, "oops");
+        let logs = s.logs("worker", None).unwrap();
+        assert_eq!((logs[0].seq, logs[1].seq, logs[1].stream), (1, 2, LogStream::Stderr));
+        s.update(&c.id, |c| c.status = ContainerStatus::Running);
+        assert_eq!(s.remove("worker"), Err(StoreError::Running("worker".into())));
+        s.update(&c.id, |c| c.status = ContainerStatus::Exited);
+        c = s.remove("worker").unwrap();
+        assert!(s.logs(&c.id, None).is_err());
     }
 
     #[test]
