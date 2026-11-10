@@ -1,0 +1,9 @@
+[package]
+name = "graviton-vmm"
+description = "Lightweight Linux VMs on Apple Virtualization.framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true

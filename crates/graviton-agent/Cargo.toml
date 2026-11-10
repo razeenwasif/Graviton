@@ -1,0 +1,10 @@
+[package]
+name = "graviton-agent"
+description = "PID 1 inside each Graviton guest VM"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+graviton-proto.workspace = true
+serde_json.workspace = true

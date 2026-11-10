@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <radialGradient id="gvBg" cx="50%" cy="28%" r="82%">
+      <stop offset="0" stop-color="#272B42"/>
+      <stop offset="0.55" stop-color="#121320"/>
+      <stop offset="1" stop-color="#07080B"/>
+    </radialGradient>
+    <radialGradient id="gvHalo" cx="50%" cy="52%" r="50%">
+      <stop offset="0" stop-color="#7C8CFF" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#7C8CFF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="gvTop" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#D3D9FF"/>
+      <stop offset="1" stop-color="#8F9BFF"/>
+    </linearGradient>
+    <linearGradient id="gvLeft" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6A79FF"/>
+      <stop offset="1" stop-color="#4150D6"/>
+    </linearGradient>
+    <linearGradient id="gvRight" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3F4BC2"/>
+      <stop offset="1" stop-color="#232A80"/>
+    </linearGradient>
+    <radialGradient id="gvGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.95"/>
+      <stop offset="0.25" stop-color="#7C8CFF" stop-opacity="0.8"/>
+      <stop offset="1" stop-color="#7C8CFF" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="gvBack"><rect x="0" y="0" width="1024" height="540"/></clipPath>
+    <clipPath id="gvFront"><rect x="0" y="540" width="1024" height="484"/></clipPath>
+  </defs>
+  <g id="artwork">
+    <rect id="plate" width="1024" height="1024" rx="230" fill="url(#gvBg)"/>
+    <rect x="3" y="3" width="1018" height="1018" rx="227" fill="none" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="6"/>
+    <circle cx="512" cy="530" r="400" fill="url(#gvHalo)"/>
+    <g transform="rotate(-18 512 540)">
+      <ellipse cx="512" cy="540" rx="340" ry="118" fill="none" stroke="#7C8CFF" stroke-opacity="0.35" stroke-width="20" clip-path="url(#gvBack)"/>
+    </g>
+    <polygon points="512,330 677,425 512,520 347,425" fill="url(#gvTop)"/>
+    <polygon points="347,425 512,520 512,710 347,615" fill="url(#gvLeft)"/>
+    <polygon points="512,520 677,425 677,615 512,710" fill="url(#gvRight)"/>
+    <g stroke="#FFFFFF" stroke-opacity="0.16" stroke-width="7" stroke-linecap="round">
+      <line x1="388" y1="460" x2="388" y2="628"/><line x1="430" y1="484" x2="430" y2="652"/><line x1="471" y1="508" x2="471" y2="676"/>
+      <line x1="553" y1="508" x2="553" y2="676"/><line x1="594" y1="484" x2="594" y2="652"/><line x1="636" y1="460" x2="636" y2="628"/>
+    </g>
+    <polyline points="347,425 512,330 677,425" fill="none" stroke="#FFFFFF" stroke-opacity="0.55" stroke-width="5" stroke-linejoin="round"/>
+    <line x1="512" y1="520" x2="512" y2="710" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="4"/>
+    <g transform="rotate(-18 512 540)">
+      <ellipse cx="512" cy="540" rx="340" ry="118" fill="none" stroke="#7C8CFF" stroke-width="20" clip-path="url(#gvFront)"/>
+      <circle cx="218" cy="599" r="78" fill="url(#gvGlow)"/>
+      <circle cx="218" cy="599" r="22" fill="#FFFFFF"/>
+    </g>
+  </g>
+</svg>

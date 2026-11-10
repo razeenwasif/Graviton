@@ -1,0 +1,15 @@
+[package]
+name = "gravitond"
+description = "The Graviton engine daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+graviton-proto.workspace = true
+graviton-core.workspace = true
+graviton-vmm.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true

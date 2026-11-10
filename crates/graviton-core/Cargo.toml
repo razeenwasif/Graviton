@@ -1,0 +1,10 @@
+[package]
+name = "graviton-core"
+description = "Image references, container state and the engine store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+graviton-proto.workspace = true
+thiserror.workspace = true
