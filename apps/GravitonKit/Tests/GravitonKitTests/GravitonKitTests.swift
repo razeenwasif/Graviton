@@ -71,13 +71,19 @@ import Testing
         let pull = String(decoding: try Wire.line(.pull(reference: "alpine")), as: UTF8.self)
         #expect(pull == "{\"method\":\"pull\",\"params\":{\"reference\":\"alpine\"}}\n")
 
-        let spec = RunSpec(image: "python:3.13-slim", name: "web", command: ["python3", "-m", "http.server"], env: ["A=1"], memoryMib: 2048)
+        let spec = RunSpec(image: "python:3.13-slim", name: "web", command: ["python3", "-m", "http.server"], env: ["A=1"], memoryMib: 2048,
+                           ports: ["8080:8000"], volumes: ["~/code:/app:ro"])
         let run = String(decoding: try Wire.line(.run(spec)), as: UTF8.self)
         // Must parse as graviton_proto::Request::Run (see the Rust test `run_from_swift`).
-        #expect(run == "{\"method\":\"run\",\"params\":{\"command\":[\"python3\",\"-m\",\"http.server\"],\"env\":[\"A=1\"],\"image\":\"python:3.13-slim\",\"memory_mib\":2048,\"name\":\"web\"}}\n")
+        #expect(run == "{\"method\":\"run\",\"params\":{\"command\":[\"python3\",\"-m\",\"http.server\"],\"env\":[\"A=1\"],\"image\":\"python:3.13-slim\",\"memory_mib\":2048,\"name\":\"web\",\"ports\":[\"8080:8000\"],\"volumes\":[\"~/code:/app:ro\"]}}\n")
 
         let removed = try Wire.decoder.decode(EngineResponse.self, from: Data(#"{"type":"removed","data":{"id":"abc"}}"#.utf8))
         guard case .removed("abc") = removed else { Issue.record("expected removed"); return }
+    }
+
+    @Test func splitsLists() {
+        #expect(RunSpec.list("8080:80, 5432\n 3000 ") == ["8080:80", "5432", "3000"])
+        #expect(RunSpec.list(" ") == [])
     }
 
     @Test func splitsCommandLines() {

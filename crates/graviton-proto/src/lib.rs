@@ -127,6 +127,29 @@ pub struct RunSpec {
     pub cpus: Option<u32>,
     #[serde(default)]
     pub memory_mib: Option<u64>,
+    /// `host:container[/tcp]` or `port`, published on 127.0.0.1.
+    #[serde(default)]
+    pub ports: Vec<String>,
+    /// `/host/dir:/container/path[:ro]` or `name:/container/path[:ro]` (a named volume).
+    #[serde(default)]
+    pub volumes: Vec<String>,
+}
+
+/// What `grav exec` asks for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecSpec {
+    /// Container id, id prefix or name.
+    pub id: String,
+    pub command: Vec<String>,
+    /// Run in a pseudo-terminal; the connection then carries raw bytes both ways.
+    #[serde(default)]
+    pub tty: bool,
+    #[serde(default)]
+    pub rows: u16,
+    #[serde(default)]
+    pub cols: u16,
+    #[serde(default)]
+    pub env: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +188,10 @@ pub enum Request {
     Run(RunSpec),
     /// Remove a stopped container.
     Remove { id: String },
+    /// Run a command in a running container. Without a TTY the daemon answers
+    /// with `ExecOutput` lines and a final `ExecExited`; with one it answers
+    /// `Attached` and the connection becomes a raw terminal stream.
+    Exec(ExecSpec),
 }
 
 /// A daemon response. Serialises as `{"type": "...", "data": ...}`.
@@ -179,6 +206,9 @@ pub enum Response {
     Container(ContainerSummary),
     Image(ImageSummary),
     Removed { id: String },
+    ExecOutput { stream: LogStream, data: Vec<u8> },
+    ExecExited { code: i32 },
+    Attached,
     Error { message: String },
 }
 
@@ -186,12 +216,29 @@ pub enum Response {
 // Agent channel (host <-> guest)
 // ---------------------------------------------------------------------------
 
+/// A virtiofs share to mount inside a container's root filesystem.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestMount {
+    pub tag: String,
+    /// Absolute path inside the container.
+    pub target: String,
+    pub read_only: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum AgentRequest {
     /// Unpack image layers (digests in the `blobs` virtiofs share, lowest
-    /// first) into a fresh root filesystem for `container`.
-    Prepare { container: String, layers: Vec<String> },
+    /// first) into a fresh root filesystem for `container`, then mount its
+    /// volumes and write its network files.
+    Prepare {
+        container: String,
+        layers: Vec<String>,
+        #[serde(default)]
+        mounts: Vec<GuestMount>,
+        #[serde(default)]
+        hostname: Option<String>,
+    },
     /// Run a process. With `container`, it runs chrooted into that container's
     /// root filesystem in new mount, UTS and IPC namespaces.
     Exec {
@@ -206,6 +253,11 @@ pub enum AgentRequest {
         user: Option<String>,
         #[serde(default)]
         hostname: Option<String>,
+        /// Terminal size when `tty` is set.
+        #[serde(default)]
+        rows: u16,
+        #[serde(default)]
+        cols: u16,
     },
     Signal { pid: i32, signal: i32 },
     Stdin { pid: i32, data: Vec<u8> },
@@ -216,7 +268,14 @@ pub enum AgentRequest {
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AgentEvent {
     Ready { kernel: String },
-    Prepared { container: String, files: u64, ms: u64 },
+    Prepared {
+        container: String,
+        files: u64,
+        ms: u64,
+        /// The guest's address on the NAT network, once DHCP has finished.
+        #[serde(default)]
+        ip: Option<String>,
+    },
     Started { pid: i32 },
     Stdout { pid: i32, data: Vec<u8> },
     Stderr { pid: i32, data: Vec<u8> },
@@ -271,12 +330,13 @@ mod tests {
     #[test]
     fn run_from_swift() {
         // Exactly what GravitonKit's `Wire.line(.run(...))` sends (see its RunTests).
-        let line = br#"{"method":"run","params":{"command":["python3","-m","http.server"],"env":["A=1"],"image":"python:3.13-slim","memory_mib":2048,"name":"web"}}"#;
+        let line = br#"{"method":"run","params":{"command":["python3","-m","http.server"],"env":["A=1"],"image":"python:3.13-slim","memory_mib":2048,"name":"web","ports":["8080:8000"],"volumes":["~/code:/app:ro"]}}"#;
         let Request::Run(spec) = decode_line::<Request>(line).unwrap() else { panic!("not a run") };
         assert_eq!(spec.image, "python:3.13-slim");
         assert_eq!(spec.name.as_deref(), Some("web"));
         assert_eq!(spec.command.as_deref(), Some(&["python3".to_string(), "-m".into(), "http.server".into()][..]));
         assert_eq!((spec.cpus, spec.memory_mib), (None, Some(2048)));
+        assert_eq!((spec.ports, spec.volumes), (vec!["8080:8000".to_string()], vec!["~/code:/app:ro".to_string()]));
         let pull: Request = decode_line(br#"{"method":"pull","params":{"reference":"alpine"}}"#).unwrap();
         assert_eq!(pull, Request::Pull { reference: "alpine".into() });
     }

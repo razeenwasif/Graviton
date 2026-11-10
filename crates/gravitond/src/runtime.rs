@@ -1,19 +1,28 @@
 //! Real containers: every container runs in its own guest VM.
 //!
-//! `Engine` owns the image store and the containers' VMs. Its methods block
-//! (registry downloads, VM boots), so the async server calls them through
-//! `spawn_blocking`. Each started container gets a supervisor thread that:
+//! `Engine` owns the image store, the containers' VMs and their saved state.
+//! Its methods block (registry downloads, VM boots), so the async server calls
+//! them through `spawn_blocking`. Each started container gets a supervisor
+//! thread that:
 //!
-//! 1. boots a VM with the blob store shared read-only (virtiofs tag `blobs`),
-//! 2. asks the agent to unpack the image's layers into a rootfs,
-//! 3. runs the image's entrypoint inside it,
-//! 4. streams stdout/stderr into the container's logs,
+//! 1. boots a VM on Virtualization.framework's NAT network, with the blob
+//!    store (virtiofs `blobs`, read-only) and the container's volumes shared,
+//! 2. asks the agent to unpack the image, mount the volumes and write the
+//!    network files (DHCP runs meanwhile),
+//! 3. publishes the container's ports on 127.0.0.1, forwarding to the guest,
+//! 4. runs the image's entrypoint and streams its output into the logs,
 //! 5. records the exit code and powers the VM off.
+//!
+//! Containers, their run settings and their logs are saved under
+//! `~/Library/Application Support/Graviton`, so they survive a restart.
 
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::hash::{BuildHasher, RandomState};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpListener};
+use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,18 +30,20 @@ use anyhow::{Context, Result, anyhow, bail};
 use graviton_core::{ImageReference, Store, paths};
 use graviton_image::{BlobStore, ImageIndex, LocalImage, Progress, Registry};
 use graviton_proto::{
-    AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ContainerStatus, ContainerSummary, EngineInfo, ImageSummary, LogLevel,
-    LogStream, PROTOCOL_VERSION, RunSpec, decode_line, encode_line,
+    AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ContainerStatus, ContainerSummary, EngineInfo, ExecSpec, GuestMount,
+    ImageSummary, LogLevel, LogLine, LogStream, Mount, PROTOCOL_VERSION, PortMapping, PortProtocol, Response, RunSpec,
+    decode_line, encode_line,
 };
 use graviton_vmm::apple::{AppleHypervisor, AppleVm};
 use graviton_vmm::{NetworkMode, SharedDirectory, VmConfig, VmHandle};
+use serde::{Deserialize, Serialize};
 
 const DEFAULT_CPUS: u32 = 2;
 const DEFAULT_MEMORY_MIB: u64 = 1024;
 const STOP_GRACE: Duration = Duration::from_secs(10);
 
-/// How to start a container again (`start`, `restart`).
-#[derive(Clone)]
+/// How to start a container (again).
+#[derive(Clone, Serialize, Deserialize)]
 struct ContainerSpec {
     image: LocalImage,
     argv: Vec<String>,
@@ -41,12 +52,34 @@ struct ContainerSpec {
     user: Option<String>,
     cpus: u32,
     memory_mib: u64,
+    #[serde(default)]
+    ports: Vec<PortMapping>,
+    #[serde(default)]
+    volumes: Vec<Volume>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Volume {
+    /// Host directory shared into the VM.
+    source: PathBuf,
+    /// Absolute path inside the container.
+    target: String,
+    read_only: bool,
+    /// Set for named volumes (`name:/path`).
+    name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct SavedState {
+    containers: Vec<ContainerSummary>,
+    specs: HashMap<String, ContainerSpec>,
 }
 
 struct Running {
     vm: Arc<AppleVm>,
     agent: Arc<Mutex<File>>,
     pid: Option<i32>,
+    forwards: Vec<tokio::task::JoinHandle<()>>,
 }
 
 pub struct Engine {
@@ -55,12 +88,15 @@ pub struct Engine {
     index: Mutex<ImageIndex>,
     specs: Mutex<HashMap<String, ContainerSpec>>,
     running: Mutex<HashMap<String, Running>>,
+    rt: tokio::runtime::Handle,
+    state_path: PathBuf,
 }
 
 impl Engine {
+    /// Open the engine, restoring saved containers. Call from inside the tokio runtime.
     pub fn open() -> Result<Arc<Self>> {
         let blobs = BlobStore::new(paths::blobs_dir());
-        std::fs::create_dir_all(blobs.root().join("sha256")).context("creating the blob store")?;
+        fs::create_dir_all(blobs.root().join("sha256")).context("creating the blob store")?;
         let index = ImageIndex::load(paths::support_dir().join("images.json"))?;
         let engine = Arc::new(Self {
             store: Arc::new(Mutex::new(Store::new())),
@@ -68,7 +104,10 @@ impl Engine {
             index: Mutex::new(index),
             specs: Mutex::new(HashMap::new()),
             running: Mutex::new(HashMap::new()),
+            rt: tokio::runtime::Handle::current(),
+            state_path: paths::support_dir().join("containers.json"),
         });
+        engine.restore()?;
         engine.refresh_images();
         Ok(engine)
     }
@@ -88,6 +127,50 @@ impl Engine {
             memory_used_bytes: used,
             disk_bytes: 0,
             disk_used_bytes: disk_used,
+        }
+    }
+
+    // -- Saved state --------------------------------------------------------
+
+    fn restore(&self) -> Result<()> {
+        let saved: SavedState = match fs::read(&self.state_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("reading {}", self.state_path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut interrupted = Vec::new();
+        {
+            let mut store = self.store.lock().unwrap();
+            for mut c in saved.containers {
+                if matches!(c.status, ContainerStatus::Running | ContainerStatus::Created | ContainerStatus::Paused) {
+                    // Its VM ended with the previous gravitond.
+                    c.status = ContainerStatus::Exited;
+                    c.started_at = None;
+                    interrupted.push(c.id.clone());
+                }
+                c.ip_address = None;
+                let id = c.id.clone();
+                if store.insert(c).is_ok() {
+                    store.set_logs(&id, read_log(&log_path(&id)));
+                }
+            }
+        }
+        *self.specs.lock().unwrap() = saved.specs;
+        for id in interrupted {
+            self.log(&id, LogLevel::Warn, LogStream::System, "gravitond restarted while this container was running; its VM stopped".into());
+        }
+        Ok(())
+    }
+
+    fn save(&self) {
+        let state = SavedState {
+            containers: self.store.lock().unwrap().containers().to_vec(),
+            specs: self.specs.lock().unwrap().clone(),
+        };
+        let tmp = self.state_path.with_extension("json.tmp");
+        let result = fs::write(&tmp, serde_json::to_vec_pretty(&state).expect("state serialises")).and_then(|_| fs::rename(&tmp, &self.state_path));
+        if let Err(err) = result {
+            eprintln!("couldn't save container state: {err}");
         }
     }
 
@@ -141,6 +224,13 @@ impl Engine {
     // -- Containers -------------------------------------------------------
 
     pub fn run(self: &Arc<Self>, spec: RunSpec) -> Result<ContainerSummary> {
+        let ports = spec.ports.iter().map(|p| parse_port(p)).collect::<Result<Vec<_>>>()?;
+        let volumes = spec.volumes.iter().map(|v| parse_volume(v)).collect::<Result<Vec<_>>>()?;
+        if let Some(name) = &spec.name {
+            if self.store.lock().unwrap().name_taken(name) {
+                bail!("the name {name} is already in use");
+            }
+        }
         let image = self.image_for(&spec.image)?;
         let config = image.config(&self.blobs)?.config;
         let argv = config.argv(spec.command.as_deref());
@@ -156,6 +246,8 @@ impl Engine {
             cpus: spec.cpus.unwrap_or(DEFAULT_CPUS),
             memory_mib: spec.memory_mib.unwrap_or(DEFAULT_MEMORY_MIB),
             image,
+            ports,
+            volumes,
         };
 
         let id = new_id();
@@ -169,8 +261,12 @@ impl Engine {
             image: display,
             status: ContainerStatus::Created,
             exit_code: None,
-            ports: vec![],
-            mounts: vec![],
+            ports: cs.ports.clone(),
+            mounts: cs
+                .volumes
+                .iter()
+                .map(|v| Mount { source: v.name.clone().unwrap_or_else(|| v.source.display().to_string()), target: v.target.clone(), read_only: v.read_only })
+                .collect(),
             ip_address: None,
             cpu_percent: None,
             memory_bytes: None,
@@ -180,6 +276,7 @@ impl Engine {
         };
         self.store.lock().unwrap().insert(summary)?;
         self.specs.lock().unwrap().insert(id.clone(), cs);
+        self.save();
         self.refresh_images();
         self.launch(&id)
     }
@@ -190,7 +287,7 @@ impl Engine {
             bail!("container {key} is already running");
         }
         if !self.specs.lock().unwrap().contains_key(&id) {
-            bail!("container {key} can't be started again (it was created by another gravitond)");
+            bail!("container {key} has no saved settings, so it can't be started again");
         }
         self.launch(&id)
     }
@@ -203,7 +300,7 @@ impl Engine {
             (Arc::clone(&r.agent), r.pid, Arc::clone(&r.vm))
         };
         if let Some(pid) = pid {
-            let _ = agent.lock().unwrap().write_all(&encode_line(&AgentRequest::Signal { pid, signal: libc_sigterm() }));
+            let _ = agent.lock().unwrap().write_all(&encode_line(&AgentRequest::Signal { pid, signal: 15 }));
         }
         let deadline = Instant::now() + STOP_GRACE;
         while self.running.lock().unwrap().contains_key(&id) && Instant::now() < deadline {
@@ -231,20 +328,40 @@ impl Engine {
     pub fn remove(&self, key: &str) -> Result<String> {
         let removed = self.store.lock().unwrap().remove(key)?;
         self.specs.lock().unwrap().remove(&removed.id);
-        let _ = std::fs::remove_dir_all(paths::vms_dir().join(&removed.id));
+        let _ = fs::remove_dir_all(paths::vms_dir().join(&removed.id));
+        self.save();
         self.refresh_images();
         Ok(removed.id)
     }
 
     /// Start the supervisor and wait until the process is running (or failed).
     fn launch(self: &Arc<Self>, id: &str) -> Result<ContainerSummary> {
+        let ports = self.specs.lock().unwrap().get(id).map(|s| s.ports.clone()).unwrap_or_default();
+        // Bind the published ports first, so a port in use fails before a VM boots.
+        let mut listeners = Vec::new();
+        for p in &ports {
+            match TcpListener::bind(("127.0.0.1", p.host_port)) {
+                Ok(listener) => listeners.push((listener, p.container_port)),
+                Err(err) => {
+                    let message = format!("port {} is already in use on this Mac ({err})", p.host_port);
+                    self.log(id, LogLevel::Error, LogStream::System, message.clone());
+                    self.store.lock().unwrap().update(id, |c| {
+                        c.status = ContainerStatus::Exited;
+                        c.exit_code = Some(125);
+                    });
+                    self.save();
+                    bail!(message);
+                }
+            }
+        }
+
         self.store.lock().unwrap().update(id, |c| {
             c.status = ContainerStatus::Created;
             c.exit_code = None;
         });
         let engine = Arc::clone(self);
         let owned = id.to_string();
-        std::thread::Builder::new().name(format!("container-{id}")).spawn(move || engine.supervise(&owned))?;
+        std::thread::Builder::new().name(format!("container-{id}")).spawn(move || engine.supervise(&owned, listeners))?;
 
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
@@ -259,8 +376,8 @@ impl Engine {
         }
     }
 
-    fn supervise(&self, id: &str) {
-        let result = self.run_in_vm(id);
+    fn supervise(&self, id: &str, listeners: Vec<(TcpListener, u16)>) {
+        let result = self.run_in_vm(id, listeners);
         let code = match result {
             Ok(code) => code,
             Err(err) => {
@@ -269,6 +386,9 @@ impl Engine {
             }
         };
         if let Some(r) = self.running.lock().unwrap().remove(id) {
+            for f in &r.forwards {
+                f.abort();
+            }
             let _ = r.agent.lock().unwrap().write_all(&encode_line(&AgentRequest::Shutdown));
             if r.vm.wait_stopped(Duration::from_secs(5)).is_err() {
                 let _ = r.vm.kill();
@@ -278,23 +398,36 @@ impl Engine {
             c.status = ContainerStatus::Exited;
             c.exit_code = Some(code);
             c.started_at = None;
+            c.ip_address = None;
         });
+        self.save();
     }
 
-    fn run_in_vm(&self, id: &str) -> Result<i32> {
+    fn run_in_vm(&self, id: &str, listeners: Vec<(TcpListener, u16)>) -> Result<i32> {
         let spec = self.specs.lock().unwrap().get(id).cloned().ok_or_else(|| anyhow!("unknown container {id}"))?;
         let name = self.store.lock().unwrap().container(id)?.name.clone();
         let t0 = Instant::now();
 
         let guest = paths::guest_dir();
         let vm_dir = paths::vms_dir().join(id);
-        std::fs::create_dir_all(&vm_dir)?;
+        fs::create_dir_all(&vm_dir)?;
         let mut config = VmConfig::new(guest.join("vmlinux"), guest.join("initrd.img"), "");
         config.cpus = spec.cpus;
         config.memory_mib = spec.memory_mib;
-        config.network = NetworkMode::None;
+        config.network = NetworkMode::Nat;
         config.console_log = Some(vm_dir.join("console.log"));
         config.shares = vec![SharedDirectory { host_path: self.blobs.root().to_path_buf(), tag: "blobs".into(), read_only: true }];
+        let mut mounts = Vec::new();
+        for (i, v) in spec.volumes.iter().enumerate() {
+            if v.name.is_some() {
+                fs::create_dir_all(&v.source).with_context(|| format!("creating volume {}", v.source.display()))?;
+            } else if !v.source.is_dir() {
+                bail!("{} doesn't exist (or isn't a folder)", v.source.display());
+            }
+            let tag = format!("v{i}");
+            config.shares.push(SharedDirectory { host_path: v.source.clone(), tag: tag.clone(), read_only: v.read_only });
+            mounts.push(GuestMount { tag, target: v.target.clone(), read_only: v.read_only });
+        }
 
         let vm = Arc::new(AppleHypervisor::new().boot_vm(&config).context("booting the container's VM")?);
         let fd = vm.connect(AGENT_VSOCK_PORT).context("connecting to the guest agent")?;
@@ -304,21 +437,53 @@ impl Engine {
             AgentEvent::Ready { .. } => {}
             other => bail!("expected ready from the agent, got {other:?}"),
         }
-        self.running.lock().unwrap().insert(id.to_string(), Running { vm: Arc::clone(&vm), agent: Arc::clone(&agent), pid: None });
+        self.running
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), Running { vm: Arc::clone(&vm), agent: Arc::clone(&agent), pid: None, forwards: vec![] });
         let booted = t0.elapsed();
 
-        send(&agent, &AgentRequest::Prepare { container: id.into(), layers: spec.image.layers.iter().map(|l| l.digest.clone()).collect() })?;
-        let (files, unpack_ms) = match events.next()? {
-            AgentEvent::Prepared { files, ms, .. } => (files, ms),
+        send(&agent, &AgentRequest::Prepare {
+            container: id.into(),
+            layers: spec.image.layers.iter().map(|l| l.digest.clone()).collect(),
+            mounts,
+            hostname: Some(name.clone()),
+        })?;
+        let (files, unpack_ms, ip) = match events.next()? {
+            AgentEvent::Prepared { files, ms, ip, .. } => (files, ms, ip),
             AgentEvent::Error { message } => bail!("{message}"),
             other => bail!("expected prepared from the agent, got {other:?}"),
         };
+        let address: Option<IpAddr> = ip.as_deref().and_then(|s| s.parse().ok());
         self.log(
             id,
             LogLevel::Info,
             LogStream::System,
-            format!("VM booted in {} ms; unpacked {files} files in {unpack_ms} ms", booted.as_millis()),
+            format!(
+                "VM booted in {} ms; unpacked {files} files in {unpack_ms} ms; {}",
+                booted.as_millis(),
+                match &ip {
+                    Some(ip) => format!("network {ip}"),
+                    None => "no network".into(),
+                }
+            ),
         );
+
+        // Publish ports now that the guest has an address.
+        if !listeners.is_empty() {
+            match address {
+                Some(ip) => {
+                    let mut handles = Vec::new();
+                    for (listener, container_port) in listeners {
+                        handles.push(self.forward(listener, SocketAddr::new(ip, container_port))?);
+                    }
+                    if let Some(r) = self.running.lock().unwrap().get_mut(id) {
+                        r.forwards = handles;
+                    }
+                }
+                None => self.log(id, LogLevel::Warn, LogStream::System, "the VM got no network address, so its ports aren't published".into()),
+            }
+        }
 
         send(&agent, &AgentRequest::Exec {
             argv: spec.argv.clone(),
@@ -328,6 +493,8 @@ impl Engine {
             container: Some(id.into()),
             user: spec.user.clone(),
             hostname: Some(name),
+            rows: 0,
+            cols: 0,
         })?;
 
         let mut out = LineBuffer::default();
@@ -341,7 +508,9 @@ impl Engine {
                     self.store.lock().unwrap().update(id, |c| {
                         c.status = ContainerStatus::Running;
                         c.started_at = Some(now_secs());
+                        c.ip_address = ip.clone();
                     });
+                    self.save();
                 }
                 AgentEvent::Stdout { data, .. } => {
                     for line in out.push(&data) {
@@ -368,8 +537,94 @@ impl Engine {
         }
     }
 
+    /// Forward connections on `listener` (127.0.0.1) to `target` in the guest.
+    fn forward(&self, listener: TcpListener, target: SocketAddr) -> Result<tokio::task::JoinHandle<()>> {
+        listener.set_nonblocking(true)?;
+        let _guard = self.rt.enter();
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        Ok(self.rt.spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else { continue };
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        }))
+    }
+
+    // -- exec -------------------------------------------------------------
+
+    /// Open a fresh agent connection and start `spec` in the container.
+    /// Returns the connection, positioned just after the agent's `started` line.
+    fn exec_start(&self, spec: &ExecSpec) -> Result<File> {
+        let (id, name) = {
+            let store = self.store.lock().unwrap();
+            let c = store.container(&spec.id)?;
+            (c.id.clone(), c.name.clone())
+        };
+        let vm = self.running.lock().unwrap().get(&id).map(|r| Arc::clone(&r.vm)).ok_or_else(|| anyhow!("container {} isn't running", spec.id))?;
+        let cs = self.specs.lock().unwrap().get(&id).cloned().ok_or_else(|| anyhow!("unknown container {}", spec.id))?;
+        if spec.command.is_empty() {
+            bail!("give a command to run");
+        }
+        let mut env = cs.env.clone();
+        env.extend(spec.env.iter().cloned());
+
+        let fd: OwnedFd = vm.connect(AGENT_VSOCK_PORT)?;
+        let mut conn = File::from(fd);
+        match read_event_unbuffered(&mut conn)? {
+            AgentEvent::Ready { .. } => {}
+            other => bail!("expected ready from the agent, got {other:?}"),
+        }
+        conn.write_all(&encode_line(&AgentRequest::Exec {
+            argv: spec.command.clone(),
+            env,
+            cwd: cs.cwd.clone(),
+            tty: spec.tty,
+            container: Some(id),
+            user: cs.user.clone(),
+            hostname: Some(name),
+            rows: spec.rows,
+            cols: spec.cols,
+        }))?;
+        match read_event_unbuffered(&mut conn)? {
+            AgentEvent::Started { .. } => Ok(conn),
+            AgentEvent::Error { message } => bail!("{message}"),
+            other => bail!("expected started from the agent, got {other:?}"),
+        }
+    }
+
+    /// Run a command without a TTY, sending its output and exit code to `out`.
+    pub fn exec_stream(&self, spec: &ExecSpec, out: tokio::sync::mpsc::Sender<Response>) -> Result<()> {
+        let conn = self.exec_start(spec)?;
+        let mut events = Events::new(BufReader::new(conn));
+        loop {
+            let response = match events.next()? {
+                AgentEvent::Stdout { data, .. } => Response::ExecOutput { stream: LogStream::Stdout, data },
+                AgentEvent::Stderr { data, .. } => Response::ExecOutput { stream: LogStream::Stderr, data },
+                AgentEvent::Exited { code, .. } => {
+                    let _ = out.blocking_send(Response::ExecExited { code });
+                    return Ok(());
+                }
+                AgentEvent::Error { message } => bail!("{message}"),
+                _ => continue,
+            };
+            if out.blocking_send(response).is_err() {
+                return Ok(()); // the client went away
+            }
+        }
+    }
+
+    /// Start a command on a TTY; the returned stream carries raw terminal bytes.
+    pub fn exec_tty(&self, spec: &ExecSpec) -> Result<OwnedFd> {
+        Ok(OwnedFd::from(self.exec_start(spec)?))
+    }
+
     fn log(&self, id: &str, level: LogLevel, stream: LogStream, message: String) {
-        self.store.lock().unwrap().push_log(id, level, stream, message);
+        let line = self.store.lock().unwrap().push_log(id, level, stream, message);
+        append_log(&log_path(id), &line);
     }
 
     fn generated_name(&self, image: &str) -> String {
@@ -389,6 +644,88 @@ impl Engine {
             if !store.name_taken(&candidate) {
                 return candidate;
             }
+        }
+    }
+}
+
+/// `8080:80`, `8080:80/tcp` or `80` (same port on both sides).
+fn parse_port(spec: &str) -> Result<PortMapping> {
+    let (ports, proto) = spec.split_once('/').unwrap_or((spec, "tcp"));
+    if proto != "tcp" {
+        bail!("`{spec}`: only TCP ports can be published so far");
+    }
+    let parse = |s: &str| s.trim().parse::<u16>().ok().filter(|p| *p > 0).ok_or_else(|| anyhow!("`{spec}` isn't a valid port mapping (try 8080:80)"));
+    let (host_port, container_port) = match ports.split(':').collect::<Vec<_>>()[..] {
+        [one] => (parse(one)?, parse(one)?),
+        [host, container] => (parse(host)?, parse(container)?),
+        _ => bail!("`{spec}` isn't a valid port mapping (try 8080:80)"),
+    };
+    Ok(PortMapping { host_port, container_port, protocol: PortProtocol::Tcp })
+}
+
+/// `/host/dir:/path[:ro]`, `~/dir:/path` or `name:/path[:ro]`.
+fn parse_volume(spec: &str) -> Result<Volume> {
+    let (rest, read_only) = match spec.rsplit_once(':') {
+        Some((rest, "ro")) => (rest, true),
+        Some((rest, "rw")) => (rest, false),
+        _ => (spec, false),
+    };
+    let (source, target) = rest.split_once(':').ok_or_else(|| anyhow!("`{spec}` should be SOURCE:/path/in/container"))?;
+    if !target.starts_with('/') {
+        bail!("`{spec}`: the path in the container must be absolute");
+    }
+    let target = target.trim_end_matches('/').to_string();
+    if target.is_empty() {
+        bail!("`{spec}`: can't mount over the container's root");
+    }
+    if let Some(home_rel) = source.strip_prefix("~/") {
+        let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| anyhow!("HOME isn't set"))?;
+        return Ok(Volume { source: home.join(home_rel), target, read_only, name: None });
+    }
+    if source.starts_with('/') {
+        return Ok(Volume { source: PathBuf::from(source), target, read_only, name: None });
+    }
+    let valid = !source.is_empty()
+        && source.as_bytes()[0].is_ascii_alphanumeric()
+        && source.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b));
+    if !valid {
+        bail!("`{source}` isn't an absolute path or a volume name (letters, digits, _ . -)");
+    }
+    Ok(Volume { source: paths::support_dir().join("volumes").join(source), target, read_only, name: Some(source.to_string()) })
+}
+
+fn log_path(id: &str) -> PathBuf {
+    paths::vms_dir().join(id).join("log.jsonl")
+}
+
+fn append_log(path: &Path, line: &LogLine) {
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(&encode_line(line));
+    }
+}
+
+fn read_log(path: &Path) -> Vec<LogLine> {
+    let Ok(f) = File::open(path) else { return vec![] };
+    BufReader::new(f).lines().map_while(Result::ok).filter_map(|l| decode_line(l.as_bytes()).ok()).collect()
+}
+
+/// Read one JSON line byte by byte, so nothing after it is consumed.
+fn read_event_unbuffered(conn: &mut File) -> Result<AgentEvent> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if conn.read(&mut byte)? == 0 {
+            bail!("the guest agent closed the connection");
+        }
+        if byte[0] == b'\n' {
+            return Ok(decode_line(&line)?);
+        }
+        line.push(byte[0]);
+        if line.len() > 1 << 20 {
+            bail!("the guest agent sent an overlong line");
         }
     }
 }
@@ -451,10 +788,6 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-const fn libc_sigterm() -> i32 {
-    15
-}
-
 fn host_memory() -> u64 {
     std::process::Command::new("/usr/sbin/sysctl")
         .args(["-n", "hw.memsize"])
@@ -486,5 +819,29 @@ mod tests {
         assert_eq!(a.len(), 12);
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, new_id());
+    }
+
+    #[test]
+    fn parses_ports() {
+        assert_eq!(parse_port("8080:80").unwrap(), PortMapping { host_port: 8080, container_port: 80, protocol: PortProtocol::Tcp });
+        assert_eq!(parse_port("5432").unwrap().container_port, 5432);
+        assert_eq!(parse_port("3000:3000/tcp").unwrap().host_port, 3000);
+        assert!(parse_port("53:53/udp").is_err());
+        assert!(parse_port("0:80").is_err());
+        assert!(parse_port("a:b:c").is_err());
+    }
+
+    #[test]
+    fn parses_volumes() {
+        let v = parse_volume("/Users/me/code:/app:ro").unwrap();
+        assert_eq!((v.source, v.target.as_str(), v.read_only, v.name), (PathBuf::from("/Users/me/code"), "/app", true, None));
+        let named = parse_volume("pgdata:/var/lib/postgresql/data").unwrap();
+        assert_eq!(named.name.as_deref(), Some("pgdata"));
+        assert!(named.source.ends_with("volumes/pgdata"));
+        assert!(!named.read_only);
+        assert!(parse_volume("/tmp:relative").is_err());
+        assert!(parse_volume("/tmp:/").is_err());
+        assert!(parse_volume("../x:/app").is_err());
+        assert!(parse_volume("nocolon").is_err());
     }
 }

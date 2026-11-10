@@ -15,6 +15,10 @@
 
 #[cfg(target_os = "linux")]
 mod container;
+#[cfg(target_os = "linux")]
+mod net;
+#[cfg(target_os = "linux")]
+mod tty;
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -63,6 +67,7 @@ pub(crate) mod linux {
         if let Err(err) = load_modules() {
             console(&AgentEvent::Error { message: format!("loading modules: {err}") });
         }
+        crate::net::start();
 
         let listener = match vsock_listen(AGENT_VSOCK_PORT) {
             Ok(fd) => fd,
@@ -94,25 +99,44 @@ pub(crate) mod linux {
         let writer: Writer = Arc::new(Mutex::new(conn.try_clone()?));
         send(&writer, &AgentEvent::Ready { kernel });
 
-        for line in BufReader::new(conn).lines() {
-            let line = line?;
+        let mut reader = BufReader::new(conn);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                return Ok(());
+            }
             if line.trim().is_empty() {
                 continue;
             }
             match decode_line::<AgentRequest>(line.as_bytes()) {
-                Ok(AgentRequest::Prepare { container, layers }) => {
+                Ok(AgentRequest::Prepare { container, layers, mounts, hostname }) => {
                     let t0 = std::time::Instant::now();
-                    match crate::container::prepare(&container, &layers) {
-                        Ok(files) => send(&writer, &AgentEvent::Prepared { container, files, ms: t0.elapsed().as_millis() as u64 }),
+                    let result = crate::container::prepare(&container, &layers).and_then(|files| {
+                        let ip = crate::net::wait(std::time::Duration::from_secs(8));
+                        crate::container::finish(&container, &mounts, hostname.as_deref().unwrap_or(&container), ip.as_deref())?;
+                        Ok((files, ip))
+                    });
+                    match result {
+                        Ok((files, ip)) => {
+                            send(&writer, &AgentEvent::Prepared { container, files, ms: t0.elapsed().as_millis() as u64, ip })
+                        }
                         Err(err) => send(&writer, &AgentEvent::Error { message: format!("preparing {container}: {err}") }),
                     }
                 }
-                Ok(AgentRequest::Exec { argv, env, cwd, tty: _, container, user, hostname }) => {
+                Ok(AgentRequest::Exec { argv, env, cwd, tty, container, user, hostname, rows, cols }) => {
+                    let has_term = env.iter().any(|e| e.starts_with("TERM="));
                     let cmd = match &container {
                         Some(id) => crate::container::command(id, &argv, &env, &cwd, user.as_deref(), hostname.as_deref().unwrap_or(id)),
                         None => plain_command(&argv, &env, &cwd),
                     };
                     match cmd {
+                        Ok(cmd) if tty => {
+                            // The connection now belongs to the terminal session.
+                            let pending = reader.buffer().to_vec();
+                            drop(writer);
+                            return crate::tty::run(cmd, reader.into_inner(), pending, rows, cols, has_term);
+                        }
                         Ok(cmd) => exec(cmd, argv.first().cloned().unwrap_or_default(), Arc::clone(&writer)),
                         Err(err) => send(&writer, &AgentEvent::Error { message: format!("exec: {err}") }),
                     }
@@ -124,13 +148,12 @@ pub(crate) mod linux {
                     }
                 }
                 Ok(AgentRequest::Stdin { .. }) => {
-                    send(&writer, &AgentEvent::Error { message: "stdin forwarding arrives with milestone 2".into() });
+                    send(&writer, &AgentEvent::Error { message: "stdin is only forwarded for TTY sessions".into() });
                 }
                 Ok(AgentRequest::Shutdown) => power_off(),
                 Err(err) => send(&writer, &AgentEvent::Error { message: format!("bad request: {err}") }),
             }
         }
-        Ok(())
     }
 
     fn plain_command(argv: &[String], env: &[String], cwd: &str) -> io::Result<Command> {
@@ -236,6 +259,9 @@ pub(crate) mod linux {
             fs::create_dir_all(target)?;
             mount(source, target, fstype)?;
         }
+        // Terminals for `grav exec -t` (containers get /dev, and so this, by bind mount).
+        fs::create_dir_all("/dev/pts")?;
+        mount_with("devpts", "/dev/pts", "devpts", libc::MS_NOSUID | libc::MS_NOEXEC, Some("ptmxmode=0666,mode=0620"))?;
         Ok(())
     }
 

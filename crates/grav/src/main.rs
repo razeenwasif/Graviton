@@ -1,6 +1,6 @@
 //! `grav`: command-line client for gravitond.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use graviton_core::{ImageReference, paths};
-use graviton_proto::{ContainerStatus, ContainerSummary, LogStream, Request, Response, RunSpec, decode_line, encode_line};
+use graviton_proto::{ContainerStatus, ContainerSummary, ExecSpec, LogStream, Request, Response, RunSpec, decode_line, encode_line};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Native containers for macOS")]
@@ -64,6 +64,12 @@ enum Command {
         /// Memory for the container's VM, in MiB.
         #[arg(long)]
         memory: Option<u64>,
+        /// Publish a port on 127.0.0.1: HOST:CONTAINER (or one port for both); repeatable.
+        #[arg(short, long = "publish")]
+        publish: Vec<String>,
+        /// Mount a folder or named volume: /host/dir:/path[:ro] or name:/path; repeatable.
+        #[arg(short, long = "volume")]
+        volume: Vec<String>,
         /// Start it and return instead of streaming its output.
         #[arg(short, long)]
         detach: bool,
@@ -74,6 +80,21 @@ enum Command {
     },
     /// Remove a stopped container.
     Rm { container: String },
+    /// Run a command in a running container.
+    Exec {
+        /// Keep stdin open (use with -t for a shell).
+        #[arg(short, long)]
+        interactive: bool,
+        /// Run in a terminal.
+        #[arg(short, long)]
+        tty: bool,
+        /// Set an environment variable (KEY=value); repeatable.
+        #[arg(short, long = "env")]
+        env: Vec<String>,
+        container: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
     /// Parse and normalise an image reference (no daemon needed).
     Resolve { reference: String },
 }
@@ -152,7 +173,7 @@ fn run(cli: Cli) -> Result<()> {
                 other => unexpected(other)?,
             }
         }
-        Command::Run { name, env, cpus, memory, detach, image, command } => {
+        Command::Run { name, env, cpus, memory, publish, volume, detach, image, command } => {
             let spec = RunSpec {
                 image,
                 name,
@@ -160,6 +181,8 @@ fn run(cli: Cli) -> Result<()> {
                 env,
                 cpus,
                 memory_mib: memory,
+                ports: publish,
+                volumes: volume.iter().map(|v| absolute_volume(v)).collect::<Result<_>>()?,
             };
             let container = match client.call(&Request::Run(spec))? {
                 Response::Container(c) => c,
@@ -171,6 +194,14 @@ fn run(cli: Cli) -> Result<()> {
                 let code = follow(&mut client, &container.id)?;
                 std::process::exit(code);
             }
+        }
+        Command::Exec { interactive, tty, env, container, command } => {
+            let code = if tty {
+                exec_tty(&socket, ExecSpec { id: container, command, tty: true, rows: 0, cols: 0, env }, interactive)?
+            } else {
+                exec_stream(&mut client, ExecSpec { id: container, command, tty: false, rows: 0, cols: 0, env })?
+            };
+            std::process::exit(code);
         }
         Command::Rm { container } => match client.call(&Request::Remove { id: container })? {
             Response::Removed { id } => println!("{id}"),
@@ -214,6 +245,111 @@ fn lifecycle(client: &mut Client, request: Request, verb: &str) -> Result<()> {
             Ok(())
         }
         other => unexpected(other),
+    }
+}
+
+/// Make a host path in a volume spec absolute (the daemon has its own working directory).
+fn absolute_volume(spec: &str) -> Result<String> {
+    let Some((source, rest)) = spec.split_once(':') else { return Ok(spec.to_string()) };
+    if source.starts_with('.') {
+        let abs = std::fs::canonicalize(source).with_context(|| format!("{source} doesn't exist"))?;
+        return Ok(format!("{}:{rest}", abs.display()));
+    }
+    Ok(spec.to_string())
+}
+
+/// `grav exec` without a terminal: print output as it arrives; returns the exit code.
+fn exec_stream(client: &mut Client, spec: ExecSpec) -> Result<i32> {
+    client.writer.write_all(&encode_line(&Request::Exec(spec)))?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if client.reader.read_line(&mut line)? == 0 {
+            bail!("gravitond closed the connection");
+        }
+        match decode_line::<Response>(line.as_bytes())? {
+            Response::ExecOutput { stream: LogStream::Stderr, data } => std::io::stderr().write_all(&data)?,
+            Response::ExecOutput { data, .. } => {
+                let mut out = std::io::stdout().lock();
+                out.write_all(&data)?;
+                out.flush()?;
+            }
+            Response::ExecExited { code } => return Ok(code),
+            Response::Error { message } => bail!(message),
+            other => return unexpected(other).map(|_| 1),
+        }
+    }
+}
+
+/// `grav exec -t`: put this terminal in raw mode and splice it with the container's.
+fn exec_tty(socket: &std::path::Path, mut spec: ExecSpec, interactive: bool) -> Result<i32> {
+    let is_tty = |fd| unsafe { libc::isatty(fd) } == 1;
+    // SAFETY: TIOCGWINSZ fills a winsize; a failure leaves the zeroed default.
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0 {
+        spec.rows = size.ws_row;
+        spec.cols = size.ws_col;
+    }
+    let mut stream = UnixStream::connect(socket).with_context(|| format!("cannot reach gravitond at {}", socket.display()))?;
+    stream.write_all(&encode_line(&Request::Exec(spec)))?;
+    // Read the answer byte by byte: what follows it is terminal output.
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while stream.read(&mut byte)? == 1 && byte[0] != b'\n' {
+        line.push(byte[0]);
+    }
+    match decode_line::<Response>(&line)? {
+        Response::Attached => {}
+        Response::Error { message } => bail!(message),
+        other => return unexpected(other).map(|_| 1),
+    }
+
+    let raw = if interactive && is_tty(libc::STDIN_FILENO) { RawMode::enable() } else { None };
+    if interactive {
+        let mut to_guest = stream.try_clone()?;
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut to_guest);
+            let _ = to_guest.shutdown(std::net::Shutdown::Write);
+        });
+    }
+    let mut out = std::io::stdout();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                out.write_all(&buf[..n])?;
+                out.flush()?;
+            }
+        }
+    }
+    drop(raw);
+    Ok(0)
+}
+
+/// Raw terminal mode for the life of the value.
+struct RawMode(libc::termios);
+
+impl RawMode {
+    fn enable() -> Option<Self> {
+        // SAFETY: tcgetattr/tcsetattr on stdin with a termios we own.
+        unsafe {
+            let mut original: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut original) != 0 {
+                return None;
+            }
+            let mut raw = original;
+            libc::cfmakeraw(&mut raw);
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw);
+            Some(Self(original))
+        }
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        // SAFETY: restores the attributes saved in `enable`.
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0) };
     }
 }
 

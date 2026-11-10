@@ -62,6 +62,37 @@ pub fn prepare(id: &str, layers: &[String]) -> io::Result<u64> {
     Ok(files)
 }
 
+/// Mount the container's volumes and write its network files.
+pub fn finish(id: &str, mounts: &[graviton_proto::GuestMount], hostname: &str, ip: Option<&str>) -> io::Result<()> {
+    let root = rootfs(id)?;
+    for m in mounts {
+        let rel = clean(Path::new(&m.target)).ok_or_else(|| io::Error::other(format!("bad mount target `{}`", m.target)))?;
+        let target = root.join(rel);
+        fs::create_dir_all(&target)?;
+        let mut flags = libc::MS_NOSUID | libc::MS_NODEV;
+        if m.read_only {
+            flags |= libc::MS_RDONLY;
+        }
+        crate::linux::mount_with(&m.tag, &target.to_string_lossy(), "virtiofs", flags, None)
+            .map_err(|e| io::Error::other(format!("mounting {} at {}: {e}", m.tag, m.target)))?;
+    }
+
+    let etc = root.join("etc");
+    fs::create_dir_all(&etc)?;
+    let write = |name: &str, contents: &str| -> io::Result<()> {
+        let path = etc.join(name);
+        remove_any(&path)?; // images often ship these as symlinks
+        fs::write(path, contents)
+    };
+    write("hostname", &format!("{hostname}\n"))?;
+    let named = ip.unwrap_or("127.0.1.1");
+    write("hosts", &format!("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n{named}\t{hostname}\n"))?;
+    if let Ok(resolv) = fs::read_to_string("/etc/resolv.conf") {
+        write("resolv.conf", &resolv)?;
+    }
+    Ok(())
+}
+
 fn mount_blobs() -> io::Result<()> {
     if Path::new(BLOBS).join("sha256").is_dir() {
         return Ok(());

@@ -277,6 +277,7 @@ dependencies = [
  "clap",
  "graviton-core",
  "graviton-proto",
+ "libc",
  "serde_json",
 ]
 
@@ -342,6 +343,7 @@ dependencies = [
  "graviton-image",
  "graviton-proto",
  "graviton-vmm",
+ "serde",
  "serde_json",
  "tokio",
 ]

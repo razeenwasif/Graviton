@@ -117,14 +117,26 @@ public struct RunSpec: Codable, Hashable, Sendable {
     public var env: [String]
     public var cpus: UInt32?
     public var memoryMib: UInt64?
+    /// `host:container` or `port`, published on 127.0.0.1.
+    public var ports: [String]
+    /// `/host/dir:/path[:ro]`, `~/dir:/path` or `name:/path`.
+    public var volumes: [String]
 
-    public init(image: String, name: String? = nil, command: [String]? = nil, env: [String] = [], cpus: UInt32? = nil, memoryMib: UInt64? = nil) {
+    public init(image: String, name: String? = nil, command: [String]? = nil, env: [String] = [], cpus: UInt32? = nil,
+                memoryMib: UInt64? = nil, ports: [String] = [], volumes: [String] = []) {
         self.image = image
         self.name = name
         self.command = command
         self.env = env
         self.cpus = cpus
         self.memoryMib = memoryMib
+        self.ports = ports
+        self.volumes = volumes
+    }
+
+    /// Split a list typed as "8080:80, 5432" or one per line.
+    public static func list(_ text: String) -> [String] {
+        text.split(whereSeparator: { $0 == "," || $0.isNewline }).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     }
 
     /// Split a command line into words, honouring single and double quotes and backslashes.

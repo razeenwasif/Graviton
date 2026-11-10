@@ -14,6 +14,8 @@ struct RunContainerSheet: View {
     @State private var name = ""
     @State private var command = ""
     @State private var envText = ""
+    @State private var portsText = ""
+    @State private var volumesText = ""
     @State private var cpus = 2
     @State private var memoryMib: UInt64 = 1024
     @State private var running: Date?
@@ -66,6 +68,14 @@ struct RunContainerSheet: View {
                 GridRow {
                     FieldLabel("Command")
                     SheetField(placeholder: "Optional: the image's default command", text: $command, mono: true)
+                }
+                GridRow {
+                    FieldLabel("Ports")
+                    SheetField(placeholder: "Optional: 8080:80, 5432 (on 127.0.0.1)", text: $portsText, mono: true)
+                }
+                GridRow {
+                    FieldLabel("Volumes")
+                    SheetField(placeholder: "Optional: ~/code:/app, pgdata:/var/lib/data", text: $volumesText, mono: true)
                 }
                 GridRow(alignment: .top) {
                     FieldLabel("Environment").padding(.top, 8)
@@ -152,7 +162,9 @@ struct RunContainerSheet: View {
             command: words.isEmpty ? nil : words,
             env: envPairs,
             cpus: UInt32(cpus),
-            memoryMib: memoryMib
+            memoryMib: memoryMib,
+            ports: RunSpec.list(portsText),
+            volumes: RunSpec.list(volumesText)
         )
         failure = nil
         running = .now

@@ -88,7 +88,7 @@ public enum Wire {
     public static var encoder: JSONEncoder {
         let e = JSONEncoder()
         e.keyEncodingStrategy = .convertToSnakeCase
-        e.outputFormatting = .sortedKeys
+        e.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         return e
     }
 

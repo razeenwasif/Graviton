@@ -10,6 +10,7 @@ graviton-proto.workspace = true
 graviton-core.workspace = true
 graviton-vmm.workspace = true
 graviton-image.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 clap.workspace = true

@@ -61,20 +61,43 @@ agent="$target_dir/aarch64-unknown-linux-musl/release/graviton-agent"
 # 3. Initramfs tree.
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
-mkdir -p "$root/bin" "$root/dev" "$root/proc" "$root/sys" "$root/tmp" "$root/run" "$root/lib/modules"
+mkdir -p "$root/bin" "$root/dev" "$root/proc" "$root/sys" "$root/tmp" "$root/run" "$root/etc" "$root/lib/modules"
 cp "$agent" "$root/init"
 cp "$busybox_dir/bin/busybox.static" "$root/bin/busybox"
 ln -s busybox "$root/bin/sh"
 
 moddir="$kernel_dir/lib/modules/$(ls "$kernel_dir/lib/modules")/kernel"
 : > "$root/lib/modules/order"
-# vsock for the agent channel; fuse + virtiofs for the shared image store.
+# vsock for the agent channel; fuse + virtiofs for the image store and volumes;
+# virtio-net (with its failover deps) and af_packet for networking and DHCP.
 for m in net/vmw_vsock/vsock net/vmw_vsock/vmw_vsock_virtio_transport_common net/vmw_vsock/vmw_vsock_virtio_transport \
-         fs/fuse/fuse fs/fuse/virtiofs; do
+         fs/fuse/fuse fs/fuse/virtiofs \
+         net/core/failover drivers/net/net_failover drivers/net/virtio_net net/packet/af_packet; do
   name=$(basename "$m")
   gunzip -c "$moddir/$m.ko.gz" > "$root/lib/modules/$name.ko"
   echo "$name.ko" >> "$root/lib/modules/order"
 done
+
+# udhcpc calls this with the lease; the agent reads /run/graviton-ip.
+cat > "$root/etc/udhcpc.script" <<'SCRIPT'
+#!/bin/sh
+case "$1" in
+  deconfig)
+    ip addr flush dev "$interface"
+    ip link set "$interface" up
+    ;;
+  bound|renew)
+    ip addr flush dev "$interface"
+    ip addr add "$ip/${mask:-24}" dev "$interface"
+    [ -n "$router" ] && ip route replace default via "${router%% *}" dev "$interface"
+    : > /etc/resolv.conf
+    for server in $dns; do echo "nameserver $server" >> /etc/resolv.conf; done
+    echo "$ip" > /run/graviton-ip
+    ;;
+esac
+exit 0
+SCRIPT
+chmod 755 "$root/etc/udhcpc.script"
 
 (cd "$root" && find . | sort | cpio -o -H newc --quiet) | gzip -9 > "$out/initrd.img"
 printf 'Initramfs: %s KiB\n' "$(( $(stat -f %z "$out/initrd.img") / 1024 ))"

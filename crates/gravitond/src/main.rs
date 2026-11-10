@@ -94,8 +94,11 @@ async fn serve_forever(args: Args) -> Result<()> {
         if args.demo { " (demo data)" } else { "" }
     );
 
+    // launchd stops agents with SIGTERM; Ctrl-C sends SIGINT.
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
+            _ = terminate.recv() => break,
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let backend = backend.clone();
@@ -124,16 +127,72 @@ fn restrict_permissions(path: &std::path::Path) -> Result<()> {
 async fn serve(stream: UnixStream, backend: Backend) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        let Some(line) = lines.next_line().await? else { return Ok(()) };
         if line.trim().is_empty() {
             continue;
         }
-        let response = match decode_line::<Request>(line.as_bytes()) {
-            Ok(request) => handle(request, &backend).await,
-            Err(err) => Response::Error { message: format!("bad request: {err}") },
+        let request = match decode_line::<Request>(line.as_bytes()) {
+            Ok(request) => request,
+            Err(err) => {
+                write.write_all(&encode_line(&Response::Error { message: format!("bad request: {err}") })).await?;
+                continue;
+            }
         };
+        if let (Request::Exec(spec), Backend::Engine(engine)) = (&request, &backend) {
+            if spec.tty {
+                // The connection becomes a raw terminal stream.
+                let reader = lines.into_inner();
+                return exec_tty(Arc::clone(engine), spec.clone(), reader, write).await;
+            }
+            exec_stream(Arc::clone(engine), spec.clone(), &mut write).await?;
+            continue;
+        }
+        let response = handle(request, &backend).await;
         write.write_all(&encode_line(&response)).await?;
     }
+}
+
+/// `grav exec` without a TTY: stream output lines, then the exit code.
+async fn exec_stream(engine: Arc<Engine>, spec: graviton_proto::ExecSpec, write: &mut tokio::net::unix::OwnedWriteHalf) -> Result<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let task = tokio::task::spawn_blocking(move || engine.exec_stream(&spec, tx));
+    while let Some(response) = rx.recv().await {
+        write.write_all(&encode_line(&response)).await?;
+    }
+    if let Ok(Err(err)) = task.await {
+        write.write_all(&encode_line(&Response::Error { message: format!("{err:#}") })).await?;
+    }
+    Ok(())
+}
+
+/// `grav exec -it`: answer `attached`, then splice the client and the guest's terminal.
+async fn exec_tty(
+    engine: Arc<Engine>,
+    spec: graviton_proto::ExecSpec,
+    mut client_in: BufReader<tokio::net::unix::OwnedReadHalf>,
+    mut client_out: tokio::net::unix::OwnedWriteHalf,
+) -> Result<()> {
+    let guest = match tokio::task::spawn_blocking(move || engine.exec_tty(&spec)).await? {
+        Ok(fd) => fd,
+        Err(err) => {
+            client_out.write_all(&encode_line(&Response::Error { message: format!("{err:#}") })).await?;
+            return Ok(());
+        }
+    };
+    client_out.write_all(&encode_line(&Response::Attached)).await?;
+    let guest = std::os::unix::net::UnixStream::from(guest);
+    guest.set_nonblocking(true)?;
+    let guest = UnixStream::from_std(guest)?;
+    let (mut guest_in, mut guest_out) = guest.into_split();
+
+    let keys = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut client_in, &mut guest_out).await;
+        let _ = guest_out.shutdown().await; // tells the agent to hang up the session
+    });
+    let _ = tokio::io::copy(&mut guest_in, &mut client_out).await;
+    keys.abort();
+    let _ = client_out.shutdown().await;
     Ok(())
 }
 
@@ -158,7 +217,7 @@ async fn handle(request: Request, backend: &Backend) -> Response {
                 Request::Start { id } => result(store.start(&id).map(Response::Container)),
                 Request::Stop { id } => result(store.stop(&id).map(Response::Container)),
                 Request::Restart { id } => result(store.restart(&id).map(Response::Container)),
-                _ => Response::Error { message: "gravitond is serving demo data; restart it without --demo to pull and run images".into() },
+                _ => Response::Error { message: "gravitond is serving demo data; restart it without --demo to pull, run and exec".into() },
             }
         }
         Backend::Engine(engine) => {
@@ -173,6 +232,7 @@ async fn handle(request: Request, backend: &Backend) -> Response {
                     Request::Stop { id } => Response::Container(engine.stop(&id)?),
                     Request::Restart { id } => Response::Container(engine.restart(&id)?),
                     Request::Remove { id } => Response::Removed { id: engine.remove(&id)? },
+                    Request::Exec(_) => unreachable!("exec is handled by serve()"),
                     _ => unreachable!("reads are answered above"),
                 })
             })

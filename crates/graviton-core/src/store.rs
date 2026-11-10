@@ -150,14 +150,25 @@ impl Store {
         Some(c.clone())
     }
 
-    pub fn push_log(&mut self, id: &str, level: LogLevel, stream: LogStream, message: impl Into<String>) {
+    /// Append a line to a container's log and return it (to persist it).
+    pub fn push_log(&mut self, id: &str, level: LogLevel, stream: LogStream, message: impl Into<String>) -> LogLine {
         let lines = self.logs.entry(id.to_string()).or_default();
         let seq = lines.last().map_or(1, |l| l.seq + 1);
         let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
-        lines.push(LogLine { seq, timestamp_ms, level, message: message.into(), stream });
+        let line = LogLine { seq, timestamp_ms, level, message: message.into(), stream };
+        lines.push(line.clone());
         if lines.len() > LOG_LIMIT {
             lines.drain(..lines.len() - LOG_LIMIT);
         }
+        line
+    }
+
+    /// Replace a container's log (when restoring saved state), keeping the newest lines.
+    pub fn set_logs(&mut self, id: &str, mut lines: Vec<LogLine>) {
+        if lines.len() > LOG_LIMIT {
+            lines.drain(..lines.len() - LOG_LIMIT);
+        }
+        self.logs.insert(id.to_string(), lines);
     }
 
     /// Remove a container that isn't running.

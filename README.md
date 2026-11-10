@@ -4,11 +4,11 @@ Native containers for macOS: a Rust engine that runs each Linux container in
 its own lightweight VM (Apple Virtualization.framework), a `grav` CLI, and
 SwiftUI apps for macOS and iOS.
 
-> Status: **milestone 2 done**. `grav pull` and `grav run` work with real
-> images from Docker Hub and GHCR: each container boots its own VM, the agent
-> unpacks the image and runs it isolated (`grav run alpine` takes about half a
-> second end to end). The Mac app pulls, runs and removes containers through
-> gravitond. Next: networking, volumes and persistent state (milestone 3).
+> Status: **milestone 3 done**. Containers run from real images, each in its
+> own VM (`grav run alpine` takes about half a second end to end), with NAT
+> networking, published ports, folder and named volumes, `grav exec` (including
+> `-it` shells), and containers and logs saved across restarts. The Mac app
+> pulls, runs and removes them. Next: remote hosts for the iPhone app.
 
 ## Layout
 
@@ -43,11 +43,24 @@ scripts/build-guest.sh                      # once: guest kernel + initramfs
 scripts/dev-gravitond.sh                    # build, sign and run the daemon
 cargo run -p grav -- pull alpine            # in another terminal
 cargo run -p grav -- run alpine cat /etc/os-release
-cargo run -p grav -- run -d --name web python:3.13-slim python3 -m http.server
+cargo run -p grav -- run -d --name web -p 8080:8000 -v ~/site:/srv python:3.13-slim \
+    python3 -m http.server 8000 --directory /srv
+curl localhost:8080
 cargo run -p grav -- ps -a
 cargo run -p grav -- logs web
+cargo run -p grav -- exec web python3 --version
+cargo run -p grav -- exec -it web sh
 cargo run -p grav -- stop web && cargo run -p grav -- rm web
 ```
+
+- `-p HOST:CONTAINER` publishes a TCP port on 127.0.0.1 (forwarded to the
+  container's VM on Virtualization.framework's NAT network).
+- `-v /mac/dir:/path[:ro]` shares a folder over virtiofs; `-v name:/path` is a
+  named volume under `~/Library/Application Support/Graviton/volumes`.
+- Containers, their settings and logs are saved; after gravitond restarts,
+  running ones show as stopped and `grav start` brings them back.
+- `scripts/install-launch-agent.sh` installs gravitond as a launch agent so it
+  starts at login (`--uninstall` removes it).
 
 `grav run` pulls the image if needed, boots a VM (2 vCPU, 1 GiB by default;
 `--cpus`, `--memory`), unpacks the image inside it, runs the entrypoint and
@@ -107,8 +120,9 @@ and both sides have tests pinning the JSON shape.
    guest over virtiofs, layers unpacked in the guest with OCI whiteouts, the
    process run chrooted in new mount/UTS/IPC namespaces as the image's user,
    `grav pull` / `run` / `stop` / `rm`, and Pull, Run and Remove in the Mac app.
-3. **Daemon features**: NAT networking, port forwarding, volumes, persistent
-   state, launchd agent.
+3. ~~**Daemon features**~~ (done): NAT networking with DHCP and DNS, `-p`
+   port forwarding, `-v` folders and named volumes, saved state and logs,
+   `grav exec` with `-it` terminals, a launch agent script.
 4. **Remote hosts**: authenticated TCP/TLS endpoint so the iOS app can pair
    with a Mac.
 5. **Polish**: exec + interactive terminals, Files/Stats/Inspect tabs, image
