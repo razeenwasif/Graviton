@@ -4,13 +4,16 @@ import SwiftUI
 struct ImagesScreen: View {
     @Environment(EngineStore.self) private var store
     @State private var showPull = false
+    @State private var runImage: ImageInfo?
 
     private var totalSize: UInt64 { store.images.map(\.sizeBytes).reduce(0, +) }
 
     var body: some View {
         ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 14)], spacing: 14) {
-                ForEach(store.images) { ImageCard(image: $0) }
+                ForEach(store.images) { image in
+                    ImageCard(image: image) { runImage = $0 }
+                }
             }
             .padding(.horizontal, 28)
             .padding(.vertical, 22)
@@ -29,14 +32,19 @@ struct ImagesScreen: View {
                     Label("Pull image", systemImage: "arrow.down.circle")
                 }
                 .buttonStyle(.borderedProminent)
+                .help(store.canManage ? "Pull an image from a registry" : "Start gravitond to pull images")
             }
         }
         .sheet(isPresented: $showPull) { PullImageSheet() }
+        .sheet(item: $runImage) { image in
+            RunContainerSheet(initialImage: "\(image.repository):\(image.tag)")
+        }
     }
 }
 
 struct ImageCard: View {
     var image: ImageInfo
+    var onRun: (ImageInfo) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -63,6 +71,7 @@ struct ImageCard: View {
         .padding(16)
         .gravitonCard()
         .contextMenu {
+            Button("Run…") { onRun(image) }
             Button("Copy Reference") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(image.reference, forType: .string)
@@ -71,24 +80,24 @@ struct ImageCard: View {
     }
 }
 
-/// Pull sheet. Registry pulls arrive with milestone 2; until then the
-/// progress is simulated so the flow can be reviewed.
+/// Pulls an image through gravitond. The daemon logs per-layer progress;
+/// the sheet shows that a pull is running and how it ended.
 struct PullImageSheet: View {
+    @Environment(EngineStore.self) private var store
     @Environment(\.dismiss) private var dismiss
-    @State private var reference = "nginx:1.27-alpine"
-    @State private var layers: [Layer] = []
-    @State private var pulling = false
+    @State private var reference = ""
+    @State private var phase: Phase = .idle
+    @FocusState private var focused: Bool
 
-    struct Layer: Identifiable {
-        let id = UUID()
-        var digest: String
-        var sizeMB: Double
-        var progress: Double
+    enum Phase: Equatable {
+        case idle
+        case pulling(since: Date)
+        case done(ImageInfo)
+        case failed(String)
     }
 
-    private var downloaded: Double { layers.map { $0.sizeMB * $0.progress }.reduce(0, +) }
-    private var total: Double { layers.map(\.sizeMB).reduce(0, +) }
-    private var done: Bool { !layers.isEmpty && layers.allSatisfy { $0.progress >= 1 } }
+    private var pulling: Bool { if case .pulling = phase { true } else { false } }
+    private var trimmed: String { reference.trimmingCharacters(in: .whitespaces) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -105,62 +114,68 @@ struct PullImageSheet: View {
                     .padding(.horizontal, 12)
                     .frame(height: 38)
                     .background(G.background, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(G.accent.opacity(0.9)))
+                    .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(G.accent.opacity(focused ? 0.9 : 0.35)))
+                    .focused($focused)
                     .disabled(pulling)
                     .onSubmit(startPull)
             }
 
-            if !layers.isEmpty {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Text("Pulling \(layers.count) layers · linux/arm64")
-                        Spacer()
-                        Text(String(format: "%.1f / %.1f MB", downloaded, total)).font(G.mono(12))
+            Group {
+                switch phase {
+                case .idle:
+                    if !store.canManage {
+                        Label("Start gravitond to pull images: scripts/dev-gravitond.sh", systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(G.warning)
                     }
-                    .font(.system(size: 12))
-                    .foregroundStyle(G.muted)
-                    ForEach(layers) { layer in
-                        HStack(spacing: 12) {
-                            Text(layer.digest).foregroundStyle(G.muted).frame(width: 96, alignment: .leading)
-                            MeterBar(layer.progress, color: layer.progress >= 1 ? G.running : G.accent)
-                            Text(layer.progress >= 1 ? "Done" : "\(Int(layer.progress * 100))%")
-                                .foregroundStyle(layer.progress >= 1 ? G.running : G.text)
-                                .frame(width: 44, alignment: .trailing)
+                case let .pulling(since):
+                    HStack(spacing: 10) {
+                        ProgressView().controlSize(.small)
+                        TimelineView(.periodic(from: since, by: 1)) { context in
+                            Text("Pulling \(trimmed)… \(Int(context.date.timeIntervalSince(since))) s")
                         }
-                        .font(G.mono(11.5))
                     }
-                    Text("Simulated: registry pulls arrive with milestone 2.").font(.system(size: 11.5)).foregroundStyle(G.faint)
+                    .foregroundStyle(G.textSecondary)
+                case let .done(image):
+                    Label("Pulled \(image.repository):\(image.tag) · \(Format.bytes(image.sizeBytes)) · \(image.architecture)", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(G.running)
+                case let .failed(message):
+                    Label(message, systemImage: "xmark.octagon.fill")
+                        .foregroundStyle(G.danger)
+                        .textSelection(.enabled)
                 }
             }
+            .font(.system(size: 12.5))
+            .fixedSize(horizontal: false, vertical: true)
 
             HStack {
+                if pulling {
+                    Text("You can close this; the pull carries on.").font(.system(size: 11.5)).foregroundStyle(G.faint)
+                }
                 Spacer()
-                Button(done ? "Close" : "Cancel") { dismiss() }
+                Button("Close") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 Button("Pull", action: startPull)
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(pulling || reference.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(pulling || trimmed.isEmpty || !store.canManage)
             }
         }
         .padding(22)
         .frame(width: 520)
         .background(Color(hex: 0x15161A))
+        .onAppear { focused = true }
     }
 
     private func startPull() {
-        guard !pulling else { return }
-        pulling = true
-        layers = [("sha256:6e7…", 3.6), ("sha256:a91…", 1.9), ("sha256:0c4…", 11.4), ("sha256:f2d…", 4.7)]
-            .map { Layer(digest: $0.0, sizeMB: $0.1, progress: 0) }
+        guard !pulling, !trimmed.isEmpty, store.canManage else { return }
+        let reference = trimmed
+        phase = .pulling(since: .now)
         Task {
-            while !done {
-                try? await Task.sleep(for: .milliseconds(120))
-                for i in layers.indices where layers[i].progress < 1 {
-                    layers[i].progress = min(1, layers[i].progress + Double.random(in: 0.02...0.09) / Double(i + 1))
-                }
+            do {
+                phase = .done(try await store.pull(reference))
+            } catch {
+                phase = .failed(error.localizedDescription)
             }
-            pulling = false
         }
     }
 }

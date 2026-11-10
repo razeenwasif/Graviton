@@ -4,10 +4,11 @@ Native containers for macOS: a Rust engine that runs each Linux container in
 its own lightweight VM (Apple Virtualization.framework), a `grav` CLI, and
 SwiftUI apps for macOS and iOS.
 
-> Status: **milestone 2 in progress**. `grav pull` and `grav run` work with
-> real images from Docker Hub and GHCR: each container boots its own VM, the
-> agent unpacks the image and runs it isolated (`grav run alpine` takes about
-> half a second end to end). The apps don't drive pulls and runs yet.
+> Status: **milestone 2 done**. `grav pull` and `grav run` work with real
+> images from Docker Hub and GHCR: each container boots its own VM, the agent
+> unpacks the image and runs it isolated (`grav run alpine` takes about half a
+> second end to end). The Mac app pulls, runs and removes containers through
+> gravitond. Next: networking, volumes and persistent state (milestone 3).
 
 ## Layout
 
@@ -23,7 +24,7 @@ crates/
 apps/
   project.yml      XcodeGen spec → Graviton.xcodeproj (generated, not committed)
   GravitonKit/     Shared Swift package: models, socket client, demo engine, theme, components
-  Mac/             macOS app (Containers, Logs, Images + Pull sheet)
+  Mac/             macOS app (Containers, Run sheet, Logs, Images + Pull sheet)
   iOS/             iOS companion (Containers, Detail, Logs)
 scripts/
   build-guest.sh   Guest kernel (Alpine linux-virt) + initramfs with the agent as /init
@@ -81,6 +82,7 @@ Tests:
 ```bash
 cargo test --workspace
 swift test --package-path apps/GravitonKit
+GRAVITON_LIVE=1 swift test --package-path apps/GravitonKit   # also drives a running gravitond
 ```
 
 ## Protocol
@@ -100,11 +102,11 @@ and both sides have tests pinning the JSON shape.
 1. ~~**Boot a VM**~~ (done): Virtualization.framework backend via
    `objc2-virtualization`, Alpine kernel + initramfs, agent answers over vsock
    and runs commands, clean power-off. `gravitond boot-check` exercises it.
-2. **Run an image** (mostly done): registry client (token auth, multi-arch
+2. ~~**Run an image**~~ (done): registry client (token auth, multi-arch
    indexes, verified downloads), content-addressed blob store shared into the
    guest over virtiofs, layers unpacked in the guest with OCI whiteouts, the
    process run chrooted in new mount/UTS/IPC namespaces as the image's user,
-   `grav pull` / `run` / `stop` / `rm`. Left: Pull and Run in the apps.
+   `grav pull` / `run` / `stop` / `rm`, and Pull, Run and Remove in the Mac app.
 3. **Daemon features**: NAT networking, port forwarding, volumes, persistent
    state, launchd agent.
 4. **Remote hosts**: authenticated TCP/TLS endpoint so the iOS app can pair

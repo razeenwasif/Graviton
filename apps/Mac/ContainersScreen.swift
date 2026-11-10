@@ -11,6 +11,7 @@ struct ContainersScreen: View {
     @State private var search = ""
     @State private var selection: Container.ID?
     @State private var path: [ContainerRoute] = []
+    @State private var showRun = false
 
     private var rows: [Container] { filter.apply(store.containers, search: search) }
 
@@ -47,13 +48,19 @@ struct ContainersScreen: View {
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     Button {
-                        // Creating containers needs the VM engine (milestone 2).
+                        showRun = true
                     } label: {
                         Label("Run container", systemImage: "plus")
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(true)
-                    .help("Running new containers arrives with milestone 2")
+                    .keyboardShortcut("n")
+                    .help(store.canManage ? "Run a new container (⌘N)" : "Start gravitond to run containers")
+                }
+            }
+            .sheet(isPresented: $showRun) {
+                RunContainerSheet { container in
+                    filter = .all
+                    selection = container.id
                 }
             }
             .navigationDestination(for: ContainerRoute.self) { route in
@@ -162,6 +169,7 @@ struct LifecycleButtons: View {
             Button("Restart") { Task { await store.restart(container) } }
         } else {
             Button("Start") { Task { await store.start(container) } }
+            Button("Remove", role: .destructive) { Task { await store.remove(container) } }
         }
     }
 }
@@ -188,6 +196,7 @@ struct Inspector: View {
                     Button("Restart") { Task { await store.restart(container) } }
                 } else {
                     Button("Start") { Task { await store.start(container) } }
+                    Button("Remove") { Task { await store.remove(container) } }
                 }
                 Button("Logs", action: openLogs)
             }

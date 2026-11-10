@@ -106,3 +106,50 @@ public struct EngineInfo: Codable, Hashable, Sendable {
     public var diskBytes: UInt64
     public var diskUsedBytes: UInt64
 }
+
+/// What to run (mirrors `RunSpec` in `graviton-proto`).
+public struct RunSpec: Codable, Hashable, Sendable {
+    public var image: String
+    public var name: String?
+    /// Replaces the image's Cmd; the entrypoint is kept.
+    public var command: [String]?
+    /// `KEY=value` pairs added to the image's environment.
+    public var env: [String]
+    public var cpus: UInt32?
+    public var memoryMib: UInt64?
+
+    public init(image: String, name: String? = nil, command: [String]? = nil, env: [String] = [], cpus: UInt32? = nil, memoryMib: UInt64? = nil) {
+        self.image = image
+        self.name = name
+        self.command = command
+        self.env = env
+        self.cpus = cpus
+        self.memoryMib = memoryMib
+    }
+
+    /// Split a command line into words, honouring single and double quotes and backslashes.
+    public static func words(_ line: String) -> [String] {
+        var words: [String] = []
+        var current = ""
+        var quote: Character?
+        var escaped = false
+        var inWord = false
+        for ch in line {
+            if escaped {
+                current.append(ch); escaped = false; inWord = true
+            } else if ch == "\\" && quote != "'" {
+                escaped = true
+            } else if let q = quote {
+                if ch == q { quote = nil } else { current.append(ch) }
+            } else if ch == "\"" || ch == "'" {
+                quote = ch; inWord = true
+            } else if ch.isWhitespace {
+                if inWord { words.append(current); current = ""; inWord = false }
+            } else {
+                current.append(ch); inWord = true
+            }
+        }
+        if inWord { words.append(current) }
+        return words
+    }
+}

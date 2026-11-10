@@ -84,6 +84,35 @@ public final class EngineStore {
         }
     }
 
+    /// Pulling and running need gravitond; the demo engine can't.
+    public var canManage: Bool { connection == .live }
+
+    /// Pull an image. Throws so a sheet can show the error in place.
+    @discardableResult
+    public func pull(_ reference: String) async throws -> ImageInfo {
+        let image = try await service.pull(reference: reference)
+        await refresh()
+        return image
+    }
+
+    /// Run a container (pulling its image first if needed). Throws so a sheet can show the error.
+    @discardableResult
+    public func run(_ spec: RunSpec) async throws -> Container {
+        let container = try await service.run(spec)
+        await refresh()
+        return container
+    }
+
+    public func remove(_ c: Container) async {
+        do {
+            _ = try await service.remove(id: c.id)
+            logs[c.id] = nil
+            await refresh()
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
     public func start(_ c: Container) async { await lifecycle { try await $0.start(id: c.id) } }
     public func stop(_ c: Container) async { await lifecycle { try await $0.stop(id: c.id) } }
     public func restart(_ c: Container) async { await lifecycle { try await $0.restart(id: c.id) } }

@@ -29,6 +29,12 @@ public protocol EngineService: Sendable {
     func start(id: String) async throws -> Container
     func stop(id: String) async throws -> Container
     func restart(id: String) async throws -> Container
+    /// Pull an image from its registry (may take minutes).
+    func pull(reference: String) async throws -> ImageInfo
+    /// Create a container and start it in its own VM; returns once it's running or has failed.
+    func run(_ spec: RunSpec) async throws -> Container
+    /// Remove a stopped container; returns its id.
+    func remove(id: String) async throws -> String
 }
 
 // MARK: - Socket engine
@@ -70,22 +76,39 @@ public final class SocketEngine: EngineService {
     public func stop(id: String) async throws -> Container { try await lifecycle(.stop(id: id)) }
     public func restart(id: String) async throws -> Container { try await lifecycle(.restart(id: id)) }
 
-    private func lifecycle(_ request: EngineRequest) async throws -> Container {
-        guard case let .container(c) = try await call(request) else { throw EngineError.unexpectedResponse }
+    public func pull(reference: String) async throws -> ImageInfo {
+        guard case let .image(image) = try await call(.pull(reference: reference), timeout: 1800) else { throw EngineError.unexpectedResponse }
+        return image
+    }
+
+    public func run(_ spec: RunSpec) async throws -> Container {
+        // Pulls the image first if it isn't local, then boots a VM.
+        guard case let .container(c) = try await call(.run(spec), timeout: 1800) else { throw EngineError.unexpectedResponse }
         return c
     }
 
-    func call(_ request: EngineRequest) async throws -> EngineResponse {
+    public func remove(id: String) async throws -> String {
+        guard case let .removed(removed) = try await call(.remove(id: id)) else { throw EngineError.unexpectedResponse }
+        return removed
+    }
+
+    private func lifecycle(_ request: EngineRequest) async throws -> Container {
+        // Stop waits up to ten seconds for SIGTERM before powering the VM off.
+        guard case let .container(c) = try await call(request, timeout: 60) else { throw EngineError.unexpectedResponse }
+        return c
+    }
+
+    func call(_ request: EngineRequest, timeout: Int = 5) async throws -> EngineResponse {
         let payload = try Wire.line(request)
         let path = self.path
-        let reply = try await Task.detached { try Self.roundTrip(path: path, payload: payload) }.value
+        let reply = try await Task.detached { try Self.roundTrip(path: path, payload: payload, timeout: timeout) }.value
         let response = try Wire.decoder.decode(EngineResponse.self, from: reply)
         if case let .error(message) = response { throw EngineError.daemon(message) }
         return response
     }
 
     /// Blocking connect → write one line → read one line.
-    static func roundTrip(path: String, payload: Data) throws -> Data {
+    static func roundTrip(path: String, payload: Data, timeout: Int) throws -> Data {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw EngineError.io(String(cString: strerror(errno))) }
         defer { close(fd) }
@@ -108,9 +131,9 @@ public final class SocketEngine: EngineService {
         }
         guard connected == 0 else { throw EngineError.unreachable(String(cString: strerror(errno))) }
 
-        var timeout = timeval(tv_sec: 3, tv_usec: 0)
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        var limit = timeval(tv_sec: timeout, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &limit, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &limit, socklen_t(MemoryLayout<timeval>.size))
         #if canImport(Darwin)
         var noSigPipe: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))

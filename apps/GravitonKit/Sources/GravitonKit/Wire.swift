@@ -10,10 +10,14 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case start(id: String)
     case stop(id: String)
     case restart(id: String)
+    case pull(reference: String)
+    case run(RunSpec)
+    case remove(id: String)
 
     private enum Keys: String, CodingKey { case method, params }
     private struct IDParams: Encodable { let id: String }
     private struct LogParams: Encodable { let id: String; let tail: Int? }
+    private struct PullParams: Encodable { let reference: String }
 
     public var method: String {
         switch self {
@@ -25,6 +29,9 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .start: "start"
         case .stop: "stop"
         case .restart: "restart"
+        case .pull: "pull"
+        case .run: "run"
+        case .remove: "remove"
         }
     }
 
@@ -34,7 +41,9 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         switch self {
         case .ping, .engineInfo, .listContainers, .listImages: break
         case let .logs(id, tail): try c.encode(LogParams(id: id, tail: tail), forKey: .params)
-        case let .start(id), let .stop(id), let .restart(id): try c.encode(IDParams(id: id), forKey: .params)
+        case let .start(id), let .stop(id), let .restart(id), let .remove(id): try c.encode(IDParams(id: id), forKey: .params)
+        case let .pull(reference): try c.encode(PullParams(reference: reference), forKey: .params)
+        case let .run(spec): try c.encode(spec, forKey: .params)
         }
     }
 }
@@ -47,9 +56,12 @@ public enum EngineResponse: Decodable, Sendable {
     case images([ImageInfo])
     case logs([LogLine])
     case container(Container)
+    case image(ImageInfo)
+    case removed(id: String)
     case error(String)
 
     private enum Keys: String, CodingKey { case type, data }
+    private struct Removed: Decodable { let id: String }
     private struct Pong: Decodable { let `protocol`: UInt32 }
     private struct ErrorData: Decodable { let message: String }
 
@@ -63,6 +75,8 @@ public enum EngineResponse: Decodable, Sendable {
         case "images": self = .images(try c.decode([ImageInfo].self, forKey: .data))
         case "logs": self = .logs(try c.decode([LogLine].self, forKey: .data))
         case "container": self = .container(try c.decode(Container.self, forKey: .data))
+        case "image": self = .image(try c.decode(ImageInfo.self, forKey: .data))
+        case "removed": self = .removed(id: try c.decode(Removed.self, forKey: .data).id)
         case "error": self = .error(try c.decode(ErrorData.self, forKey: .data).message)
         default:
             throw DecodingError.dataCorruptedError(forKey: .type, in: c, debugDescription: "unknown response type \(type)")

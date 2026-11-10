@@ -126,6 +126,22 @@ public actor DemoEngine: EngineService {
         return try start(id: id)
     }
 
+    public func pull(reference: String) throws -> ImageInfo {
+        throw EngineError.daemon("Pulling images needs gravitond. Start it with scripts/dev-gravitond.sh.")
+    }
+
+    public func run(_ spec: RunSpec) throws -> Container {
+        throw EngineError.daemon("Running containers needs gravitond. Start it with scripts/dev-gravitond.sh.")
+    }
+
+    public func remove(id: String) throws -> String {
+        let i = try resolve(id)
+        guard !list[i].isRunning else { throw EngineError.daemon("container \(list[i].name) is running; stop it first") }
+        let removed = list.remove(at: i)
+        logLines[removed.id] = nil
+        return removed.id
+    }
+
     private func resolve(_ key: String) throws -> Int {
         if let i = list.firstIndex(where: { $0.name == key || $0.id == key }) { return i }
         let hits = list.indices.filter { !key.isEmpty && list[$0].id.hasPrefix(key) }

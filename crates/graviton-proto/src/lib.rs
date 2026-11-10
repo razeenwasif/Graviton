@@ -269,6 +269,19 @@ mod tests {
     }
 
     #[test]
+    fn run_from_swift() {
+        // Exactly what GravitonKit's `Wire.line(.run(...))` sends (see its RunTests).
+        let line = br#"{"method":"run","params":{"command":["python3","-m","http.server"],"env":["A=1"],"image":"python:3.13-slim","memory_mib":2048,"name":"web"}}"#;
+        let Request::Run(spec) = decode_line::<Request>(line).unwrap() else { panic!("not a run") };
+        assert_eq!(spec.image, "python:3.13-slim");
+        assert_eq!(spec.name.as_deref(), Some("web"));
+        assert_eq!(spec.command.as_deref(), Some(&["python3".to_string(), "-m".into(), "http.server".into()][..]));
+        assert_eq!((spec.cpus, spec.memory_mib), (None, Some(2048)));
+        let pull: Request = decode_line(br#"{"method":"pull","params":{"reference":"alpine"}}"#).unwrap();
+        assert_eq!(pull, Request::Pull { reference: "alpine".into() });
+    }
+
+    #[test]
     fn agent_event_shape() {
         let line = encode_line(&AgentEvent::Exited { pid: 7, code: 0 });
         assert_eq!(

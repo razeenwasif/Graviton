@@ -65,3 +65,32 @@ import Testing
         #expect(Format.percent(nil) == "—")
     }
 }
+
+@Suite struct RunTests {
+    @Test func encodesPullRunRemove() throws {
+        let pull = String(decoding: try Wire.line(.pull(reference: "alpine")), as: UTF8.self)
+        #expect(pull == "{\"method\":\"pull\",\"params\":{\"reference\":\"alpine\"}}\n")
+
+        let spec = RunSpec(image: "python:3.13-slim", name: "web", command: ["python3", "-m", "http.server"], env: ["A=1"], memoryMib: 2048)
+        let run = String(decoding: try Wire.line(.run(spec)), as: UTF8.self)
+        // Must parse as graviton_proto::Request::Run (see the Rust test `run_from_swift`).
+        #expect(run == "{\"method\":\"run\",\"params\":{\"command\":[\"python3\",\"-m\",\"http.server\"],\"env\":[\"A=1\"],\"image\":\"python:3.13-slim\",\"memory_mib\":2048,\"name\":\"web\"}}\n")
+
+        let removed = try Wire.decoder.decode(EngineResponse.self, from: Data(#"{"type":"removed","data":{"id":"abc"}}"#.utf8))
+        guard case .removed("abc") = removed else { Issue.record("expected removed"); return }
+    }
+
+    @Test func splitsCommandLines() {
+        #expect(RunSpec.words("python3 -c 'print(1 + 1)'") == ["python3", "-c", "print(1 + 1)"])
+        #expect(RunSpec.words(#"sh -c "echo \"hi there\"""#) == ["sh", "-c", #"echo "hi there""#])
+        #expect(RunSpec.words("  echo   a\\ b  ") == ["echo", "a b"])
+        #expect(RunSpec.words("") == [])
+    }
+
+    @Test func demoCanRemoveButNotPull() async throws {
+        let engine = DemoEngine()
+        await #expect(throws: EngineError.self) { try await engine.pull(reference: "alpine") }
+        await #expect(throws: EngineError.self) { try await engine.remove(id: "web") }
+        #expect(try await engine.remove(id: "worker") == "e4c5d6f7a8b9")
+    }
+}
