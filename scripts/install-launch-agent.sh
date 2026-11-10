@@ -3,6 +3,7 @@
 # crashes. The signed binary goes to ~/Library/Application Support/Graviton/bin
 # and logs to ~/Library/Logs/Graviton/gravitond.log.
 #   scripts/install-launch-agent.sh            # install (or update) and start
+#   scripts/install-launch-agent.sh --remote   # ...and accept paired phones (see grav pair)
 #   scripts/install-launch-agent.sh --uninstall
 set -eu
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -19,6 +20,9 @@ if [ "${1:-}" = "--uninstall" ]; then
   exit 0
 fi
 
+remote_arg=""
+[ "${1:-}" = "--remote" ] && remote_arg="<string>--remote</string>"
+
 cargo build --quiet --release --manifest-path "$repo/Cargo.toml" -p gravitond
 target_dir=$(cargo metadata --format-version 1 --no-deps --manifest-path "$repo/Cargo.toml" |
   python3 -I -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
@@ -32,7 +36,7 @@ cat > "$plist" <<PLIST
 <plist version="1.0">
 <dict>
   <key>Label</key><string>$label</string>
-  <key>ProgramArguments</key><array><string>$bin_dir/gravitond</string></array>
+  <key>ProgramArguments</key><array><string>$bin_dir/gravitond</string>$remote_arg</array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>

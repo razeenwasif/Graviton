@@ -3,6 +3,7 @@ import SwiftUI
 
 struct ContainerListView: View {
     @Environment(EngineStore.self) private var store
+    var openHosts: () -> Void = {}
     @State private var filter: ContainerFilter = .all
     @State private var search = ""
 
@@ -12,7 +13,12 @@ struct ContainerListView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    HostChip()
+                    HostChip(openHosts: openHosts)
+                    if store.connection == .unreachable {
+                        Label("Can't reach \(store.liveName ?? "the Mac"). Showing what it last sent. \(store.liveError ?? "")", systemImage: "wifi.exclamationmark")
+                            .font(.system(size: 13))
+                            .foregroundStyle(G.danger)
+                    }
 
                     HStack(spacing: 10) {
                         SummaryTile(title: "Running") {
@@ -66,16 +72,48 @@ struct ContainerListView: View {
 
 struct HostChip: View {
     @Environment(EngineStore.self) private var store
+    @Environment(HostStore.self) private var hosts
+    var openHosts: () -> Void = {}
+
+    private var label: String {
+        switch store.connection {
+        case .live, .unreachable: store.liveName ?? "Mac"
+        case .connecting: store.liveName ?? "Connecting…"
+        case .demo: "Demo data"
+        }
+    }
+
+    private var dot: Color {
+        switch store.connection {
+        case .live: G.running
+        case .unreachable: G.danger
+        case .demo, .connecting: G.warning
+        }
+    }
 
     var body: some View {
         Menu {
-            Label(store.connection == .live ? "Connected" : "Demo data", systemImage: "checkmark")
+            Button {
+                hosts.select(nil)
+                store.use(nil, named: nil)
+            } label: {
+                Label("Demo data", systemImage: hosts.selectedID == nil ? "checkmark" : "sparkles")
+            }
+            ForEach(hosts.hosts) { host in
+                Button {
+                    hosts.select(host.id)
+                    store.use(hosts.engineForSelection(), named: host.name)
+                } label: {
+                    Label(host.name, systemImage: hosts.selectedID == host.id ? "checkmark" : "desktopcomputer")
+                }
+            }
             Divider()
-            Button("Pair a Mac…") {}.disabled(true)
+            Button("Pair a Mac…", systemImage: "plus", action: openHosts)
         } label: {
             HStack(spacing: 8) {
-                if store.connection == .live { StatusDot(running: true) } else { Circle().fill(G.warning).frame(width: 8, height: 8) }
-                Text(store.connection == .live ? "This Mac" : "Demo host").font(.system(size: 13, weight: .medium))
+                Circle().fill(dot).frame(width: 8, height: 8)
+                    .background { if store.connection == .live { Circle().fill(G.running.opacity(0.18)).frame(width: 14, height: 14) } }
+                Text(label).font(.system(size: 13, weight: .medium))
                 Image(systemName: "chevron.down").font(.system(size: 10, weight: .bold)).foregroundStyle(G.muted)
             }
             .foregroundStyle(G.text)

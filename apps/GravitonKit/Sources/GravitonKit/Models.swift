@@ -165,3 +165,20 @@ public struct RunSpec: Codable, Hashable, Sendable {
         return words
     }
 }
+
+/// What `grav pair` shows (mirrors `PairingInfo` in `graviton-proto`).
+public struct PairingInfo: Codable, Hashable, Sendable {
+    public var code: String
+    public var expiresInSecs: UInt64
+    public var host: String
+    public var port: UInt16
+    public var fingerprint: String
+    public var addresses: [String]
+}
+
+public struct PairedDevice: Codable, Hashable, Sendable, Identifiable {
+    public var id: String
+    public var name: String
+    public var pairedAt: UInt64
+    public var lastSeen: UInt64?
+}

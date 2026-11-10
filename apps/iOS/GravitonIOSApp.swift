@@ -3,24 +3,42 @@ import SwiftUI
 
 @main
 struct GravitonIOSApp: App {
-    // iOS can't reach the Mac's Unix socket; remote hosts arrive in milestone 4.
+    // The phone talks to a paired Mac's gravitond over TLS, or shows demo data.
     @State private var store = EngineStore(useDaemon: false)
+    @State private var hosts = HostStore()
+    @State private var browser = HostBrowser()
+    @State private var pairTarget: PairingTarget?
+    @State private var tab = 0
 
     var body: some Scene {
         WindowGroup {
-            TabView {
-                Tab("Containers", systemImage: "shippingbox") { ContainerListView() }
-                Tab("Images", systemImage: "square.stack.3d.up") { ImageListView() }
-                Tab("Activity", systemImage: "waveform.path.ecg") {
+            TabView(selection: $tab) {
+                Tab("Containers", systemImage: "shippingbox", value: 0) { ContainerListView(openHosts: { tab = 3 }) }
+                Tab("Images", systemImage: "square.stack.3d.up", value: 1) { ImageListView() }
+                Tab("Activity", systemImage: "waveform.path.ecg", value: 2) {
                     Placeholder(title: "Activity", symbol: "waveform.path.ecg",
                                 detail: "Events and alerts from your hosts will show up here.")
                 }
-                Tab("Hosts", systemImage: "desktopcomputer") {
-                    Placeholder(title: "Hosts", symbol: "desktopcomputer",
-                                detail: "Pair with gravitond on your Mac to control it from here. Until then the app shows demo data.")
+                Tab("Hosts", systemImage: "desktopcomputer", value: 3) {
+                    HostsView(pairTarget: $pairTarget)
+                }
+            }
+            .sheet(item: $pairTarget) { PairSheet(target: $0) }
+            .onOpenURL { url in
+                // The QR code from `grav pair` holds a graviton://pair link.
+                if let target = PairingTarget(link: url.absoluteString) {
+                    tab = 3
+                    pairTarget = target
+                }
+            }
+            .onAppear {
+                if let engine = hosts.engineForSelection() {
+                    store.use(engine, named: hosts.selected?.name)
                 }
             }
             .environment(store)
+            .environment(hosts)
+            .environment(browser)
             .preferredColorScheme(.dark)
             .tint(G.accent)
             .task { await store.run() }

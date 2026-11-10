@@ -11,8 +11,10 @@ public final class EngineStore {
         case connecting
         /// Connected to gravitond.
         case live
-        /// Using sample data (no daemon, or on iOS before remote hosts exist).
+        /// Using sample data (no daemon, or no Mac chosen on iOS).
         case demo
+        /// A chosen Mac isn't answering; the last data it sent stays on screen.
+        case unreachable
     }
 
     public private(set) var connection: Connection = .connecting
@@ -23,20 +25,45 @@ public final class EngineStore {
     public private(set) var cpuHistory: [String: [Double]] = [:]
     public private(set) var memoryHistory: [String: [Double]] = [:]
     public var lastError: String?
+    /// Why the live engine isn't answering (shown on iOS's host chip).
+    public private(set) var liveError: String?
 
     public static let historyLength = 40
 
-    private let live: SocketEngine?
+    /// The engine tried first: gravitond's socket on the Mac, a paired Mac on iOS.
+    private var live: (any EngineService)?
     private let demo: DemoEngine
+    /// What `live` is called in the UI ("This Mac", or the paired Mac's name).
+    public private(set) var liveName: String?
+    /// Show sample data when `live` doesn't answer (the Mac app without gravitond).
+    /// Off for a chosen Mac on iOS, where sample data would be mistaken for it.
+    private var fallBackToDemo = true
 
-    /// - Parameter useDaemon: try gravitond first (macOS). Pass `false` for demo-only.
+    /// - Parameter useDaemon: try gravitond's local socket first (macOS). Pass `false` for demo data.
     public init(useDaemon: Bool = true) {
         live = useDaemon ? SocketEngine() : nil
+        liveName = useDaemon ? "This Mac" : nil
         demo = DemoEngine()
     }
 
+    /// Switch to another engine (a paired Mac), or `nil` for demo data. Clears what was shown.
+    public func use(_ engine: (any EngineService)?, named name: String?) {
+        live = engine
+        liveName = name
+        fallBackToDemo = false
+        connection = .connecting
+        containers = []
+        images = []
+        self.engine = nil
+        logs = [:]
+        cpuHistory = [:]
+        memoryHistory = [:]
+        Task { await refresh() }
+    }
+
     private var service: any EngineService {
-        connection == .live ? live! : demo
+        if connection == .live, let live { return live }
+        return demo
     }
 
     public var runningCount: Int { containers.filter(\.isRunning).count }
@@ -57,10 +84,22 @@ public final class EngineStore {
     }
 
     public func refresh() async {
-        if let live, (try? await live.ping()) != nil {
-            connection = .live
+        if let live {
+            do {
+                _ = try await live.ping()
+                connection = .live
+                liveError = nil
+            } catch {
+                liveError = error.localizedDescription
+                if !fallBackToDemo {
+                    connection = .unreachable
+                    return
+                }
+                connection = .demo
+            }
         } else {
             connection = .demo
+            liveError = nil
         }
         do {
             let service = self.service

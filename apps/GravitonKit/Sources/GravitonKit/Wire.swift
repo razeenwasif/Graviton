@@ -13,11 +13,18 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case pull(reference: String)
     case run(RunSpec)
     case remove(id: String)
+    case pairBegin
+    case listDevices
+    case revokeDevice(id: String)
+    case pair(code: String, device: String)
+    case auth(token: String)
 
     private enum Keys: String, CodingKey { case method, params }
     private struct IDParams: Encodable { let id: String }
     private struct LogParams: Encodable { let id: String; let tail: Int? }
     private struct PullParams: Encodable { let reference: String }
+    private struct PairParams: Encodable { let code: String; let device: String }
+    private struct AuthParams: Encodable { let token: String }
 
     public var method: String {
         switch self {
@@ -32,6 +39,11 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .pull: "pull"
         case .run: "run"
         case .remove: "remove"
+        case .pairBegin: "pair_begin"
+        case .listDevices: "list_devices"
+        case .revokeDevice: "revoke_device"
+        case .pair: "pair"
+        case .auth: "auth"
         }
     }
 
@@ -39,7 +51,10 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         var c = encoder.container(keyedBy: Keys.self)
         try c.encode(method, forKey: .method)
         switch self {
-        case .ping, .engineInfo, .listContainers, .listImages: break
+        case .ping, .engineInfo, .listContainers, .listImages, .pairBegin, .listDevices: break
+        case let .revokeDevice(id): try c.encode(IDParams(id: id), forKey: .params)
+        case let .pair(code, device): try c.encode(PairParams(code: code, device: device), forKey: .params)
+        case let .auth(token): try c.encode(AuthParams(token: token), forKey: .params)
         case let .logs(id, tail): try c.encode(LogParams(id: id, tail: tail), forKey: .params)
         case let .start(id), let .stop(id), let .restart(id), let .remove(id): try c.encode(IDParams(id: id), forKey: .params)
         case let .pull(reference): try c.encode(PullParams(reference: reference), forKey: .params)
@@ -58,10 +73,17 @@ public enum EngineResponse: Decodable, Sendable {
     case container(Container)
     case image(ImageInfo)
     case removed(id: String)
+    case pairing(PairingInfo)
+    case devices([PairedDevice])
+    case revoked(id: String)
+    case paired(token: String, deviceId: String, host: String)
+    case authenticated(host: String)
     case error(String)
 
     private enum Keys: String, CodingKey { case type, data }
     private struct Removed: Decodable { let id: String }
+    private struct Paired: Decodable { let token: String; let deviceId: String; let host: String }
+    private struct Host: Decodable { let host: String }
     private struct Pong: Decodable { let `protocol`: UInt32 }
     private struct ErrorData: Decodable { let message: String }
 
@@ -77,6 +99,13 @@ public enum EngineResponse: Decodable, Sendable {
         case "container": self = .container(try c.decode(Container.self, forKey: .data))
         case "image": self = .image(try c.decode(ImageInfo.self, forKey: .data))
         case "removed": self = .removed(id: try c.decode(Removed.self, forKey: .data).id)
+        case "pairing": self = .pairing(try c.decode(PairingInfo.self, forKey: .data))
+        case "devices": self = .devices(try c.decode([PairedDevice].self, forKey: .data))
+        case "revoked": self = .revoked(id: try c.decode(Removed.self, forKey: .data).id)
+        case "paired":
+            let p = try c.decode(Paired.self, forKey: .data)
+            self = .paired(token: p.token, deviceId: p.deviceId, host: p.host)
+        case "authenticated": self = .authenticated(host: try c.decode(Host.self, forKey: .data).host)
         case "error": self = .error(try c.decode(ErrorData.self, forKey: .data).message)
         default:
             throw DecodingError.dataCorruptedError(forKey: .type, in: c, debugDescription: "unknown response type \(type)")

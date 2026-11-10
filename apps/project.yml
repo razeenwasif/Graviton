@@ -47,6 +47,14 @@ targets:
     sources: [iOS]
     dependencies:
       - package: GravitonKit
+    info:
+      path: iOS/Info.plist
+      properties:
+        NSLocalNetworkUsageDescription: Graviton looks for Macs running gravitond on your network so you can pair with them and see their containers.
+        NSBonjourServices: [_graviton._tcp]
+        CFBundleURLTypes:
+          - CFBundleURLName: dev.graviton.pair
+            CFBundleURLSchemes: [graviton]
     settings:
       base:
         PRODUCT_NAME: Graviton

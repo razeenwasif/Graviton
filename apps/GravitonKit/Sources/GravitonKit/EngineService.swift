@@ -22,6 +22,8 @@ public enum EngineError: Error, LocalizedError, Equatable {
 /// gravitond; `DemoEngine` is an in-process stand-in for previews, iOS (until
 /// remote hosts land) and when the daemon isn't running.
 public protocol EngineService: Sendable {
+    /// Cheap reachability check; returns the protocol version.
+    func ping() async throws -> UInt32
     func engineInfo() async throws -> EngineInfo
     func containers() async throws -> [Container]
     func images() async throws -> [ImageInfo]
@@ -90,6 +92,21 @@ public final class SocketEngine: EngineService {
     public func remove(id: String) async throws -> String {
         guard case let .removed(removed) = try await call(.remove(id: id)) else { throw EngineError.unexpectedResponse }
         return removed
+    }
+
+    /// A one-time code for pairing a phone (gravitond must run with --remote).
+    public func pairBegin() async throws -> PairingInfo {
+        guard case let .pairing(info) = try await call(.pairBegin) else { throw EngineError.unexpectedResponse }
+        return info
+    }
+
+    public func devices() async throws -> [PairedDevice] {
+        guard case let .devices(list) = try await call(.listDevices) else { throw EngineError.unexpectedResponse }
+        return list
+    }
+
+    public func revokeDevice(id: String) async throws {
+        guard case .revoked = try await call(.revokeDevice(id: id)) else { throw EngineError.unexpectedResponse }
     }
 
     private func lifecycle(_ request: EngineRequest) async throws -> Container {

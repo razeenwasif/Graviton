@@ -126,6 +126,9 @@ struct EngineCard: View {
                 case .connecting:
                     ProgressView().controlSize(.mini)
                     Text("Connecting…").fontWeight(.medium)
+                case .unreachable:
+                    Circle().fill(G.danger).frame(width: 8, height: 8)
+                    Text("Can't reach gravitond").fontWeight(.medium)
                 }
             }
             if let e = store.engine, e.memoryBytes > 0 {

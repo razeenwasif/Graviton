@@ -6,6 +6,7 @@
 //! the sample containers from the design mockups instead.
 
 mod boot_check;
+mod remote;
 mod runtime;
 
 use std::path::PathBuf;
@@ -31,6 +32,14 @@ struct Args {
     #[arg(long)]
     demo: bool,
 
+    /// Also listen for paired phones over TLS on the local network (see `grav pair`).
+    #[arg(long)]
+    remote: bool,
+
+    /// TCP port for --remote.
+    #[arg(long, default_value_t = graviton_proto::REMOTE_PORT)]
+    remote_port: u16,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -43,7 +52,7 @@ enum Command {
 
 /// What answers requests: real VMs, or the sample data.
 #[derive(Clone)]
-enum Backend {
+pub(crate) enum Backend {
     Engine(Arc<Engine>),
     Demo(Arc<Mutex<Store>>),
 }
@@ -85,6 +94,20 @@ async fn serve_forever(args: Args) -> Result<()> {
         Backend::Engine(Engine::open()?)
     };
 
+    let remote = if args.remote {
+        let remote = remote::Remote::open(args.remote_port)?;
+        let serving = Arc::clone(&remote);
+        let for_remote = backend.clone();
+        tokio::spawn(async move {
+            if let Err(err) = serving.serve(for_remote).await {
+                eprintln!("remote endpoint stopped: {err:#}");
+            }
+        });
+        Some(remote)
+    } else {
+        None
+    };
+
     let listener = UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
     restrict_permissions(&socket)?;
     eprintln!(
@@ -102,8 +125,9 @@ async fn serve_forever(args: Args) -> Result<()> {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let backend = backend.clone();
+                let remote = remote.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = serve(stream, backend).await {
+                    if let Err(err) = serve(stream, backend, remote).await {
                         eprintln!("connection error: {err:#}");
                     }
                 });
@@ -124,7 +148,7 @@ fn restrict_permissions(path: &std::path::Path) -> Result<()> {
         .with_context(|| format!("chmod {}", path.display()))
 }
 
-async fn serve(stream: UnixStream, backend: Backend) -> Result<()> {
+async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::Remote>>) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     loop {
@@ -139,6 +163,26 @@ async fn serve(stream: UnixStream, backend: Backend) -> Result<()> {
                 continue;
             }
         };
+        // Pairing is managed from the Mac itself.
+        let local = match &request {
+            Request::PairBegin | Request::ListDevices | Request::RevokeDevice { .. } => Some(match &remote {
+                None => Response::Error { message: "remote access is off; start gravitond with --remote to pair a phone".into() },
+                Some(r) => match &request {
+                    Request::PairBegin => result(r.begin_pairing().map(Response::Pairing)),
+                    Request::ListDevices => Response::Devices(r.devices()),
+                    Request::RevokeDevice { id } => result(r.revoke(id).map(|id| Response::Revoked { id })),
+                    _ => unreachable!(),
+                },
+            }),
+            Request::Pair { .. } | Request::Auth { .. } => {
+                Some(Response::Error { message: "pairing happens over the remote endpoint, not the local socket".into() })
+            }
+            _ => None,
+        };
+        if let Some(response) = local {
+            write.write_all(&encode_line(&response)).await?;
+            continue;
+        }
         if let (Request::Exec(spec), Backend::Engine(engine)) = (&request, &backend) {
             if spec.tty {
                 // The connection becomes a raw terminal stream.
@@ -154,7 +198,7 @@ async fn serve(stream: UnixStream, backend: Backend) -> Result<()> {
 }
 
 /// `grav exec` without a TTY: stream output lines, then the exit code.
-async fn exec_stream(engine: Arc<Engine>, spec: graviton_proto::ExecSpec, write: &mut tokio::net::unix::OwnedWriteHalf) -> Result<()> {
+pub(crate) async fn exec_stream(engine: Arc<Engine>, spec: graviton_proto::ExecSpec, write: &mut (impl tokio::io::AsyncWrite + Unpin)) -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let task = tokio::task::spawn_blocking(move || engine.exec_stream(&spec, tx));
     while let Some(response) = rx.recv().await {
@@ -196,7 +240,7 @@ async fn exec_tty(
     Ok(())
 }
 
-async fn handle(request: Request, backend: &Backend) -> Response {
+pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
     // Reads answer straight from the store.
     {
         let store = backend.store().lock().unwrap();
@@ -233,6 +277,9 @@ async fn handle(request: Request, backend: &Backend) -> Response {
                     Request::Restart { id } => Response::Container(engine.restart(&id)?),
                     Request::Remove { id } => Response::Removed { id: engine.remove(&id)? },
                     Request::Exec(_) => unreachable!("exec is handled by serve()"),
+                    Request::PairBegin | Request::ListDevices | Request::RevokeDevice { .. } | Request::Pair { .. } | Request::Auth { .. } => {
+                        Response::Error { message: "not available here".into() }
+                    }
                     _ => unreachable!("reads are answered above"),
                 })
             })

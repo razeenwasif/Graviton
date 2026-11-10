@@ -70,6 +70,8 @@ public actor DemoEngine: EngineService {
         }]
     }
 
+    public func ping() -> UInt32 { 1 }
+
     public func engineInfo() -> EngineInfo {
         let used = list.compactMap(\.memoryBytes).reduce(0, +) + 1_900 * 1024 * 1024
         return EngineInfo(version: "0.1.0", protocol: 1, kernel: "Linux 6.12 (demo)", arch: "arm64", cpus: 4,

@@ -17,6 +17,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// vsock port the guest agent listens on.
 pub const AGENT_VSOCK_PORT: u32 = 1024;
 
+/// TCP port of gravitond's remote (TLS) endpoint, and its Bonjour service type.
+pub const REMOTE_PORT: u16 = 7843;
+pub const BONJOUR_SERVICE: &str = "_graviton._tcp";
+
 // ---------------------------------------------------------------------------
 // Domain types
 // ---------------------------------------------------------------------------
@@ -135,6 +139,30 @@ pub struct RunSpec {
     pub volumes: Vec<String>,
 }
 
+/// What `grav pair` shows: everything a phone needs to pair with this Mac.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingInfo {
+    /// One-time code, valid for `expires_in_secs`.
+    pub code: String,
+    pub expires_in_secs: u64,
+    /// The Mac's name as shown on the phone.
+    pub host: String,
+    pub port: u16,
+    /// SHA-256 of the endpoint's certificate, lowercase hex; the phone pins it.
+    pub fingerprint: String,
+    /// This Mac's LAN addresses.
+    pub addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairedDevice {
+    pub id: String,
+    pub name: String,
+    /// Unix seconds.
+    pub paired_at: u64,
+    pub last_seen: Option<u64>,
+}
+
 /// What `grav exec` asks for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecSpec {
@@ -192,6 +220,16 @@ pub enum Request {
     /// with `ExecOutput` lines and a final `ExecExited`; with one it answers
     /// `Attached` and the connection becomes a raw terminal stream.
     Exec(ExecSpec),
+    /// Local only: create a one-time pairing code for a phone.
+    PairBegin,
+    /// Local only: devices paired with this Mac.
+    ListDevices,
+    /// Local only: forget a paired device; its token stops working.
+    RevokeDevice { id: String },
+    /// Remote, first message: trade a pairing code for a token.
+    Pair { code: String, device: String },
+    /// Remote, first message: authenticate with a token from `Pair`.
+    Auth { token: String },
 }
 
 /// A daemon response. Serialises as `{"type": "...", "data": ...}`.
@@ -209,6 +247,11 @@ pub enum Response {
     ExecOutput { stream: LogStream, data: Vec<u8> },
     ExecExited { code: i32 },
     Attached,
+    Pairing(PairingInfo),
+    Devices(Vec<PairedDevice>),
+    Revoked { id: String },
+    Paired { token: String, device_id: String, host: String },
+    Authenticated { host: String },
     Error { message: String },
 }
 

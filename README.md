@@ -8,7 +8,8 @@ SwiftUI apps for macOS and iOS.
 > own VM (`grav run alpine` takes about half a second end to end), with NAT
 > networking, published ports, folder and named volumes, `grav exec` (including
 > `-it` shells), and containers and logs saved across restarts. The Mac app
-> pulls, runs and removes them. Next: remote hosts for the iPhone app.
+> pulls, runs and removes them, and the iPhone app pairs with a Mac over TLS
+> to show and control its containers.
 
 ## Layout
 
@@ -60,7 +61,21 @@ cargo run -p grav -- stop web && cargo run -p grav -- rm web
 - Containers, their settings and logs are saved; after gravitond restarts,
   running ones show as stopped and `grav start` brings them back.
 - `scripts/install-launch-agent.sh` installs gravitond as a launch agent so it
-  starts at login (`--uninstall` removes it).
+  starts at login (`--remote` to accept phones, `--uninstall` to remove it).
+
+Pair the iPhone app:
+
+```bash
+scripts/dev-gravitond.sh --remote    # TLS on port 7843, advertised over Bonjour
+cargo run -p grav -- pair            # one-time code, address, fingerprint, QR code
+cargo run -p grav -- devices         # paired phones; `devices revoke ID` forgets one
+```
+
+On the phone, open Hosts and pick the Mac (or add it by address, paste the
+link, or scan the QR code with the Camera), enter the code and check the
+fingerprint matches. The phone pins the Mac's certificate and keeps its token
+in the Keychain; gravitond stores only token hashes, in
+`~/Library/Application Support/Graviton/remote/`.
 
 `grav run` pulls the image if needed, boots a VM (2 vCPU, 1 GiB by default;
 `--cpus`, `--memory`), unpacks the image inside it, runs the entrypoint and
@@ -123,7 +138,8 @@ and both sides have tests pinning the JSON shape.
 3. ~~**Daemon features**~~ (done): NAT networking with DHCP and DNS, `-p`
    port forwarding, `-v` folders and named volumes, saved state and logs,
    `grav exec` with `-it` terminals, a launch agent script.
-4. **Remote hosts**: authenticated TCP/TLS endpoint so the iOS app can pair
-   with a Mac.
+4. ~~**Remote hosts**~~ (done): `gravitond --remote` serves TLS with a
+   self-signed certificate and Bonjour; `grav pair` codes and links; the iPhone
+   app discovers, pairs, pins the fingerprint and switches between Macs.
 5. **Polish**: exec + interactive terminals, Files/Stats/Inspect tabs, image
    builds, app sandbox + XPC, signing and notarisation.

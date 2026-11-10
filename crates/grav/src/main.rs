@@ -95,8 +95,21 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
+    /// Pair a phone with this Mac (gravitond must run with --remote).
+    Pair,
+    /// Devices paired with this Mac.
+    Devices {
+        #[command(subcommand)]
+        action: Option<DeviceAction>,
+    },
     /// Parse and normalise an image reference (no daemon needed).
     Resolve { reference: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum DeviceAction {
+    /// Forget a device; it has to pair again.
+    Revoke { id: String },
 }
 
 fn main() {
@@ -207,6 +220,26 @@ fn run(cli: Cli) -> Result<()> {
             Response::Removed { id } => println!("{id}"),
             other => unexpected(other)?,
         },
+        Command::Pair => match client.call(&Request::PairBegin)? {
+            Response::Pairing(p) => print_pairing(&p)?,
+            other => unexpected(other)?,
+        },
+        Command::Devices { action: None } => match client.call(&Request::ListDevices)? {
+            Response::Devices(list) if list.is_empty() => println!("No devices are paired. Run `grav pair` to add one."),
+            Response::Devices(list) => {
+                println!("{:<14} {:<28} {:<18} LAST SEEN", "ID", "NAME", "PAIRED");
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                for d in list {
+                    let seen = d.last_seen.map_or("never".into(), |t| format!("{} ago", uptime(now.saturating_sub(t))));
+                    println!("{:<14} {:<28} {:<18} {seen}", d.id, d.name, format!("{} ago", uptime(now.saturating_sub(d.paired_at))));
+                }
+            }
+            other => unexpected(other)?,
+        },
+        Command::Devices { action: Some(DeviceAction::Revoke { id }) } => match client.call(&Request::RevokeDevice { id })? {
+            Response::Revoked { id } => println!("{id} revoked"),
+            other => unexpected(other)?,
+        },
         Command::Resolve { .. } => unreachable!(),
     }
     Ok(())
@@ -246,6 +279,30 @@ fn lifecycle(client: &mut Client, request: Request, verb: &str) -> Result<()> {
         }
         other => unexpected(other),
     }
+}
+
+fn print_pairing(p: &graviton_proto::PairingInfo) -> Result<()> {
+    let address = p.addresses.first().cloned().unwrap_or_else(|| "this-mac.local".into());
+    let link = format!(
+        "graviton://pair?host={address}&port={}&fp={}&code={}&name={}",
+        p.port,
+        p.fingerprint,
+        p.code,
+        p.host.replace(' ', "%20")
+    );
+    let qr = qrcode::QrCode::new(link.as_bytes())?;
+    println!("{}", qr.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(true).build());
+    println!("Pair a phone with {}", p.host);
+    println!();
+    println!("  Code         {}-{}", &p.code[..4], &p.code[4..]);
+    println!("  Address      {}  (port {})", if p.addresses.is_empty() { "unknown".into() } else { p.addresses.join(", ") }, p.port);
+    println!("  Fingerprint  {}", p.fingerprint.as_bytes().chunks(4).take(4).map(|c| String::from_utf8_lossy(c).to_uppercase()).collect::<Vec<_>>().join(" "));
+    println!();
+    println!("In Graviton on the phone: Hosts, then pick this Mac (or add it by address) and enter the code.");
+    println!("Check the fingerprint the phone shows matches. The code works once, for {} minutes.", p.expires_in_secs / 60);
+    println!();
+    println!("Link: {link}");
+    Ok(())
 }
 
 /// Make a host path in a volume spec absolute (the daemon has its own working directory).
