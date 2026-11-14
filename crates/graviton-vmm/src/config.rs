@@ -33,6 +33,11 @@ pub struct VmConfig {
     pub shares: Vec<SharedDirectory>,
     /// Where to write the guest console (hvc0). Defaults to a temp file.
     pub console_log: Option<PathBuf>,
+    /// A connected datagram socket for a second network device (`eth1`),
+    /// carrying raw Ethernet frames: containers reach each other through it,
+    /// since Virtualization.framework's NAT keeps guests apart. The caller
+    /// keeps it open while the VM runs.
+    pub switch_port: Option<std::os::fd::RawFd>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -60,6 +65,7 @@ impl VmConfig {
             network: NetworkMode::Nat,
             shares: Vec::new(),
             console_log: None,
+            switch_port: None,
         }
     }
 

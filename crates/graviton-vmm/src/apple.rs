@@ -27,9 +27,10 @@ use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::AllocAnyThread;
-use objc2_foundation::{NSArray, NSError, NSString, NSURL};
+use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::{
-    VZBootLoader, VZDirectorySharingDeviceConfiguration, VZEntropyDeviceConfiguration, VZFileSerialPortAttachment,
+    VZBootLoader, VZDirectorySharingDeviceConfiguration, VZEntropyDeviceConfiguration, VZFileHandleNetworkDeviceAttachment,
+    VZFileSerialPortAttachment,
     VZGenericPlatformConfiguration, VZLinuxBootLoader, VZNATNetworkDeviceAttachment, VZNetworkDeviceAttachment,
     VZNetworkDeviceConfiguration, VZPlatformConfiguration, VZSerialPortAttachment, VZSerialPortConfiguration,
     VZSharedDirectory, VZSingleDirectoryShare, VZSocketDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
@@ -289,12 +290,26 @@ unsafe fn build_configuration(config: &VmConfig, console_log: &Path) -> Result<R
             VZVirtioSocketDeviceConfiguration::new().into_super(),
         ]));
 
+        let mut nics: Vec<Retained<VZNetworkDeviceConfiguration>> = Vec::new();
         if config.network == NetworkMode::Nat {
+            // eth0: NAT, for the internet and the Mac.
             let net = VZVirtioNetworkDeviceConfiguration::new();
             let nat = VZNATNetworkDeviceAttachment::new();
             let nat: &VZNetworkDeviceAttachment = &nat;
             net.setAttachment(Some(nat));
-            c.setNetworkDevices(&NSArray::<VZNetworkDeviceConfiguration>::from_retained_slice(&[net.into_super()]));
+            nics.push(net.into_super());
+        }
+        if let Some(fd) = config.switch_port {
+            // eth1: raw frames to gravitond's switch, for other containers.
+            let handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(NSFileHandle::alloc(), fd, false);
+            let attachment = VZFileHandleNetworkDeviceAttachment::initWithFileHandle(VZFileHandleNetworkDeviceAttachment::alloc(), &handle);
+            let net = VZVirtioNetworkDeviceConfiguration::new();
+            let attachment: &VZNetworkDeviceAttachment = &attachment;
+            net.setAttachment(Some(attachment));
+            nics.push(net.into_super());
+        }
+        if !nics.is_empty() {
+            c.setNetworkDevices(&NSArray::<VZNetworkDeviceConfiguration>::from_retained_slice(&nics));
         }
 
         let shares: Vec<Retained<VZDirectorySharingDeviceConfiguration>> = config

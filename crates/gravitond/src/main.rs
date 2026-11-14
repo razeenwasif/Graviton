@@ -9,6 +9,7 @@ mod boot_check;
 mod build;
 mod remote;
 mod runtime;
+mod switch;
 mod upload;
 
 use std::path::PathBuf;

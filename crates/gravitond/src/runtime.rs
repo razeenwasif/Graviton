@@ -87,6 +87,8 @@ struct Running {
     agent: Arc<Mutex<File>>,
     pid: Option<i32>,
     forwards: Vec<tokio::task::JoinHandle<()>>,
+    /// The VM's port on the container network; unplugged when this is dropped (after the VM stops).
+    _port: Option<crate::switch::Port>,
 }
 
 #[derive(Default)]
@@ -103,6 +105,7 @@ pub struct Engine {
     specs: Mutex<HashMap<String, ContainerSpec>>,
     running: Mutex<HashMap<String, Running>>,
     stats: Mutex<HashMap<String, StatsHistory>>,
+    switch: crate::switch::Switch,
     rt: tokio::runtime::Handle,
     state_path: PathBuf,
 }
@@ -120,6 +123,7 @@ impl Engine {
             specs: Mutex::new(HashMap::new()),
             running: Mutex::new(HashMap::new()),
             stats: Mutex::new(HashMap::new()),
+            switch: crate::switch::Switch::new(),
             rt: tokio::runtime::Handle::current(),
             state_path: paths::support_dir().join("containers.json"),
         });
@@ -450,6 +454,9 @@ impl Engine {
             mounts.push(GuestMount { tag, target: v.target.clone(), read_only: v.read_only });
         }
 
+        // A second network device on the container network, so containers reach each other.
+        let port = self.switch.attach().context("joining the container network")?;
+        config.switch_port = Some(port.vm_fd());
         let vm = Arc::new(AppleHypervisor::new().boot_vm(&config).context("booting the container's VM")?);
         let fd = vm.connect(AGENT_VSOCK_PORT).context("connecting to the guest agent")?;
         let agent = Arc::new(Mutex::new(File::from(fd)));
@@ -461,7 +468,7 @@ impl Engine {
         self.running
             .lock()
             .unwrap()
-            .insert(id.to_string(), Running { vm: Arc::clone(&vm), agent: Arc::clone(&agent), pid: None, forwards: vec![] });
+            .insert(id.to_string(), Running { vm: Arc::clone(&vm), agent: Arc::clone(&agent), pid: None, forwards: vec![], _port: Some(port) });
         let booted = t0.elapsed();
 
         send(&agent, &AgentRequest::Prepare {
