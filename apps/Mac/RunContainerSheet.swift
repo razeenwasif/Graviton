@@ -76,6 +76,10 @@ struct RunContainerSheet: View {
                 GridRow {
                     FieldLabel("Volumes")
                     SheetField(placeholder: "Optional: ~/code:/app, pgdata:/var/lib/data", text: $volumesText, mono: true)
+                    if !store.isLocal && !volumesText.isEmpty {
+                        Text("Folders are on \(store.liveName ?? "that Mac"), not this one. Named volumes live there too.")
+                            .font(.system(size: 11.5)).foregroundStyle(G.warning)
+                    }
                 }
                 GridRow(alignment: .top) {
                     FieldLabel("Environment").padding(.top, 8)

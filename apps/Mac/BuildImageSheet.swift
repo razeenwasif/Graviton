@@ -40,7 +40,9 @@ struct BuildImageSheet: View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Build image").font(.system(size: 16, weight: .semibold))
-                Text("From a folder with a Dockerfile. Each build runs in its own VM; unchanged steps come from the cache.")
+                Text(store.isLocal
+                     ? "From a folder with a Dockerfile. Each build runs in its own VM; unchanged steps come from the cache."
+                     : "From a folder on this Mac, built on \(store.liveName ?? "the other Mac"): the folder is sent there first, minus what .dockerignore leaves out.")
                     .font(.system(size: 12.5)).foregroundStyle(G.muted)
             }
 
@@ -128,7 +130,7 @@ struct BuildImageSheet: View {
         switch phase {
         case .idle:
             if !store.canBuild {
-                Label("Builds need gravitond running on this Mac: scripts/dev-gravitond.sh", systemImage: "exclamationmark.triangle")
+                Label("Builds need gravitond running (grav service install), here or on a paired Mac", systemImage: "exclamationmark.triangle")
                     .foregroundStyle(G.warning)
             }
         case let .building(since):

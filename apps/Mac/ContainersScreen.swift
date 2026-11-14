@@ -77,7 +77,7 @@ struct ContainersScreen: View {
                     filter = .all
                     selection = id
                     path = [ContainerRoute(id: id, tab: tab)]
-                case .images, nil:
+                case .images, .pairMac, nil:
                     return
                 }
                 router.pending = nil

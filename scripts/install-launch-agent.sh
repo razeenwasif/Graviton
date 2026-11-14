@@ -66,5 +66,8 @@ cat > "$plist" <<PLIST
 PLIST
 
 launchctl bootout "$domain/$label" 2>/dev/null || true
+# bootout returns before the old engine has gone; bootstrap fails (error 5) until it has.
+i=0
+while launchctl print "$domain/$label" >/dev/null 2>&1 && [ $i -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
 launchctl bootstrap "$domain" "$plist"
 echo "gravitond is installed and running; it starts at login. Logs: $log_dir/gravitond.log"

@@ -255,6 +255,14 @@ impl Remote {
                 (Request::PairBegin | Request::ListDevices | Request::RevokeDevice { .. } | Request::Pair { .. } | Request::Auth { .. }, _) => {
                     write.write_all(&encode_line(&Response::Error { message: "only available on the Mac itself".into() })).await?;
                 }
+                (Request::Build(spec), crate::Backend::Engine(engine)) => {
+                    if spec.upload.is_none() {
+                        let message = "from another Mac, send the build folder with the request (grav build --host uploads it)";
+                        write.write_all(&encode_line(&Response::Error { message: message.into() })).await?;
+                        continue;
+                    }
+                    crate::build_stream(Arc::clone(engine), spec.clone(), lines.get_mut(), &mut write).await?;
+                }
                 (Request::Exec(spec), crate::Backend::Engine(engine)) => {
                     if spec.tty {
                         // The connection becomes a terminal session.

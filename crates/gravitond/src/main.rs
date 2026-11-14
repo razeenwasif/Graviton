@@ -9,6 +9,7 @@ mod boot_check;
 mod build;
 mod remote;
 mod runtime;
+mod upload;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -185,7 +186,7 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
             continue;
         }
         if let (Request::Build(spec), Backend::Engine(engine)) = (&request, &backend) {
-            build_stream(Arc::clone(engine), spec.clone(), &mut write).await?;
+            build_stream(Arc::clone(engine), spec.clone(), lines.get_mut(), &mut write).await?;
             continue;
         }
         if let (Request::Exec(spec), Backend::Engine(engine)) = (&request, &backend) {
@@ -202,8 +203,33 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
     }
 }
 
-/// `grav build`: stream the build's log lines, then the image.
-async fn build_stream(engine: Arc<Engine>, spec: graviton_proto::BuildSpec, write: &mut (impl tokio::io::AsyncWrite + Unpin)) -> Result<()> {
+/// `grav build`: stream the build's log lines, then the image. With an
+/// upload, the build folder comes next on `read`.
+pub(crate) async fn build_stream(
+    engine: Arc<Engine>,
+    mut spec: graviton_proto::BuildSpec,
+    read: &mut (impl tokio::io::AsyncRead + Unpin),
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> Result<()> {
+    let upload = match spec.upload {
+        None => None,
+        Some(size) => match upload::receive(read, size).await {
+            Ok(up) => {
+                let line = format!("Received the build folder ({} files, {:.1} MB)", up.files, up.bytes as f64 / 1048576.0);
+                write.write_all(&encode_line(&Response::BuildLog { line })).await?;
+                spec.context = up.dir.display().to_string();
+                if spec.dockerfile.is_none() && up.dir.join(graviton_proto::UPLOADED_DOCKERFILE).is_file() {
+                    spec.dockerfile = Some(graviton_proto::UPLOADED_DOCKERFILE.into());
+                }
+                Some(up)
+            }
+            Err(err) => {
+                // The rest of the upload can't be told apart from requests: hang up.
+                write.write_all(&encode_line(&Response::Error { message: format!("{err:#}") })).await?;
+                anyhow::bail!("build upload failed: {err:#}");
+            }
+        },
+    };
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let task = tokio::task::spawn_blocking(move || {
         let lines = tx.clone();
@@ -222,6 +248,7 @@ async fn build_stream(engine: Arc<Engine>, spec: graviton_proto::BuildSpec, writ
         }
     }
     let _ = task.await;
+    drop(upload); // deletes the received folder
     Ok(())
 }
 

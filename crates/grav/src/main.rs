@@ -1,4 +1,7 @@
-//! `grav`: command-line client for gravitond.
+//! `grav`: command-line client for gravitond, on this Mac or a paired one.
+
+mod remote;
+mod service;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -11,6 +14,7 @@ use graviton_core::{ImageReference, paths};
 use std::sync::{Arc, Mutex};
 
 use graviton_proto::frame::{Decoder, Frame};
+use remote::Target;
 use graviton_proto::{BuildSpec, ContainerStatus, ContainerSummary, ExecSpec, FileKind, LogStream, Request, Response, RunSpec, decode_line, encode_line};
 
 #[derive(Parser, Debug)]
@@ -19,6 +23,10 @@ struct Cli {
     /// Control socket path (default: $GRAVITON_SOCKET or ~/Library/Application Support/Graviton/gravitond.sock)
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
+
+    /// Run on a paired Mac (see `grav hosts`), or `local` for this one.
+    #[arg(long, global = true, env = "GRAVITON_HOST")]
+    host: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -140,6 +148,16 @@ enum Command {
         #[command(subcommand)]
         action: Option<DeviceAction>,
     },
+    /// Other Macs this one can run containers on.
+    Hosts {
+        #[command(subcommand)]
+        action: Option<HostsAction>,
+    },
+    /// Run this Mac's gravitond (the one inside Graviton.app) at login.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Parse and normalise an image reference (no daemon needed).
     Resolve { reference: String },
 }
@@ -148,6 +166,39 @@ enum Command {
 enum DeviceAction {
     /// Forget a device; it has to pair again.
     Revoke { id: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum HostsAction {
+    /// Pair with a Mac running `gravitond --remote`: give its address (or the
+    /// graviton://pair link) and the code `grav pair` shows on it.
+    Add {
+        /// ADDRESS[:PORT], e.g. mini.local, or the graviton://pair?... link.
+        target: String,
+        /// The code from `grav pair` (asked for if not given).
+        code: Option<String>,
+        /// What to call it in --host (default: from its name).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Forget a host (on that Mac, `grav devices revoke` stops its token too).
+    Rm { name: String },
+    /// Send commands to this host when no --host is given (`local` for this Mac).
+    Use { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceAction {
+    /// Start gravitond now and at every login.
+    Install {
+        /// Also accept paired Macs and phones (TLS on port 7843).
+        #[arg(long)]
+        remote: bool,
+    },
+    /// Stop it and don't start it at login.
+    Uninstall,
+    /// Whether it's installed and running.
+    Status,
 }
 
 fn main() {
@@ -164,11 +215,24 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    let socket = cli.socket.unwrap_or_else(paths::socket_path);
-    let mut client = Client::connect(&socket)?;
+    match &cli.command {
+        Command::Hosts { action } => return hosts(action.as_ref()),
+        Command::Service { action: ServiceAction::Install { remote } } => return service::install(*remote),
+        Command::Service { action: ServiceAction::Uninstall } => return service::uninstall(),
+        Command::Service { action: ServiceAction::Status } => return service::status(),
+        _ => {}
+    }
+
+    let socket = cli.socket.clone().unwrap_or_else(paths::socket_path);
+    let target = Target::resolve(cli.host.as_deref(), socket)?;
+    if target.is_remote() && matches!(cli.command, Command::Pair | Command::Devices { .. }) {
+        bail!("pairing is managed on the Mac itself: run `grav pair` there");
+    }
+    let mut client = Client::connect(&target)?;
 
     match cli.command {
         Command::Ping => match client.call(&Request::Ping)? {
+            Response::Pong { protocol } if target.is_remote() => println!("gravitond on {} is up (protocol v{protocol})", target.describe()),
             Response::Pong { protocol } => println!("gravitond is up (protocol v{protocol})"),
             other => unexpected(other)?,
         },
@@ -248,7 +312,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Exec { interactive, tty, env, container, command } => {
             let code = if tty {
-                exec_tty(&socket, ExecSpec { id: container, command, tty: true, rows: 0, cols: 0, env }, interactive)?
+                exec_tty(&target, ExecSpec { id: container, command, tty: true, rows: 0, cols: 0, env }, interactive)?
             } else {
                 exec_stream(&mut client, ExecSpec { id: container, command, tty: false, rows: 0, cols: 0, env })?
             };
@@ -310,15 +374,25 @@ fn run(cli: Cli) -> Result<()> {
             Response::Details(d) => println!("{}", serde_json::to_string_pretty(&d)?),
             other => unexpected(other)?,
         },
-        Command::Build { tag, file, build_arg, target, no_cache, path } => {
+        Command::Build { tag, file, build_arg, target: build_target, no_cache, path } => {
             let context = std::fs::canonicalize(&path).with_context(|| format!("{} doesn't exist", path.display()))?;
             let dockerfile = match file {
                 // A path given on the command line is relative to where you are.
                 Some(f) => Some(std::fs::canonicalize(&f).with_context(|| format!("{f} doesn't exist"))?.display().to_string()),
                 None => None,
             };
-            let spec = BuildSpec { context: context.display().to_string(), dockerfile, tag, build_args: build_arg, target, no_cache };
-            client.writer.write_all(&encode_line(&Request::Build(spec)))?;
+            let mut spec = BuildSpec { context: context.display().to_string(), dockerfile, tag, build_args: build_arg, target: build_target, no_cache, upload: None };
+            if let Target::Remote(host) = &target {
+                // That Mac can't see this folder: send it along.
+                let archive = pack_context(&context, &mut spec)?;
+                let size = archive.path().metadata()?.len();
+                eprintln!("Sending {} to {} ({:.1} MB)…", context.display(), host.name, size as f64 / 1048576.0);
+                spec.upload = Some(size);
+                client.writer.write_all(&encode_line(&Request::Build(spec)))?;
+                std::io::copy(&mut std::fs::File::open(archive.path())?, &mut client.writer)?;
+            } else {
+                client.writer.write_all(&encode_line(&Request::Build(spec)))?;
+            }
             let mut line = String::new();
             loop {
                 line.clear();
@@ -360,7 +434,7 @@ fn run(cli: Cli) -> Result<()> {
             Response::Revoked { id } => println!("{id} revoked"),
             other => unexpected(other)?,
         },
-        Command::Resolve { .. } => unreachable!(),
+        Command::Resolve { .. } | Command::Hosts { .. } | Command::Service { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -371,10 +445,8 @@ struct Client {
 }
 
 impl Client {
-    fn connect(path: &std::path::Path) -> Result<Self> {
-        let stream = UnixStream::connect(path).with_context(|| {
-            format!("cannot reach gravitond at {} (is it running? try `gravitond`)", path.display())
-        })?;
+    fn connect(target: &Target) -> Result<Self> {
+        let stream = target.connect()?;
         Ok(Self { reader: BufReader::new(stream.try_clone()?), writer: stream })
     }
 
@@ -458,14 +530,152 @@ fn exec_stream(client: &mut Client, spec: ExecSpec) -> Result<i32> {
     }
 }
 
+/// Pack a build folder for another Mac: everything `.dockerignore` keeps,
+/// plus the Dockerfile and `.dockerignore` themselves. Points `spec` at the
+/// Dockerfile inside the archive and names the image after the folder.
+fn pack_context(context: &std::path::Path, spec: &mut BuildSpec) -> Result<TempFile> {
+    use graviton_proto::build::{Ignore, walk};
+    let ignore_lines = std::fs::read_to_string(context.join(".dockerignore")).map(|t| Ignore::lines(&t)).unwrap_or_default();
+    let ignore = Ignore::new(&ignore_lines);
+    let archive = TempFile::new("grav-context", "tar.gz")?;
+    let gz = flate2::write::GzEncoder::new(std::fs::File::create(archive.path())?, flate2::Compression::fast());
+    let mut tar = tar::Builder::new(gz);
+    tar.follow_symlinks(false);
+    let mut forced: Vec<PathBuf> = vec![".dockerignore".into()];
+    match spec.dockerfile.take() {
+        None => forced.push("Dockerfile".into()),
+        Some(file) => match std::path::Path::new(&file).strip_prefix(context) {
+            Ok(rel) => {
+                forced.push(rel.to_path_buf());
+                spec.dockerfile = Some(rel.display().to_string());
+            }
+            // Outside the folder: it travels under a fixed name.
+            Err(_) => tar.append_path_with_name(&file, graviton_proto::UPLOADED_DOCKERFILE)?,
+        },
+    }
+    for rel in walk(context, std::path::Path::new(""), &ignore)? {
+        if !rel.as_os_str().is_empty() {
+            tar.append_path_with_name(context.join(&rel), &rel)?;
+        }
+    }
+    for rel in forced {
+        if ignore.is_ignored(&rel) && context.join(&rel).is_file() {
+            tar.append_path_with_name(context.join(&rel), &rel)?;
+        }
+    }
+    tar.into_inner()?.finish()?;
+    if spec.tag.is_none() {
+        let name: String = context
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '-' })
+            .collect();
+        let name = name.trim_matches(['-', '.', '_']).to_string();
+        spec.tag = Some(if name.is_empty() { "graviton-build".into() } else { name });
+    }
+    Ok(archive)
+}
+
+/// A file in the temporary folder, removed when dropped.
+struct TempFile(PathBuf);
+
+impl TempFile {
+    fn new(stem: &str, ext: &str) -> Result<Self> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        Ok(Self(std::env::temp_dir().join(format!("{stem}-{}-{nanos}.{ext}", std::process::id()))))
+    }
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn hosts(action: Option<&HostsAction>) -> Result<()> {
+    let mut hosts = remote::Hosts::load()?;
+    match action {
+        None => {
+            if hosts.hosts.is_empty() {
+                println!("No other Macs yet. On the Mac mini: `grav service install --remote`, then `grav pair`;");
+                println!("here: `grav hosts add ADDRESS CODE`.");
+                return Ok(());
+            }
+            let default = hosts.default.clone();
+            println!("{:<3}{:<18} {:<26} {:<20} MAC", "", "NAME", "ADDRESS", "FINGERPRINT");
+            println!("{:<3}{:<18} {:<26} {:<20}", if default.is_none() { "*" } else { "" }, "local", "this Mac", "");
+            for h in &hosts.hosts {
+                let star = if default.as_deref().is_some_and(|d| d.eq_ignore_ascii_case(&h.name)) { "*" } else { "" };
+                println!("{star:<3}{:<18} {:<26} {:<20} {}", h.name, format!("{}:{}", h.address, h.port), remote::fingerprint_short(&h.fingerprint), h.host_name);
+            }
+            println!("\n* = where commands go without --host (change with `grav hosts use NAME`)");
+        }
+        Some(HostsAction::Add { target, code, name }) => {
+            let t = remote::PairTarget::parse(target)?;
+            let code = match code.clone().or(t.code.clone()) {
+                Some(c) => c,
+                None => {
+                    eprint!("Code from `grav pair` on that Mac: ");
+                    std::io::stderr().flush()?;
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    line.trim().to_string()
+                }
+            };
+            let host = remote::pair(&t.address, t.port, &code, t.fingerprint.as_deref(), name.as_deref())?;
+            if t.fingerprint.is_none() {
+                // Paired by address: check it's really that Mac.
+                eprintln!("{} says its fingerprint is {}.", host.host_name, remote::fingerprint_short(&host.fingerprint));
+                if !remote::confirm("Does that match what `grav pair` showed on it?") {
+                    bail!("not saved. On that Mac, `grav devices revoke {}` removes the pairing", host.device_id);
+                }
+            }
+            hosts.hosts.retain(|h| !h.name.eq_ignore_ascii_case(&host.name) && h.fingerprint != host.fingerprint);
+            println!("Paired with {} as `{}` ({}:{}, {}).", host.host_name, host.name, host.address, host.port, remote::fingerprint_short(&host.fingerprint));
+            println!("Use it with `grav --host {} ps`, or make it the default: `grav hosts use {}`.", host.name, host.name);
+            hosts.hosts.push(host);
+            hosts.save()?;
+        }
+        Some(HostsAction::Rm { name }) => {
+            let before = hosts.hosts.len();
+            hosts.hosts.retain(|h| !h.name.eq_ignore_ascii_case(name));
+            if hosts.hosts.len() == before {
+                bail!("no host called {name}");
+            }
+            if hosts.default.as_deref().is_some_and(|d| d.eq_ignore_ascii_case(name)) {
+                hosts.default = None;
+            }
+            hosts.save()?;
+            println!("Forgot {name}.");
+        }
+        Some(HostsAction::Use { name }) => {
+            if name == "local" {
+                hosts.default = None;
+                println!("Commands go to this Mac unless you pass --host.");
+            } else {
+                let host = hosts.get(name).ok_or_else(|| anyhow::anyhow!("no host called {name}: see `grav hosts`"))?;
+                println!("Commands go to {} unless you pass --host (`--host local` for this Mac).", host.name);
+                hosts.default = Some(host.name.clone());
+            }
+            hosts.save()?;
+        }
+    }
+    Ok(())
+}
+
 /// `grav exec -t`: put this terminal in raw mode and connect it to the
 /// container's; returns the program's exit code.
-fn exec_tty(socket: &std::path::Path, mut spec: ExecSpec, interactive: bool) -> Result<i32> {
+fn exec_tty(target: &Target, mut spec: ExecSpec, interactive: bool) -> Result<i32> {
     let is_tty = |fd| unsafe { libc::isatty(fd) } == 1;
     if let Some((rows, cols)) = window_size() {
         (spec.rows, spec.cols) = (rows, cols);
     }
-    let mut stream = UnixStream::connect(socket).with_context(|| format!("cannot reach gravitond at {}", socket.display()))?;
+    let mut stream = target.connect()?;
     stream.write_all(&encode_line(&Request::Exec(spec)))?;
     // Read the answer byte by byte: what follows it is terminal frames.
     let mut line = Vec::new();

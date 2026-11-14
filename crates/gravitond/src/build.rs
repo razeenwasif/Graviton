@@ -761,7 +761,7 @@ mod tests {
 
     #[test]
     fn names_images_after_the_folder() {
-        let spec = |tag: Option<&str>| BuildSpec { context: "/x".into(), dockerfile: None, tag: tag.map(String::from), build_args: vec![], target: None, no_cache: false };
+        let spec = |tag: Option<&str>| BuildSpec { context: "/x".into(), dockerfile: None, tag: tag.map(String::from), build_args: vec![], target: None, no_cache: false, upload: None };
         assert_eq!(image_reference(&spec(None), Path::new("/Users/me/My App")).unwrap(), "docker.io/library/my-app:latest");
         assert_eq!(image_reference(&spec(Some("web:1.2")), Path::new("/x")).unwrap(), "docker.io/library/web:1.2");
         assert!(image_reference(&spec(Some("Bad Name")), Path::new("/x")).is_err());

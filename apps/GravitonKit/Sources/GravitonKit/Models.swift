@@ -322,6 +322,8 @@ public struct BuildSpec: Codable, Hashable, Sendable {
     public var buildArgs: [String]
     public var target: String?
     public var noCache: Bool
+    /// Bytes of tar that follow the request (a folder sent to another Mac).
+    public var upload: UInt64?
 
     public init(context: String, dockerfile: String? = nil, tag: String? = nil, buildArgs: [String] = [], target: String? = nil, noCache: Bool = false) {
         self.context = context
@@ -330,6 +332,14 @@ public struct BuildSpec: Codable, Hashable, Sendable {
         self.buildArgs = buildArgs
         self.target = target
         self.noCache = noCache
+    }
+
+    /// The image name a build of `context` gets when none is given: the folder's name.
+    public static func defaultName(for context: String) -> String {
+        let base = URL(fileURLWithPath: context).lastPathComponent.lowercased()
+        let cleaned = String(base.map { $0.isASCII && ($0.isLetter || $0.isNumber || "-_.".contains($0)) ? $0 : "-" })
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-._"))
+        return cleaned.isEmpty ? "graviton-build" : cleaned
     }
 }
 

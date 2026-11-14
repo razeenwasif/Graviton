@@ -185,7 +185,14 @@ pub struct BuildSpec {
     /// Rebuild every step instead of reusing cached layers.
     #[serde(default)]
     pub no_cache: bool,
+    /// From another Mac: the build folder follows the request line as this
+    /// many bytes of tar (gzipped or not), and `context` is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload: Option<u64>,
 }
+
+/// Where an uploaded build folder's Dockerfile goes when it lives outside the folder.
+pub const UPLOADED_DOCKERFILE: &str = ".graviton-dockerfile";
 
 /// What `grav exec` asks for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

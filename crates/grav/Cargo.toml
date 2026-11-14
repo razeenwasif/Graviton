@@ -10,6 +10,11 @@ graviton-proto.workspace = true
 graviton-core.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
-clap.workspace = true
+clap = { workspace = true, features = ["env"] }
 libc = "0.2"
 qrcode = { version = "0.14", default-features = false }
+serde.workspace = true
+sha2 = "0.10"
+tar = "0.4"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

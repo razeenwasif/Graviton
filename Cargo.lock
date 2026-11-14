@@ -366,11 +366,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "flate2",
  "graviton-core",
  "graviton-proto",
  "libc",
  "qrcode",
+ "rustls",
+ "serde",
  "serde_json",
+ "sha2",
+ "tar",
 ]
 
 [[package]]
@@ -432,6 +437,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "flate2",
  "graviton-core",
  "graviton-image",
  "graviton-proto",
@@ -443,6 +449,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "tokio",
  "tokio-rustls",
 ]

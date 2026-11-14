@@ -174,3 +174,75 @@ import Testing
         await #expect(throws: EngineError.self) { for try await _ in store.build(BuildSpec(context: "/tmp")) {} }
     }
 }
+
+@Suite struct RemoteHostTests {
+    @Test func dockerignoreMatchesRust() {
+        // The same cases as graviton-proto's `dockerignore` test.
+        let ig = DockerIgnore(["# deps", "node_modules", "*.log", "**/__pycache__", ".git", "!keep.log"])
+        #expect(ig.isIgnored("node_modules"))
+        #expect(ig.isIgnored("node_modules/x/y.js"))
+        #expect(ig.isIgnored("debug.log"))
+        #expect(!ig.isIgnored("keep.log"))
+        #expect(!ig.isIgnored("src/debug.log"))
+        #expect(ig.isIgnored("src/pkg/__pycache__/a.pyc"))
+        #expect(!ig.isIgnored("src/main.py"))
+        #expect(DockerIgnore.glob("[a-c]x", "bx") && !DockerIgnore.glob("[!a-c]x", "bx") && DockerIgnore.glob("file?.txt", "file1.txt"))
+    }
+
+    @Test func packsAFolderTarCanRead() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "graviton-pack-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let deep = "src/" + String(repeating: "very-long-folder-name/", count: 6)
+        try FileManager.default.createDirectory(at: dir.appending(path: deep), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dir.appending(path: "node_modules/x"), withIntermediateDirectories: true)
+        try "FROM alpine\n".write(to: dir.appending(path: "Dockerfile"), atomically: true, encoding: .utf8)
+        try "node_modules\nDockerfile\n".write(to: dir.appending(path: ".dockerignore"), atomically: true, encoding: .utf8)
+        try "deep\n".write(to: dir.appending(path: deep + "file.txt"), atomically: true, encoding: .utf8)
+        try "junk".write(to: dir.appending(path: "node_modules/x/junk.js"), atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(atPath: dir.appending(path: "link").path, withDestinationPath: "src")
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.appending(path: "Dockerfile").path)
+
+        let (archive, size) = try BuildUpload.pack(dir, dockerfile: nil)
+        defer { try? FileManager.default.removeItem(at: archive) }
+        #expect(size % 512 == 0)
+        let tar = Process()
+        tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        tar.arguments = ["-tvf", archive.path]
+        let pipe = Pipe()
+        tar.standardOutput = pipe
+        try tar.run()
+        tar.waitUntilExit()
+        let listing = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        #expect(tar.terminationStatus == 0)
+        #expect(listing.contains(deep + "file.txt"))       // long names survive
+        #expect(listing.contains("link -> src"))
+        #expect(listing.contains("-rwxr-xr-x") && listing.contains("Dockerfile")) // ignored, but always sent
+        #expect(!listing.contains("node_modules"))
+    }
+
+    @MainActor @Test func sharesHostsWithGrav() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "graviton-hosts-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appending(path: "hosts.json")
+        // Exactly what grav writes.
+        try #"{"default":"mini","hosts":[{"name":"mini","address":"10.0.0.5","port":7843,"fingerprint":"ab","token":"t","device_id":"d1","host_name":"My Mac mini"}]}"#
+            .write(to: url, atomically: true, encoding: .utf8)
+        let defaults = UserDefaults(suiteName: "graviton-tests-\(UUID().uuidString)")!
+        let hosts = SharedHosts(url: url, defaults: defaults)
+        #expect(hosts.hosts.map(\.name) == ["mini"])
+        #expect(hosts.hosts.first?.remoteHost.address == "10.0.0.5")
+        #expect(hosts.selected == nil)  // the app's choice is its own
+
+        let result = PairingResult(host: RemoteHost(deviceID: "d2", name: "Razeen's MacBook", serviceName: nil, address: "10.0.0.9", port: 7843, fingerprint: "cd"), token: "t2")
+        try hosts.add(result)
+        #expect(hosts.hosts.map(\.name).sorted() == ["mini", "razeens-macbook"])
+        let raw = try String(contentsOf: url, encoding: .utf8)
+        #expect(raw.contains(#""default" : "mini""#) && raw.contains(#""device_id" : "d2""#))
+        let perms = try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber
+        #expect(perms?.intValue == 0o600)
+        try hosts.forget("mini")
+        #expect(hosts.hosts.map(\.name) == ["razeens-macbook"])
+        #expect(!(try String(contentsOf: url, encoding: .utf8)).contains(#""default" : "mini""#))
+    }
+}

@@ -5,12 +5,19 @@ import SwiftUI
 struct GravitonMacApp: App {
     @State private var store: EngineStore
     @State private var shells = ShellSessions()
+    @State private var hosts: SharedHosts
     @State private var router = AppRouter()
     @AppStorage("showsMenuBarExtra") private var showsMenuBarExtra = true
 
     init() {
         let store = EngineStore(useDaemon: true)
+        let hosts = SharedHosts()
+        // Show the Mac picked last time.
+        if let mac = hosts.current {
+            store.use(RemoteEngine(host: mac.remoteHost, token: mac.token), named: mac.name)
+        }
         _store = State(initialValue: store)
+        _hosts = State(initialValue: hosts)
         // Poll for the app's whole life, not just while a window is open: the menu bar item shows it too.
         Task { await store.run() }
     }
@@ -21,6 +28,7 @@ struct GravitonMacApp: App {
                 .environment(store)
                 .environment(shells)
                 .environment(router)
+                .environment(hosts)
                 .preferredColorScheme(.dark)
                 .tint(G.accent)
                 .frame(minWidth: 980, minHeight: 620)
@@ -33,6 +41,7 @@ struct GravitonMacApp: App {
                     .keyboardShortcut("r")
                 Toggle("Show in Menu Bar", isOn: $showsMenuBarExtra)
             }
+            HostCommands(store: store, hosts: hosts, shells: shells, router: router)
         }
 
         MenuBarExtra(isInserted: $showsMenuBarExtra) {
@@ -65,6 +74,9 @@ struct RootView: View {
     @Environment(EngineStore.self) private var store
     @Environment(AppRouter.self) private var router
     @State private var section: Section? = .containers
+    @State private var pairing = false
+    @Environment(SharedHosts.self) private var hosts
+    @Environment(ShellSessions.self) private var shells
 
     var body: some View {
         NavigationSplitView {
@@ -92,9 +104,15 @@ struct RootView: View {
                 router.pending = nil
             case .runContainer, .container:
                 section = .containers // ContainersScreen handles the rest.
+            case .pairMac:
+                pairing = true
+                router.pending = nil
             case nil:
                 break
             }
+        }
+        .sheet(isPresented: $pairing) {
+            PairMacSheet { mac in switchHost(to: mac, store: store, hosts: hosts, shells: shells) }
         }
         .alert("Something went wrong", isPresented: Binding(
             get: { store.lastError != nil },
@@ -149,11 +167,12 @@ struct EngineCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            HostMenu()
             HStack(spacing: 8) {
                 switch store.connection {
                 case .live:
                     StatusDot(running: true)
-                    Text("Engine running").fontWeight(.medium)
+                    Text(store.isLocal ? "Engine running" : "Connected").fontWeight(.medium)
                 case .demo:
                     Circle().fill(G.warning).frame(width: 8, height: 8)
                     Text("Demo data").fontWeight(.medium)
@@ -162,7 +181,7 @@ struct EngineCard: View {
                     Text("Connecting…").fontWeight(.medium)
                 case .unreachable:
                     Circle().fill(G.danger).frame(width: 8, height: 8)
-                    Text("Can't reach gravitond").fontWeight(.medium)
+                    Text(store.isLocal ? "Can't reach gravitond" : "Can't reach \(store.liveName ?? "it")").fontWeight(.medium)
                 }
             }
             if let e = store.engine, e.memoryBytes > 0 {

@@ -10,6 +10,8 @@ final class AppRouter {
         case runContainer
         case container(String, DetailTab)
         case images
+        /// Open the Pair a Mac sheet.
+        case pairMac
     }
 
     /// Set by the menu bar panel; the screen that handles it sets it back to `nil`.

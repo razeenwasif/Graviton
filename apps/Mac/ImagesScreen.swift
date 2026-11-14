@@ -25,7 +25,7 @@ struct ImagesScreen: View {
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button("Build…") { showBuild = true }
-                    .help(store.canBuild ? "Build an image from a folder with a Dockerfile" : "Start gravitond on this Mac to build images")
+                    .help(store.canBuild ? "Build an image from a folder with a Dockerfile" : "Start gravitond (grav service install) to build images")
                 Button {
                     showPull = true
                 } label: {

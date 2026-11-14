@@ -46,6 +46,15 @@ public final class EngineStore {
         demo = DemoEngine()
     }
 
+    /// Back to gravitond on this Mac (falling back to demo data when it isn't running).
+    public func useLocal() {
+        use(SocketEngine(), named: "This Mac")
+        fallBackToDemo = true
+    }
+
+    /// Whether the engine shown is this Mac's own.
+    public var isLocal: Bool { live is SocketEngine }
+
     /// Switch to another engine (a paired Mac), or `nil` for demo data. Clears what was shown.
     public func use(_ engine: (any EngineService)?, named name: String?) {
         live = engine
@@ -142,15 +151,18 @@ public final class EngineStore {
         return container
     }
 
-    /// Builds read a folder on this Mac, so they need the local gravitond.
-    public var canBuild: Bool { connection == .live && live is SocketEngine }
+    /// Builds need a real engine: this Mac's reads the folder; a paired Mac's is sent it.
+    public var canBuild: Bool { connection == .live && (live is SocketEngine || live is RemoteEngine) }
 
     /// Build an image; the stream carries log lines, then the image. The image list refreshes at the end.
     public func build(_ spec: BuildSpec) -> AsyncThrowingStream<BuildEvent, Error> {
-        guard canBuild, let engine = live as? SocketEngine else {
-            return AsyncThrowingStream { $0.finish(throwing: EngineError.daemon("Builds need gravitond running on this Mac.")) }
+        let upstream: AsyncThrowingStream<BuildEvent, Error>
+        switch live {
+        case let local as SocketEngine where canBuild: upstream = local.build(spec)
+        case let remote as RemoteEngine where canBuild: upstream = remote.build(spec)
+        default:
+            return AsyncThrowingStream { $0.finish(throwing: EngineError.daemon("Builds need gravitond running, here or on a paired Mac.")) }
         }
-        let upstream = engine.build(spec)
         return AsyncThrowingStream { continuation in
             let task = Task { @MainActor [weak self] in
                 do {

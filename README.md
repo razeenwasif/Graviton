@@ -14,7 +14,7 @@ SwiftUI apps for macOS and iOS.
 > Terminal tab. `grav build` (and Build… in the Mac app) builds images from
 > Dockerfiles, multi-stage included, with a layer cache. The iPhone app pairs
 > with a Mac over TLS to show and control its containers, and opens shells in
-> them too.
+> them too; `grav --host` and the Mac app's Host menu do the same between Macs.
 
 ## Layout
 
@@ -124,6 +124,39 @@ cargo test --workspace
 swift test --package-path apps/GravitonKit
 GRAVITON_LIVE=1 swift test --package-path apps/GravitonKit   # also drives a running gravitond
 ```
+
+## Using another Mac
+
+Containers can run on any Apple-silicon Mac with Graviton.app; this one then
+drives it over TLS, pinned to that Mac's certificate.
+
+On the other Mac (once):
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Graviton.app   # if it came by AirDrop or a download
+/Applications/Graviton.app/Contents/MacOS/grav service install --remote
+/Applications/Graviton.app/Contents/MacOS/grav pair           # a code, its address and fingerprint, a link
+```
+
+On this Mac:
+
+```bash
+grav hosts add mini.local ABCD-EFGH --name mini   # or paste the graviton://pair link
+grav --host mini ps                               # one command there
+grav hosts use mini                               # or make it the default (--host local for this Mac)
+grav hosts                                        # paired Macs; grav hosts rm NAME forgets one
+```
+
+Everything works against a paired Mac, `exec -it` shells included.
+`grav build` sends the folder there first (minus what `.dockerignore` leaves
+out), so you build local projects on the other Mac. Volume paths (`-v
+~/code:/app`) are paths on that Mac. Pairings live in `hosts.json` in
+Graviton's support folder (readable only by you) and are shared with the Mac
+app, whose Host menu (⌥⌘0 for this Mac, ⌥⌘1… for the others) and sidebar
+switch which Mac the window shows; it can pair too.
+
+`grav service install|uninstall|status` runs the gravitond inside Graviton.app
+at login on any Mac, without the source.
 
 ## Releasing
 

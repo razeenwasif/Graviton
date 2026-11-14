@@ -378,6 +378,51 @@ public actor RemoteEngine: EngineService {
         return details
     }
 
+    /// Builds send the folder over a connection of their own: the log streams back.
+    public nonisolated func build(_ spec: BuildSpec) -> AsyncThrowingStream<BuildEvent, Error> {
+        let host = self.host, token = self.token
+        return AsyncThrowingStream { continuation in
+            let task = Task.detached {
+                var archive: URL?
+                defer { if let archive { try? FileManager.default.removeItem(at: archive) } }
+                do {
+                    var spec = spec
+                    let folder = URL(fileURLWithPath: spec.context)
+                    let (file, size) = try BuildUpload.pack(folder, dockerfile: spec.dockerfile)
+                    archive = file
+                    if spec.tag == nil { spec.tag = BuildSpec.defaultName(for: spec.context) }
+                    spec.upload = size
+                    continuation.yield(.log("Sending \(folder.lastPathComponent) to \(host.name) (\(Format.bytes(size)))…"))
+
+                    let c = try await LineConnection.open(host.endpoints, pin: host.fingerprint)
+                    defer { c.cancel() }
+                    guard case .authenticated = try await c.call(.auth(token: token)) else { throw EngineError.unexpectedResponse }
+                    try await c.send(Wire.line(.build(spec)))
+                    let source = try FileHandle(forReadingFrom: file)
+                    defer { try? source.close() }
+                    while let chunk = try source.read(upToCount: 1 << 20), !chunk.isEmpty {
+                        try Task.checkCancellation()
+                        try await c.send(chunk)
+                    }
+                    while true {
+                        switch try Wire.decoder.decode(EngineResponse.self, from: try await c.readLine()) {
+                        case let .buildLog(line): continuation.yield(.log(line))
+                        case let .image(image):
+                            continuation.yield(.built(image))
+                            continuation.finish()
+                            return
+                        case let .error(message): throw EngineError.daemon(message)
+                        default: throw EngineError.unexpectedResponse
+                        }
+                    }
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     /// Terminals get a connection of their own, so they don't hold up other requests.
     public func openTerminal(_ spec: ExecSpec) async throws -> any TerminalSession {
         try await RemoteTerminal.open(host: host, token: token, spec: spec)
