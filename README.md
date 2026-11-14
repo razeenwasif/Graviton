@@ -31,13 +31,14 @@ apps/
   project.yml      XcodeGen spec → Graviton.xcodeproj (generated, not committed)
   GravitonKit/     Shared Swift package: models, socket client, demo engine, theme, components
   Shared/          Swift shared by both apps: shell sessions drawn by SwiftTerm
-  Mac/             macOS app (Containers, Run sheet, Logs, Terminal, Stats, Files, Inspect, Images + Pull sheet)
+  Mac/             macOS app (Containers, Run sheet, Logs, Terminal, Stats, Files, Inspect, Images + Pull sheet, menu bar item)
   iOS/             iOS companion (Containers, Detail, Logs, Shell, Hosts)
 scripts/
   build-guest.sh   Guest kernel (Alpine linux-virt) + initramfs with the agent as /init
   dev-gravitond.sh Build gravitond, sign it with the virtualization entitlement, run it
 design/
   icon.svg, icon-macos.svg, make-icons.sh   App icon source → asset catalogs
+  menubar.svg      Menu bar glyph (template image; drawn natively by Mac/MenuBarGlyph.swift)
 ```
 
 The UI follows the mockups on the Graviton design canvas (dark, minimal, one

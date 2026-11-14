@@ -3,10 +3,12 @@ import SwiftUI
 
 struct ContainerRoute: Hashable {
     var id: String
+    var tab: DetailTab = .logs
 }
 
 struct ContainersScreen: View {
     @Environment(EngineStore.self) private var store
+    @Environment(AppRouter.self) private var router
     @State private var filter: ContainerFilter = .all
     @State private var search = ""
     @State private var selection: Container.ID?
@@ -64,7 +66,21 @@ struct ContainersScreen: View {
                 }
             }
             .navigationDestination(for: ContainerRoute.self) { route in
-                ContainerDetailScreen(containerID: route.id)
+                ContainerDetailScreen(containerID: route.id, initialTab: route.tab)
+            }
+            .onChange(of: router.pending, initial: true) { _, request in
+                switch request {
+                case .runContainer:
+                    path = []
+                    showRun = true
+                case let .container(id, tab):
+                    filter = .all
+                    selection = id
+                    path = [ContainerRoute(id: id, tab: tab)]
+                case .images, nil:
+                    return
+                }
+                router.pending = nil
             }
             .animation(.snappy(duration: 0.2), value: selection)
             .onAppear {

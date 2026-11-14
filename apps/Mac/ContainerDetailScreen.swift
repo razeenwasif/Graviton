@@ -10,7 +10,12 @@ enum DetailTab: String, CaseIterable, Identifiable {
 struct ContainerDetailScreen: View {
     @Environment(EngineStore.self) private var store
     var containerID: String
-    @State private var tab: DetailTab = .logs
+    @State private var tab: DetailTab
+
+    init(containerID: String, initialTab: DetailTab = .logs) {
+        self.containerID = containerID
+        _tab = State(initialValue: initialTab)
+    }
 
     var body: some View {
         if let c = store.container(containerID) {

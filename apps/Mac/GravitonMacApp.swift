@@ -3,18 +3,27 @@ import SwiftUI
 
 @main
 struct GravitonMacApp: App {
-    @State private var store = EngineStore(useDaemon: true)
+    @State private var store: EngineStore
     @State private var shells = ShellSessions()
+    @State private var router = AppRouter()
+    @AppStorage("showsMenuBarExtra") private var showsMenuBarExtra = true
+
+    init() {
+        let store = EngineStore(useDaemon: true)
+        _store = State(initialValue: store)
+        // Poll for the app's whole life, not just while a window is open: the menu bar item shows it too.
+        Task { await store.run() }
+    }
 
     var body: some Scene {
-        WindowGroup("Graviton") {
+        WindowGroup("Graviton", id: "main") {
             RootView()
                 .environment(store)
                 .environment(shells)
+                .environment(router)
                 .preferredColorScheme(.dark)
                 .tint(G.accent)
                 .frame(minWidth: 980, minHeight: 620)
-                .task { await store.run() }
         }
         .defaultSize(width: 1440, height: 900)
         .windowToolbarStyle(.unified(showsTitle: true))
@@ -22,8 +31,19 @@ struct GravitonMacApp: App {
             CommandGroup(after: .toolbar) {
                 Button("Refresh") { Task { await store.refresh() } }
                     .keyboardShortcut("r")
+                Toggle("Show in Menu Bar", isOn: $showsMenuBarExtra)
             }
         }
+
+        MenuBarExtra(isInserted: $showsMenuBarExtra) {
+            MenuBarPanel()
+                .environment(store)
+                .environment(router)
+        } label: {
+            MenuBarLabel()
+                .environment(store)
+        }
+        .menuBarExtraStyle(.window)
     }
 }
 
@@ -43,6 +63,7 @@ enum Section: String, Hashable, CaseIterable, Identifiable {
 
 struct RootView: View {
     @Environment(EngineStore.self) private var store
+    @Environment(AppRouter.self) private var router
     @State private var section: Section? = .containers
 
     var body: some View {
@@ -63,6 +84,17 @@ struct RootView: View {
                 }
             }
             .background(G.background)
+        }
+        .onChange(of: router.pending, initial: true) { _, request in
+            switch request {
+            case .images:
+                section = .images
+                router.pending = nil
+            case .runContainer, .container:
+                section = .containers // ContainersScreen handles the rest.
+            case nil:
+                break
+            }
         }
         .alert("Something went wrong", isPresented: Binding(
             get: { store.lastError != nil },

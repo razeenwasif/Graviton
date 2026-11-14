@@ -1,0 +1,32 @@
+<!-- Menu bar glyph (template image), 18 × 18 pt. Reference for apps/Mac/MenuBarGlyph.swift,
+     which draws the same geometry natively. Black + alpha only: macOS tints template images.
+     The "offline" variant (no engine) draws the cube as an outline instead of shaded faces. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18" width="18" height="18">
+  <defs>
+    <!-- Front half of the tilted orbit (below its axis). -->
+    <clipPath id="front"><rect x="-20" y="0" width="40" height="20" transform="translate(9 10.4) rotate(-18)"/></clipPath>
+    <!-- Back half, minus the cube that hides it. -->
+    <clipPath id="back"><path clip-rule="evenodd" d="M0 0H18V18H0Z M9 2.4L14.1 5.35V11.3L9 14.25L3.9 11.3V5.35Z" transform=""/></clipPath>
+    <mask id="gaps" maskUnits="userSpaceOnUse" x="0" y="0" width="18" height="18">
+      <rect width="18" height="18" fill="#fff"/>
+      <g clip-path="url(#front)"><ellipse cx="0" cy="0" rx="8.1" ry="2.75" transform="translate(9 10.4) rotate(-18)" fill="none" stroke="#000" stroke-width="2.35"/></g>
+      <circle cx="2.76" cy="13.87" r="2.45" fill="#000"/>
+    </mask>
+    <mask id="particleGap" maskUnits="userSpaceOnUse" x="0" y="0" width="18" height="18">
+      <rect width="18" height="18" fill="#fff"/>
+      <circle cx="2.76" cy="13.87" r="2.45" fill="#000"/>
+    </mask>
+  </defs>
+  <g mask="url(#gaps)">
+    <g clip-path="url(#back)">
+      <ellipse rx="8.1" ry="2.75" transform="translate(9 10.4) rotate(-18)" fill="none" stroke="#000" stroke-opacity="0.55" stroke-width="1.125"/>
+    </g>
+    <polygon points="9,2.4 14.1,5.35 9,8.3 3.9,5.35" fill="#000"/>
+    <polygon points="3.9,5.35 9,8.3 9,14.25 3.9,11.3" fill="#000" fill-opacity="0.62"/>
+    <polygon points="9,8.3 14.1,5.35 14.1,11.3 9,14.25" fill="#000" fill-opacity="0.34"/>
+  </g>
+  <g clip-path="url(#front)" mask="url(#particleGap)">
+    <ellipse rx="8.1" ry="2.75" transform="translate(9 10.4) rotate(-18)" fill="none" stroke="#000" stroke-width="1.25"/>
+  </g>
+  <circle cx="2.76" cy="13.87" r="1.55" fill="#000"/>
+</svg>
