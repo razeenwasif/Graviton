@@ -45,6 +45,8 @@ public protocol EngineService: Sendable {
     func inspect(id: String) async throws -> ContainerDetails
     /// Start a program on a terminal in a running container.
     func openTerminal(_ spec: ExecSpec) async throws -> any TerminalSession
+    /// Recent events after `since` (oldest first), at most `limit`.
+    func events(since: UInt64?, limit: Int?) async throws -> [EngineEvent]
 }
 
 // MARK: - Socket engine
@@ -120,6 +122,11 @@ public final class SocketEngine: EngineService {
     public func inspect(id: String) async throws -> ContainerDetails {
         guard case let .details(details) = try await call(.inspect(id: id)) else { throw EngineError.unexpectedResponse }
         return details
+    }
+
+    public func events(since: UInt64?, limit: Int?) async throws -> [EngineEvent] {
+        guard case let .events(list) = try await call(.events(since: since, limit: limit)) else { throw EngineError.unexpectedResponse }
+        return list
     }
 
     public func openTerminal(_ spec: ExecSpec) async throws -> any TerminalSession {

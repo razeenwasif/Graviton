@@ -73,6 +73,15 @@ struct ContainerDetailView: View {
                     }
 
                     VStack(spacing: 0) {
+                        DetailLink(title: "Stats", symbol: "chart.xyaxis.line", detail: "CPU, memory, network, processes") { MobileStatsView(container: c) }
+                        Divider().overlay(G.border)
+                        DetailLink(title: "Files", symbol: "folder", detail: c.isRunning ? "Browse and preview" : "Start it to browse", enabled: c.isRunning) { MobileFilesView(container: c) }
+                        Divider().overlay(G.border)
+                        DetailLink(title: "Inspect", symbol: "info.circle", detail: "Command, image, VM, environment") { MobileInspectView(container: c) }
+                    }
+                    .background(G.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+
+                    VStack(spacing: 0) {
                         InfoRow(label: "Port", value: c.ports.first?.label ?? "—")
                         Divider().overlay(G.border)
                         InfoRow(label: "IP address", value: c.ipAddress ?? "—")
@@ -139,5 +148,34 @@ struct InfoRow: View {
         .font(.system(size: 14))
         .padding(.horizontal, 16)
         .frame(minHeight: 48)
+    }
+}
+
+/// A row that opens one of the container's screens.
+struct DetailLink<Destination: View>: View {
+    var title: String
+    var symbol: String
+    var detail: String
+    var enabled = true
+    @ViewBuilder var destination: () -> Destination
+
+    var body: some View {
+        NavigationLink(destination: destination) {
+            HStack(spacing: 12) {
+                Image(systemName: symbol).foregroundStyle(G.accent).frame(width: 24)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.system(size: 15, weight: .medium)).foregroundStyle(G.text)
+                    Text(detail).font(.system(size: 12)).foregroundStyle(G.muted)
+                }
+                Spacer()
+                Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Color(hex: 0x5F6672))
+            }
+            .padding(.horizontal, 16)
+            .frame(minHeight: 56)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.45)
     }
 }

@@ -141,6 +141,19 @@ pub struct RunSpec {
     pub volumes: Vec<String>,
 }
 
+/// Push alert set-up on this Mac.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushInfo {
+    pub configured: bool,
+    pub key_id: Option<String>,
+    pub team_id: Option<String>,
+    /// Paired devices that registered for alerts.
+    pub devices: u32,
+    /// What the last send did (for `grav push test`).
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
 /// What `grav pair` shows: everything a phone needs to pair with this Mac.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingInfo {
@@ -163,6 +176,45 @@ pub struct PairedDevice {
     /// Unix seconds.
     pub paired_at: u64,
     pub last_seen: Option<u64>,
+}
+
+/// Something that happened on the engine, for the Activity feed and alerts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineEvent {
+    /// Increases by one per event; ask for events after the last one you saw.
+    pub seq: u64,
+    /// Unix milliseconds.
+    pub timestamp_ms: u64,
+    pub kind: EventKind,
+    #[serde(default)]
+    pub container_id: Option<String>,
+    #[serde(default)]
+    pub container: Option<String>,
+    #[serde(default)]
+    pub image: Option<String>,
+    /// One line for people: "web exited with code 1".
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    Started,
+    /// Exited on its own with code 0, or stopped on request.
+    Stopped,
+    /// Exited on its own with a non-zero code, or couldn't start.
+    Failed,
+    Pulled,
+    Built,
+    BuildFailed,
+    Removed,
+}
+
+impl EventKind {
+    /// Worth interrupting someone for (a push alert).
+    pub fn is_alert(self) -> bool {
+        matches!(self, EventKind::Failed | EventKind::Built | EventKind::BuildFailed)
+    }
 }
 
 /// What `grav build` asks for.
@@ -361,6 +413,22 @@ pub enum Request {
     ReadFile { id: String, path: String },
     /// How a container is configured.
     Inspect { id: String },
+    /// Recent events, oldest first: those after `since` (a `seq`), at most `limit`.
+    Events {
+        #[serde(default)]
+        since: Option<u64>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Local only: store the APNs key (a .p8's text) in the login Keychain,
+    /// so failures and finished builds reach paired phones as push alerts.
+    PushSetup { key_id: String, team_id: String, p8: String },
+    /// Local only: whether push alerts are set up, and to how many phones.
+    PushStatus,
+    /// Local only: send a test alert to every registered phone.
+    PushTest,
+    /// Remote only: this device's APNs token (hex); `sandbox` for debug builds.
+    RegisterPush { token: String, sandbox: bool },
     /// Local only: create a one-time pairing code for a phone.
     PairBegin,
     /// Local only: devices paired with this Mac.
@@ -393,6 +461,8 @@ pub enum Response {
     Files(DirectoryListing),
     File(FileContents),
     Details(Box<ContainerDetails>),
+    Events(Vec<EngineEvent>),
+    Push(PushInfo),
     Pairing(PairingInfo),
     Devices(Vec<PairedDevice>),
     Revoked { id: String },

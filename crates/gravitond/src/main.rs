@@ -7,6 +7,8 @@
 
 mod boot_check;
 mod build;
+mod events;
+mod push;
 mod remote;
 mod runtime;
 mod switch;
@@ -99,6 +101,13 @@ async fn serve_forever(args: Args) -> Result<()> {
 
     let remote = if args.remote {
         let remote = remote::Remote::open(args.remote_port)?;
+        // Push alerts for failures and builds, to phones that registered for them.
+        let push = push::Push::new(Arc::clone(&remote), tokio::runtime::Handle::current());
+        if let Backend::Engine(engine) = &backend {
+            let p = Arc::clone(&push);
+            engine.events.subscribe(move |event| p.notify(event));
+        }
+        let _ = remote.push.set(push);
         let serving = Arc::clone(&remote);
         let for_remote = backend.clone();
         tokio::spawn(async move {
@@ -168,6 +177,32 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
         };
         // Pairing is managed from the Mac itself.
         let local = match &request {
+            Request::PushSetup { .. } | Request::PushStatus | Request::PushTest => Some(match remote.as_ref().and_then(|r| r.push.get()) {
+                None => Response::Error { message: "push alerts need gravitond --remote (phones pair through it)".into() },
+                Some(push) => match &request {
+                    Request::PushSetup { key_id, team_id, p8 } => result(push.setup(key_id, team_id, p8).map(Response::Push)),
+                    Request::PushStatus => Response::Push(push.info()),
+                    Request::PushTest => {
+                        let results = push.send_all("Graviton", "Push alerts from this Mac are working.", None).await;
+                        let mut info = push.info();
+                        info.note = Some(if results.is_empty() {
+                            "no phone has registered for alerts yet: open Graviton on it and allow notifications".into()
+                        } else {
+                            results
+                                .iter()
+                                .map(|(device, r)| match r {
+                                    Ok(()) => format!("{device}: sent"),
+                                    Err(e) => format!("{device}: {e:#}"),
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        });
+                        Response::Push(info)
+                    }
+                    _ => unreachable!(),
+                },
+            }),
+            Request::RegisterPush { .. } => Some(Response::Error { message: "phones register for alerts over the remote endpoint".into() }),
             Request::PairBegin | Request::ListDevices | Request::RevokeDevice { .. } => Some(match &remote {
                 None => Response::Error { message: "remote access is off; start gravitond with --remote to pair a phone".into() },
                 Some(r) => match &request {
@@ -238,6 +273,18 @@ pub(crate) async fn build_stream(
             eprintln!("build: {line}");
             let _ = lines.send(Response::BuildLog { line });
         });
+        let tag = spec.tag.clone().unwrap_or_else(|| "image".into());
+        match &result {
+            Ok(image) => {
+                let name = format!("{}:{}", image.repository, image.tag);
+                engine.events.record(graviton_proto::EventKind::Built, None, Some(&name), format!("Built {name}"));
+            }
+            Err(err) => {
+                let why = format!("{err:#}");
+                let short = why.lines().next().unwrap_or("").chars().take(160).collect::<String>();
+                engine.events.record(graviton_proto::EventKind::BuildFailed, None, Some(&tag), format!("Build of {tag} failed: {short}"));
+            }
+        }
         let _ = tx.send(match result {
             Ok(image) => Response::Image(image),
             Err(err) => Response::Error { message: format!("{err:#}") },
@@ -337,9 +384,11 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                     Request::ListFiles { id, path } => Response::Files(engine.list_files(&id, &path)?),
                     Request::ReadFile { id, path } => Response::File(engine.read_file(&id, &path)?),
                     Request::Inspect { id } => Response::Details(Box::new(engine.inspect(&id)?)),
+                    Request::Events { since, limit } => Response::Events(engine.events.since(since, limit)),
                     Request::Exec(_) => unreachable!("exec is handled by serve()"),
                     Request::Build(_) => Response::Error { message: "builds run on the Mac itself: use grav build there".into() },
-                    Request::PairBegin | Request::ListDevices | Request::RevokeDevice { .. } | Request::Pair { .. } | Request::Auth { .. } => {
+                    Request::PairBegin | Request::ListDevices | Request::RevokeDevice { .. } | Request::Pair { .. } | Request::Auth { .. }
+                    | Request::PushSetup { .. } | Request::PushStatus | Request::PushTest | Request::RegisterPush { .. } => {
                         Response::Error { message: "not available here".into() }
                     }
                     _ => unreachable!("reads are answered above"),

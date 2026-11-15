@@ -38,6 +38,19 @@ struct Device {
     token_sha256: String,
     paired_at: u64,
     last_seen: Option<u64>,
+    /// Its APNs device token (hex), once it has registered for alerts.
+    #[serde(default)]
+    push_token: Option<String>,
+    /// Registered from a debug build: alerts go through APNs's sandbox.
+    #[serde(default)]
+    push_sandbox: bool,
+}
+
+/// Where to send a device's push alerts.
+pub struct PushTarget {
+    pub name: String,
+    pub token: String,
+    pub sandbox: bool,
 }
 
 struct PendingCode {
@@ -53,6 +66,8 @@ struct State {
 }
 
 pub struct Remote {
+    /// Push alerts, set once at start-up.
+    pub push: std::sync::OnceLock<Arc<crate::push::Push>>,
     state: Mutex<State>,
     devices_path: PathBuf,
     acceptor: tokio_rustls::TlsAcceptor,
@@ -87,6 +102,7 @@ impl Remote {
         };
         let host = computer_name();
         Ok(Arc::new(Self {
+            push: std::sync::OnceLock::new(),
             state: Mutex::new(State { devices, ..Default::default() }),
             devices_path,
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
@@ -164,6 +180,8 @@ impl Remote {
             token_sha256: sha256_hex(token.as_bytes()),
             paired_at: now_secs(),
             last_seen: Some(now_secs()),
+            push_token: None,
+            push_sandbox: false,
         };
         let device_id = entry.id.clone();
         state.devices.push(entry);
@@ -172,22 +190,64 @@ impl Remote {
         Ok(Response::Paired { token, device_id, host: self.host.clone() })
     }
 
-    fn authenticate(&self, token: &str) -> bool {
+    /// The device a token belongs to.
+    fn authenticate(&self, token: &str) -> Option<String> {
         let hash = sha256_hex(token.as_bytes());
         let mut state = self.state.lock().unwrap();
-        let mut found = false;
+        let mut found = None;
         for d in state.devices.iter_mut() {
             if constant_time_eq(d.token_sha256.as_bytes(), hash.as_bytes()) {
                 d.last_seen = Some(now_secs());
-                found = true;
+                found = Some(d.id.clone());
             }
         }
-        if found {
+        if found.is_some() {
             let devices = state.devices.clone();
             drop(state);
             self.save(&devices);
         }
         found
+    }
+
+    /// Remember where to send a device's alerts.
+    pub fn register_push(&self, device_id: &str, token: &str, sandbox: bool) -> Result<()> {
+        let token = token.trim().to_ascii_lowercase();
+        if !(32..=200).contains(&token.len()) || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+            anyhow::bail!("that isn't an APNs device token");
+        }
+        let mut state = self.state.lock().unwrap();
+        let device = state.devices.iter_mut().find(|d| d.id == device_id).ok_or_else(|| anyhow::anyhow!("unknown device"))?;
+        device.push_token = Some(token);
+        device.push_sandbox = sandbox;
+        let devices = state.devices.clone();
+        drop(state);
+        self.save(&devices);
+        Ok(())
+    }
+
+    /// APNs said this token is no longer valid (the app was removed).
+    pub fn forget_push(&self, token: &str) {
+        let mut state = self.state.lock().unwrap();
+        for d in state.devices.iter_mut().filter(|d| d.push_token.as_deref() == Some(token)) {
+            d.push_token = None;
+        }
+        let devices = state.devices.clone();
+        drop(state);
+        self.save(&devices);
+    }
+
+    pub fn push_targets(&self) -> Vec<PushTarget> {
+        self.state
+            .lock()
+            .unwrap()
+            .devices
+            .iter()
+            .filter_map(|d| d.push_token.clone().map(|token| PushTarget { name: d.name.clone(), token, sandbox: d.push_sandbox }))
+            .collect()
+    }
+
+    pub fn host_name(&self) -> &str {
+        &self.host
     }
 
     fn save(&self, devices: &[Device]) {
@@ -228,10 +288,24 @@ impl Remote {
         let Some(first) = tokio::time::timeout(Duration::from_secs(15), lines.next_line()).await.context("no hello")?? else {
             return Ok(());
         };
+        let mut device_id: Option<String> = None;
         let reply = match decode_line::<Request>(first.as_bytes()) {
-            Ok(Request::Pair { code, device }) => self.pair(&code, &device).unwrap_or_else(|e| Response::Error { message: e.to_string() }),
-            Ok(Request::Auth { token }) if self.authenticate(&token) => Response::Authenticated { host: self.host.clone() },
-            Ok(Request::Auth { .. }) => Response::Error { message: "this device isn't paired with this Mac any more".into() },
+            Ok(Request::Pair { code, device }) => match self.pair(&code, &device) {
+                Ok(reply) => {
+                    if let Response::Paired { device_id: id, .. } = &reply {
+                        device_id = Some(id.clone());
+                    }
+                    reply
+                }
+                Err(e) => Response::Error { message: e.to_string() },
+            },
+            Ok(Request::Auth { token }) => match self.authenticate(&token) {
+                Some(id) => {
+                    device_id = Some(id);
+                    Response::Authenticated { host: self.host.clone() }
+                }
+                None => Response::Error { message: "this device isn't paired with this Mac any more".into() },
+            },
             _ => Response::Error { message: "pair or authenticate first".into() },
         };
         let ok = matches!(reply, Response::Paired { .. } | Response::Authenticated { .. });
@@ -252,7 +326,19 @@ impl Remote {
                 }
             };
             match (&request, &backend) {
-                (Request::PairBegin | Request::ListDevices | Request::RevokeDevice { .. } | Request::Pair { .. } | Request::Auth { .. }, _) => {
+                (Request::RegisterPush { token, sandbox }, _) => {
+                    let reply = match device_id.as_deref().map(|id| self.register_push(id, token, *sandbox)) {
+                        Some(Ok(())) => match self.push.get() {
+                            Some(push) => Response::Push(push.info()),
+                            None => Response::Error { message: "push alerts aren't available on this Mac".into() },
+                        },
+                        Some(Err(e)) => Response::Error { message: e.to_string() },
+                        None => Response::Error { message: "authenticate first".into() },
+                    };
+                    write.write_all(&encode_line(&reply)).await?;
+                }
+                (Request::PairBegin | Request::ListDevices | Request::RevokeDevice { .. } | Request::Pair { .. } | Request::Auth { .. }
+                | Request::PushSetup { .. } | Request::PushStatus | Request::PushTest, _) => {
                     write.write_all(&encode_line(&Response::Error { message: "only available on the Mac itself".into() })).await?;
                 }
                 (Request::Build(spec), crate::Backend::Engine(engine)) => {

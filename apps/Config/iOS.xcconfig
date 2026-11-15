@@ -1,0 +1,7 @@
+// The iPhone app signs automatically with your team, so it can install on
+// your devices. The team ID comes from Signing.local.xcconfig (ignored by git).
+
+#include? "Signing.local.xcconfig"
+
+DEVELOPMENT_TEAM = $(GRAVITON_TEAM_ID)
+CODE_SIGN_STYLE = Automatic

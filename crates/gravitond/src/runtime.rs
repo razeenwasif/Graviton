@@ -17,7 +17,7 @@
 //! Containers, their run settings and their logs are saved under
 //! `~/Library/Application Support/Graviton`, so they survive a restart.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{BuildHasher, RandomState};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -106,6 +106,10 @@ pub struct Engine {
     running: Mutex<HashMap<String, Running>>,
     stats: Mutex<HashMap<String, StatsHistory>>,
     switch: crate::switch::Switch,
+    /// What happened, for the Activity feed and push alerts.
+    pub events: Arc<crate::events::EventLog>,
+    /// Containers being stopped on request (so their exit isn't a failure).
+    stopping: Mutex<HashSet<String>>,
     rt: tokio::runtime::Handle,
     state_path: PathBuf,
 }
@@ -124,6 +128,8 @@ impl Engine {
             running: Mutex::new(HashMap::new()),
             stats: Mutex::new(HashMap::new()),
             switch: crate::switch::Switch::new(),
+            events: Arc::new(crate::events::EventLog::open(paths::support_dir().join("events.jsonl"))),
+            stopping: Mutex::new(HashSet::new()),
             rt: tokio::runtime::Handle::current(),
             state_path: paths::support_dir().join("containers.json"),
         });
@@ -219,7 +225,10 @@ impl Engine {
         eprintln!("  done in {:.1} s", t0.elapsed().as_secs_f64());
         self.index.lock().unwrap().insert(image.clone())?;
         self.refresh_images();
-        Ok(image.summary(self.used_by(&image.reference)))
+        let summary = image.summary(self.used_by(&image.reference));
+        let name = format!("{}:{}", summary.repository, summary.tag);
+        self.events.record(graviton_proto::EventKind::Pulled, None, Some(&name), format!("Pulled {name} ({:.1} MB)", summary.size_bytes as f64 / 1048576.0));
+        Ok(summary)
     }
 
     pub(crate) fn image_for(&self, reference: &str) -> Result<LocalImage> {
@@ -321,6 +330,7 @@ impl Engine {
             let r = running.get(&id).ok_or_else(|| anyhow!("container {key} isn't running"))?;
             (Arc::clone(&r.agent), r.pid, Arc::clone(&r.vm))
         };
+        self.stopping.lock().unwrap().insert(id.clone());
         if let Some(pid) = pid {
             let _ = agent.lock().unwrap().write_all(&encode_line(&AgentRequest::Signal { pid, signal: 15 }));
         }
@@ -349,6 +359,7 @@ impl Engine {
 
     pub fn remove(&self, key: &str) -> Result<String> {
         let removed = self.store.lock().unwrap().remove(key)?;
+        self.events.record(graviton_proto::EventKind::Removed, Some((&removed.id, &removed.name)), Some(&removed.image), format!("{} removed", removed.name));
         self.specs.lock().unwrap().remove(&removed.id);
         self.stats.lock().unwrap().remove(&removed.id);
         let _ = fs::remove_dir_all(paths::vms_dir().join(&removed.id));
@@ -401,6 +412,7 @@ impl Engine {
 
     fn supervise(self: &Arc<Self>, id: &str, listeners: Vec<(TcpListener, u16)>) {
         let result = self.run_in_vm(id, listeners);
+        let failure = result.as_ref().err().map(|e| format!("{e:#}"));
         let code = match result {
             Ok(code) => code,
             Err(err) => {
@@ -408,6 +420,7 @@ impl Engine {
                 125
             }
         };
+        let requested = self.stopping.lock().unwrap().remove(id);
         if let Some(r) = self.running.lock().unwrap().remove(id) {
             for f in &r.forwards {
                 f.abort();
@@ -426,6 +439,14 @@ impl Engine {
             c.memory_bytes = None;
         });
         self.save();
+        let (name, image) = self.store.lock().unwrap().container(id).map(|c| (c.name.clone(), c.image.clone())).unwrap_or_default();
+        let (kind, message) = match (&failure, requested, code) {
+            (Some(why), _, _) => (graviton_proto::EventKind::Failed, format!("{name} couldn't start: {why}")),
+            (None, true, _) => (graviton_proto::EventKind::Stopped, format!("{name} stopped")),
+            (None, false, 0) => (graviton_proto::EventKind::Stopped, format!("{name} exited")),
+            (None, false, code) => (graviton_proto::EventKind::Failed, format!("{name} exited with code {code}")),
+        };
+        self.events.record(kind, Some((id, &name)), Some(&image), message);
     }
 
     fn run_in_vm(self: &Arc<Self>, id: &str, listeners: Vec<(TcpListener, u16)>) -> Result<i32> {
@@ -540,6 +561,8 @@ impl Engine {
                     });
                     self.save();
                     self.start_monitor(id, Arc::clone(&vm));
+                    let (cname, image) = self.store.lock().unwrap().container(id).map(|c| (c.name.clone(), c.image.clone())).unwrap_or_default();
+                    self.events.record(graviton_proto::EventKind::Started, Some((id, &cname)), Some(&image), format!("{cname} started"));
                 }
                 AgentEvent::Stdout { data, .. } => {
                     for line in out.push(&data) {

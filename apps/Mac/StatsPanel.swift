@@ -6,8 +6,8 @@ import SwiftUI
 /// card surface (dark band, CVD ΔE 26.6): blue for the single-series charts
 /// and received traffic, amber for sent.
 private enum Series {
-    static let primary = Color(hex: 0x6E7EF2)
-    static let secondary = Color(hex: 0xB98142)
+    static let primary = G.chartPrimary
+    static let secondary = G.chartSecondary
 }
 
 /// The Stats tab: live CPU, memory and network charts and the process list.
@@ -237,24 +237,6 @@ private struct MemoryChart: View {
         .statsAxes { Format.bytes(UInt64(max(0, $0))) }
         .chartXSelection(value: $hover)
         .accessibilityLabel("Memory use over the last five minutes")
-    }
-}
-
-/// Bytes per second between consecutive samples.
-struct NetworkRate: Identifiable {
-    var date: Date
-    var received: Double
-    var sent: Double
-    var id: Date { date }
-
-    static func series(_ samples: [StatSample]) -> [NetworkRate] {
-        zip(samples, samples.dropFirst()).compactMap { a, b in
-            let secs = Double(b.timestampMs - a.timestampMs) / 1000
-            guard secs > 0 else { return nil }
-            return NetworkRate(date: b.date,
-                               received: Double(b.netRxBytes.subtractingReportingOverflow(a.netRxBytes).partialValue) / secs,
-                               sent: Double(b.netTxBytes.subtractingReportingOverflow(a.netTxBytes).partialValue) / secs)
-        }
     }
 }
 

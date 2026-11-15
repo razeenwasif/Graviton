@@ -250,6 +250,23 @@ public actor DemoEngine: EngineService {
         return DemoTerminal(container: c.name)
     }
 
+    public func events(since: UInt64?, limit: Int?) -> [EngineEvent] {
+        let now = UInt64(Date.now.timeIntervalSince1970 * 1000)
+        let min: UInt64 = 60_000
+        let all = [
+            EngineEvent(seq: 1, timestampMs: now - 260 * min, kind: .pulled, image: "postgres:17-alpine", message: "Pulled postgres:17-alpine (274 MB)"),
+            EngineEvent(seq: 2, timestampMs: now - 240 * min, kind: .started, containerId: "5d10e7b3c4aa", container: "postgres", image: "postgres:17-alpine", message: "postgres started"),
+            EngineEvent(seq: 3, timestampMs: now - 192 * min, kind: .built, image: "storefront/api:0.4.2", message: "Built storefront/api:0.4.2"),
+            EngineEvent(seq: 4, timestampMs: now - 190 * min, kind: .started, containerId: "a3f9c2e81b07", container: "api-gateway", image: "storefront/api:0.4.2", message: "api-gateway started"),
+            EngineEvent(seq: 5, timestampMs: now - 95 * min, kind: .failed, containerId: "1f2e3d4c5b6a", container: "minio", image: "minio/minio:latest", message: "minio exited with code 137"),
+            EngineEvent(seq: 6, timestampMs: now - 52 * min, kind: .stopped, containerId: "e4c5d6f7a8b9", container: "worker", image: "storefront/worker:0.4.2", message: "worker exited"),
+            EngineEvent(seq: 7, timestampMs: now - 41 * min, kind: .started, containerId: "c71a88e09f12", container: "web", image: "node:22-slim", message: "web started"),
+            EngineEvent(seq: 8, timestampMs: now - 12 * min, kind: .buildFailed, image: "storefront/web", message: "Build of storefront/web failed: Dockerfile line 7: RUN npm ci: the command returned 1"),
+        ]
+        let after = all.filter { since == nil || $0.seq > since! }
+        return Array(after.suffix(limit ?? after.count))
+    }
+
     private func resolve(_ key: String) throws -> Int {
         if let i = list.firstIndex(where: { $0.name == key || $0.id == key }) { return i }
         let hits = list.indices.filter { !key.isEmpty && list[$0].id.hasPrefix(key) }

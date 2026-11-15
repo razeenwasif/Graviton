@@ -22,6 +22,8 @@ public final class EngineStore {
     public private(set) var images: [ImageInfo] = []
     public private(set) var engine: EngineInfo?
     public private(set) var logs: [String: [LogLine]] = [:]
+    /// Recent events, newest last.
+    public private(set) var events: [EngineEvent] = []
     public private(set) var cpuHistory: [String: [Double]] = [:]
     public private(set) var memoryHistory: [String: [Double]] = [:]
     public var lastError: String?
@@ -65,6 +67,7 @@ public final class EngineStore {
         images = []
         self.engine = nil
         logs = [:]
+        events = []
         cpuHistory = [:]
         memoryHistory = [:]
         Task { await refresh() }
@@ -119,9 +122,19 @@ public final class EngineStore {
             images = try await imgs
             engine = try await info
             recordHistory()
+            await refreshEvents(from: service)
         } catch {
             lastError = error.localizedDescription
         }
+    }
+
+    /// Fetch events newer than the last one shown (the whole recent list the first time).
+    private func refreshEvents(from service: any EngineService) async {
+        guard let fresh = try? await service.events(since: events.last?.seq, limit: events.isEmpty ? 200 : nil) else { return }
+        // An engine that restarted with a fresh log starts again from 1.
+        if let first = fresh.first, let last = events.last, first.seq <= last.seq { events = [] }
+        events.append(contentsOf: fresh)
+        if events.count > 500 { events.removeFirst(events.count - 500) }
     }
 
     public func loadLogs(for id: String, tail: Int? = 500) async {

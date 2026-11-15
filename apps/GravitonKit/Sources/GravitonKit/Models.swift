@@ -166,6 +166,15 @@ public struct RunSpec: Codable, Hashable, Sendable {
     }
 }
 
+/// Push alert set-up on a Mac (`PushInfo` in `graviton-proto`).
+public struct PushInfo: Codable, Hashable, Sendable {
+    public var configured: Bool
+    public var keyId: String?
+    public var teamId: String?
+    public var devices: UInt32
+    public var note: String?
+}
+
 /// What `grav pair` shows (mirrors `PairingInfo` in `graviton-proto`).
 public struct PairingInfo: Codable, Hashable, Sendable {
     public var code: String
@@ -347,4 +356,66 @@ public struct BuildSpec: Codable, Hashable, Sendable {
 public enum BuildEvent: Sendable, Equatable {
     case log(String)
     case built(ImageInfo)
+}
+
+/// Bytes per second between consecutive stat samples.
+public struct NetworkRate: Identifiable, Sendable {
+    public var date: Date
+    public var received: Double
+    public var sent: Double
+    public var id: Date { date }
+
+    public static func series(_ samples: [StatSample]) -> [NetworkRate] {
+        zip(samples, samples.dropFirst()).compactMap { a, b in
+            let secs = Double(b.timestampMs - a.timestampMs) / 1000
+            guard secs > 0 else { return nil }
+            return NetworkRate(date: b.date,
+                               received: Double(b.netRxBytes.subtractingReportingOverflow(a.netRxBytes).partialValue) / secs,
+                               sent: Double(b.netTxBytes.subtractingReportingOverflow(a.netTxBytes).partialValue) / secs)
+        }
+    }
+}
+
+/// Something that happened on the engine (`EngineEvent` in `graviton-proto`).
+public struct EngineEvent: Codable, Identifiable, Hashable, Sendable {
+    public enum Kind: String, Codable, Sendable {
+        case started, stopped, failed, pulled, built, buildFailed = "build_failed", removed
+    }
+
+    public var seq: UInt64
+    public var timestampMs: UInt64
+    public var kind: Kind
+    public var containerId: String?
+    public var container: String?
+    public var image: String?
+    public var message: String
+
+    public var id: UInt64 { seq }
+    public var date: Date { Date(timeIntervalSince1970: Double(timestampMs) / 1000) }
+    public var isProblem: Bool { kind == .failed || kind == .buildFailed }
+
+    public init(seq: UInt64, timestampMs: UInt64, kind: Kind, containerId: String? = nil, container: String? = nil, image: String? = nil, message: String) {
+        self.seq = seq
+        self.timestampMs = timestampMs
+        self.kind = kind
+        self.containerId = containerId
+        self.container = container
+        self.image = image
+        self.message = message
+    }
+
+    enum CodingKeys: String, CodingKey { case seq, timestampMs, kind, containerId, container, image, message }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        seq = try c.decode(UInt64.self, forKey: .seq)
+        timestampMs = try c.decode(UInt64.self, forKey: .timestampMs)
+        // convertFromSnakeCase turns "build_failed" into "buildFailed"; accept both.
+        let raw = try c.decode(String.self, forKey: .kind)
+        kind = Kind(rawValue: raw) ?? (raw == "buildFailed" ? .buildFailed : .stopped)
+        containerId = try c.decodeIfPresent(String.self, forKey: .containerId)
+        container = try c.decodeIfPresent(String.self, forKey: .container)
+        image = try c.decodeIfPresent(String.self, forKey: .image)
+        message = try c.decode(String.self, forKey: .message)
+    }
 }

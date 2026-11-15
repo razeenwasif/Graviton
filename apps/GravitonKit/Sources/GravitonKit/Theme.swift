@@ -26,6 +26,11 @@ public enum G {
     public static let warning = Color(hex: 0xF5B547)
     public static let danger = Color(hex: 0xFF8A8A)
     public static let stopped = Color(hex: 0x5A606B)
+    /// Chart series, checked with the dataviz palette validator on the card
+    /// surface (dark band, colour-blind ΔE 26.6): one-series charts and
+    /// received traffic in blue, sent traffic in amber.
+    public static let chartPrimary = Color(hex: 0x6E7EF2)
+    public static let chartSecondary = Color(hex: 0xB98142)
 
     public static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
         .system(size: size, weight: weight, design: .monospaced)

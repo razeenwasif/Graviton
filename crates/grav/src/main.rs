@@ -141,6 +141,20 @@ enum Command {
     Cat { container: String, path: String },
     /// Show how a container is configured, as JSON.
     Inspect { container: String },
+    /// What happened recently: containers started, stopped and failed, pulls and builds.
+    Events {
+        /// How many (default 30).
+        #[arg(short = 'n', long, default_value_t = 30)]
+        tail: usize,
+        /// Keep watching for new ones.
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Push alerts to paired phones (failed containers, finished builds).
+    Push {
+        #[command(subcommand)]
+        action: PushAction,
+    },
     /// Pair a phone with this Mac (gravitond must run with --remote).
     Pair,
     /// Devices paired with this Mac.
@@ -188,6 +202,25 @@ enum HostsAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum PushAction {
+    /// Give gravitond the APNs key (.p8); it's kept in this Mac's login Keychain.
+    Setup {
+        /// The key's ten-character id (from its file name: AuthKey_<ID>.p8).
+        #[arg(long)]
+        key_id: String,
+        /// Your team id.
+        #[arg(long)]
+        team_id: String,
+        /// The .p8 file.
+        file: PathBuf,
+    },
+    /// Whether alerts are set up, and how many phones get them.
+    Status,
+    /// Send a test alert to every phone that registered.
+    Test,
+}
+
+#[derive(Subcommand, Debug)]
 enum ServiceAction {
     /// Start gravitond now and at every login.
     Install {
@@ -225,8 +258,8 @@ fn run(cli: Cli) -> Result<()> {
 
     let socket = cli.socket.clone().unwrap_or_else(paths::socket_path);
     let target = Target::resolve(cli.host.as_deref(), socket)?;
-    if target.is_remote() && matches!(cli.command, Command::Pair | Command::Devices { .. }) {
-        bail!("pairing is managed on the Mac itself: run `grav pair` there");
+    if target.is_remote() && matches!(cli.command, Command::Pair | Command::Devices { .. } | Command::Push { .. }) {
+        bail!("pairing and push alerts are managed on the Mac itself: run this there (or with --host local)");
     }
     let mut client = Client::connect(&target)?;
 
@@ -410,10 +443,61 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Events { tail, follow } => {
+            let mut last = None;
+            loop {
+                let limit = if last.is_none() { Some(tail) } else { None };
+                match client.call(&Request::Events { since: last, limit })? {
+                    Response::Events(list) => {
+                        for e in &list {
+                            let marker = match e.kind {
+                                graviton_proto::EventKind::Failed | graviton_proto::EventKind::BuildFailed => "✗",
+                                graviton_proto::EventKind::Started | graviton_proto::EventKind::Built | graviton_proto::EventKind::Pulled => "✓",
+                                _ => "·",
+                            };
+                            println!("{}  {marker} {}", clock(e.timestamp_ms), e.message);
+                        }
+                        if let Some(e) = list.last() {
+                            last = Some(e.seq);
+                        } else if last.is_none() {
+                            last = Some(0);
+                        }
+                    }
+                    other => return unexpected(other),
+                }
+                if !follow {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
         Command::Rm { container } => match client.call(&Request::Remove { id: container })? {
             Response::Removed { id } => println!("{id}"),
             other => unexpected(other)?,
         },
+        Command::Push { action } => {
+            let request = match action {
+                PushAction::Setup { key_id, team_id, file } => {
+                    let p8 = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+                    Request::PushSetup { key_id, team_id, p8 }
+                }
+                PushAction::Status => Request::PushStatus,
+                PushAction::Test => Request::PushTest,
+            };
+            match client.call(&request)? {
+                Response::Push(info) => {
+                    match (&info.key_id, &info.team_id) {
+                        (Some(k), Some(t)) => println!("Push alerts are on: key {k}, team {t}, kept in the login Keychain."),
+                        _ => println!("Push alerts aren't set up: grav push setup --key-id ID --team-id TEAM AuthKey_ID.p8"),
+                    }
+                    println!("{} phone{} registered for alerts.", info.devices, if info.devices == 1 { "" } else { "s" });
+                    if let Some(note) = info.note {
+                        println!("{note}");
+                    }
+                }
+                other => unexpected(other)?,
+            }
+        }
         Command::Pair => match client.call(&Request::PairBegin)? {
             Response::Pairing(p) => print_pairing(&p)?,
             other => unexpected(other)?,
@@ -877,9 +961,16 @@ fn uptime(secs: u64) -> String {
 }
 
 /// HH:MM:SS.mmm in UTC (good enough until we pull in a time crate).
+/// Unix milliseconds as local wall-clock time, `hh:mm:ss.mmm`.
 fn clock(ms: u64) -> String {
-    let secs = ms / 1000;
-    format!("{:02}:{:02}:{:02}.{:03}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60, ms % 1000)
+    let secs = (ms / 1000) as libc::time_t;
+    // SAFETY: localtime_r fills a tm we own from a time_t we own.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+        let s = ms / 1000;
+        return format!("{:02}:{:02}:{:02}.{:03}", (s / 3600) % 24, (s / 60) % 60, s % 60, ms % 1000);
+    }
+    format!("{:02}:{:02}:{:02}.{:03}", tm.tm_hour, tm.tm_min, tm.tm_sec, ms % 1000)
 }
 
 #[cfg(test)]
@@ -893,6 +984,7 @@ mod tests {
         assert_eq!(bytes(3 * 1024 * 1024 * 1024 + 100 * 1024 * 1024), "3.1 GB");
         assert_eq!(uptime(45), "45s");
         assert_eq!(uptime(11_520), "3h 12m");
-        assert_eq!(clock(3_723_004), "01:02:03.004");
+        // Local time: only the seconds and milliseconds are the same everywhere.
+        assert!(clock(3_723_004).ends_with(":03.004"));
     }
 }

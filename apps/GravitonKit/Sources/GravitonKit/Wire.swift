@@ -19,6 +19,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case listFiles(id: String, path: String)
     case readFile(id: String, path: String)
     case inspect(id: String)
+    case events(since: UInt64?, limit: Int?)
+    case registerPush(token: String, sandbox: Bool)
     case pairBegin
     case listDevices
     case revokeDevice(id: String)
@@ -32,6 +34,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     private struct PairParams: Encodable { let code: String; let device: String }
     private struct AuthParams: Encodable { let token: String }
     private struct PathParams: Encodable { let id: String; let path: String }
+    private struct EventsParams: Encodable { let since: UInt64?; let limit: Int? }
+    private struct PushParams: Encodable { let token: String; let sandbox: Bool }
 
     public var method: String {
         switch self {
@@ -52,6 +56,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .listFiles: "list_files"
         case .readFile: "read_file"
         case .inspect: "inspect"
+        case .events: "events"
+        case .registerPush: "register_push"
         case .pairBegin: "pair_begin"
         case .listDevices: "list_devices"
         case .revokeDevice: "revoke_device"
@@ -73,6 +79,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
             try c.encode(IDParams(id: id), forKey: .params)
         case let .listFiles(id, path), let .readFile(id, path): try c.encode(PathParams(id: id, path: path), forKey: .params)
         case let .exec(spec): try c.encode(spec, forKey: .params)
+        case let .events(since, limit): try c.encode(EventsParams(since: since, limit: limit), forKey: .params)
+        case let .registerPush(token, sandbox): try c.encode(PushParams(token: token, sandbox: sandbox), forKey: .params)
         case let .pull(reference): try c.encode(PullParams(reference: reference), forKey: .params)
         case let .run(spec): try c.encode(spec, forKey: .params)
         case let .build(spec): try c.encode(spec, forKey: .params)
@@ -96,6 +104,8 @@ public enum EngineResponse: Decodable, Sendable {
     case files(DirectoryListing)
     case file(FileContents)
     case details(ContainerDetails)
+    case events([EngineEvent])
+    case push(PushInfo)
     case pairing(PairingInfo)
     case devices([PairedDevice])
     case revoked(id: String)
@@ -129,6 +139,8 @@ public enum EngineResponse: Decodable, Sendable {
         case "files": self = .files(try c.decode(DirectoryListing.self, forKey: .data))
         case "file": self = .file(try c.decode(FileContents.self, forKey: .data))
         case "details": self = .details(try c.decode(ContainerDetails.self, forKey: .data))
+        case "events": self = .events(try c.decode([EngineEvent].self, forKey: .data))
+        case "push": self = .push(try c.decode(PushInfo.self, forKey: .data))
         case "pairing": self = .pairing(try c.decode(PairingInfo.self, forKey: .data))
         case "devices": self = .devices(try c.decode([PairedDevice].self, forKey: .data))
         case "revoked": self = .revoked(id: try c.decode(Removed.self, forKey: .data).id)

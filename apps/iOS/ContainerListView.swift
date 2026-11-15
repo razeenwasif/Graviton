@@ -6,11 +6,13 @@ struct ContainerListView: View {
     var openHosts: () -> Void = {}
     @State private var filter: ContainerFilter = .all
     @State private var search = ""
+    @State private var running = false
+    @State private var path: [String] = []
 
     private var rows: [Container] { filter.apply(store.containers, search: search) }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     HostChip(openHosts: openHosts)
@@ -60,12 +62,15 @@ struct ContainerListView: View {
             .refreshable { await store.refresh() }
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
-                    Button {} label: { Image(systemName: "plus") }
-                        .disabled(true)
+                    Button { running = true } label: { Image(systemName: "plus") }
+                        .disabled(!store.canManage)
                         .accessibilityLabel("Run container")
                 }
             }
             .navigationDestination(for: String.self) { ContainerDetailView(containerID: $0) }
+            .sheet(isPresented: $running) {
+                MobileRunSheet { c in path = [c.id] }
+            }
         }
     }
 }

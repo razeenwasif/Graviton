@@ -13,8 +13,11 @@ SwiftUI apps for macOS and iOS.
 > network charts, processes, files and configuration, with a shell in a
 > Terminal tab. `grav build` (and Build… in the Mac app) builds images from
 > Dockerfiles, multi-stage included, with a layer cache. The iPhone app pairs
-> with a Mac over TLS to show and control its containers, and opens shells in
-> them too; `grav --host` and the Mac app's Host menu do the same between Macs.
+> with a Mac over TLS to show and control its containers: it runs containers
+> and pulls images, opens shells, shows Stats, Files and Inspect, keeps an
+> Activity feed of what happened on each Mac, and gets push alerts when a
+> container fails or a build finishes. `grav --host` and the Mac app's Host
+> menu do the same between Macs.
 
 ## Layout
 
@@ -32,7 +35,7 @@ apps/
   GravitonKit/     Shared Swift package: models, socket client, demo engine, theme, components
   Shared/          Swift shared by both apps: shell sessions drawn by SwiftTerm
   Mac/             macOS app (Containers, Run sheet, Logs, Terminal, Stats, Files, Inspect, Images + Pull sheet, menu bar item)
-  iOS/             iOS companion (Containers, Detail, Logs, Shell, Hosts)
+  iOS/             iOS companion (Containers, Detail, Logs, Shell, Stats, Files, Inspect, Run + Pull sheets, Activity, Hosts)
 scripts/
   build-guest.sh   Guest kernel (Alpine linux-virt) + initramfs with the agent as /init
   dev-gravitond.sh Build gravitond, sign it with the virtualization entitlement, run it
@@ -123,6 +126,40 @@ Tests:
 cargo test --workspace
 swift test --package-path apps/GravitonKit
 GRAVITON_LIVE=1 swift test --package-path apps/GravitonKit   # also drives a running gravitond
+```
+
+## The iPhone app
+
+Pair it with each Mac (see above), then: + on Containers runs a container,
+Images pulls one, and a container's page has Logs, Shell, Stats, Files and
+Inspect. Activity lists what each Mac's engine did (started, stopped, failed,
+pulled, built, removed), kept in `events.jsonl`, the last 500 events; `grav
+events [-n N] [-f]` shows the same feed in a terminal.
+
+Push alerts, for a container that fails and a build that finishes or fails,
+go through Apple's push service with your team's APNs key (a `.p8` from
+Certificates, Identifiers & Profiles > Keys). Set it up on each Mac, on that
+Mac itself:
+
+```bash
+grav --host local push setup --key-id KEYID --team-id TEAMID AuthKey_KEYID.p8
+grav --host local push status    # on or off, and how many phones are registered
+grav --host local push test      # one alert to every registered phone
+```
+
+gravitond checks the key and keeps it in the login Keychain (service
+`dev.graviton.apns`); only the two ids go in `push.json`. The phone registers
+for alerts with each Mac it's paired with once you allow notifications.
+
+To build the app for your own iPhone, put your team ID in
+`apps/Config/Signing.local.xcconfig` (as for releases); `apps/Config/iOS.xcconfig`
+signs automatically with it and the push entitlement:
+
+```bash
+cd apps && xcodegen generate
+xcodebuild -project Graviton.xcodeproj -scheme GravitonIOS -destination generic/platform=iOS \
+    -allowProvisioningUpdates -skipPackagePluginValidation build
+xcrun devicectl device install app --device DEVICE_ID path/to/Graviton.app
 ```
 
 ## Using another Mac
@@ -272,4 +309,6 @@ cargo run -p grav -- inspect web      # how it was configured, as JSON
    drawn by [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm), MIT);
    image builds with `grav build` and the Mac app's Build sheet (done);
    Developer ID signing and notarisation with `scripts/release.sh` (ready;
-   needs your certificate); app sandbox + XPC for the App Store.
+   needs your certificate); other Macs as hosts and a container network
+   (done); the iPhone's Run, Pull, Stats, Files, Inspect, Activity and push
+   alerts (done); app sandbox + XPC for the App Store.

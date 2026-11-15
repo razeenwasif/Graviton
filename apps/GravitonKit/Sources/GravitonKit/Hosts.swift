@@ -28,6 +28,12 @@ public final class HostStore {
     public var selected: RemoteHost? { hosts.first { $0.id == selectedID } }
 
     /// An engine for the selected Mac, or `nil` for demo data.
+    /// An engine for any paired Mac.
+    public func engine(for id: String) -> RemoteEngine? {
+        guard let host = hosts.first(where: { $0.id == id }), let token = Self.token(for: host.id) else { return nil }
+        return RemoteEngine(host: host, token: token)
+    }
+
     public func engineForSelection() -> RemoteEngine? {
         guard let host = selected, let token = Self.token(for: host.id) else { return nil }
         return RemoteEngine(host: host, token: token)

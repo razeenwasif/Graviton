@@ -60,6 +60,10 @@ targets:
     dependencies:
       - package: GravitonKit
       - package: SwiftTerm
+    # Automatic signing with your team (Config/iOS.xcconfig).
+    configFiles:
+      Debug: Config/iOS.xcconfig
+      Release: Config/iOS.xcconfig
     info:
       path: iOS/Info.plist
       properties:
@@ -72,6 +76,7 @@ targets:
       base:
         PRODUCT_NAME: Graviton
         PRODUCT_BUNDLE_IDENTIFIER: dev.graviton.ios
+        CODE_SIGN_ENTITLEMENTS: iOS/Graviton.entitlements
         TARGETED_DEVICE_FAMILY: "1,2"
         INFOPLIST_KEY_CFBundleDisplayName: Graviton
         INFOPLIST_KEY_UILaunchScreen_Generation: YES

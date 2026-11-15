@@ -346,11 +346,23 @@ public actor RemoteEngine: EngineService {
     public func start(id: String) async throws -> Container { try await container(.start(id: id)) }
     public func stop(id: String) async throws -> Container { try await container(.stop(id: id)) }
     public func restart(id: String) async throws -> Container { try await container(.restart(id: id)) }
-    public func run(_ spec: RunSpec) async throws -> Container { try await container(.run(spec)) }
+    /// Runs and pulls can take minutes (a pull, a VM boot): they get a connection
+    /// of their own so the shared one keeps answering the list and logs meanwhile.
+    public func run(_ spec: RunSpec) async throws -> Container {
+        guard case let .container(c) = try await separately(.run(spec)) else { throw EngineError.unexpectedResponse }
+        return c
+    }
 
     public func pull(reference: String) async throws -> ImageInfo {
-        guard case let .image(image) = try await call(.pull(reference: reference)) else { throw EngineError.unexpectedResponse }
+        guard case let .image(image) = try await separately(.pull(reference: reference)) else { throw EngineError.unexpectedResponse }
         return image
+    }
+
+    private nonisolated func separately(_ request: EngineRequest) async throws -> EngineResponse {
+        let c = try await LineConnection.open(host.endpoints, pin: host.fingerprint)
+        defer { c.cancel() }
+        guard case .authenticated = try await c.call(.auth(token: token)) else { throw EngineError.unexpectedResponse }
+        return try await c.call(request)
     }
 
     public func remove(id: String) async throws -> String {
@@ -376,6 +388,17 @@ public actor RemoteEngine: EngineService {
     public func inspect(id: String) async throws -> ContainerDetails {
         guard case let .details(details) = try await call(.inspect(id: id)) else { throw EngineError.unexpectedResponse }
         return details
+    }
+
+    public func events(since: UInt64?, limit: Int?) async throws -> [EngineEvent] {
+        guard case let .events(list) = try await call(.events(since: since, limit: limit)) else { throw EngineError.unexpectedResponse }
+        return list
+    }
+
+    /// Ask this Mac to send push alerts to this device.
+    public func registerPush(token: String, sandbox: Bool) async throws -> PushInfo {
+        guard case let .push(info) = try await call(.registerPush(token: token, sandbox: sandbox)) else { throw EngineError.unexpectedResponse }
+        return info
     }
 
     /// Builds send the folder over a connection of their own: the log streams back.
