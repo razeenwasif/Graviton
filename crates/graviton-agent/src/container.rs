@@ -1,8 +1,11 @@
 //! Container root filesystems and isolated processes inside the guest.
 //!
 //! * `prepare` mounts the host's blob store (virtiofs tag `blobs`, read-only),
-//!   puts a tmpfs at `/run/containers/<id>/rootfs`, and unpacks the image's
-//!   layers into it in order, applying OCI whiteouts.
+//!   makes `/run/containers/<id>/rootfs`, and unpacks the image's layers into
+//!   it in order, applying OCI whiteouts. Roots live on the VM's scratch disk
+//!   (`/dev/vda`, formatted ext4 on first use each boot) so an image and what
+//!   a job writes don't have to fit in the VM's memory; a VM without one (an
+//!   older gravitond) gets a tmpfs as before.
 //! * `command` builds a `Command` that, between fork and exec, enters new
 //!   mount, UTS and IPC namespaces, moves the rootfs to `/` and chroots into
 //!   it (pivot_root can't leave an initramfs), mounts `/proc` and `/sys`,
@@ -22,6 +25,47 @@ use flate2::read::GzDecoder;
 
 const BLOBS: &str = "/run/blobs";
 const CONTAINERS: &str = "/run/containers";
+/// The scratch disk gravitond attaches, if it does.
+const DISK: &str = "/dev/vda";
+
+/// Whether container roots live on the scratch disk: formats and mounts it at
+/// `CONTAINERS` the first time it's asked, once per boot.
+fn on_disk() -> io::Result<bool> {
+    static READY: std::sync::OnceLock<Result<bool, String>> = std::sync::OnceLock::new();
+    READY.get_or_init(|| format_disk().map_err(|e| e.to_string())).clone().map_err(io::Error::other)
+}
+
+fn format_disk() -> io::Result<bool> {
+    if !Path::new(DISK).exists() {
+        return Ok(false);
+    }
+    // Scratch, rebuilt each boot: no journal and no checksums to pay for,
+    // nothing to discard (it's a fresh, empty sparse file), and a fixed UUID
+    // and hash seed. Making those up needs randomness the kernel doesn't have
+    // this early in boot, and mke2fs waited seconds for it.
+    let out = crate::reap::output(Command::new("/sbin/mke2fs").args([
+        "-q",
+        "-F",
+        "-t",
+        "ext4",
+        "-O",
+        "^has_journal,^metadata_csum",
+        "-E",
+        "lazy_itable_init=1,nodiscard,hash_seed=67726176-6974-6f6e-0000-000000000001",
+        "-U",
+        "67726176-6974-6f6e-0000-000000000002",
+        "-m",
+        "0",
+        DISK,
+    ]))?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!("formatting {DISK}: {}", String::from_utf8_lossy(&out.stderr).trim())));
+    }
+    fs::create_dir_all(CONTAINERS)?;
+    crate::linux::mount_with(DISK, CONTAINERS, "ext4", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOATIME, None)
+        .map_err(|e| io::Error::other(format!("mounting {DISK}: {e}")))?;
+    Ok(true)
+}
 
 pub fn rootfs(id: &str) -> io::Result<PathBuf> {
     let ok = !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
@@ -34,13 +78,22 @@ pub fn rootfs(id: &str) -> io::Result<PathBuf> {
 /// Unpack `layers` (sha256 digests, lowest first) into a fresh rootfs. Returns the entry count.
 pub fn prepare(id: &str, layers: &[String]) -> io::Result<u64> {
     mount_blobs()?;
+    let disk = on_disk()?;
     let root = rootfs(id)?;
     if root.exists() {
         let _ = umount(&root);
         let _ = fs::remove_dir_all(&root);
     }
     fs::create_dir_all(&root)?;
-    crate::linux::mount_with("tmpfs", &root.to_string_lossy(), "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, Some("mode=0755,size=90%"))?;
+    let path = root.to_string_lossy();
+    if disk {
+        // Entering the container moves its root to `/`, which needs a mount
+        // point: bind the folder onto itself.
+        crate::linux::mount_with(&path, &path, "none", libc::MS_BIND, None)?;
+        set_mode(&root, 0o755)?;
+    } else {
+        crate::linux::mount_with("tmpfs", &path, "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, Some("mode=0755,size=90%"))?;
+    }
 
     let mut files = 0;
     for digest in layers {

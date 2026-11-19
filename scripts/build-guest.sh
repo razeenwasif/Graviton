@@ -10,6 +10,8 @@ set -eu
 ALPINE=${ALPINE:-v3.22}
 KERNEL_PKG=${KERNEL_PKG:-linux-virt-6.12.115-r0}
 BUSYBOX_PKG=${BUSYBOX_PKG:-busybox-static-1.37.0-r20}
+# mke2fs, to format each VM's scratch disk, with the libraries it links against.
+E2FS_PKGS=${E2FS_PKGS:-"e2fsprogs-1.47.2-r2 e2fsprogs-libs-1.47.2-r2 libcom_err-1.47.2-r2 libblkid-2.41.6-r1 libuuid-2.41.6-r1 libeconf-0.6.3-r0 musl-1.2.5-r13"}
 MIRROR="https://dl-cdn.alpinelinux.org/alpine/$ALPINE/main/aarch64"
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -32,6 +34,8 @@ fetch() { # package -> extracted directory
 
 kernel_dir=$(fetch "$KERNEL_PKG")
 busybox_dir=$(fetch "$BUSYBOX_PKG")
+e2fs_dirs=""
+for p in $E2FS_PKGS; do e2fs_dirs="$e2fs_dirs $(fetch "$p")"; done
 
 # 1. Kernel. Alpine ships an EFI zboot image; Virtualization.framework's Linux
 #    boot loader wants the raw arm64 Image, so unwrap the gzip payload.
@@ -61,18 +65,30 @@ agent="$target_dir/aarch64-unknown-linux-musl/release/graviton-agent"
 # 3. Initramfs tree.
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
-mkdir -p "$root/bin" "$root/dev" "$root/proc" "$root/sys" "$root/tmp" "$root/run" "$root/etc" "$root/lib/modules"
+mkdir -p "$root/bin" "$root/sbin" "$root/dev" "$root/proc" "$root/sys" "$root/tmp" "$root/run" "$root/etc" "$root/lib/modules" "$root/usr/lib"
 cp "$agent" "$root/init"
 cp "$busybox_dir/bin/busybox.static" "$root/bin/busybox"
 ln -s busybox "$root/bin/sh"
 
+# mke2fs (dynamically linked against musl) for the scratch disk, its config,
+# and the shared libraries it needs, where musl's loader looks.
+for d in $e2fs_dirs; do
+  [ -f "$d/sbin/mke2fs" ] && cp "$d/sbin/mke2fs" "$root/sbin/mke2fs"
+  [ -f "$d/etc/mke2fs.conf" ] && cp "$d/etc/mke2fs.conf" "$root/etc/mke2fs.conf"
+  [ -d "$d/usr/lib" ] && find "$d/usr/lib" -maxdepth 1 -name 'lib*.so*' -exec cp -P {} "$root/usr/lib/" \;
+  [ -d "$d/lib" ] && find "$d/lib" -maxdepth 1 -name '*musl*' -exec cp -P {} "$root/lib/" \;
+done
+[ -x "$root/sbin/mke2fs" ] && [ -e "$root/lib/ld-musl-aarch64.so.1" ] || { echo "mke2fs or musl missing from the guest" >&2; exit 1; }
+
 moddir="$kernel_dir/lib/modules/$(ls "$kernel_dir/lib/modules")/kernel"
 : > "$root/lib/modules/order"
 # vsock for the agent channel; fuse + virtiofs for the image store and volumes;
-# virtio-net (with its failover deps) and af_packet for networking and DHCP.
+# virtio-net (with its failover deps) and af_packet for networking and DHCP;
+# virtio-blk and ext4 (with its deps, in order) for the scratch disk.
 for m in net/vmw_vsock/vsock net/vmw_vsock/vmw_vsock_virtio_transport_common net/vmw_vsock/vmw_vsock_virtio_transport \
          fs/fuse/fuse fs/fuse/virtiofs \
-         net/core/failover drivers/net/net_failover drivers/net/virtio_net net/packet/af_packet; do
+         net/core/failover drivers/net/net_failover drivers/net/virtio_net net/packet/af_packet \
+         lib/crc16 crypto/crc32c_generic fs/mbcache fs/jbd2/jbd2 fs/ext4/ext4 drivers/block/virtio_blk; do
   name=$(basename "$m")
   gunzip -c "$moddir/$m.ko.gz" > "$root/lib/modules/$name.ko"
   echo "$name.ko" >> "$root/lib/modules/order"

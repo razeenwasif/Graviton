@@ -30,13 +30,14 @@ pub fn start() {
 
 fn configure() -> Option<String> {
     let bb = "/bin/busybox";
-    let _ = Command::new(bb).args(["ip", "link", "set", "lo", "up"]).status();
-    let status = Command::new(bb)
-        .args(["udhcpc", "-i", "eth0", "-f", "-q", "-n", "-t", "8", "-T", "1", "-A", "1", "-s", "/etc/udhcpc.script"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?;
+    let _ = crate::reap::status(Command::new(bb).args(["ip", "link", "set", "lo", "up"]));
+    let status = crate::reap::status(
+        Command::new(bb)
+            .args(["udhcpc", "-i", "eth0", "-f", "-q", "-n", "-t", "8", "-T", "1", "-A", "1", "-s", "/etc/udhcpc.script"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .ok()?;
     if !status.success() {
         return None;
     }
@@ -50,7 +51,7 @@ fn configure() -> Option<String> {
 }
 
 fn ip(args: &[&str]) -> Result<String, String> {
-    let out = Command::new("/bin/busybox").arg("ip").args(args).output().map_err(|e| e.to_string())?;
+    let out = crate::reap::output(Command::new("/bin/busybox").arg("ip").args(args)).map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err(format!("ip {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()));
     }

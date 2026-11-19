@@ -8,7 +8,7 @@
 //! | agent channel   | `VZVirtioSocketDeviceConfiguration` (vsock)                       |
 //! | network (NAT)   | `VZVirtioNetworkDeviceConfiguration` + `VZNATNetworkDeviceAttachment` |
 //! | shared dirs     | `VZVirtioFileSystemDeviceConfiguration` (virtiofs)                |
-//! | rootfs          | `VZVirtioBlockDeviceConfiguration` (milestone 2)                  |
+//! | rootfs (a disk) | `VZVirtioBlockDeviceConfiguration` + a disk image, read-write     |
 //!
 //! The calling process must be signed with the
 //! `com.apple.security.virtualization` entitlement (see `scripts/dev-gravitond.sh`).
@@ -30,7 +30,8 @@ use objc2::AllocAnyThread;
 use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::{
     VZBootLoader, VZDirectorySharingDeviceConfiguration, VZEntropyDeviceConfiguration, VZFileHandleNetworkDeviceAttachment,
-    VZFileSerialPortAttachment,
+    VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode, VZFileSerialPortAttachment,
+    VZStorageDeviceAttachment, VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
     VZGenericPlatformConfiguration, VZLinuxBootLoader, VZNATNetworkDeviceAttachment, VZNetworkDeviceAttachment,
     VZNetworkDeviceConfiguration, VZPlatformConfiguration, VZSerialPortAttachment, VZSerialPortConfiguration,
     VZSharedDirectory, VZSingleDirectoryShare, VZSocketDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
@@ -328,6 +329,23 @@ unsafe fn build_configuration(config: &VmConfig, console_log: &Path) -> Result<R
             .collect();
         if !shares.is_empty() {
             c.setDirectorySharingDevices(&NSArray::from_retained_slice(&shares));
+        }
+
+        // The disk the guest keeps containers' files on (/dev/vda). It's
+        // scratch, rebuilt each boot, so the Mac caches it and never flushes
+        // it to its own disk on the guest's behalf.
+        if !config.rootfs.as_os_str().is_empty() {
+            let disk = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
+                VZDiskImageStorageDeviceAttachment::alloc(),
+                &file_url(&config.rootfs),
+                false,
+                VZDiskImageCachingMode::Cached,
+                VZDiskImageSynchronizationMode::None,
+            )
+            .map_err(|e| VmmError::Framework(format!("disk {}: {}", config.rootfs.display(), e.localizedDescription())))?;
+            let disk: &VZStorageDeviceAttachment = &disk;
+            let block = VZVirtioBlockDeviceConfiguration::initWithAttachment(VZVirtioBlockDeviceConfiguration::alloc(), disk);
+            c.setStorageDevices(&NSArray::<VZStorageDeviceConfiguration>::from_retained_slice(&[block.into_super()]));
         }
 
         c.validateWithError()

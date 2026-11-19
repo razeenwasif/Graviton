@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest as _, Sha256};
 
@@ -79,10 +80,16 @@ impl BlobStore {
 
     /// Stream `reader` into the store, verifying it hashes to `expected`.
     /// `on_bytes` is called with the running byte count.
+    ///
+    /// Each write has a partial file of its own: two pulls of the same layer
+    /// at once (two CI jobs starting the same image) used to share one, so
+    /// their bytes interleaved while each verified only its own stream, and
+    /// a corrupt layer was renamed into place.
     pub fn write_verified(&self, expected: &Digest, mut reader: impl Read, mut on_bytes: impl FnMut(u64)) -> Result<u64> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = self.root.join("sha256");
         fs::create_dir_all(&dir)?;
-        let tmp = dir.join(format!(".{}.partial", expected.hex()));
+        let tmp = dir.join(format!(".{}.{}-{}.partial", expected.hex(), std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         let mut file = File::create(&tmp)?;
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; 256 * 1024];
@@ -103,6 +110,7 @@ impl BlobStore {
             on_bytes(total);
         }
         file.sync_all()?;
+        drop(file);
         let actual = Digest(format!("sha256:{}", hex(&hasher.finalize())));
         if &actual != expected {
             let _ = fs::remove_file(&tmp);
@@ -140,6 +148,29 @@ mod tests {
         store.write_bytes(&d, b"hello").unwrap();
         assert!(store.has(&d));
         assert_eq!(store.read(&d).unwrap(), b"hello");
+
+        // Writers of the same blob at once each verify and land whole.
+        let big: Vec<u8> = (0..4_000_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let big_digest = Digest::of(&big);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    // Small reads, so the writers really do interleave.
+                    struct Slow<'a>(&'a [u8]);
+                    impl Read for Slow<'_> {
+                        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                            let n = self.0.len().min(buf.len()).min(4096);
+                            buf[..n].copy_from_slice(&self.0[..n]);
+                            self.0 = &self.0[n..];
+                            Ok(n)
+                        }
+                    }
+                    store.write_verified(&big_digest, Slow(&big), |_| {}).unwrap();
+                });
+            }
+        });
+        assert_eq!(Digest::of(&store.read(&big_digest).unwrap()), big_digest);
+        assert!(fs::read_dir(dir.join("sha256")).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".partial")));
 
         let wrong = Digest::of(b"other");
         assert!(matches!(store.write_bytes(&wrong, b"hello"), Err(ImageError::DigestMismatch { .. })));

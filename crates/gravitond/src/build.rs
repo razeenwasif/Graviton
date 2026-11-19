@@ -536,7 +536,7 @@ fn boot_builder(engine: &Engine, context: &Path, build_id: &str, log: &mut dyn F
     let out_dir = dir.join("out");
     fs::create_dir_all(&out_dir)?;
     let guest = paths::guest_dir();
-    let mut config = VmConfig::new(guest.join("vmlinux"), guest.join("initrd.img"), "");
+    let mut config = VmConfig::new(guest.join("vmlinux"), guest.join("initrd.img"), crate::runtime::scratch_disk(&dir)?);
     let host_cpus = std::thread::available_parallelism().map_or(2, |n| n.get() as u32);
     config.cpus = host_cpus.clamp(1, 4);
     config.memory_mib = 4096;

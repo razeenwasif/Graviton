@@ -24,6 +24,8 @@ mod files;
 #[cfg(target_os = "linux")]
 mod net;
 #[cfg(target_os = "linux")]
+mod reap;
+#[cfg(target_os = "linux")]
 mod stats;
 #[cfg(target_os = "linux")]
 mod tty;
@@ -63,8 +65,10 @@ pub(crate) mod linux {
             unsafe { std::env::set_var("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin") };
             // The initramfs ships one static busybox; give the guest its applets (ls, cat, ...).
             if fs::metadata("/bin/busybox").is_ok() {
-                let _ = Command::new("/bin/busybox").args(["--install", "-s", "/bin"]).status();
+                let _ = crate::reap::status(Command::new("/bin/busybox").args(["--install", "-s", "/bin"]));
             }
+            // Orphans inside containers are re-parented to us; wait for them.
+            crate::reap::start();
         }
 
         let kernel = fs::read_to_string("/proc/sys/kernel/osrelease")
@@ -215,7 +219,7 @@ pub(crate) mod linux {
 
     fn exec(mut cmd: Command, program: String, writer: Writer) {
         cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = match cmd.spawn() {
+        let mut child = match crate::reap::spawn(&mut cmd) {
             Ok(child) => child,
             Err(err) => {
                 send(&writer, &AgentEvent::Error { message: format!("exec {program}: {err}") });
@@ -229,6 +233,7 @@ pub(crate) mod linux {
         let err = child.stderr.take().map(|s| pump(s, pid, true, Arc::clone(&writer)));
         thread::spawn(move || {
             let status = child.wait();
+            crate::reap::release(pid);
             // Drain output before announcing the exit so clients see it in order.
             for t in [out, err].into_iter().flatten() {
                 let _ = t.join();

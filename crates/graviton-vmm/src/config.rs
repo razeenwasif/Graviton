@@ -27,6 +27,8 @@ pub struct VmConfig {
     pub memory_mib: u64,
     pub kernel: PathBuf,
     pub initrd: PathBuf,
+    /// A disk image attached read-write as the guest's `/dev/vda`, where the
+    /// agent keeps containers' files; empty for none.
     pub rootfs: PathBuf,
     pub cmdline: String,
     pub network: NetworkMode,

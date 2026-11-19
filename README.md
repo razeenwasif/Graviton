@@ -92,6 +92,14 @@ in the Keychain; gravitond stores only token hashes, in
 streams the output; the exit code is the container's. `gravitond --demo`
 serves the sample containers from the design mockups instead.
 
+The container's files live on a scratch disk, not in the VM's memory: each VM
+gets a sparse disk image (`disk.img` beside its console log, up to
+`$GRAVITON_DISK_GIB`, default 64 GiB, using only what's written), which the
+agent formats ext4 at boot and deletes with the VM. So an image and what runs
+in it can be far bigger than `--memory`. Two containers of an image that isn't
+here yet share one pull. The agent is PID 1, so it also waits for processes
+orphaned inside the container, which would otherwise stay zombies.
+
 Boot a bare guest VM and run a command in it (milestone 1's check):
 
 ```bash

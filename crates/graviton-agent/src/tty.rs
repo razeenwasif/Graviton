@@ -53,7 +53,7 @@ fn session(mut cmd: Command, conn: &mut File, pending: Vec<u8>, rows: u16, cols:
             Ok(())
         });
     }
-    let mut child = match cmd.spawn() {
+    let mut child = match crate::reap::spawn(&mut cmd) {
         Ok(child) => child,
         Err(err) => {
             let _ = conn.write_all(&encode_line(&AgentEvent::Error { message: format!("exec: {err}") }));
@@ -119,7 +119,9 @@ fn session(mut cmd: Command, conn: &mut File, pending: Vec<u8>, rows: u16, cols:
             }
         }
     }
-    let code = match child.wait() {
+    let waited = child.wait();
+    crate::reap::release(pid);
+    let code = match waited {
         Ok(s) => s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0)),
         Err(_) => -1,
     };

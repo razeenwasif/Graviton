@@ -110,6 +110,8 @@ pub struct Engine {
     pub events: Arc<crate::events::EventLog>,
     /// Containers being stopped on request (so their exit isn't a failure).
     stopping: Mutex<HashSet<String>>,
+    /// One pull per image at a time: a second waits for the first, then finds it.
+    pulling: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     rt: tokio::runtime::Handle,
     state_path: PathBuf,
 }
@@ -117,6 +119,7 @@ pub struct Engine {
 impl Engine {
     /// Open the engine, restoring saved containers. Call from inside the tokio runtime.
     pub fn open() -> Result<Arc<Self>> {
+        remove_stale_disks();
         let blobs = BlobStore::new(paths::blobs_dir());
         fs::create_dir_all(blobs.root().join("sha256")).context("creating the blob store")?;
         let index = ImageIndex::load(paths::support_dir().join("images.json"))?;
@@ -130,6 +133,7 @@ impl Engine {
             switch: crate::switch::Switch::new(),
             events: Arc::new(crate::events::EventLog::open(paths::support_dir().join("events.jsonl"))),
             stopping: Mutex::new(HashSet::new()),
+            pulling: Mutex::new(HashMap::new()),
             rt: tokio::runtime::Handle::current(),
             state_path: paths::support_dir().join("containers.json"),
         });
@@ -232,6 +236,12 @@ impl Engine {
     }
 
     pub(crate) fn image_for(&self, reference: &str) -> Result<LocalImage> {
+        if let Some(img) = self.index.lock().unwrap().get(reference) {
+            return Ok(img.clone());
+        }
+        // Two containers of a new image at once: one pull, and the other waits for it.
+        let gate = Arc::clone(self.pulling.lock().unwrap().entry(reference.to_string()).or_default());
+        let _turn = gate.lock().unwrap();
         if let Some(img) = self.index.lock().unwrap().get(reference) {
             return Ok(img.clone());
         }
@@ -450,6 +460,13 @@ impl Engine {
     }
 
     fn run_in_vm(self: &Arc<Self>, id: &str, listeners: Vec<(TcpListener, u16)>) -> Result<i32> {
+        let result = self.run_in_vm_inner(id, listeners);
+        // The container's files went with the VM; give the space back.
+        let _ = fs::remove_file(paths::vms_dir().join(id).join(SCRATCH_DISK));
+        result
+    }
+
+    fn run_in_vm_inner(self: &Arc<Self>, id: &str, listeners: Vec<(TcpListener, u16)>) -> Result<i32> {
         let spec = self.specs.lock().unwrap().get(id).cloned().ok_or_else(|| anyhow!("unknown container {id}"))?;
         let name = self.store.lock().unwrap().container(id)?.name.clone();
         let t0 = Instant::now();
@@ -457,7 +474,7 @@ impl Engine {
         let guest = paths::guest_dir();
         let vm_dir = paths::vms_dir().join(id);
         fs::create_dir_all(&vm_dir)?;
-        let mut config = VmConfig::new(guest.join("vmlinux"), guest.join("initrd.img"), "");
+        let mut config = VmConfig::new(guest.join("vmlinux"), guest.join("initrd.img"), scratch_disk(&vm_dir)?);
         config.cpus = spec.cpus;
         config.memory_mib = spec.memory_mib;
         config.network = NetworkMode::Nat;
@@ -978,6 +995,31 @@ fn host_memory() -> u64 {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
+}
+
+/// The file a VM's scratch disk lives in, beside its console log.
+pub(crate) const SCRATCH_DISK: &str = "disk.img";
+
+/// A fresh, empty, sparse disk image in `dir` for a VM to keep containers'
+/// files on (the guest formats it at boot). It holds up to
+/// `$GRAVITON_DISK_GIB` (default 64) GiB, but takes only what's written to it
+/// on the Mac's disk. Their files used to live in the VM's RAM, so an image
+/// and its build's output had to fit in the memory the container was given.
+pub(crate) fn scratch_disk(dir: &Path) -> Result<PathBuf> {
+    let gib: u64 = std::env::var("GRAVITON_DISK_GIB").ok().and_then(|v| v.parse().ok()).filter(|g| (1..=2048).contains(g)).unwrap_or(64);
+    let path = dir.join(SCRATCH_DISK);
+    let _ = fs::remove_file(&path);
+    let file = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+    file.set_len(gib << 30).with_context(|| format!("sizing {}", path.display()))?;
+    Ok(path)
+}
+
+/// Scratch disks left by VMs that were running when gravitond stopped.
+pub(crate) fn remove_stale_disks() {
+    let Ok(entries) = fs::read_dir(paths::vms_dir()) else { return };
+    for e in entries.flatten() {
+        let _ = fs::remove_file(e.path().join(SCRATCH_DISK));
+    }
 }
 
 #[cfg(test)]
