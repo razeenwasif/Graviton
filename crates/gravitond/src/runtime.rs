@@ -199,8 +199,15 @@ impl Engine {
             containers: self.store.lock().unwrap().containers().to_vec(),
             specs: self.specs.lock().unwrap().clone(),
         };
-        let tmp = self.state_path.with_extension("json.tmp");
+        // Saves from different threads each get their own temporary file: with
+        // one shared, a rename could find it already moved away.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = self.state_path.with_extension(format!("json.{n}.tmp"));
         let result = fs::write(&tmp, serde_json::to_vec_pretty(&state).expect("state serialises")).and_then(|_| fs::rename(&tmp, &self.state_path));
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
         if let Err(err) = result {
             eprintln!("couldn't save container state: {err}");
         }

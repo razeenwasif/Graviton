@@ -27,6 +27,8 @@ use serde_json::json;
 
 use crate::remote::Remote;
 
+/// How long an alert waits for the Keychain before giving up.
+const KEYCHAIN_WAIT: Duration = Duration::from_secs(15);
 const KEYCHAIN_SERVICE: &str = "dev.graviton.apns";
 /// The iPhone app's bundle id.
 const TOPIC: &str = "dev.graviton.ios";
@@ -108,17 +110,31 @@ impl Push {
     }
 
     /// A signed token, reused until it's 50 minutes old.
-    fn jwt(&self) -> Result<String> {
+    ///
+    /// Reading the key can block: when gravitond's signature changes, the
+    /// Keychain asks on the Mac's screen whether to let it, and waits for a
+    /// click. That read once ran here on the engine's own threads with this
+    /// lock held, so every alert after it queued on the lock and gravitond
+    /// stopped answering anything. Now it runs on a blocking thread, with no
+    /// lock held, and gives up after a while.
+    async fn jwt(&self) -> Result<String> {
         let settings = self.settings.lock().unwrap().clone().ok_or_else(|| anyhow!("push alerts aren't set up: run `grav push setup`"))?;
-        let mut cached = self.jwt.lock().unwrap();
-        if let Some((jwt, made)) = cached.as_ref().filter(|(_, made)| made.elapsed() < JWT_LIFETIME) {
-            let _ = made;
+        if let Some((jwt, _)) = self.jwt.lock().unwrap().as_ref().filter(|(_, made)| made.elapsed() < JWT_LIFETIME) {
             return Ok(jwt.clone());
         }
-        let p8 = security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, &settings.key_id)
-            .map_err(|e| anyhow!("can't read the APNs key from the login Keychain ({e}); run `grav push setup` again"))?;
+        let key_id = settings.key_id.clone();
+        let read = tokio::task::spawn_blocking(move || security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, &key_id));
+        let p8 = match tokio::time::timeout(KEYCHAIN_WAIT, read).await {
+            Ok(Ok(Ok(p8))) => p8,
+            Ok(Ok(Err(e))) => bail!("can't read the APNs key from the login Keychain ({e}); run `grav push setup` again"),
+            Ok(Err(e)) => bail!("reading the APNs key: {e}"),
+            Err(_) => bail!(
+                "the login Keychain didn't hand over the APNs key within {} s; it may be asking on this Mac's screen whether gravitond may read it",
+                KEYCHAIN_WAIT.as_secs()
+            ),
+        };
         let jwt = apns_jwt(std::str::from_utf8(&p8)?, &settings.key_id, &settings.team_id, now())?;
-        *cached = Some((jwt.clone(), Instant::now()));
+        *self.jwt.lock().unwrap() = Some((jwt.clone(), Instant::now()));
         Ok(jwt)
     }
 
@@ -155,7 +171,7 @@ impl Push {
     }
 
     async fn send(&self, token: &str, sandbox: bool, title: &str, body: &str, seq: Option<u64>) -> Result<()> {
-        let jwt = self.jwt()?;
+        let jwt = self.jwt().await?;
         let host = if sandbox { "api.sandbox.push.apple.com" } else { "api.push.apple.com" };
         let payload = json!({
             "aps": {"alert": {"title": title, "body": body}, "sound": "default", "thread-id": "graviton"},
