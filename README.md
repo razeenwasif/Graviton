@@ -203,6 +203,27 @@ switch which Mac the window shows; it can pair too.
 `grav service install|uninstall|status` runs the gravitond inside Graviton.app
 at login on any Mac, without the source.
 
+## Updating another Mac
+
+To update the engine on a Mac that runs Graviton.app as a server (the mini,
+say) straight from this checkout, without a release:
+
+```bash
+scripts/deploy-remote.sh mini            # gravitond and grav
+scripts/deploy-remote.sh mini --guest    # and the guest kernel and initramfs
+```
+
+It builds both binaries, signs them with your Apple Development certificate
+(`GRAVITON_SIGN_IDENTITY` picks another), copies them over, and swaps each in
+as a new file before restarting gravitond there. If the new one doesn't
+answer, the old files go back. It refuses while containers are running
+(`--force` restarts anyway, stopping them). The certificate matters: the
+Keychain on that Mac trusts the signature that stored the APNs key, so an ad
+hoc build, whose identity changes every time, makes it ask on that Mac's
+screen again. With a certificate it asks once (click Always Allow) and keeps
+trusting later deploys. Replacing a binary in place instead of as a new file
+gets it killed at launch, because macOS caches signatures by file.
+
 ## Releasing
 
 `scripts/release.sh` builds a distributable Graviton.app: the app with
