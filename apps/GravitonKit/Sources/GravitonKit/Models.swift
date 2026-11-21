@@ -137,6 +137,7 @@ public struct EngineInfo: Codable, Hashable, Sendable {
     public var memoryUsedBytes: UInt64
     public var diskBytes: UInt64
     public var diskUsedBytes: UInt64
+    public var rosetta: Bool? = nil
 }
 
 /// What to run (mirrors `RunSpec` in `graviton-proto`).
@@ -155,9 +156,11 @@ public struct RunSpec: Codable, Hashable, Sendable {
     public var volumes: [String]
     /// Automatic restart policy (`no`, `on-failure`, `always`); nil defaults to `no`.
     public var restart: RestartPolicy?
+    /// Target platform when pulling the image (`linux/amd64`, `linux/arm64`).
+    public var platform: String?
 
     public init(image: String, name: String? = nil, command: [String]? = nil, env: [String] = [], cpus: UInt32? = nil,
-                memoryMib: UInt64? = nil, ports: [String] = [], volumes: [String] = [], restart: RestartPolicy? = nil) {
+                memoryMib: UInt64? = nil, ports: [String] = [], volumes: [String] = [], restart: RestartPolicy? = nil, platform: String? = nil) {
         self.image = image
         self.name = name
         self.command = command
@@ -167,6 +170,7 @@ public struct RunSpec: Codable, Hashable, Sendable {
         self.ports = ports
         self.volumes = volumes
         self.restart = restart
+        self.platform = platform
     }
 
     /// Split a list typed as "8080:80, 5432" or one per line.
@@ -334,6 +338,8 @@ public struct ContainerDetails: Codable, Hashable, Sendable {
     public var kernel: String
     public var vmDir: String
     public var restart: RestartPolicy?
+    public var architecture: String? = nil
+    public var rosetta: Bool? = nil
 }
 
 /// What `grav exec` asks for.
@@ -369,14 +375,17 @@ public struct BuildSpec: Codable, Hashable, Sendable {
     public var noCache: Bool
     /// Bytes of tar that follow the request (a folder sent to another Mac).
     public var upload: UInt64?
+    /// Target platform (`linux/amd64`, `linux/arm64`).
+    public var platform: String?
 
-    public init(context: String, dockerfile: String? = nil, tag: String? = nil, buildArgs: [String] = [], target: String? = nil, noCache: Bool = false) {
+    public init(context: String, dockerfile: String? = nil, tag: String? = nil, buildArgs: [String] = [], target: String? = nil, noCache: Bool = false, platform: String? = nil) {
         self.context = context
         self.dockerfile = dockerfile
         self.tag = tag
         self.buildArgs = buildArgs
         self.target = target
         self.noCache = noCache
+        self.platform = platform
     }
 
     /// The image name a build of `context` gets when none is given: the folder's name.
@@ -589,9 +598,11 @@ public struct DiskUsage: Codable, Hashable, Sendable {
     public var buildCacheSteps: UInt32
     public var buildCacheBytes: UInt64
     public var unreferencedBytes: UInt64
+    public var snapshots: UInt32? = nil
+    public var snapshotsBytes: UInt64? = nil
 
-    /// What a plain prune frees: the build cache and unreferenced layers.
-    public var alwaysReclaimable: UInt64 { buildCacheBytes + unreferencedBytes }
+    /// What a plain prune frees: the build cache, idle VM snapshots, and unreferenced layers.
+    public var alwaysReclaimable: UInt64 { buildCacheBytes + (snapshotsBytes ?? 0) + unreferencedBytes }
 }
 
 /// What a prune removes; the build cache and unreferenced layers always go.
@@ -614,6 +625,7 @@ public struct PruneReport: Codable, Hashable, Sendable {
     public var blobs: UInt32
     public var freedBytes: UInt64
     public var dryRun: Bool
+    public var snapshots: UInt32? = nil
 }
 
 // MARK: - Volumes & network

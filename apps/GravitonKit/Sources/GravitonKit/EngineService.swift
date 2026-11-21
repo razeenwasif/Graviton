@@ -124,14 +124,14 @@ public final class SocketEngine: EngineService {
     }
 
     /// Pull an image, streaming per-layer progress before the final image.
-    public func pullStream(reference: String) -> AsyncThrowingStream<PullEvent, Error> {
+    public func pullStream(reference: String, platform: String? = nil) -> AsyncThrowingStream<PullEvent, Error> {
         let path = self.path
         return AsyncThrowingStream { continuation in
             let thread = Thread {
                 do {
                     let fd = try Self.connect(path: path)
                     defer { close(fd) }
-                    try Self.writeAll(fd, Array(try Wire.line(.pull(reference: reference, progress: true))))
+                    try Self.writeAll(fd, Array(try Wire.line(.pull(reference: reference, progress: true, platform: platform))))
                     var buffer = Data()
                     var chunk = [UInt8](repeating: 0, count: 64 * 1024)
                     while true {

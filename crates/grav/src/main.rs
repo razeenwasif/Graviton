@@ -63,7 +63,12 @@ enum Command {
     /// Restart a container.
     Restart { container: String },
     /// Pull an image from its registry.
-    Pull { reference: String },
+    Pull {
+        /// Target platform (e.g. linux/amd64, linux/arm64).
+        #[arg(long)]
+        platform: Option<String>,
+        reference: String,
+    },
     /// Log in to an OCI registry (Docker Hub, GHCR, etc.); credentials stay in the Mac's Keychain.
     Login {
         /// Registry hostname (default: docker.io).
@@ -118,6 +123,9 @@ enum Command {
         /// Automatically remove the container when it exits.
         #[arg(long)]
         rm: bool,
+        /// Target platform when pulling the image (e.g. linux/amd64, linux/arm64).
+        #[arg(long)]
+        platform: Option<String>,
         image: String,
         /// Command (replaces the image's default command).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -143,6 +151,9 @@ enum Command {
         /// Rebuild every step.
         #[arg(long)]
         no_cache: bool,
+        /// Target platform for base images and output image (e.g. linux/amd64, linux/arm64).
+        #[arg(long)]
+        platform: Option<String>,
         /// The build context.
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -214,6 +225,12 @@ enum Command {
     /// The shared container network: addresses, DNS names and published ports.
     #[command(visible_alias = "networks")]
     Network,
+    /// Manage cached VM memory snapshots for fast container starts (`status`, `warm`, `clear`).
+    #[command(visible_alias = "snapshots")]
+    Snapshot {
+        #[command(subcommand)]
+        action: Option<SnapshotAction>,
+    },
     /// What happened recently: containers started, stopped and failed, pulls and builds.
     Events {
         /// How many (default 30).
@@ -257,6 +274,29 @@ enum VolumeAction {
     Create { name: String },
     /// Remove a named volume no container uses.
     Rm { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum SnapshotAction {
+    /// Show cached VM snapshots and disk usage.
+    Status,
+    /// Pre-warm one or more VM snapshots for fast container restore.
+    Warm {
+        /// vCPUs for the template VM (default: 2).
+        #[arg(long)]
+        cpus: Option<u32>,
+        /// Memory for the template VM in MiB (default: 1024).
+        #[arg(long)]
+        memory: Option<u64>,
+        /// Warm a Rosetta-enabled template VM for linux/amd64 images.
+        #[arg(long)]
+        rosetta: bool,
+        /// Number of slots to keep ready for concurrent containers (1–8, default: 1).
+        #[arg(long)]
+        slots: Option<u32>,
+    },
+    /// Delete idle cached VM snapshots from disk.
+    Clear,
 }
 
 #[derive(Subcommand, Debug)]
@@ -357,6 +397,10 @@ fn run(cli: Cli) -> Result<()> {
                 println!("Version:   {}", e.version);
                 println!("Kernel:    {}", e.kernel);
                 println!("Arch:      {} · {} vCPU", e.arch, e.cpus);
+                println!(
+                    "Rosetta:   {}",
+                    if e.rosetta { "available (linux/amd64)" } else { "not installed" }
+                );
                 println!("Memory:    {} in VMs of {} on this Mac", bytes(e.memory_used_bytes), bytes(e.memory_bytes));
                 if e.disk_bytes > 0 {
                     println!("Disk:      {} / {}", bytes(e.disk_used_bytes), bytes(e.disk_bytes));
@@ -390,7 +434,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Start { container } => lifecycle(&mut client, Request::Start { id: container }, "started")?,
         Command::Stop { container } => lifecycle(&mut client, Request::Stop { id: container }, "stopped")?,
         Command::Restart { container } => lifecycle(&mut client, Request::Restart { id: container }, "restarted")?,
-        Command::Pull { reference } => pull_image(&mut client, &reference)?,
+        Command::Pull { platform, reference } => pull_image(&mut client, &reference, platform.as_deref())?,
         Command::Login { registry, username, password_stdin, list } => {
             if list {
                 match client.call(&Request::ListLogins)? {
@@ -430,7 +474,7 @@ fn run(cli: Cli) -> Result<()> {
                 other => unexpected(other)?,
             }
         }
-        Command::Run { name, env, cpus, memory, publish, volume, restart, detach, interactive, tty, rm, image, command } => {
+        Command::Run { name, env, cpus, memory, publish, volume, restart, detach, interactive, tty, rm, platform, image, command } => {
             if detach && (tty || interactive) {
                 bail!("can't combine -d/--detach with -i or -t");
             }
@@ -451,6 +495,7 @@ fn run(cli: Cli) -> Result<()> {
                 rows: 0,
                 cols: 0,
                 auto_remove: rm,
+                platform,
             };
             if tty {
                 let code = run_tty(&target, spec, interactive)?;
@@ -610,7 +655,47 @@ fn run(cli: Cli) -> Result<()> {
             }
             other => unexpected(other)?,
         },
-        Command::Build { tag, file, build_arg, secret, target: build_target, no_cache, path } => {
+        Command::Snapshot { action } => {
+            let req = match action.unwrap_or(SnapshotAction::Status) {
+                SnapshotAction::Status => Request::SnapshotStatus,
+                SnapshotAction::Warm { cpus, memory, rosetta, slots } => {
+                    eprintln!("Warming VM snapshot…");
+                    Request::SnapshotWarm { cpus, memory_mib: memory, rosetta, slots }
+                }
+                SnapshotAction::Clear => Request::SnapshotClear,
+            };
+            match client.call(&req)? {
+                Response::Snapshots(info) => {
+                    println!(
+                        "Snapshots: {} ({} slot{}, {} in use, {} on disk; max {}/shape)",
+                        if info.enabled { "enabled" } else { "disabled" },
+                        info.total_slots,
+                        if info.total_slots == 1 { "" } else { "s" },
+                        info.in_use,
+                        bytes(info.total_bytes),
+                        info.max_slots_per_shape
+                    );
+                    if !info.groups.is_empty() {
+                        println!();
+                        println!("{:<10} {:<10} {:<10} {:>6} {:>8} {:>10}", "CPUS", "MEMORY", "MODE", "SLOTS", "IN USE", "SIZE");
+                        for g in info.groups {
+                            let mode = if g.rosetta { "rosetta" } else { "native" };
+                            println!(
+                                "{:<10} {:<10} {:<10} {:>6} {:>8} {:>10}",
+                                format!("{} vCPU", g.cpus),
+                                format!("{} MiB", g.memory_mib),
+                                mode,
+                                g.slots,
+                                g.in_use,
+                                bytes(g.size_bytes)
+                            );
+                        }
+                    }
+                }
+                other => unexpected(other)?,
+            }
+        }
+        Command::Build { tag, file, build_arg, secret, target: build_target, no_cache, platform, path } => {
             let context = std::fs::canonicalize(&path).with_context(|| format!("{} doesn't exist", path.display()))?;
             let dockerfile = match file {
                 // A path given on the command line is relative to where you are.
@@ -627,6 +712,7 @@ fn run(cli: Cli) -> Result<()> {
                 no_cache,
                 upload: None,
                 secrets,
+                platform,
             };
             if let Target::Remote(host) = &target {
                 // That Mac can't see this folder: send it along.
@@ -690,9 +776,10 @@ fn run(cli: Cli) -> Result<()> {
                 println!("{:<18} {:>8} {:>11} {:>14}", "Images", u.images, bytes(u.blobs_bytes), format!("{} ({} unused)", bytes(u.unused_images_bytes), u.unused_images));
                 println!("{:<18} {:>8} {:>11} {:>14}", "Container disks", u.containers, bytes(u.container_disks_bytes), format!("{} ({} stopped)", bytes(u.stopped_disks_bytes), u.stopped_containers));
                 println!("{:<18} {:>8} {:>11} {:>14}", "Build cache", u.build_cache_steps, bytes(u.build_cache_bytes), bytes(u.build_cache_bytes));
+                println!("{:<18} {:>8} {:>11} {:>14}", "VM snapshots", u.snapshots, bytes(u.snapshots_bytes), bytes(u.snapshots_bytes));
                 println!("{:<18} {:>8} {:>11} {:>14}", "Unreferenced", "", bytes(u.unreferenced_bytes), bytes(u.unreferenced_bytes));
                 println!();
-                println!("grav prune frees the build cache and unreferenced layers ({});", bytes(u.build_cache_bytes + u.unreferenced_bytes));
+                println!("grav prune frees the build cache, idle VM snapshots and unreferenced layers ({});", bytes(u.build_cache_bytes + u.snapshots_bytes + u.unreferenced_bytes));
                 println!("--images and --containers add unused images and stopped containers.");
             }
             other => unexpected(other)?,
@@ -717,7 +804,15 @@ fn run(cli: Cli) -> Result<()> {
                     for i in &r.images {
                         println!("{verb} image {}", ImageReference::parse(i).map(|x| x.display_name()).unwrap_or(i.clone()));
                     }
-                    println!("{verb} {} build-cache step{} and {} unreferenced layer file{}", r.build_cache_steps, if r.build_cache_steps == 1 { "" } else { "s" }, r.blobs, if r.blobs == 1 { "" } else { "s" });
+                    println!(
+                        "{verb} {} build-cache step{}, {} VM snapshot{} and {} unreferenced layer file{}",
+                        r.build_cache_steps,
+                        if r.build_cache_steps == 1 { "" } else { "s" },
+                        r.snapshots,
+                        if r.snapshots == 1 { "" } else { "s" },
+                        r.blobs,
+                        if r.blobs == 1 { "" } else { "s" }
+                    );
                     println!("{} {}", if r.dry_run { "Would free" } else { "Freed" }, bytes(r.freed_bytes));
                 }
                 other => unexpected(other)?,
@@ -1431,10 +1526,17 @@ fn prompt_password(prompt: &str) -> Result<String> {
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
-fn pull_image(client: &mut Client, reference: &str) -> Result<()> {
+fn pull_image(client: &mut Client, reference: &str, platform: Option<&str>) -> Result<()> {
     let is_tty = unsafe { libc::isatty(libc::STDERR_FILENO) } == 1;
-    eprintln!("Pulling {reference}…");
-    client.writer.write_all(&encode_line(&Request::Pull { reference: reference.to_string(), progress: true }))?;
+    match platform {
+        Some(p) => eprintln!("Pulling {reference} ({p})…"),
+        None => eprintln!("Pulling {reference}…"),
+    }
+    client.writer.write_all(&encode_line(&Request::Pull {
+        reference: reference.to_string(),
+        progress: true,
+        platform: platform.map(String::from),
+    }))?;
     client.writer.flush()?;
 
     #[derive(Clone)]

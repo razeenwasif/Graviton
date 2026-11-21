@@ -83,7 +83,13 @@ pub(crate) mod linux {
         if let Err(err) = load_modules() {
             console(&AgentEvent::Error { message: format!("loading modules: {err}") });
         }
-        crate::net::start();
+        setup_rosetta();
+        // Template VMs saved as snapshots bring links up but defer DHCP until `Prepare` runs after restore.
+        if is_snapshot_boot() {
+            crate::net::bring_up_links();
+        } else {
+            crate::net::start();
+        }
 
         let listener = match vsock_listen(AGENT_VSOCK_PORT) {
             Ok(fd) => fd,
@@ -126,8 +132,13 @@ pub(crate) mod linux {
                 continue;
             }
             match decode_line::<AgentRequest>(line.as_bytes()) {
-                Ok(AgentRequest::Prepare { container, layers, mounts, hostname }) => {
+                Ok(AgentRequest::Prepare { container, layers, mounts, hostname, now_secs }) => {
                     let t0 = std::time::Instant::now();
+                    if let Some(secs) = now_secs {
+                        set_wall_clock(secs);
+                    }
+                    // Idempotent: starts DHCP now if this VM was restored from a snapshot.
+                    crate::net::start();
                     let result = crate::container::prepare(&container, &layers).and_then(|(files, reused)| {
                         let ip = crate::net::wait(std::time::Duration::from_secs(8));
                         let dns = crate::container::finish(&container, &mounts, hostname.as_deref().unwrap_or(&container), ip.as_deref())?;
@@ -419,6 +430,53 @@ pub(crate) mod linux {
             }
         }
         Ok(())
+    }
+
+    /// True when the kernel cmdline carries `graviton.snapshot=1` (template VM
+    /// that will be saved before DHCP, disk access, or virtiofs volume mounts).
+    fn is_snapshot_boot() -> bool {
+        fs::read_to_string("/proc/cmdline")
+            .map(|s| s.split_whitespace().any(|tok| tok == "graviton.snapshot=1"))
+            .unwrap_or(false)
+    }
+
+    /// Sync guest `CLOCK_REALTIME` to host UTC seconds after VM snapshot restore.
+    fn set_wall_clock(secs: u64) {
+        let ts = libc::timespec { tv_sec: secs as _, tv_nsec: 0 };
+        // SAFETY: valid timespec pointer passed to clock_settime(CLOCK_REALTIME).
+        unsafe {
+            let _ = libc::clock_settime(libc::CLOCK_REALTIME, &raw const ts);
+        }
+    }
+
+    /// Mount Apple's `rosetta` virtiofs share (if attached) and register the
+    /// x86_64 ELF handler in `binfmt_misc` with `OCF` flags so the kernel pins
+    /// the open interpreter fd across container `chroot`s.
+    fn setup_rosetta() {
+        const ROSETTA_DIR: &str = "/run/rosetta";
+        const BINFMT_DIR: &str = "/proc/sys/fs/binfmt_misc";
+        const ROSETTA_BINFMT: &str =
+            ":rosetta:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:/run/rosetta/rosetta:OCF";
+
+        if fs::create_dir_all(ROSETTA_DIR).is_err() {
+            return;
+        }
+        // Note: intentionally NOT MS_NOEXEC — `/run/rosetta/rosetta` must be executable.
+        if mount_with("rosetta", ROSETTA_DIR, "virtiofs", libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV, None).is_err() {
+            return;
+        }
+        if !std::path::Path::new("/run/rosetta/rosetta").is_file() {
+            return;
+        }
+        if mount_with("binfmt_misc", BINFMT_DIR, "binfmt_misc", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, None).is_err() {
+            console(&AgentEvent::Error { message: "rosetta: couldn't mount binfmt_misc".into() });
+            return;
+        }
+        if !std::path::Path::new("/proc/sys/fs/binfmt_misc/rosetta").exists() {
+            if let Err(err) = fs::write("/proc/sys/fs/binfmt_misc/register", ROSETTA_BINFMT) {
+                console(&AgentEvent::Error { message: format!("rosetta: binfmt_misc register failed: {err}") });
+            }
+        }
     }
 
     fn vsock_listen(port: u32) -> io::Result<OwnedFd> {

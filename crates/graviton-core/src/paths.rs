@@ -70,6 +70,11 @@ pub fn volumes_dir() -> PathBuf {
     support_dir().join("volumes")
 }
 
+/// Cached VM memory snapshots (`.vzsave` + per-slot machine identities).
+pub fn snapshots_dir() -> PathBuf {
+    support_dir().join("snapshots")
+}
+
 #[cfg(test)]
 mod bundle_tests {
     use super::*;

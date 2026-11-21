@@ -393,7 +393,7 @@ public actor RemoteEngine: EngineService {
     }
 
     /// Pull an image on the paired Mac, streaming per-layer progress before the final image.
-    public nonisolated func pullStream(reference: String) -> AsyncThrowingStream<PullEvent, Error> {
+    public nonisolated func pullStream(reference: String, platform: String? = nil) -> AsyncThrowingStream<PullEvent, Error> {
         let host = self.host, token = self.token
         return AsyncThrowingStream { continuation in
             let task = Task.detached {
@@ -401,7 +401,7 @@ public actor RemoteEngine: EngineService {
                     let c = try await LineConnection.open(host.endpoints, pin: host.fingerprint)
                     defer { c.cancel() }
                     guard case .authenticated = try await c.call(.auth(token: token)) else { throw EngineError.unexpectedResponse }
-                    try await c.send(Wire.line(.pull(reference: reference, progress: true)))
+                    try await c.send(Wire.line(.pull(reference: reference, progress: true, platform: platform)))
                     while true {
                         try Task.checkCancellation()
                         switch try Wire.decoder.decode(EngineResponse.self, from: try await c.readLine()) {

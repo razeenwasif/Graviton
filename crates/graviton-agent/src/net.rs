@@ -13,12 +13,27 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+static STARTED: AtomicBool = AtomicBool::new(false);
 static ADDRESS: OnceLock<Option<String>> = OnceLock::new();
 
+/// Bring `lo` and `eth0` links up early (without requesting DHCP yet) so VMs
+/// saved as snapshots already have their links up when restored.
+pub fn bring_up_links() {
+    let bb = "/bin/busybox";
+    let _ = crate::reap::status(Command::new(bb).args(["ip", "link", "set", "lo", "up"]));
+    if Path::new("/sys/class/net/eth0").exists() {
+        let _ = crate::reap::status(Command::new(bb).args(["ip", "link", "set", "eth0", "up"]));
+    }
+}
+
 pub fn start() {
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
     if !Path::new("/sys/class/net/eth0").exists() {
         let _ = ADDRESS.set(None);
         return;

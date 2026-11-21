@@ -37,7 +37,9 @@ apps/
   Mac/             macOS app (Containers, Run sheet, Logs, Terminal, Stats, Files, Inspect, Images + Pull/Build/Clean Up sheets, Volumes, Networks, menu bar item)
   iOS/             iOS companion (Containers, Detail, Logs, Shell, Stats, Files, Inspect, Run + Pull sheets, Activity, Hosts)
 scripts/
-  build-guest.sh   Guest kernel (Alpine linux-virt) + initramfs with the agent as /init
+  build-kernel.sh  Build custom Linux 6.12-graviton arm64 kernel (zero modules, ~8.2 MiB) inside Graviton
+  kernel.config    Minimal arm64 Kconfig (virtio, vsock, virtiofs, ext4, overlayfs, balloon, binfmt_misc)
+  build-guest.sh   Guest kernel (custom 6.12-graviton if cached, else Alpine linux-virt) + initramfs with agent as /init
   dev-gravitond.sh Build gravitond, sign it with the virtualization entitlement, run it
 design/
   icon.svg, icon-macos.svg, make-icons.sh   App icon source → asset catalogs
@@ -104,6 +106,25 @@ cargo run -p grav -- stop web && cargo run -p grav -- rm web
   `env=...`), `type=bind` and `type=tmpfs` mounts, and hard links preserved as
   tar link entries in layers. `grav df` counts persistent cache mounts and
   `grav prune` reclaims them.
+- `scripts/build-kernel.sh` builds Graviton's purpose-built arm64 Linux 6.12
+  kernel (`scripts/kernel.config`, zero loadable modules, all virtio/vsock/virtiofs/ext4/overlayfs/balloon/binfmt_misc
+  drivers compiled in, ~8.2 MiB) inside a Graviton container and caches it for
+  `scripts/build-guest.sh` (which uses it automatically when cached, `--custom`
+  to build it, or `--alpine` for Alpine's `linux-virt` fallback). Every VM also
+  attaches a `virtio-balloon` device for host RAM reclaim.
+- **Rosetta for `linux/amd64` images**: when Apple Rosetta for Linux is
+  installed (`softwareupdate --install-rosetta`), `grav pull`, `grav run`, and
+  `grav build` accept `--platform linux/amd64` (also pickable in the Mac Pull
+  sheet), and `amd64`-only images fall back to Rosetta automatically. The guest
+  mounts `VZLinuxRosettaDirectoryShare` and registers `binfmt_misc` with `OCF`
+  flags so x86_64 binaries execute directly inside chrooted containers.
+- **VM snapshots**: `gravitond` caches saved `.vzsave` VM states in a per-shape
+  slot pool (up to 8 unique-identity slots per `(cpus, memory, rosetta)` shape
+  with distinct pinned MACs, dynamic `-v` volumes via `VZMultipleDirectoryShare`,
+  host UTC clock sync, and block-cache invalidation across container restarts).
+  Manage snapshots with `grav snapshot [status|warm|clear]` (or disable with
+  `GRAVITON_NO_SNAPSHOTS=1`); `grav df` reports snapshot disk usage and
+  `grav prune` clears idle snapshots.
 - `scripts/install-launch-agent.sh` installs gravitond as a launch agent so it
   starts at login (`--remote` to accept phones, `--uninstall` to remove it).
 
@@ -159,6 +180,8 @@ Boot a bare guest VM and run a command in it (milestone 1's check):
 
 ```bash
 scripts/dev-gravitond.sh boot-check            # runs `uname -a` in the guest
+scripts/dev-gravitond.sh boot-check --rosetta  # verify Rosetta binfmt_misc registration
+scripts/dev-gravitond.sh boot-check --snapshot # benchmark VM snapshot save + restore
 scripts/dev-gravitond.sh boot-check --cpus 4 --memory 1024 -- /bin/sh -c 'nproc; free -m'
 ```
 

@@ -39,6 +39,9 @@ struct InspectPanel: View {
                     InspectSection("Image") {
                         InspectRow("Reference", d.imageReference)
                         InspectRow("Digest", d.imageDigest)
+                        if let arch = d.architecture {
+                            InspectRow("Architecture", d.rosetta == true ? "\(arch) · Rosetta" : arch)
+                        }
                     }
                     InspectSection("Virtual machine") {
                         InspectRow("vCPUs", "\(d.cpus)")

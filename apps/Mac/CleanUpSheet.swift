@@ -27,7 +27,11 @@ struct CleanUpSheet: View {
                symbol: "sparkles") {
             if let u = usage {
                 VStack(spacing: 0) {
-                    row("Build cache and unreferenced layers", detail: "\(u.buildCacheSteps) cached build steps", bytes: u.alwaysReclaimable, toggle: nil)
+                    let snapCount = u.snapshots ?? 0
+                    let cacheDetail = snapCount > 0
+                        ? "\(u.buildCacheSteps) cached build steps · \(snapCount) VM snapshot\(snapCount == 1 ? "" : "s")"
+                        : "\(u.buildCacheSteps) cached build steps"
+                    row("Build cache, VM snapshots and unreferenced layers", detail: cacheDetail, bytes: u.alwaysReclaimable, toggle: nil)
                     Rectangle().fill(G.border).frame(height: 1)
                     row("Unused images", detail: "\(u.unusedImages) of \(u.images) images no container uses", bytes: u.unusedImagesBytes, toggle: $images)
                     Rectangle().fill(G.border).frame(height: 1)
@@ -68,13 +72,14 @@ struct CleanUpSheet: View {
 
     /// What's on disk, and how much of it this clean-up frees.
     private func usageBar(_ u: DiskUsage) -> some View {
-        let total = Double(max(u.blobsBytes + u.containerDisksBytes, 1))
+        let used = u.blobsBytes + u.containerDisksBytes + (u.snapshotsBytes ?? 0)
+        let total = Double(max(used, 1))
         let freeing = Double(preview?.freedBytes ?? 0)
         return VStack(alignment: .leading, spacing: 8) {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color.white.opacity(0.06))
-                    Capsule().fill(G.accent.opacity(0.35)).frame(width: geo.size.width * Double(u.blobsBytes + u.containerDisksBytes) / total)
+                    Capsule().fill(G.accent.opacity(0.35)).frame(width: geo.size.width * Double(used) / total)
                     Capsule().fill(G.accent).frame(width: max(geo.size.width * min(freeing / total, 1), freeing > 0 ? 4 : 0))
                 }
             }
@@ -113,7 +118,9 @@ struct CleanUpSheet: View {
     }
 
     private func summary(_ p: PruneReport) -> String {
-        var parts = ["\(p.buildCacheSteps) cached build steps", "\(p.blobs) layer files"]
+        var parts = ["\(p.buildCacheSteps) cached build steps"]
+        if let s = p.snapshots, s > 0 { parts.append("\(s) VM snapshot\(s == 1 ? "" : "s")") }
+        parts.append("\(p.blobs) layer files")
         if !p.images.isEmpty { parts.append("\(p.images.count) image\(p.images.count == 1 ? "" : "s")") }
         if !p.containers.isEmpty { parts.append("\(p.containers.count) container\(p.containers.count == 1 ? "" : "s")") }
         return "Removes " + ListFormatter.localizedString(byJoining: parts) + "."

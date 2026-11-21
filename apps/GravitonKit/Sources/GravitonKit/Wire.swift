@@ -14,7 +14,7 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case start(id: String)
     case stop(id: String)
     case restart(id: String)
-    case pull(reference: String, progress: Bool = false)
+    case pull(reference: String, progress: Bool = false, platform: String? = nil)
     case run(RunSpec)
     case build(BuildSpec)
     case remove(id: String)
@@ -43,6 +43,7 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     private struct PullParams: Encodable {
         let reference: String
         let progress: Bool?
+        let platform: String?
     }
     private struct PairParams: Encodable { let code: String; let device: String }
     private struct AuthParams: Encodable { let token: String }
@@ -100,7 +101,7 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case let .auth(token): try c.encode(AuthParams(token: token), forKey: .params)
         case let .logs(id, tail): try c.encode(LogParams(id: id, tail: tail), forKey: .params)
         case .diskUsage: break
-        case let .removeImage(reference): try c.encode(PullParams(reference: reference, progress: nil), forKey: .params)
+        case let .removeImage(reference): try c.encode(PullParams(reference: reference, progress: nil, platform: nil), forKey: .params)
         case let .prune(spec): try c.encode(spec, forKey: .params)
         case let .start(id), let .stop(id), let .restart(id), let .remove(id), let .stats(id), let .inspect(id):
             try c.encode(IDParams(id: id), forKey: .params)
@@ -111,8 +112,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case let .exec(spec): try c.encode(spec, forKey: .params)
         case let .events(since, limit): try c.encode(EventsParams(since: since, limit: limit), forKey: .params)
         case let .registerPush(token, sandbox): try c.encode(PushParams(token: token, sandbox: sandbox), forKey: .params)
-        case let .pull(reference, progress):
-            try c.encode(PullParams(reference: reference, progress: progress ? true : nil), forKey: .params)
+        case let .pull(reference, progress, platform):
+            try c.encode(PullParams(reference: reference, progress: progress ? true : nil, platform: platform), forKey: .params)
         case let .run(spec): try c.encode(spec, forKey: .params)
         case let .build(spec): try c.encode(spec, forKey: .params)
         }

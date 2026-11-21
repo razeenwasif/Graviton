@@ -116,6 +116,9 @@ pub fn disk_usage(engine: &Engine) -> DiskUsage {
     }
     usage.build_cache_steps = refs.build_cache_steps;
     usage.build_cache_bytes += crate::build::cache_mounts_bytes();
+    let (snapshots, snapshots_bytes) = engine.snapshots.disk_usage();
+    usage.snapshots = snapshots;
+    usage.snapshots_bytes = snapshots_bytes;
     usage
 }
 
@@ -233,6 +236,11 @@ pub fn prune(engine: &Engine, spec: &PruneSpec) -> Result<PruneReport> {
             report.freed_bytes += size;
         }
     }
+
+    // 5. Idle cached VM snapshots (automatically re-warmed on demand).
+    let (snap_count, snap_bytes) = engine.snapshots.clear_idle(spec.dry_run);
+    report.snapshots = snap_count;
+    report.freed_bytes += snap_bytes;
 
     if !spec.dry_run {
         remove_stale_builds(&paths::support_dir().join("builds"));

@@ -27,6 +27,12 @@ pub struct BootCheckArgs {
     /// Memory in MiB.
     #[arg(long, default_value_t = 512)]
     memory: u64,
+    /// Attach Apple's Rosetta for Linux share (if installed on this Mac).
+    #[arg(long)]
+    rosetta: bool,
+    /// Test VM snapshot save and restore (saves state to a temp file, restores, then runs command).
+    #[arg(long)]
+    snapshot: bool,
     /// Command to run in the guest.
     #[arg(last = true, default_values_t = ["/bin/busybox".to_string(), "uname".to_string(), "-a".to_string()])]
     command: Vec<String>,
@@ -35,6 +41,9 @@ pub struct BootCheckArgs {
 pub fn run(args: BootCheckArgs) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
+        use graviton_vmm::VmIdentity;
+        use graviton_vmm::apple::AppleHypervisor;
+
         let guest = paths::guest_dir();
         let mut config = VmConfig::new(
             args.kernel.unwrap_or_else(|| guest.join("vmlinux")),
@@ -43,15 +52,47 @@ pub fn run(args: BootCheckArgs) -> Result<()> {
         );
         config.cpus = args.cpus;
         config.memory_mib = args.memory;
+        config.rosetta = args.rosetta;
+        config.balloon = true;
         let vm_dir = paths::vms_dir().join("boot-check");
         std::fs::create_dir_all(&vm_dir).with_context(|| format!("creating {}", vm_dir.display()))?;
         config.console_log = Some(vm_dir.join("console.log"));
 
         let t0 = Instant::now();
-        let vm = graviton_vmm::apple::AppleHypervisor::new().boot_vm(&config)?;
-        println!("VM started            {:>6} ms", t0.elapsed().as_millis());
+        let vm = if args.snapshot {
+            config.cmdline = crate::snapshot::SNAPSHOT_CMDLINE.into();
+            config.identity = Some(VmIdentity {
+                machine_id: AppleHypervisor::new_machine_id(),
+                nat_mac: Some("02:47:72:00:00:fe".into()),
+                switch_mac: None,
+            });
+            let template = AppleHypervisor::new().boot_vm_saveable(&config)?;
+            println!("Template VM started    {:>6} ms", t0.elapsed().as_millis());
+            {
+                let mut conn = File::from(template.connect(AGENT_VSOCK_PORT)?);
+                let _ = crate::runtime::read_event_unbuffered(&mut conn)?;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+            template.pause()?;
+            let snap_path = vm_dir.join("boot-check.vzsave");
+            template.save_state(&snap_path)?;
+            println!("Snapshot saved         {:>6} ms", t0.elapsed().as_millis());
+            let _ = template.kill();
+            drop(template);
 
-        let result = talk_to_agent(&vm, args.command, t0);
+            let t_restore = Instant::now();
+            let restored = AppleHypervisor::new().restore_vm(&config, &snap_path)?;
+            println!("Snapshot restored      {:>6} ms", t_restore.elapsed().as_millis());
+            let _ = std::fs::remove_file(&snap_path);
+            restored
+        } else {
+            let vm = AppleHypervisor::new().boot_vm(&config)?;
+            println!("VM started            {:>6} ms", t0.elapsed().as_millis());
+            vm
+        };
+
+        let t_agent = Instant::now();
+        let result = talk_to_agent(&vm, args.command, if args.snapshot { t_agent } else { t0 });
         if result.is_err() {
             let _ = vm.kill();
             if let Ok(log) = std::fs::read_to_string(vm.console_log()) {

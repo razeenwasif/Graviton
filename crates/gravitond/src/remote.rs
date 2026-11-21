@@ -341,8 +341,8 @@ impl Remote {
                 | Request::PushSetup { .. } | Request::PushStatus | Request::PushTest, _) => {
                     write.write_all(&encode_line(&Response::Error { message: "only available on the Mac itself".into() })).await?;
                 }
-                (Request::Pull { reference, progress: true }, crate::Backend::Engine(engine)) => {
-                    crate::pull_stream(Arc::clone(engine), reference.clone(), &mut write).await?;
+                (Request::Pull { reference, progress: true, platform }, crate::Backend::Engine(engine)) => {
+                    crate::pull_stream(Arc::clone(engine), reference.clone(), platform.clone(), &mut write).await?;
                 }
                 (Request::Build(spec), crate::Backend::Engine(engine)) => {
                     if spec.upload.is_none() {

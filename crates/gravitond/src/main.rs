@@ -13,6 +13,7 @@ mod events;
 mod push;
 mod remote;
 mod runtime;
+mod snapshot;
 mod switch;
 mod upload;
 
@@ -227,8 +228,8 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
             write.write_all(&encode_line(&response)).await?;
             continue;
         }
-        if let (Request::Pull { reference, progress: true }, Backend::Engine(engine)) = (&request, &backend) {
-            pull_stream(Arc::clone(engine), reference.clone(), &mut write).await?;
+        if let (Request::Pull { reference, progress: true, platform }, Backend::Engine(engine)) = (&request, &backend) {
+            pull_stream(Arc::clone(engine), reference.clone(), platform.clone(), &mut write).await?;
             continue;
         }
         if let (Request::Build(spec), Backend::Engine(engine)) = (&request, &backend) {
@@ -266,12 +267,13 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
 pub(crate) async fn pull_stream(
     engine: Arc<Engine>,
     reference: String,
+    platform: Option<String>,
     write: &mut (impl tokio::io::AsyncWrite + Unpin),
 ) -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let task = tokio::task::spawn_blocking(move || {
         let updates = tx.clone();
-        let result = engine.pull_with_progress(&reference, |progress| {
+        let result = engine.pull_with_progress(&reference, platform.as_deref(), |progress| {
             let _ = updates.send(Response::PullProgress(progress));
         });
         let _ = tx.send(match result {
@@ -571,6 +573,7 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                 Request::Restart { id } => result(store.restart(&id).map(Response::Container)),
                 Request::ListVolumes => Response::Volumes(demo_volumes(&store)),
                 Request::NetworkInfo => Response::Network(demo_network(&store)),
+                Request::SnapshotStatus => Response::Snapshots(graviton_proto::SnapshotInfo::default()),
                 _ => Response::Error { message: "gravitond is serving demo data; restart it without --demo to pull, run, exec and browse files".into() },
             }
         }
@@ -587,7 +590,7 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                         Response::VolumeRemoved { name, freed_bytes }
                     }
                     Request::NetworkInfo => Response::Network(engine.network_info()),
-                    Request::Pull { reference, .. } => Response::Image(engine.pull(&reference)?),
+                    Request::Pull { reference, platform, .. } => Response::Image(engine.pull(&reference, platform.as_deref())?),
                     Request::RegistryLogin { registry, username, password } => {
                         let (registry, username) = engine.auth.login(&registry, &username, &password)?;
                         Response::LoggedIn { registry, username }
@@ -608,6 +611,11 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                         Response::ImageRemoved { reference, freed_bytes, kept_bytes }
                     }
                     Request::Prune(spec) => Response::Pruned(cleanup::prune(&engine, &spec)?),
+                    Request::SnapshotStatus => Response::Snapshots(engine.snapshot_status()),
+                    Request::SnapshotWarm { cpus, memory_mib, rosetta, slots } => {
+                        Response::Snapshots(engine.snapshot_warm(cpus, memory_mib, rosetta, slots)?)
+                    }
+                    Request::SnapshotClear => Response::Snapshots(engine.snapshot_clear()),
                     Request::Stats { id } => Response::Stats(engine.stats(&id)?),
                     Request::ListFiles { id, path } => Response::Files(engine.list_files(&id, &path)?),
                     Request::ReadFile { id, path } => Response::File(engine.read_file(&id, &path)?),
@@ -717,7 +725,7 @@ mod tests {
             Response::Error { message } => assert!(message.contains("no such container")),
             other => panic!("unexpected {other:?}"),
         }
-        match handle(Request::Pull { reference: "alpine".into(), progress: false }, &backend).await {
+        match handle(Request::Pull { reference: "alpine".into(), progress: false, platform: None }, &backend).await {
             Response::Error { message } => assert!(message.contains("demo")),
             other => panic!("unexpected {other:?}"),
         }

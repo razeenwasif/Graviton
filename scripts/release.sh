@@ -96,10 +96,12 @@ cp "$target_dir/release/gravitond" "$target_dir/release/grav" "$app/Contents/Mac
 mkdir -p "$app/Contents/Resources/guest"
 cp "$guest/vmlinux" "$guest/initrd.img" "$app/Contents/Resources/guest/"
 cat > "$app/Contents/Resources/guest/SOURCES.txt" <<'TXT'
-The guest kernel (vmlinux) is Linux from Alpine Linux's linux-virt package, and
-the initramfs (initrd.img) holds busybox-static and kernel modules from Alpine
-Linux, plus graviton-agent. Linux and BusyBox are licensed under the GNU GPL
-version 2. Their source is available from Alpine Linux:
+The guest kernel (vmlinux) is Linux 6.12 built from upstream kernel.org source
+with scripts/kernel.config (or Alpine Linux's linux-virt package when built
+with --alpine), and the initramfs (initrd.img) holds busybox-static and
+e2fsprogs/musl from Alpine Linux, plus graviton-agent. Linux and BusyBox are
+licensed under the GNU GPL version 2. Their source is available from:
+  https://cdn.kernel.org/pub/linux/kernel/v6.x/
   https://pkgs.alpinelinux.org/packages?name=linux-virt&branch=v3.22&arch=aarch64
   https://pkgs.alpinelinux.org/packages?name=busybox&branch=v3.22&arch=aarch64
   https://gitlab.alpinelinux.org/alpine/aports (build recipes)

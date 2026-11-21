@@ -17,7 +17,7 @@ pub mod apple;
 use std::os::fd::OwnedFd;
 use std::time::Duration;
 
-pub use config::{ConfigError, NetworkMode, SharedDirectory, VmConfig};
+pub use config::{ConfigError, NetworkMode, SharedDirectory, VmConfig, VmIdentity};
 
 use thiserror::Error;
 

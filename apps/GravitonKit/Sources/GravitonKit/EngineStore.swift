@@ -178,11 +178,11 @@ public final class EngineStore {
     }
 
     /// Pull an image with streamed per-layer progress. Refreshes the image list when done.
-    public func pullStream(_ reference: String) -> AsyncThrowingStream<PullEvent, Error> {
+    public func pullStream(_ reference: String, platform: String? = nil) -> AsyncThrowingStream<PullEvent, Error> {
         let upstream: AsyncThrowingStream<PullEvent, Error>
         switch live {
-        case let local as SocketEngine where canManage: upstream = local.pullStream(reference: reference)
-        case let remote as RemoteEngine where canManage: upstream = remote.pullStream(reference: reference)
+        case let local as SocketEngine where canManage: upstream = local.pullStream(reference: reference, platform: platform)
+        case let remote as RemoteEngine where canManage: upstream = remote.pullStream(reference: reference, platform: platform)
         default:
             return AsyncThrowingStream { $0.finish(throwing: EngineError.daemon("Pulls need gravitond running, here or on a paired Mac.")) }
         }

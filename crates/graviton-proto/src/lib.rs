@@ -284,9 +284,20 @@ pub struct RunSpec {
     /// Automatically remove the container after it exits (`grav run --rm`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_remove: bool,
+    /// Target platform when pulling the image (e.g. `linux/amd64` or `linux/arm64`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
 }
 
 fn is_zero_u16(n: &u16) -> bool {
+    *n == 0
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_zero_u64(n: &u64) -> bool {
     *n == 0
 }
 
@@ -410,6 +421,9 @@ pub struct BuildSpec {
     /// Secrets for `RUN --mount=type=secret,id=...` (in memory only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<BuildSecret>,
+    /// Target platform for base images and output config (e.g. `linux/amd64`, `linux/arm64`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
 }
 
 /// Where an uploaded build folder's Dockerfile goes when it lives outside the folder.
@@ -435,6 +449,11 @@ pub struct DiskUsage {
     pub build_cache_bytes: u64,
     /// Layers nothing refers to any more.
     pub unreferenced_bytes: u64,
+    /// Cached VM memory snapshots (slots) and their total disk usage.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub snapshots: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub snapshots_bytes: u64,
 }
 
 /// What `grav prune` removes. The build cache and unreferenced layers always go.
@@ -462,6 +481,9 @@ pub struct PruneReport {
     pub blobs: u32,
     pub freed_bytes: u64,
     pub dry_run: bool,
+    /// Cached VM snapshot slots deleted.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub snapshots: u32,
 }
 
 /// What `grav exec` asks for.
@@ -581,6 +603,12 @@ pub struct ContainerDetails {
     /// Automatic restart policy saved with the container.
     #[serde(default)]
     pub restart: RestartPolicy,
+    /// Image architecture (e.g. `arm64`, `amd64`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<String>,
+    /// True when running an x86_64 image through Rosetta for Linux.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rosetta: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -594,6 +622,31 @@ pub struct EngineInfo {
     pub memory_used_bytes: u64,
     pub disk_bytes: u64,
     pub disk_used_bytes: u64,
+    /// Whether Apple's Rosetta for Linux is available for running `linux/amd64` images.
+    #[serde(default)]
+    pub rosetta: bool,
+}
+
+/// Cached VM memory snapshot pool for one VM shape (`grav snapshot status`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotGroup {
+    pub cpus: u32,
+    pub memory_mib: u64,
+    pub rosetta: bool,
+    pub slots: u32,
+    pub in_use: u32,
+    pub size_bytes: u64,
+}
+
+/// Summary of the daemon's VM snapshot pool (`grav snapshot status|warm|clear`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotInfo {
+    pub enabled: bool,
+    pub total_slots: u32,
+    pub in_use: u32,
+    pub total_bytes: u64,
+    pub max_slots_per_shape: u32,
+    pub groups: Vec<SnapshotGroup>,
 }
 
 // ---------------------------------------------------------------------------
@@ -627,6 +680,8 @@ pub enum Request {
         reference: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         progress: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        platform: Option<String>,
     },
     /// Verify and save credentials for an OCI registry (password goes in the Mac's Keychain).
     RegistryLogin {
@@ -651,6 +706,21 @@ pub enum Request {
     RemoveImage { reference: String },
     /// Clear the build cache and unreferenced layers, and more if asked.
     Prune(PruneSpec),
+    /// Inspect cached VM snapshots.
+    SnapshotStatus,
+    /// Pre-warm one or more VM snapshots for fast container restore.
+    SnapshotWarm {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cpus: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory_mib: Option<u64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        rosetta: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slots: Option<u32>,
+    },
+    /// Remove all idle cached VM snapshots from disk.
+    SnapshotClear,
     /// Run a command in a running container. Without a TTY the daemon answers
     /// with `ExecOutput` lines and a final `ExecExited`; with one it answers
     /// `Attached` and the connection then carries terminal [`frame`]s.
@@ -721,6 +791,7 @@ pub enum Response {
     /// `kept_bytes`: its layers the build cache still holds (`grav prune` frees them).
     ImageRemoved { reference: String, freed_bytes: u64, kept_bytes: u64 },
     Pruned(PruneReport),
+    Snapshots(SnapshotInfo),
     BuildLog { line: String },
     ExecOutput { stream: LogStream, data: Vec<u8> },
     ExecExited { code: i32 },
@@ -830,6 +901,9 @@ pub enum AgentRequest {
         mounts: Vec<GuestMount>,
         #[serde(default)]
         hostname: Option<String>,
+        /// Host Unix wall-clock time in seconds (used after VM snapshot restore so guest clock matches host UTC).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        now_secs: Option<u64>,
     },
     /// Run a process. With `container`, it runs chrooted into that container's
     /// root filesystem in new mount, UTS and IPC namespaces.
@@ -1132,9 +1206,22 @@ mod tests {
         assert_eq!("no".parse::<RestartPolicy>().unwrap(), RestartPolicy::No);
         assert!("bogus".parse::<RestartPolicy>().is_err());
         let pull: Request = decode_line(br#"{"method":"pull","params":{"reference":"alpine"}}"#).unwrap();
-        assert_eq!(pull, Request::Pull { reference: "alpine".into(), progress: false });
+        assert_eq!(pull, Request::Pull { reference: "alpine".into(), progress: false, platform: None });
         let pull_stream: Request = decode_line(br#"{"method":"pull","params":{"progress":true,"reference":"alpine"}}"#).unwrap();
-        assert_eq!(pull_stream, Request::Pull { reference: "alpine".into(), progress: true });
+        assert_eq!(pull_stream, Request::Pull { reference: "alpine".into(), progress: true, platform: None });
+        let pull_amd64: Request = decode_line(br#"{"method":"pull","params":{"platform":"linux/amd64","reference":"alpine"}}"#).unwrap();
+        assert_eq!(pull_amd64, Request::Pull { reference: "alpine".into(), progress: false, platform: Some("linux/amd64".into()) });
+        let snap_req = Request::SnapshotWarm { cpus: Some(2), memory_mib: Some(1024), rosetta: true, slots: Some(2) };
+        assert_eq!(decode_line::<Request>(&encode_line(&snap_req)).unwrap(), snap_req);
+        let snap_resp = Response::Snapshots(SnapshotInfo {
+            enabled: true,
+            total_slots: 2,
+            in_use: 1,
+            total_bytes: 256 << 20,
+            max_slots_per_shape: 8,
+            groups: vec![SnapshotGroup { cpus: 2, memory_mib: 1024, rosetta: false, slots: 2, in_use: 1, size_bytes: 256 << 20 }],
+        });
+        assert_eq!(decode_line::<Response>(&encode_line(&snap_resp)).unwrap(), snap_resp);
     }
 
     #[test]

@@ -30,26 +30,26 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use graviton_core::{ImageReference, Store, paths};
-use graviton_image::{BlobStore, ImageIndex, LocalImage, Progress, Registry};
+use graviton_image::{BlobStore, ImageError, ImageIndex, LocalImage, Progress, PullOptions, Registry};
 use graviton_proto::{
     AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ContainerDetails, ContainerStats, ContainerStatus, ContainerSummary,
     DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats, HostEntry, ImageSummary, LogLevel, LogLine, LogStream,
     Mount, NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy, RunSpec,
-    StatSample, VolumeMountRef, VolumeSummary, decode_line, encode_line,
+    SnapshotInfo, StatSample, VolumeMountRef, VolumeSummary, decode_line, encode_line,
 };
 use graviton_vmm::apple::{AppleHypervisor, AppleVm};
 use graviton_vmm::{NetworkMode, SharedDirectory, VmConfig, VmHandle};
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_CPUS: u32 = 2;
-const DEFAULT_MEMORY_MIB: u64 = 1024;
+pub(crate) const DEFAULT_CPUS: u32 = 2;
+pub(crate) const DEFAULT_MEMORY_MIB: u64 = 1024;
 const STOP_GRACE: Duration = Duration::from_secs(10);
 /// Exponential backoff for automatic restarts: 1s, 2s, 4s, ..., capped at 60s.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Staying up at least this long resets the restart backoff back to 1s.
 const HEALTHY_UPTIME: Duration = Duration::from_secs(10);
-const KERNEL: &str = "Linux 6.12 (Alpine linux-virt)";
+const KERNEL_FALLBACK: &str = "Linux 6.12";
 /// How often running containers are sampled, and how many samples are kept (5 minutes).
 const STATS_INTERVAL: Duration = Duration::from_secs(2);
 const STATS_KEPT: usize = 150;
@@ -134,6 +134,8 @@ struct Running {
     forwards: Vec<tokio::task::JoinHandle<()>>,
     /// The VM's port on the container network; unplugged when this is dropped (after the VM stops).
     _port: Option<crate::switch::Port>,
+    /// Exclusive lease on the snapshot slot this VM restored from; released after the VM stops.
+    _snapshot: Option<crate::snapshot::SnapshotLease>,
 }
 
 #[derive(Default)]
@@ -148,6 +150,7 @@ pub struct Engine {
     pub(crate) blobs: BlobStore,
     pub(crate) index: Mutex<ImageIndex>,
     pub(crate) specs: Mutex<HashMap<String, ContainerSpec>>,
+    pub(crate) snapshots: Arc<crate::snapshot::SnapshotPool>,
     running: Mutex<HashMap<String, Running>>,
     stats: Mutex<HashMap<String, StatsHistory>>,
     switch: crate::switch::Switch,
@@ -164,7 +167,7 @@ pub struct Engine {
     pending_restarts: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Set during daemon shutdown so running containers keep `want_running` and don't emit false failure alerts.
     shutting_down: AtomicBool,
-    /// One pull per image at a time: a second waits for the first, then finds it.
+    /// One pull per image+platform at a time: a second waits for the first, then finds it.
     pulling: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     rt: tokio::runtime::Handle,
     state_path: PathBuf,
@@ -181,6 +184,7 @@ impl Engine {
             blobs,
             index: Mutex::new(index),
             specs: Mutex::new(HashMap::new()),
+            snapshots: Arc::new(crate::snapshot::SnapshotPool::open()),
             running: Mutex::new(HashMap::new()),
             stats: Mutex::new(HashMap::new()),
             switch: crate::switch::Switch::new(),
@@ -242,14 +246,32 @@ impl Engine {
         EngineInfo {
             version: env!("CARGO_PKG_VERSION").into(),
             protocol: PROTOCOL_VERSION,
-            kernel: KERNEL.into(),
+            kernel: detect_guest_kernel(),
             arch: graviton_image::guest_arch().into(),
             cpus: std::thread::available_parallelism().map_or(0, |n| n.get() as u32),
             memory_bytes: host_memory(),
             memory_used_bytes: used,
             disk_bytes: 0,
             disk_used_bytes: disk_used,
+            rosetta: AppleHypervisor::rosetta_available(),
         }
+    }
+
+    pub fn snapshot_status(&self) -> SnapshotInfo {
+        self.snapshots.status()
+    }
+
+    pub fn snapshot_warm(&self, cpus: Option<u32>, memory_mib: Option<u64>, rosetta: bool, slots: Option<u32>) -> Result<SnapshotInfo> {
+        let cpus = cpus.unwrap_or(DEFAULT_CPUS);
+        let memory_mib = memory_mib.unwrap_or(DEFAULT_MEMORY_MIB);
+        let desired = slots.unwrap_or(1) as usize;
+        self.snapshots.ensure_slots(self.blobs.root(), cpus, memory_mib, rosetta, desired)?;
+        Ok(self.snapshots.status())
+    }
+
+    pub fn snapshot_clear(&self) -> SnapshotInfo {
+        let _ = self.snapshots.clear_idle(false);
+        self.snapshots.status()
     }
 
     // -- Saved state --------------------------------------------------------
@@ -322,74 +344,128 @@ impl Engine {
 
     // -- Images -----------------------------------------------------------
 
-    pub fn pull(&self, reference: &str) -> Result<ImageSummary> {
-        self.pull_with_progress(reference, |_| {})
+    pub fn pull(&self, reference: &str, platform: Option<&str>) -> Result<ImageSummary> {
+        self.pull_with_progress(reference, platform, |_| {})
     }
 
-    pub fn pull_with_progress(&self, reference: &str, mut on_progress: impl FnMut(graviton_proto::PullProgress)) -> Result<ImageSummary> {
+    pub fn pull_with_progress(
+        &self,
+        reference: &str,
+        platform: Option<&str>,
+        mut on_progress: impl FnMut(graviton_proto::PullProgress),
+    ) -> Result<ImageSummary> {
         let parsed = ImageReference::parse(reference)?;
         let creds = self.auth.credentials_for(&parsed.registry)?;
-        eprintln!("pull {}", parsed.display_name());
+        let rosetta_available = AppleHypervisor::rosetta_available();
+        if let Some(p) = platform {
+            let want = graviton_image::normalize_platform(p)?;
+            if want == "amd64" && graviton_image::guest_arch() != "amd64" && !rosetta_available {
+                bail!("linux/amd64 images need Apple Rosetta for Linux (run `softwareupdate --install-rosetta`)");
+            }
+        }
+        eprintln!(
+            "pull {}{}",
+            parsed.display_name(),
+            platform.map(|p| format!(" ({p})")).unwrap_or_default()
+        );
         let t0 = Instant::now();
         let mut last_log = Instant::now();
         let mut last_emit = Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now);
         let mut last_layer_idx: Option<usize> = None;
         let mut total_layers = 0usize;
-        let image = Registry::new().pull_with_auth(&parsed, &self.blobs, creds.as_ref(), |p| match p {
-            Progress::Resolved { layers, total_bytes, .. } => {
-                total_layers = layers;
-                eprintln!("  {layers} layers, {:.1} MiB", total_bytes as f64 / 1048576.0);
-                on_progress(graviton_proto::PullProgress::Resolved { layers, total_bytes });
-            }
-            Progress::Layer { index, digest, done, total, cached } => {
-                let short = digest.strip_prefix("sha256:").map(|h| &h[..h.len().min(12)]).unwrap_or(&digest);
-                if cached {
-                    eprintln!("  layer {} {short} (cached)", index + 1);
-                } else if done == total || last_log.elapsed() > Duration::from_secs(1) {
-                    last_log = Instant::now();
-                    eprintln!(
-                        "  layer {} {short} {:>3}%",
-                        index + 1,
-                        (done * 100).checked_div(total).unwrap_or(100)
-                    );
+        let opts = PullOptions {
+            auth: creds.as_ref(),
+            platform,
+            allow_amd64_fallback: rosetta_available,
+        };
+        let image = Registry::new()
+            .pull_with_options(&parsed, &self.blobs, opts, |p| match p {
+                Progress::Resolved { layers, total_bytes, .. } => {
+                    total_layers = layers;
+                    eprintln!("  {layers} layers, {:.1} MiB", total_bytes as f64 / 1048576.0);
+                    on_progress(graviton_proto::PullProgress::Resolved { layers, total_bytes });
                 }
-                let is_new_layer = last_layer_idx != Some(index);
-                let is_terminal = cached || (total > 0 && done >= total);
-                if is_new_layer || is_terminal || last_emit.elapsed() >= Duration::from_millis(100) {
-                    last_layer_idx = Some(index);
-                    last_emit = Instant::now();
-                    on_progress(graviton_proto::PullProgress::Layer {
-                        index,
-                        total_layers,
-                        digest,
-                        done,
-                        total,
-                        cached,
-                    });
+                Progress::Layer { index, digest, done, total, cached } => {
+                    let short = digest.strip_prefix("sha256:").map(|h| &h[..h.len().min(12)]).unwrap_or(&digest);
+                    if cached {
+                        eprintln!("  layer {} {short} (cached)", index + 1);
+                    } else if done == total || last_log.elapsed() > Duration::from_secs(1) {
+                        last_log = Instant::now();
+                        eprintln!(
+                            "  layer {} {short} {:>3}%",
+                            index + 1,
+                            (done * 100).checked_div(total).unwrap_or(100)
+                        );
+                    }
+                    let is_new_layer = last_layer_idx != Some(index);
+                    let is_terminal = cached || (total > 0 && done >= total);
+                    if is_new_layer || is_terminal || last_emit.elapsed() >= Duration::from_millis(100) {
+                        last_layer_idx = Some(index);
+                        last_emit = Instant::now();
+                        on_progress(graviton_proto::PullProgress::Layer {
+                            index,
+                            total_layers,
+                            digest,
+                            done,
+                            total,
+                            cached,
+                        });
+                    }
                 }
-            }
-        })?;
-        eprintln!("  done in {:.1} s", t0.elapsed().as_secs_f64());
+            })
+            .map_err(|err| match err {
+                ImageError::NoPlatform { reference, arch, available }
+                    if platform.is_none() && !rosetta_available && available.contains("linux/amd64") =>
+                {
+                    anyhow!(
+                        "no linux/{arch} image for {reference} (available: {available}); install Rosetta with `softwareupdate --install-rosetta` to run linux/amd64 images"
+                    )
+                }
+                other => other.into(),
+            })?;
+        eprintln!("  done in {:.1} s ({})", t0.elapsed().as_secs_f64(), image.architecture);
         self.index.lock().unwrap().insert(image.clone())?;
         self.refresh_images();
         let summary = image.summary(self.used_by(&image.reference));
         let name = format!("{}:{}", summary.repository, summary.tag);
-        self.events.record(graviton_proto::EventKind::Pulled, None, Some(&name), format!("Pulled {name} ({:.1} MB)", summary.size_bytes as f64 / 1048576.0));
+        let arch_note = if summary.architecture == "amd64" && graviton_image::guest_arch() != "amd64" {
+            ", amd64 via Rosetta"
+        } else {
+            ""
+        };
+        self.events.record(
+            graviton_proto::EventKind::Pulled,
+            None,
+            Some(&name),
+            format!("Pulled {name} ({:.1} MB{arch_note})", summary.size_bytes as f64 / 1048576.0),
+        );
         Ok(summary)
     }
 
     pub(crate) fn image_for(&self, reference: &str) -> Result<LocalImage> {
-        if let Some(img) = self.index.lock().unwrap().get(reference) {
+        self.image_for_platform(reference, None)
+    }
+
+    pub(crate) fn image_for_platform(&self, reference: &str, platform: Option<&str>) -> Result<LocalImage> {
+        let want_arch = platform.map(graviton_image::normalize_platform).transpose()?;
+        let matches = |img: &LocalImage| want_arch.as_deref().is_none_or(|a| img.architecture == a);
+        if let Some(img) = self.index.lock().unwrap().get(reference).filter(|i| matches(i)) {
             return Ok(img.clone());
         }
-        // Two containers of a new image at once: one pull, and the other waits for it.
-        let gate = Arc::clone(self.pulling.lock().unwrap().entry(reference.to_string()).or_default());
+        // Two containers of a new image+platform at once: one pull, and the other waits for it.
+        let key = format!("{}|{}", reference, want_arch.as_deref().unwrap_or(""));
+        let gate = Arc::clone(self.pulling.lock().unwrap().entry(key).or_default());
         let _turn = gate.lock().unwrap();
-        if let Some(img) = self.index.lock().unwrap().get(reference) {
+        if let Some(img) = self.index.lock().unwrap().get(reference).filter(|i| matches(i)) {
             return Ok(img.clone());
         }
-        self.pull(reference)?;
-        self.index.lock().unwrap().get(reference).cloned().ok_or_else(|| anyhow!("pulled {reference} but can't find it"))
+        self.pull(reference, platform)?;
+        self.index
+            .lock()
+            .unwrap()
+            .get(reference)
+            .cloned()
+            .ok_or_else(|| anyhow!("pulled {reference} but can't find it"))
     }
 
     pub(crate) fn used_by(&self, reference: &str) -> u32 {
@@ -415,7 +491,13 @@ impl Engine {
                 bail!("the name {name} is already in use");
             }
         }
-        let image = self.image_for(&spec.image)?;
+        let image = self.image_for_platform(&spec.image, spec.platform.as_deref())?;
+        if image.architecture == "amd64" && graviton_image::guest_arch() != "amd64" && !AppleHypervisor::rosetta_available() {
+            bail!(
+                "{} is a linux/amd64 image, which needs Apple Rosetta for Linux (run `softwareupdate --install-rosetta`)",
+                spec.image
+            );
+        }
         let config = image.config(&self.blobs)?.config;
         let argv = config.argv(spec.command.as_deref());
         if argv.is_empty() {
@@ -848,11 +930,18 @@ impl Engine {
         let guest = paths::guest_dir();
         let vm_dir = paths::vms_dir().join(id);
         fs::create_dir_all(&vm_dir)?;
+        let rosetta = spec.image.architecture == "amd64" && graviton_image::guest_arch() != "amd64";
+        if rosetta && !AppleHypervisor::rosetta_available() {
+            bail!("linux/amd64 images need Apple Rosetta for Linux (run `softwareupdate --install-rosetta`)");
+        }
         let mut config = VmConfig::new(guest.join("vmlinux"), guest.join("initrd.img"), container_disk(&vm_dir)?);
         config.cpus = spec.cpus;
         config.memory_mib = spec.memory_mib;
         config.network = NetworkMode::Nat;
         config.console_log = Some(vm_dir.join("console.log"));
+        config.rosetta = rosetta;
+        config.balloon = true;
+        config.multi_share_tag = Some("graviton".into());
         config.shares = vec![SharedDirectory { host_path: self.blobs.root().to_path_buf(), tag: "blobs".into(), read_only: true }];
         let mut mounts = Vec::new();
         for (i, v) in spec.volumes.iter().enumerate() {
@@ -869,7 +958,10 @@ impl Engine {
         // A second network device on the container network, so containers reach each other.
         let port = self.switch.attach().context("joining the container network")?;
         config.switch_port = Some(port.vm_fd());
-        let vm = Arc::new(AppleHypervisor::new().boot_vm(&config).context("booting the container's VM")?);
+        let (vm, snapshot_lease, from_snapshot) = match self.snapshots.try_restore(&config)? {
+            Some((restored, lease)) => (Arc::new(restored), Some(lease), true),
+            None => (Arc::new(AppleHypervisor::new().boot_vm(&config).context("booting the container's VM")?), None, false),
+        };
         let fd = vm.connect(AGENT_VSOCK_PORT).context("connecting to the guest agent")?;
         let agent = Arc::new(Mutex::new(File::from(fd)));
         let mut events = Events::new(BufReader::new(agent.lock().unwrap().try_clone()?));
@@ -888,6 +980,7 @@ impl Engine {
                 dns: false,
                 forwards: vec![],
                 _port: Some(port),
+                _snapshot: snapshot_lease,
             },
         );
         let booted = t0.elapsed();
@@ -897,6 +990,7 @@ impl Engine {
             layers: spec.image.layers.iter().map(|l| l.digest.clone()).collect(),
             mounts,
             hostname: Some(name.clone()),
+            now_secs: from_snapshot.then(now_secs),
         })?;
         let (files, unpack_ms, ip, reused, dns) = match events.next()? {
             AgentEvent::Prepared { files, ms, ip, reused, dns, .. } => (files, ms, ip, reused, dns),
@@ -916,8 +1010,10 @@ impl Engine {
             LogLevel::Info,
             LogStream::System,
             format!(
-                "VM booted in {} ms; {}; {}",
+                "{} in {} ms{}; {}; {}",
+                if from_snapshot { "VM restored from snapshot" } else { "VM booted" },
                 booted.as_millis(),
+                if rosetta { " (amd64 via Rosetta)" } else { "" },
                 if reused { format!("kept its files from the last run ({unpack_ms} ms)") } else { format!("unpacked {files} files in {unpack_ms} ms") },
                 match &ip {
                     Some(ip) => format!("network {ip}"),
@@ -925,6 +1021,9 @@ impl Engine {
                 }
             ),
         );
+        if !from_snapshot {
+            self.snapshots.maybe_warm_background(self.blobs.root().to_path_buf(), spec.cpus, spec.memory_mib, rosetta);
+        }
 
         // Publish ports now that the guest has an address.
         if !bound.is_empty() {
@@ -1241,9 +1340,11 @@ impl Engine {
             hostname: container.name.clone(),
             cpus: spec.cpus,
             memory_mib: spec.memory_mib,
-            kernel: KERNEL.into(),
+            kernel: detect_guest_kernel(),
             vm_dir: paths::vms_dir().join(&container.id).display().to_string(),
             restart: spec.restart,
+            architecture: Some(spec.image.architecture.clone()),
+            rosetta: spec.image.architecture == "amd64" && graviton_image::guest_arch() != "amd64",
             container,
         })
     }
@@ -1833,6 +1934,45 @@ fn host_memory() -> u64 {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
+}
+
+/// Read the active guest kernel's banner (`Linux version X.Y.Z-...`) from
+/// `vmlinux`, cached by `(path, len, mtime)` so `grav info` / `inspect` stay instant.
+fn detect_guest_kernel() -> String {
+    type CacheKey = (PathBuf, u64, u64);
+    static CACHE: std::sync::OnceLock<Mutex<Option<(CacheKey, String)>>> = std::sync::OnceLock::new();
+    let path = paths::guest_dir().join("vmlinux");
+    let Ok(meta) = fs::metadata(&path) else { return KERNEL_FALLBACK.into() };
+    let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+    let key = (path.clone(), meta.len(), mtime);
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if let Some((k, label)) = cache.lock().unwrap().as_ref() {
+        if *k == key {
+            return label.clone();
+        }
+    }
+    let label = fs::read(&path)
+        .ok()
+        .and_then(|bytes| extract_linux_version(&bytes))
+        .map(|ver| {
+            if ver.ends_with("-virt") {
+                format!("Linux {ver} (Alpine)")
+            } else {
+                format!("Linux {ver}")
+            }
+        })
+        .unwrap_or_else(|| KERNEL_FALLBACK.into());
+    *cache.lock().unwrap() = Some((key, label.clone()));
+    label
+}
+
+fn extract_linux_version(bytes: &[u8]) -> Option<String> {
+    const NEEDLE: &[u8] = b"Linux version ";
+    let pos = bytes.windows(NEEDLE.len()).position(|w| w == NEEDLE)?;
+    let rest = &bytes[pos + NEEDLE.len()..];
+    let end = rest.iter().position(|&b| b == b' ' || b == 0 || b == b'\n')?;
+    let ver = std::str::from_utf8(&rest[..end]).ok()?.trim();
+    (!ver.is_empty()).then(|| ver.to_string())
 }
 
 /// The file a VM's scratch disk lives in, beside its console log.

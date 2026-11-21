@@ -155,9 +155,16 @@ struct PullImageSheet: View {
     @Environment(EngineStore.self) private var store
     @Environment(\.dismiss) private var dismiss
     @State private var reference = ""
+    @State private var platform = ""
     @State private var phase: Phase = .idle
     @State private var progress = PullState()
     @FocusState private var focused: Bool
+
+    private static let platformChoices: [(String, String)] = [
+        ("", "Auto"),
+        ("linux/arm64", "arm64"),
+        ("linux/amd64", "amd64 (Rosetta)"),
+    ]
 
     enum Phase: Equatable {
         case idle
@@ -177,6 +184,12 @@ struct PullImageSheet: View {
                     .disabled(pulling)
                     .onSubmit(startPull)
                     .gravitonField(mono: true, height: 36)
+            }
+            if store.engine?.rosetta == true {
+                GFormRow("Platform", hint: "Auto prefers arm64 and falls back to amd64 via Rosetta.") {
+                    GSegmented(selection: $platform, options: Self.platformChoices)
+                        .disabled(pulling)
+                }
             }
 
             switch phase {
@@ -210,12 +223,13 @@ struct PullImageSheet: View {
     private func startPull() {
         guard !pulling, !trimmed.isEmpty, store.canManage else { return }
         let reference = trimmed
+        let selectedPlatform = platform.isEmpty ? nil : platform
         progress = PullState()
         phase = .pulling(since: .now)
         Task {
             do {
                 var finished: ImageInfo?
-                for try await event in store.pullStream(reference) {
+                for try await event in store.pullStream(reference, platform: selectedPlatform) {
                     switch event {
                     case let .progress(update):
                         progress.apply(update)

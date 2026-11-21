@@ -24,6 +24,7 @@ use std::process::Command;
 use flate2::read::GzDecoder;
 
 const BLOBS: &str = "/run/blobs";
+const SHARES: &str = "/run/shares";
 const CONTAINERS: &str = "/run/containers";
 /// The scratch disk gravitond attaches, if it does.
 const DISK: &str = "/dev/vda";
@@ -35,10 +36,24 @@ fn on_disk() -> io::Result<bool> {
     READY.get_or_init(|| format_disk().map_err(|e| e.to_string())).clone().map_err(io::Error::other)
 }
 
+/// Drop any kernel block-device page cache for `dev` before inspecting or
+/// mounting it: a VM restored from a snapshot probed `/dev/vda` against a blank
+/// template disk before the container's real `disk.img` was attached.
+fn invalidate_block_cache(dev: &str) {
+    const BLKFLSBUF: libc::Ioctl = 0x1261;
+    if let Ok(file) = File::open(dev) {
+        // SAFETY: BLKFLSBUF flushes/invalidates cached pages on this unmounted block device.
+        unsafe {
+            let _ = libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&file), BLKFLSBUF, 0);
+        }
+    }
+}
+
 fn format_disk() -> io::Result<bool> {
     if !Path::new(DISK).exists() {
         return Ok(false);
     }
+    invalidate_block_cache(DISK);
     if !is_ext4(DISK) {
         format(DISK)?;
     }
@@ -168,12 +183,24 @@ pub fn finish(id: &str, mounts: &[graviton_proto::GuestMount], hostname: &str, i
         let rel = clean(Path::new(&m.target)).ok_or_else(|| io::Error::other(format!("bad mount target `{}`", m.target)))?;
         let target = root.join(rel);
         fs::create_dir_all(&target)?;
-        let mut flags = libc::MS_NOSUID | libc::MS_NODEV;
-        if m.read_only {
-            flags |= libc::MS_RDONLY;
+        let multi_src = ensure_multi_share().then(|| Path::new(SHARES).join(&m.tag)).filter(|p| p.exists());
+        if let Some(src) = multi_src {
+            let dst = target.to_string_lossy();
+            crate::linux::mount_with(&src.to_string_lossy(), &dst, "none", libc::MS_BIND, None)
+                .map_err(|e| io::Error::other(format!("binding {} at {}: {e}", m.tag, m.target)))?;
+            let mut remount = libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV;
+            if m.read_only {
+                remount |= libc::MS_RDONLY;
+            }
+            let _ = crate::linux::mount_with("", &dst, "none", remount, None);
+        } else {
+            let mut flags = libc::MS_NOSUID | libc::MS_NODEV;
+            if m.read_only {
+                flags |= libc::MS_RDONLY;
+            }
+            crate::linux::mount_with(&m.tag, &target.to_string_lossy(), "virtiofs", flags, None)
+                .map_err(|e| io::Error::other(format!("mounting {} at {}: {e}", m.tag, m.target)))?;
         }
-        crate::linux::mount_with(&m.tag, &target.to_string_lossy(), "virtiofs", flags, None)
-            .map_err(|e| io::Error::other(format!("mounting {} at {}: {e}", m.tag, m.target)))?;
     }
 
     let etc = root.join("etc");
@@ -209,11 +236,39 @@ pub fn finish(id: &str, mounts: &[graviton_proto::GuestMount], hostname: &str, i
     Ok(dns_active)
 }
 
+/// Mount the host's `graviton` multi-directory virtiofs share at `/run/shares`,
+/// if attached. Container VMs pack `blobs` plus any `-v` volumes under one
+/// `VZMultipleDirectoryShare` so VM snapshots can restore with arbitrary volumes.
+fn ensure_multi_share() -> bool {
+    static MOUNTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MOUNTED.get_or_init(|| {
+        if fs::create_dir_all(SHARES).is_err() {
+            return false;
+        }
+        crate::linux::mount_with("graviton", SHARES, "virtiofs", libc::MS_NOSUID | libc::MS_NODEV, None).is_ok()
+    })
+}
+
 fn mount_blobs() -> io::Result<()> {
     if Path::new(BLOBS).join("sha256").is_dir() {
         return Ok(());
     }
     fs::create_dir_all(BLOBS)?;
+    if ensure_multi_share() {
+        let src = Path::new(SHARES).join("blobs");
+        if src.is_dir() {
+            crate::linux::mount_with(&src.to_string_lossy(), BLOBS, "none", libc::MS_BIND, None)
+                .map_err(|e| io::Error::other(format!("binding the image store: {e}")))?;
+            let _ = crate::linux::mount_with(
+                "",
+                BLOBS,
+                "none",
+                libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
+                None,
+            );
+            return Ok(());
+        }
+    }
     crate::linux::mount_with("blobs", BLOBS, "virtiofs", libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV, None)
         .map_err(|e| io::Error::other(format!("mounting the image store: {e}")))
 }

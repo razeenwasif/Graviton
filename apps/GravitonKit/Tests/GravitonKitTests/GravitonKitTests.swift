@@ -79,6 +79,21 @@ import Testing
         let pullStream = String(decoding: try Wire.line(.pull(reference: "alpine", progress: true)), as: UTF8.self)
         #expect(pullStream == "{\"method\":\"pull\",\"params\":{\"progress\":true,\"reference\":\"alpine\"}}\n")
 
+        let pullPlatform = String(decoding: try Wire.line(.pull(reference: "alpine", progress: true, platform: "linux/amd64")), as: UTF8.self)
+        #expect(pullPlatform == "{\"method\":\"pull\",\"params\":{\"platform\":\"linux/amd64\",\"progress\":true,\"reference\":\"alpine\"}}\n")
+
+        let engineJSON = #"{"type":"engine","data":{"version":"0.1.0","protocol":2,"kernel":"Linux 6.12.118-graviton","arch":"arm64","cpus":10,"memory_bytes":16,"memory_used_bytes":2,"disk_bytes":0,"disk_used_bytes":1,"rosetta":true}}"#
+        guard case let .engine(info) = try Wire.decoder.decode(EngineResponse.self, from: Data(engineJSON.utf8)) else {
+            Issue.record("expected engine info"); return
+        }
+        #expect(info.rosetta == true && info.kernel == "Linux 6.12.118-graviton")
+
+        let dfJSON = #"{"type":"disk_usage","data":{"images":1,"unused_images":0,"blobs_bytes":100,"unused_images_bytes":0,"containers":1,"stopped_containers":0,"container_disks_bytes":200,"stopped_disks_bytes":0,"build_cache_steps":2,"build_cache_bytes":300,"unreferenced_bytes":50,"snapshots":2,"snapshots_bytes":400}}"#
+        guard case let .diskUsage(usage) = try Wire.decoder.decode(EngineResponse.self, from: Data(dfJSON.utf8)) else {
+            Issue.record("expected disk usage"); return
+        }
+        #expect(usage.snapshots == 2 && usage.snapshotsBytes == 400 && usage.alwaysReclaimable == 750)
+
         let resolvedJSON = #"{"type":"pull_progress","data":{"stage":"resolved","layers":2,"total_bytes":1000}}"#
         guard case let .pullProgress(.resolved(layers, totalBytes)) = try Wire.decoder.decode(EngineResponse.self, from: Data(resolvedJSON.utf8)) else {
             Issue.record("expected resolved pull_progress"); return

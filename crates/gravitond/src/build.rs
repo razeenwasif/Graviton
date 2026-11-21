@@ -157,6 +157,7 @@ fn ensure_cache_mount_dir(key: &str) -> Result<PathBuf> {
 /// Where a stage has got to.
 #[derive(Clone)]
 struct State {
+    architecture: String,
     layers: Vec<BuiltLayer>,
     /// The base image's whole OCI config; `config` is rewritten at the end.
     base_config: Value,
@@ -354,8 +355,13 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
                     s.args.clear();
                     s
                 }
-                None => base_state(engine, &base, log)?,
+                None => base_state(engine, &base, spec.platform.as_deref(), log)?,
             };
+            if state.architecture == "amd64" && graviton_image::guest_arch() != "amd64" && !AppleHypervisor::rosetta_available() {
+                bail!(
+                    "building a linux/amd64 image needs Apple Rosetta for Linux (run `softwareupdate --install-rosetta`)"
+                );
+            }
             let container = format!("b{build_id}s{i}");
             let mut live = false; // the container holds `state.layers`
             let mut use_cache = !spec.no_cache;
@@ -808,10 +814,15 @@ fn image_reference(spec: &BuildSpec, context: &Path) -> Result<String> {
 }
 
 /// A stage starting from an image (pulled if needed) or `scratch`.
-fn base_state(engine: &Engine, base: &str, log: &mut dyn FnMut(String)) -> Result<State> {
+fn base_state(engine: &Engine, base: &str, platform: Option<&str>, log: &mut dyn FnMut(String)) -> Result<State> {
+    let target_arch = match platform {
+        Some(p) => graviton_image::normalize_platform(p)?,
+        None => graviton_image::guest_arch().into(),
+    };
     let empty = State {
+        architecture: target_arch.clone(),
         layers: vec![],
-        base_config: json!({"architecture": graviton_image::guest_arch(), "os": "linux", "config": {}}),
+        base_config: json!({"architecture": target_arch, "os": "linux", "config": {}}),
         env: vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()],
         entrypoint: None,
         cmd: None,
@@ -823,17 +834,26 @@ fn base_state(engine: &Engine, base: &str, log: &mut dyn FnMut(String)) -> Resul
         volumes: BTreeSet::new(),
         stop_signal: None,
         history: vec![],
-        key: hash(&["scratch"]),
+        key: hash(&["scratch", &target_arch]),
         args: BTreeMap::new(),
         created: None,
     };
     if base == "scratch" {
         return Ok(empty);
     }
-    if engine.index.lock().unwrap().get(base).is_none() {
-        log(format!(" ---> pulling {base}"));
+    let need_pull = engine
+        .index
+        .lock()
+        .unwrap()
+        .get(base)
+        .is_none_or(|i| platform.is_some() && i.architecture != target_arch);
+    if need_pull {
+        log(format!(
+            " ---> pulling {base}{}",
+            platform.map(|p| format!(" ({p})")).unwrap_or_default()
+        ));
     }
-    let image = engine.image_for(base)?;
+    let image = engine.image_for_platform(base, platform)?;
     let raw = engine.blobs.read(&Digest::parse(&image.config_digest)?)?;
     let config: Value = serde_json::from_slice(&raw).context("reading the base image's config")?;
     let diff_ids: Vec<String> = config["rootfs"]["diff_ids"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
@@ -843,6 +863,7 @@ fn base_state(engine: &Engine, base: &str, log: &mut dyn FnMut(String)) -> Resul
     let c = &config["config"];
     let strings = |v: &Value| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>());
     Ok(State {
+        architecture: image.architecture.clone(),
         layers: image
             .layers
             .iter()
@@ -860,7 +881,7 @@ fn base_state(engine: &Engine, base: &str, log: &mut dyn FnMut(String)) -> Resul
         volumes: c["Volumes"].as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default(),
         stop_signal: c["StopSignal"].as_str().map(String::from),
         history: config["history"].as_array().cloned().unwrap_or_default(),
-        key: hash(&["image", &image.manifest_digest]),
+        key: hash(&["image", &image.manifest_digest, &image.architecture]),
         base_config: config,
         args: BTreeMap::new(),
         created: None,
@@ -973,6 +994,8 @@ fn boot_builder(
     config.memory_mib = 4096;
     config.network = NetworkMode::Nat;
     config.console_log = Some(dir.join("console.log"));
+    config.rosetta = AppleHypervisor::rosetta_available();
+    config.balloon = true;
     config.shares = vec![
         SharedDirectory { host_path: engine.blobs.root().to_path_buf(), tag: "blobs".into(), read_only: true },
         SharedDirectory { host_path: context.to_path_buf(), tag: "context".into(), read_only: true },
@@ -998,6 +1021,7 @@ fn prepare(b: &mut Builder, container: &str, layers: &[BuiltLayer]) -> Result<()
         layers: layers.iter().map(|l| l.digest.clone()).collect(),
         mounts: vec![],
         hostname: Some("graviton-build".into()),
+        now_secs: None,
     })? {
         AgentEvent::Prepared { .. } => {
             b.prepared.insert(container.into());
@@ -1134,7 +1158,7 @@ fn write_image(engine: &Engine, reference: &str, s: &State) -> Result<LocalImage
         None => s.base_config["created"].as_str().map(String::from).unwrap_or_else(|| rfc3339(0)),
     };
     config["config"] = Value::Object(rc);
-    config["architecture"] = json!(graviton_image::guest_arch());
+    config["architecture"] = json!(s.architecture);
     config["os"] = json!("linux");
     config["created"] = json!(created);
     config["rootfs"] = json!({"type": "layers", "diff_ids": s.layers.iter().map(|l| l.diff_id.clone()).collect::<Vec<_>>()});
@@ -1163,7 +1187,7 @@ fn write_image(engine: &Engine, reference: &str, s: &State) -> Result<LocalImage
         manifest_digest: manifest_digest.to_string(),
         config_digest: config_digest.to_string(),
         layers: s.layers.iter().map(|l| Layer { digest: l.digest.clone(), size: l.size, media_type: l.media_type.clone() }).collect(),
-        architecture: graviton_image::guest_arch().into(),
+        architecture: s.architecture.clone(),
         pulled_at: now_secs(),
     })
 }
@@ -1222,6 +1246,7 @@ mod tests {
             no_cache: false,
             upload: None,
             secrets: vec![],
+            platform: None,
         };
         assert_eq!(image_reference(&spec(None), Path::new("/Users/me/My App")).unwrap(), "docker.io/library/my-app:latest");
         assert_eq!(image_reference(&spec(Some("web:1.2")), Path::new("/x")).unwrap(), "docker.io/library/web:1.2");
@@ -1247,6 +1272,7 @@ mod tests {
 
     fn base_state_for_test() -> State {
         State {
+            architecture: "arm64".into(),
             layers: vec![],
             base_config: json!({}),
             env: vec!["PATH=/bin".into()],

@@ -16,9 +16,20 @@ pub enum NetworkMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedDirectory {
     pub host_path: PathBuf,
-    /// virtiofs tag the agent mounts.
+    /// virtiofs tag (or directory key inside `multi_share_tag`) the agent mounts.
     pub tag: String,
     pub read_only: bool,
+}
+
+/// Stable hardware identity pinned across VM snapshot save and restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmIdentity {
+    /// Serialised `VZGenericMachineIdentifier.dataRepresentation`.
+    pub machine_id: Vec<u8>,
+    /// Colon-hex MAC address for `eth0` (NAT), e.g. `"02:47:72:00:00:01"`.
+    pub nat_mac: Option<String>,
+    /// Colon-hex MAC address for `eth1` (container switch).
+    pub switch_mac: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +44,17 @@ pub struct VmConfig {
     pub cmdline: String,
     pub network: NetworkMode,
     pub shares: Vec<SharedDirectory>,
+    /// When set, pack all `shares` into one `VZMultipleDirectoryShare` under
+    /// this virtiofs tag (allowing container volumes to be attached dynamically
+    /// when restoring a saved VM snapshot).
+    pub multi_share_tag: Option<String>,
+    /// Attach Apple's `VZLinuxRosettaDirectoryShare` under virtiofs tag `rosetta`
+    /// so the guest can execute `linux/amd64` ELF binaries via `binfmt_misc`.
+    pub rosetta: bool,
+    /// Attach a `virtio-balloon` device so the host can reclaim idle guest RAM.
+    pub balloon: bool,
+    /// Stable hardware identity required when saving or restoring VM snapshots.
+    pub identity: Option<VmIdentity>,
     /// Where to write the guest console (hvc0). Defaults to a temp file.
     pub console_log: Option<PathBuf>,
     /// A connected datagram socket for a second network device (`eth1`),
@@ -66,6 +88,10 @@ impl VmConfig {
             cmdline: "console=hvc0 quiet panic=-1".into(),
             network: NetworkMode::Nat,
             shares: Vec::new(),
+            multi_share_tag: None,
+            rosetta: false,
+            balloon: true,
+            identity: None,
             console_log: None,
             switch_port: None,
         }

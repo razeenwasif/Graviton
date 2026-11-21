@@ -27,16 +27,18 @@ use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::AllocAnyThread;
-use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString, NSURL};
+use objc2_foundation::{NSArray, NSData, NSDictionary, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::{
-    VZBootLoader, VZDirectorySharingDeviceConfiguration, VZEntropyDeviceConfiguration, VZFileHandleNetworkDeviceAttachment,
-    VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode, VZFileSerialPortAttachment,
+    VZBootLoader, VZDirectorySharingDeviceConfiguration, VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment,
+    VZDiskImageSynchronizationMode, VZEntropyDeviceConfiguration, VZFileHandleNetworkDeviceAttachment, VZFileSerialPortAttachment,
+    VZGenericMachineIdentifier, VZGenericPlatformConfiguration, VZLinuxBootLoader, VZLinuxRosettaAvailability,
+    VZLinuxRosettaDirectoryShare, VZMACAddress, VZMemoryBalloonDeviceConfiguration, VZMultipleDirectoryShare,
+    VZNATNetworkDeviceAttachment, VZNetworkDeviceAttachment, VZNetworkDeviceConfiguration, VZPlatformConfiguration,
+    VZSerialPortAttachment, VZSerialPortConfiguration, VZSharedDirectory, VZSingleDirectoryShare, VZSocketDeviceConfiguration,
     VZStorageDeviceAttachment, VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
-    VZGenericPlatformConfiguration, VZLinuxBootLoader, VZNATNetworkDeviceAttachment, VZNetworkDeviceAttachment,
-    VZNetworkDeviceConfiguration, VZPlatformConfiguration, VZSerialPortAttachment, VZSerialPortConfiguration,
-    VZSharedDirectory, VZSingleDirectoryShare, VZSocketDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
-    VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
-    VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration, VZVirtualMachine,
+    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
+    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration,
+    VZVirtioTraditionalMemoryBalloonDevice, VZVirtioTraditionalMemoryBalloonDeviceConfiguration, VZVirtualMachine,
     VZVirtualMachineConfiguration, VZVirtualMachineState,
 };
 
@@ -58,8 +60,65 @@ impl AppleHypervisor {
         unsafe { VZVirtualMachine::isSupported() }
     }
 
+    /// Whether Apple's Rosetta for Linux binaries is installed on this Mac.
+    pub fn rosetta_available() -> bool {
+        // SAFETY: class method with no arguments.
+        unsafe { VZLinuxRosettaDirectoryShare::availability() == VZLinuxRosettaAvailability::Installed }
+    }
+
+    /// Generate a fresh serialisable machine identifier for VM snapshot save/restore.
+    pub fn new_machine_id() -> Vec<u8> {
+        // SAFETY: creating a brand new VZGenericMachineIdentifier and reading its bytes.
+        unsafe { VZGenericMachineIdentifier::new().dataRepresentation().to_vec() }
+    }
+
     /// Boot and return the concrete handle (gives access to the console log path).
     pub fn boot_vm(&self, config: &VmConfig) -> Result<AppleVm, VmmError> {
+        self.boot_vm_inner(config, false)
+    }
+
+    /// Boot after validating that Virtualization.framework supports saving and
+    /// restoring this exact VM configuration (`validateSaveRestoreSupport`).
+    pub fn boot_vm_saveable(&self, config: &VmConfig) -> Result<AppleVm, VmmError> {
+        self.boot_vm_inner(config, true)
+    }
+
+    fn boot_vm_inner(&self, config: &VmConfig, require_save_restore: bool) -> Result<AppleVm, VmmError> {
+        let vm = self.prepare_vm(config, require_save_restore)?;
+        let (tx, rx) = mpsc::channel();
+        let done = Sendable(RcBlock::new(move |err: *mut NSError| {
+            let _ = tx.send(error_text(err));
+        }));
+        vm.on_queue(|machine| unsafe { machine.startWithCompletionHandler(done.get()) });
+        match rx.recv_timeout(START_TIMEOUT) {
+            Ok(None) => Ok(vm),
+            Ok(Some(message)) => Err(VmmError::Framework(format!("starting VM: {message}"))),
+            Err(_) => Err(VmmError::Timeout("waiting for the VM to start")),
+        }
+    }
+
+    /// Restore a VM from a saved `.vzsave` state file and resume execution.
+    pub fn restore_vm(&self, config: &VmConfig, state_path: &Path) -> Result<AppleVm, VmmError> {
+        if !state_path.is_file() {
+            return Err(VmmError::Framework(format!("snapshot not found at {}", state_path.display())));
+        }
+        let vm = self.prepare_vm(config, true)?;
+        let state_url = Sendable(file_url(state_path));
+        let (tx, rx) = mpsc::channel();
+        let done = Sendable(RcBlock::new(move |err: *mut NSError| {
+            let _ = tx.send(error_text(err));
+        }));
+        vm.on_queue(|machine| unsafe { machine.restoreMachineStateFromURL_completionHandler(state_url.get(), done.get()) });
+        match rx.recv_timeout(START_TIMEOUT) {
+            Ok(None) => {}
+            Ok(Some(message)) => return Err(VmmError::Framework(format!("restoring VM snapshot: {message}"))),
+            Err(_) => return Err(VmmError::Timeout("waiting for the VM snapshot to restore")),
+        }
+        vm.resume()?;
+        Ok(vm)
+    }
+
+    fn prepare_vm(&self, config: &VmConfig, require_save_restore: bool) -> Result<AppleVm, VmmError> {
         config.validate()?;
         if !Self::is_supported() {
             return Err(VmmError::Unavailable("Virtualization.framework reports this Mac can't run VMs".into()));
@@ -69,27 +128,14 @@ impl AppleHypervisor {
                 return Err(VmmError::Framework(format!("{what} not found at {} (run scripts/build-guest.sh)", path.display())));
             }
         }
-
         let console_log = config.console_log.clone().unwrap_or_else(|| std::env::temp_dir().join("graviton-console.log"));
         // SAFETY: building a configuration object graph on this thread; nothing is shared yet.
-        let configuration = unsafe { build_configuration(config, &console_log)? };
+        let configuration = unsafe { build_configuration(config, &console_log, require_save_restore)? };
 
         let queue = DispatchQueue::new("dev.graviton.vm", None);
         // SAFETY: the VM is bound to `queue`; all later access goes through `on_queue`.
         let vm = unsafe { VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), &configuration, &queue) };
-        let vm = AppleVm { vm: Sendable(vm), queue, console_log };
-
-        let (tx, rx) = mpsc::channel();
-        let done = RcBlock::new(move |err: *mut NSError| {
-            let _ = tx.send(error_text(err));
-        });
-        let done = Sendable(done);
-        vm.on_queue(|machine| unsafe { machine.startWithCompletionHandler(done.get()) });
-        match rx.recv_timeout(START_TIMEOUT) {
-            Ok(None) => Ok(vm),
-            Ok(Some(message)) => Err(VmmError::Framework(format!("starting VM: {message}"))),
-            Err(_) => Err(VmmError::Timeout("waiting for the VM to start")),
-        }
+        Ok(AppleVm { vm: Sendable(vm), queue, console_log })
     }
 }
 
@@ -128,6 +174,62 @@ impl AppleVm {
     /// Where the guest's hvc0 console is written.
     pub fn console_log(&self) -> &Path {
         &self.console_log
+    }
+
+    /// Pause a running VM (required before `save_state`).
+    pub fn pause(&self) -> Result<(), VmmError> {
+        let (tx, rx) = mpsc::channel();
+        let done = Sendable(RcBlock::new(move |err: *mut NSError| {
+            let _ = tx.send(error_text(err));
+        }));
+        self.on_queue(|vm| unsafe { vm.pauseWithCompletionHandler(done.get()) });
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(None) => Ok(()),
+            Ok(Some(message)) => Err(VmmError::Framework(format!("pausing VM: {message}"))),
+            Err(_) => Err(VmmError::Timeout("waiting for the VM to pause")),
+        }
+    }
+
+    /// Resume a paused (or freshly restored) VM.
+    pub fn resume(&self) -> Result<(), VmmError> {
+        let (tx, rx) = mpsc::channel();
+        let done = Sendable(RcBlock::new(move |err: *mut NSError| {
+            let _ = tx.send(error_text(err));
+        }));
+        self.on_queue(|vm| unsafe { vm.resumeWithCompletionHandler(done.get()) });
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(None) => Ok(()),
+            Ok(Some(message)) => Err(VmmError::Framework(format!("resuming VM: {message}"))),
+            Err(_) => Err(VmmError::Timeout("waiting for the VM to resume")),
+        }
+    }
+
+    /// Save a paused VM's state to `path` (host-encrypted `.vzsave`).
+    pub fn save_state(&self, path: &Path) -> Result<(), VmmError> {
+        let _ = std::fs::remove_file(path);
+        let url = Sendable(file_url(path));
+        let (tx, rx) = mpsc::channel();
+        let done = Sendable(RcBlock::new(move |err: *mut NSError| {
+            let _ = tx.send(error_text(err));
+        }));
+        self.on_queue(|vm| unsafe { vm.saveMachineStateToURL_completionHandler(url.get(), done.get()) });
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(None) => Ok(()),
+            Ok(Some(message)) => Err(VmmError::Framework(format!("saving VM state: {message}"))),
+            Err(_) => Err(VmmError::Timeout("waiting for the VM state to save")),
+        }
+    }
+
+    /// Ask the guest's `virtio-balloon` driver to adjust physical RAM to `bytes`.
+    pub fn set_balloon_target_bytes(&self, bytes: u64) {
+        self.on_queue(|vm| unsafe {
+            let devices = vm.memoryBalloonDevices();
+            if let Some(dev) = devices.firstObject() {
+                if let Ok(balloon) = dev.downcast::<VZVirtioTraditionalMemoryBalloonDevice>() {
+                    balloon.setTargetVirtualMachineMemorySize(bytes);
+                }
+            }
+        });
     }
 
     /// Run `f` on the VM's queue and return its result.
@@ -208,7 +310,8 @@ impl VmHandle for AppleVm {
 
     /// Connect to a guest port, retrying while the guest boots and starts listening.
     fn connect(&self, port: u32) -> Result<OwnedFd, VmmError> {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(20);
         loop {
             match self.connect_once(port) {
                 Ok(fd) => return Ok(fd),
@@ -219,7 +322,8 @@ impl VmHandle for AppleVm {
                     if Instant::now() >= deadline {
                         return Err(VmmError::Framework(format!("connecting to vsock port {port}: {message}")));
                     }
-                    std::thread::sleep(Duration::from_millis(50));
+                    let delay = if start.elapsed() < Duration::from_secs(2) { 10 } else { 50 };
+                    std::thread::sleep(Duration::from_millis(delay));
                 }
             }
         }
@@ -257,7 +361,11 @@ impl Drop for AppleVm {
 ///
 /// # Safety
 /// Must be called before the configuration is shared with a `VZVirtualMachine`.
-unsafe fn build_configuration(config: &VmConfig, console_log: &Path) -> Result<Retained<VZVirtualMachineConfiguration>, VmmError> {
+unsafe fn build_configuration(
+    config: &VmConfig,
+    console_log: &Path,
+    require_save_restore: bool,
+) -> Result<Retained<VZVirtualMachineConfiguration>, VmmError> {
     unsafe {
         let boot = VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &file_url(&config.kernel));
         boot.setInitialRamdiskURL(Some(&file_url(&config.initrd)));
@@ -269,6 +377,12 @@ unsafe fn build_configuration(config: &VmConfig, console_log: &Path) -> Result<R
         c.setCPUCount(config.cpus as usize);
         c.setMemorySize(config.memory_mib * 1024 * 1024);
         let platform = VZGenericPlatformConfiguration::new();
+        if let Some(id) = &config.identity {
+            let data = NSData::with_bytes(&id.machine_id);
+            let mid = VZGenericMachineIdentifier::initWithDataRepresentation(VZGenericMachineIdentifier::alloc(), &data)
+                .ok_or_else(|| VmmError::Framework("invalid saved machine identifier".into()))?;
+            platform.setMachineIdentifier(&mid);
+        }
         let platform: &VZPlatformConfiguration = &platform;
         c.setPlatform(platform);
 
@@ -290,11 +404,21 @@ unsafe fn build_configuration(config: &VmConfig, console_log: &Path) -> Result<R
         c.setSocketDevices(&NSArray::<VZSocketDeviceConfiguration>::from_retained_slice(&[
             VZVirtioSocketDeviceConfiguration::new().into_super(),
         ]));
+        if config.balloon {
+            c.setMemoryBalloonDevices(&NSArray::<VZMemoryBalloonDeviceConfiguration>::from_retained_slice(&[
+                VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new().into_super(),
+            ]));
+        }
 
         let mut nics: Vec<Retained<VZNetworkDeviceConfiguration>> = Vec::new();
         if config.network == NetworkMode::Nat {
             // eth0: NAT, for the internet and the Mac.
             let net = VZVirtioNetworkDeviceConfiguration::new();
+            if let Some(mac_str) = config.identity.as_ref().and_then(|i| i.nat_mac.as_deref()) {
+                let mac = VZMACAddress::initWithString(VZMACAddress::alloc(), &NSString::from_str(mac_str))
+                    .ok_or_else(|| VmmError::Framework(format!("invalid MAC address `{mac_str}`")))?;
+                net.setMACAddress(&mac);
+            }
             let nat = VZNATNetworkDeviceAttachment::new();
             let nat: &VZNetworkDeviceAttachment = &nat;
             net.setAttachment(Some(nat));
@@ -305,6 +429,11 @@ unsafe fn build_configuration(config: &VmConfig, console_log: &Path) -> Result<R
             let handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(NSFileHandle::alloc(), fd, false);
             let attachment = VZFileHandleNetworkDeviceAttachment::initWithFileHandle(VZFileHandleNetworkDeviceAttachment::alloc(), &handle);
             let net = VZVirtioNetworkDeviceConfiguration::new();
+            if let Some(mac_str) = config.identity.as_ref().and_then(|i| i.switch_mac.as_deref()) {
+                let mac = VZMACAddress::initWithString(VZMACAddress::alloc(), &NSString::from_str(mac_str))
+                    .ok_or_else(|| VmmError::Framework(format!("invalid MAC address `{mac_str}`")))?;
+                net.setMACAddress(&mac);
+            }
             let attachment: &VZNetworkDeviceAttachment = &attachment;
             net.setAttachment(Some(attachment));
             nics.push(net.into_super());
@@ -313,10 +442,25 @@ unsafe fn build_configuration(config: &VmConfig, console_log: &Path) -> Result<R
             c.setNetworkDevices(&NSArray::<VZNetworkDeviceConfiguration>::from_retained_slice(&nics));
         }
 
-        let shares: Vec<Retained<VZDirectorySharingDeviceConfiguration>> = config
-            .shares
-            .iter()
-            .map(|s| {
+        let mut shares: Vec<Retained<VZDirectorySharingDeviceConfiguration>> = Vec::new();
+        if let Some(tag) = &config.multi_share_tag {
+            let keys: Vec<Retained<NSString>> = config.shares.iter().map(|s| NSString::from_str(&s.tag)).collect();
+            let key_refs: Vec<&NSString> = keys.iter().map(|k| &**k).collect();
+            let dirs: Vec<Retained<VZSharedDirectory>> = config
+                .shares
+                .iter()
+                .map(|s| VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &file_url(&s.host_path), s.read_only))
+                .collect();
+            let dict = NSDictionary::from_retained_objects(&key_refs, &dirs);
+            let share = VZMultipleDirectoryShare::initWithDirectories(VZMultipleDirectoryShare::alloc(), &dict);
+            let fs = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                VZVirtioFileSystemDeviceConfiguration::alloc(),
+                &NSString::from_str(tag),
+            );
+            fs.setShare(Some(&share.into_super()));
+            shares.push(fs.into_super());
+        } else {
+            for s in &config.shares {
                 let dir = VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &file_url(&s.host_path), s.read_only);
                 let share = VZSingleDirectoryShare::initWithDirectory(VZSingleDirectoryShare::alloc(), &dir);
                 let fs = VZVirtioFileSystemDeviceConfiguration::initWithTag(
@@ -324,16 +468,28 @@ unsafe fn build_configuration(config: &VmConfig, console_log: &Path) -> Result<R
                     &NSString::from_str(&s.tag),
                 );
                 fs.setShare(Some(&share.into_super()));
-                fs.into_super()
-            })
-            .collect();
+                shares.push(fs.into_super());
+            }
+        }
+        if config.rosetta {
+            let rosetta = VZLinuxRosettaDirectoryShare::initWithError(VZLinuxRosettaDirectoryShare::alloc()).map_err(|e| {
+                VmmError::Unavailable(format!(
+                    "Rosetta for Linux isn't available ({}; run `softwareupdate --install-rosetta`)",
+                    e.localizedDescription()
+                ))
+            })?;
+            let fs = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                VZVirtioFileSystemDeviceConfiguration::alloc(),
+                &NSString::from_str("rosetta"),
+            );
+            fs.setShare(Some(&rosetta.into_super()));
+            shares.push(fs.into_super());
+        }
         if !shares.is_empty() {
             c.setDirectorySharingDevices(&NSArray::from_retained_slice(&shares));
         }
 
-        // The disk the guest keeps containers' files on (/dev/vda). It's
-        // scratch, rebuilt each boot, so the Mac caches it and never flushes
-        // it to its own disk on the guest's behalf.
+        // The disk the guest keeps containers' files on (/dev/vda).
         if !config.rootfs.as_os_str().is_empty() {
             let disk = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
                 VZDiskImageStorageDeviceAttachment::alloc(),
@@ -350,6 +506,10 @@ unsafe fn build_configuration(config: &VmConfig, console_log: &Path) -> Result<R
 
         c.validateWithError()
             .map_err(|e| VmmError::Framework(format!("invalid VM configuration: {}", e.localizedDescription())))?;
+        if require_save_restore {
+            c.validateSaveRestoreSupportWithError()
+                .map_err(|e| VmmError::Framework(format!("VM configuration can't be saved/restored: {}", e.localizedDescription())))?;
+        }
         Ok(c)
     }
 }

@@ -38,6 +38,59 @@ impl fmt::Debug for Credentials {
     }
 }
 
+/// Options controlling registry authentication and target platform selection.
+#[derive(Debug, Clone, Default)]
+pub struct PullOptions<'a> {
+    pub auth: Option<&'a Credentials>,
+    /// Explicit platform (e.g. `linux/amd64`, `linux/arm64`, `amd64`, `arm64`).
+    pub platform: Option<&'a str>,
+    /// When `platform` is `None` and the native guest arch (`arm64`) isn't available,
+    /// fall back to `linux/amd64` (for running under Apple Rosetta for Linux).
+    pub allow_amd64_fallback: bool,
+}
+
+/// Normalize a user-supplied platform string into its OCI architecture name
+/// (`"arm64"` or `"amd64"`), validating that the OS (if given) is `linux`.
+pub fn normalize_platform(raw: &str) -> Result<String> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return Err(ImageError::Unsupported("empty platform".into()));
+    }
+    let parts: Vec<&str> = trimmed.split('/').collect();
+    let arch = match parts.as_slice() {
+        [a] => *a,
+        [os, a] | [os, a, _] => {
+            if *os != "linux" {
+                return Err(ImageError::Unsupported(format!(
+                    "platform `{raw}` (Graviton runs Linux images: linux/arm64, linux/amd64)"
+                )));
+            }
+            *a
+        }
+        _ => {
+            return Err(ImageError::Unsupported(format!(
+                "platform `{raw}` (use linux/arm64 or linux/amd64)"
+            )));
+        }
+    };
+    match arch {
+        "arm64" | "aarch64" => Ok("arm64".into()),
+        "amd64" | "x86_64" | "x86-64" => Ok("amd64".into()),
+        _ => Err(ImageError::Unsupported(format!(
+            "architecture `{arch}` in platform `{raw}` (use linux/arm64 or linux/amd64)"
+        ))),
+    }
+}
+
+fn normalize_arch_label(arch: &str) -> String {
+    match arch.trim().to_ascii_lowercase().as_str() {
+        "" => guest_arch().into(),
+        "aarch64" => "arm64".into(),
+        "x86_64" | "x86-64" => "amd64".into(),
+        other => other.into(),
+    }
+}
+
 /// Pull progress, reported as layers download.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
@@ -100,7 +153,7 @@ impl Registry {
 
     /// Pull `reference` anonymously for the guest's architecture into `blobs`.
     pub fn pull(&self, reference: &ImageReference, blobs: &BlobStore, progress: impl FnMut(Progress)) -> Result<LocalImage> {
-        self.pull_with_auth(reference, blobs, None, progress)
+        self.pull_with_options(reference, blobs, PullOptions::default(), progress)
     }
 
     /// Pull `reference` for the guest's architecture into `blobs`, using `auth`
@@ -110,12 +163,24 @@ impl Registry {
         reference: &ImageReference,
         blobs: &BlobStore,
         auth: Option<&Credentials>,
+        progress: impl FnMut(Progress),
+    ) -> Result<LocalImage> {
+        self.pull_with_options(reference, blobs, PullOptions { auth, ..PullOptions::default() }, progress)
+    }
+
+    /// Pull `reference` into `blobs` with explicit authentication and platform/Rosetta options.
+    pub fn pull_with_options(
+        &self,
+        reference: &ImageReference,
+        blobs: &BlobStore,
+        opts: PullOptions<'_>,
         mut progress: impl FnMut(Progress),
     ) -> Result<LocalImage> {
+        let requested_arch = opts.platform.map(normalize_platform).transpose()?;
         let canonical = normalize_registry(&reference.registry);
         let host = registry_host(&canonical);
         let repo = &reference.repository;
-        let mut session = Session::new(&self.agent, canonical, host, repo.clone(), auth);
+        let mut session = Session::new(&self.agent, canonical, host, repo.clone(), opts.auth);
 
         let tag_or_digest = reference.digest.clone().or_else(|| reference.tag.clone()).unwrap_or_else(|| "latest".into());
         let (mut bytes, mut media_type, mut digest) = session.manifest(&tag_or_digest)?;
@@ -124,11 +189,24 @@ impl Registry {
 
         if INDEX_TYPES.contains(&media.as_str()) || manifest.manifests.is_some() {
             let entries = manifest.manifests.take().unwrap_or_default();
-            let chosen = pick_platform(&entries, guest_arch()).ok_or_else(|| ImageError::NoPlatform {
-                reference: reference.display_name(),
-                arch: guest_arch().into(),
-                available: describe_platforms(&entries),
-            })?;
+            let chosen = match requested_arch.as_deref() {
+                Some(want) => pick_platform(&entries, want).ok_or_else(|| ImageError::NoPlatform {
+                    reference: reference.display_name(),
+                    arch: want.into(),
+                    available: describe_platforms(&entries),
+                })?,
+                None => pick_platform(&entries, guest_arch())
+                    .or_else(|| {
+                        (opts.allow_amd64_fallback && guest_arch() != "amd64")
+                            .then(|| pick_platform(&entries, "amd64"))
+                            .flatten()
+                    })
+                    .ok_or_else(|| ImageError::NoPlatform {
+                        reference: reference.display_name(),
+                        arch: guest_arch().into(),
+                        available: describe_platforms(&entries),
+                    })?,
+            };
             let chosen_digest = chosen.digest.clone();
             (bytes, media_type, digest) = session.manifest(&chosen_digest)?;
             manifest = json(&bytes, "manifest")?;
@@ -140,15 +218,31 @@ impl Registry {
         let manifest_digest = Digest::parse(&digest)?;
         blobs.write_bytes(&manifest_digest, &bytes)?;
 
-        let total_bytes = layers.iter().map(|l| l.size).sum();
-        progress(Progress::Resolved { manifest: manifest_digest.to_string(), layers: layers.len(), total_bytes });
-
         let config_digest = Digest::parse(&config.digest)?;
         if !blobs.has(&config_digest) {
             session.blob(&config_digest, blobs, |_| {})?;
         }
         let image_config: ImageConfig =
             serde_json::from_slice(&blobs.read(&config_digest)?).map_err(|source| ImageError::Json { what: "image config".into(), source })?;
+        let actual_arch = normalize_arch_label(&image_config.architecture);
+        if let Some(want) = requested_arch.as_deref() {
+            if actual_arch != want {
+                return Err(ImageError::NoPlatform {
+                    reference: reference.display_name(),
+                    arch: want.into(),
+                    available: format!("linux/{actual_arch}"),
+                });
+            }
+        } else if actual_arch != guest_arch() && !(actual_arch == "amd64" && opts.allow_amd64_fallback) {
+            return Err(ImageError::NoPlatform {
+                reference: reference.display_name(),
+                arch: guest_arch().into(),
+                available: format!("linux/{actual_arch}"),
+            });
+        }
+
+        let total_bytes = layers.iter().map(|l| l.size).sum();
+        progress(Progress::Resolved { manifest: manifest_digest.to_string(), layers: layers.len(), total_bytes });
 
         for (index, layer) in layers.iter().enumerate() {
             let d = Digest::parse(&layer.digest)?;
@@ -167,7 +261,7 @@ impl Registry {
             manifest_digest: manifest_digest.to_string(),
             config_digest: config_digest.to_string(),
             layers: layers.into_iter().map(|l| Layer { digest: l.digest, size: l.size, media_type: l.media_type }).collect(),
-            architecture: if image_config.architecture.is_empty() { guest_arch().into() } else { image_config.architecture },
+            architecture: actual_arch,
             pulled_at: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
         })
     }
@@ -747,6 +841,106 @@ mod tests {
         assert!(reg.pull(&img_ref, &blobs, |_| {}).is_err());
         let img = reg.pull_with_auth(&img_ref, &blobs, Some(&good), |_| {}).unwrap();
         assert_eq!(img.layers.len(), 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn normalizes_platforms() {
+        assert_eq!(normalize_platform("linux/amd64").unwrap(), "amd64");
+        assert_eq!(normalize_platform("amd64").unwrap(), "amd64");
+        assert_eq!(normalize_platform("x86_64").unwrap(), "amd64");
+        assert_eq!(normalize_platform("linux/arm64/v8").unwrap(), "arm64");
+        assert_eq!(normalize_platform("aarch64").unwrap(), "arm64");
+        assert!(normalize_platform("windows/amd64").is_err());
+        assert!(normalize_platform("linux/riscv64").is_err());
+        assert!(normalize_platform("").is_err());
+    }
+
+    #[test]
+    fn pulls_explicit_amd64_and_falls_back_when_allowed() {
+        let amd_cfg = br#"{"architecture":"amd64","os":"linux","config":{"Cmd":["/bin/true"]}}"#.to_vec();
+        let amd_cfg_d = Digest::of(&amd_cfg);
+        let layer = b"amd64-layer".to_vec();
+        let layer_d = Digest::of(&layer);
+        let amd_man = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{amd_cfg_d}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{layer_d}","size":{}}}]}}"#,
+            amd_cfg.len(),
+            layer.len()
+        )
+        .into_bytes();
+        let amd_man_d = Digest::of(&amd_man);
+        let index = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{amd_man_d}","size":{},"platform":{{"architecture":"amd64","os":"linux"}}}}]}}"#,
+            amd_man.len()
+        )
+        .into_bytes();
+        let index_d = Digest::of(&index);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let amd_man_d_s = amd_man_d.to_string();
+        let amd_cfg_d_s = amd_cfg_d.to_string();
+        let layer_d_s = layer_d.to_string();
+        let index_d_s = index_d.to_string();
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let path = req_line.split_whitespace().nth(1).unwrap_or("").to_string();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                }
+                let reply = |s: &mut std::net::TcpStream, ct: &str, d: &str, body: &[u8]| {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nDocker-Content-Digest: {d}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = s.write_all(head.as_bytes());
+                    let _ = s.write_all(body);
+                };
+                if path == "/v2/only/amd64/manifests/latest" {
+                    reply(&mut stream, "application/vnd.oci.image.index.v1+json", &index_d_s, &index);
+                } else if path == format!("/v2/only/amd64/manifests/{amd_man_d_s}") {
+                    reply(&mut stream, "application/vnd.oci.image.manifest.v1+json", &amd_man_d_s, &amd_man);
+                } else if path == format!("/v2/only/amd64/blobs/{amd_cfg_d_s}") {
+                    reply(&mut stream, "application/octet-stream", &amd_cfg_d_s, &amd_cfg);
+                } else if path == format!("/v2/only/amd64/blobs/{layer_d_s}") {
+                    reply(&mut stream, "application/octet-stream", &layer_d_s, &layer);
+                } else {
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                }
+            }
+        });
+
+        let tmp = std::env::temp_dir().join(format!("graviton-reg-amd64-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let blobs = BlobStore::new(tmp.clone());
+        let reg = Registry::new();
+        let img_ref = ImageReference::parse(&format!("{addr}/only/amd64:latest")).unwrap();
+
+        if guest_arch() == "arm64" {
+            // Without fallback, amd64-only image fails cleanly.
+            assert!(matches!(
+                reg.pull_with_options(&img_ref, &blobs, PullOptions::default(), |_| {}),
+                Err(ImageError::NoPlatform { .. })
+            ));
+            // With Rosetta fallback enabled, amd64-only image pulls automatically.
+            let img = reg
+                .pull_with_options(&img_ref, &blobs, PullOptions { allow_amd64_fallback: true, ..PullOptions::default() }, |_| {})
+                .unwrap();
+            assert_eq!(img.architecture, "amd64");
+        }
+        // Explicit --platform linux/amd64 works unconditionally.
+        let img = reg
+            .pull_with_options(&img_ref, &blobs, PullOptions { platform: Some("linux/amd64"), ..PullOptions::default() }, |_| {})
+            .unwrap();
+        assert_eq!(img.architecture, "amd64");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
