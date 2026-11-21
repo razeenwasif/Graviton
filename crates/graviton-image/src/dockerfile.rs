@@ -1,11 +1,11 @@
 //! A Dockerfile parser for `grav build`.
 //!
-//! Supported: FROM (with `AS name` and earlier stages as bases), RUN, CMD,
+//! Supported: FROM (with `AS name` and earlier stages as bases), RUN (with
+//! `--mount=type=cache|secret|bind|tmpfs`, heredocs and `#!` shebangs), CMD,
 //! ENTRYPOINT and SHELL in shell or JSON form, COPY and ADD (local files,
-//! `--from`, `--chown`), ENV, ARG, WORKDIR, USER, EXPOSE, LABEL, VOLUME,
-//! STOPSIGNAL, and line continuations. `RUN --mount=type=cache` runs without
-//! the cache. Heredocs, ONBUILD, `ADD <url>` and `--chmod` are refused with a
-//! clear message.
+//! `ADD <http(s)://url>`, heredocs, `--from`, `--chown`, `--chmod`,
+//! `--checksum`), ENV, ARG, WORKDIR, USER, EXPOSE, LABEL, VOLUME, STOPSIGNAL,
+//! and line continuations.
 
 use std::collections::BTreeMap;
 
@@ -17,13 +17,64 @@ pub enum Command {
     Shell(String),
 }
 
+/// An inline heredoc attached to `COPY` / `ADD`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heredoc {
+    /// Delimiter word (also the default filename when copying into a directory).
+    pub name: String,
+    pub content: String,
+    /// True when the delimiter was unquoted (`<<EOF`), meaning `$VAR` expands.
+    pub expand: bool,
+}
+
+/// One `--mount=...` attached to a `RUN` instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunMount {
+    Cache {
+        target: String,
+        id: Option<String>,
+        read_only: bool,
+        mode: Option<String>,
+    },
+    Secret {
+        id: String,
+        target: Option<String>,
+        env: Option<String>,
+        required: bool,
+        mode: Option<String>,
+    },
+    Bind {
+        source: String,
+        target: String,
+        from: Option<String>,
+        read_write: bool,
+    },
+    Tmpfs {
+        target: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
-    Run(Command),
+    Run {
+        command: Command,
+        mounts: Vec<RunMount>,
+        /// Script fed on stdin when `RUN <<EOF` uses a `#!` shebang.
+        stdin: Option<String>,
+    },
     Cmd(Command),
     Entrypoint(Command),
     Shell(Vec<String>),
-    Copy { sources: Vec<String>, dest: String, from: Option<String>, chown: Option<String>, add: bool },
+    Copy {
+        sources: Vec<String>,
+        heredocs: Vec<Heredoc>,
+        dest: String,
+        from: Option<String>,
+        chown: Option<String>,
+        chmod: Option<String>,
+        checksum: Option<String>,
+        add: bool,
+    },
     Env(Vec<(String, String)>),
     Arg(String, Option<String>),
     Workdir(String),
@@ -38,7 +89,7 @@ pub enum Kind {
 pub struct Instruction {
     /// 1-based line where it starts.
     pub line: usize,
-    /// As written (continuations joined), for the build log and the cache key.
+    /// One-line summary as written (continuations joined), for the build log.
     pub text: String,
     pub kind: Kind,
 }
@@ -73,18 +124,24 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Parse an octal file mode such as `755`, `0644`, or `4755`.
+pub fn parse_octal_mode(s: &str) -> Result<u32, String> {
+    let s = s.trim();
+    if s.is_empty() || s.len() > 4 || !s.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        return Err(format!("invalid octal mode `{s}` (expected e.g. 755 or 0644)"));
+    }
+    u32::from_str_radix(s, 8).map_err(|_| format!("invalid octal mode `{s}`"))
+}
+
 impl Dockerfile {
     pub fn parse(text: &str) -> Result<Self, ParseError> {
         let mut df = Dockerfile::default();
-        for (line, raw) in logical_lines(text) {
+        for LogicalLine { line, text: raw, heredocs } in logical_lines(text)? {
             let err = |message: String| ParseError { line, message };
             let trimmed = raw.trim();
             let (word, rest) = trimmed.split_once(char::is_whitespace).unwrap_or((trimmed, ""));
             let rest = rest.trim();
             let instr = word.to_ascii_uppercase();
-            if rest.contains("<<") && matches!(instr.as_str(), "RUN" | "COPY" | "ADD") && heredoc(rest) {
-                return Err(err("heredocs aren't supported yet; use a script file or RUN with && instead".into()));
-            }
             if instr == "FROM" {
                 let mut words = split_words(rest);
                 words.retain(|w| !w.starts_with("--platform="));
@@ -99,17 +156,18 @@ impl Dockerfile {
             let kind = match instr.as_str() {
                 "RUN" => {
                     let mut rest = rest;
+                    let mut mounts = Vec::new();
                     while let Some(flag) = rest.strip_prefix("--") {
                         let (f, after) = flag.split_once(char::is_whitespace).unwrap_or((flag, ""));
-                        if f.starts_with("mount=") && !f.contains("type=cache") {
-                            return Err(err(format!("RUN --{f} isn't supported (only type=cache mounts, which run without the cache)")));
-                        }
-                        if !f.starts_with("mount=") && !f.starts_with("network=") {
+                        if let Some(spec) = f.strip_prefix("mount=") {
+                            mounts.push(parse_run_mount(spec).map_err(err)?);
+                        } else if !f.starts_with("network=") && !f.starts_with("security=") {
                             return Err(err(format!("RUN --{f} isn't supported")));
                         }
                         rest = after.trim_start();
                     }
-                    Kind::Run(command(rest))
+                    let (cmd, stdin) = build_run_command(rest, &heredocs);
+                    Kind::Run { command: cmd, mounts, stdin }
                 }
                 "CMD" => Kind::Cmd(command(rest)),
                 "ENTRYPOINT" => Kind::Entrypoint(command(rest)),
@@ -121,6 +179,8 @@ impl Dockerfile {
                     let add = instr == "ADD";
                     let mut from = None;
                     let mut chown = None;
+                    let mut chmod = None;
+                    let mut checksum = None;
                     let mut rest = rest;
                     while rest.starts_with("--") {
                         let (flag, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
@@ -128,20 +188,53 @@ impl Dockerfile {
                             from = Some(unquote(v));
                         } else if let Some(v) = flag.strip_prefix("--chown=") {
                             chown = Some(unquote(v));
-                        } else if flag != "--link" && !flag.starts_with("--link=") {
+                        } else if let Some(v) = flag.strip_prefix("--chmod=") {
+                            let val = unquote(v);
+                            if !val.contains('$') {
+                                parse_octal_mode(&val).map_err(err)?;
+                            }
+                            chmod = Some(val);
+                        } else if add && flag.starts_with("--checksum=") {
+                            checksum = Some(unquote(flag.strip_prefix("--checksum=").unwrap()));
+                        } else if flag != "--link" && !flag.starts_with("--link=") && flag != "--keep-git-dir" && !flag.starts_with("--keep-git-dir=") {
                             return Err(err(format!("{instr} {flag} isn't supported")));
                         }
                         rest = after.trim_start();
                     }
-                    let mut paths = json_array(rest).unwrap_or_else(|| split_words(rest));
+                    let mut paths = json_array(rest).unwrap_or_else(|| split_words_keeping_heredoc_tokens(rest));
                     if paths.len() < 2 {
                         return Err(err(format!("{instr} needs at least one source and a destination")));
                     }
                     let dest = paths.pop().unwrap();
-                    if add && paths.iter().any(|p| p.contains("://")) {
-                        return Err(err("ADD from a URL isn't supported; use RUN with curl or wget".into()));
+                    let mut sources = Vec::new();
+                    let mut attached_heredocs = Vec::new();
+                    let mut hd_iter = heredocs.into_iter();
+                    for p in paths {
+                        if parse_heredoc_marker(&p, true).is_some() {
+                            let hd = hd_iter
+                                .next()
+                                .ok_or_else(|| err(format!("{instr} heredoc `{p}` had no body")))?;
+                            attached_heredocs.push(Heredoc {
+                                name: hd.delimiter,
+                                content: hd.content,
+                                expand: hd.expand,
+                            });
+                        } else {
+                            if p.contains("://") {
+                                if !add {
+                                    return Err(err("COPY doesn't accept URLs; use ADD <url> instead".into()));
+                                }
+                                if !p.starts_with("http://") && !p.starts_with("https://") {
+                                    return Err(err(format!("ADD only supports http:// and https:// URLs; got `{p}`")));
+                                }
+                            }
+                            sources.push(p);
+                        }
                     }
-                    Kind::Copy { sources: paths, dest, from, chown, add }
+                    if sources.is_empty() && attached_heredocs.is_empty() {
+                        return Err(err(format!("{instr} needs at least one source")));
+                    }
+                    Kind::Copy { sources, heredocs: attached_heredocs, dest, from, chown, chmod, checksum, add }
                 }
                 "ENV" => Kind::Env(pairs(rest, true).map_err(err)?),
                 "LABEL" => Kind::Label(pairs(rest, false).map_err(err)?),
@@ -187,43 +280,384 @@ impl Dockerfile {
     }
 }
 
-/// Join continuation lines (`\` at the end) and drop comments and blanks.
-fn logical_lines(text: &str) -> Vec<(usize, String)> {
-    let mut out = Vec::new();
-    let mut current: Option<(usize, String)> = None;
-    for (i, line) in text.lines().enumerate() {
-        let t = line.trim();
-        if t.starts_with('#') || (t.is_empty() && current.is_none()) {
-            continue; // comments may sit inside a continued instruction
+fn build_run_command(rest: &str, heredocs: &[RawHeredoc]) -> (Command, Option<String>) {
+    if heredocs.is_empty() {
+        return (command(rest), None);
+    }
+    // Pure BuildKit heredoc script (`RUN <<EOF` or `RUN <<-EOF` or `RUN <<'EOF'`).
+    if heredocs.len() == 1 && parse_heredoc_marker(rest.trim(), false).is_some() {
+        let body = &heredocs[0].content;
+        if let Some(first_line) = body.lines().next().and_then(|l| l.strip_prefix("#!")) {
+            let mut argv = split_words(first_line.trim());
+            if !argv.is_empty() {
+                // Mirror kernel shebang execution: pass the script path (backed by an
+                // unlinked seekable temp file on fd 0 in the guest) as the final arg.
+                argv.push("/proc/self/fd/0".into());
+                return (Command::Exec(argv), Some(body.clone()));
+            }
         }
-        let (content, continued) = match line.trim_end().strip_suffix('\\') {
-            Some(c) => (c.to_string(), true),
-            None => (line.to_string(), false),
+        return (Command::Shell(body.clone()), None);
+    }
+    // Inline shell heredoc(s) such as `RUN cat <<EOF > /etc/app.conf`.
+    let mut script = String::from(rest);
+    script.push('\n');
+    for hd in heredocs {
+        script.push_str(&hd.raw_body);
+        script.push_str(&hd.delimiter);
+        script.push('\n');
+    }
+    (Command::Shell(script), None)
+}
+
+fn parse_run_mount(spec: &str) -> Result<RunMount, String> {
+    let mut kind = "bind".to_string();
+    let mut target: Option<String> = None;
+    let mut source: Option<String> = None;
+    let mut id: Option<String> = None;
+    let mut from: Option<String> = None;
+    let mut env: Option<String> = None;
+    let mut mode: Option<String> = None;
+    let mut ro: Option<bool> = None;
+    let mut rw: Option<bool> = None;
+    let mut required = false;
+
+    for item in split_csv(spec) {
+        if item.is_empty() {
+            continue;
+        }
+        let (k, v) = match item.split_once('=') {
+            Some((k, v)) => (k.trim(), Some(unquote(v.trim()))),
+            None => (item.trim(), None),
         };
-        match current.as_mut() {
-            Some((_, acc)) => {
-                acc.push(' ');
-                acc.push_str(content.trim());
+        let bool_val = |v: Option<String>| -> Result<bool, String> {
+            match v.as_deref() {
+                None | Some("true") | Some("1") | Some("") => Ok(true),
+                Some("false") | Some("0") => Ok(false),
+                Some(other) => Err(format!("invalid boolean `{other}` in --mount={spec}")),
             }
-            None => current = Some((i + 1, content.trim().to_string())),
-        }
-        if !continued {
-            if let Some((n, s)) = current.take().filter(|(_, s)| !s.trim().is_empty()) {
-                out.push((n, s));
+        };
+        match k {
+            "type" => kind = v.ok_or_else(|| format!("mount type needs a value in --mount={spec}"))?,
+            "target" | "dst" | "destination" => target = v,
+            "source" | "src" => source = v,
+            "id" => id = v,
+            "from" => from = v,
+            "env" => env = v,
+            "mode" => {
+                if let Some(m) = v {
+                    if !m.contains('$') {
+                        parse_octal_mode(&m)?;
+                    }
+                    mode = Some(m);
+                }
             }
+            "ro" | "readonly" => ro = Some(bool_val(v)?),
+            "rw" | "readwrite" => rw = Some(bool_val(v)?),
+            "required" => required = bool_val(v)?,
+            // Accepted for compatibility with BuildKit Dockerfiles.
+            "sharing" | "uid" | "gid" | "size" | "z" | "Z" => {}
+            other => return Err(format!("unknown option `{other}` in --mount={spec}")),
         }
     }
-    if let Some((n, s)) = current.filter(|(_, s)| !s.trim().is_empty()) {
-        out.push((n, s));
+
+    match kind.as_str() {
+        "cache" => {
+            let target = target.ok_or_else(|| format!("--mount=type=cache needs target=... (got `{spec}`)"))?;
+            let read_only = ro.unwrap_or_else(|| rw.map(|w| !w).unwrap_or(false));
+            Ok(RunMount::Cache { target, id, read_only, mode })
+        }
+        "secret" => {
+            let id = id
+                .or_else(|| {
+                    target
+                        .as_deref()
+                        .and_then(|t| t.rsplit('/').next())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                })
+                .ok_or_else(|| format!("--mount=type=secret needs id=... (got `{spec}`)"))?;
+            Ok(RunMount::Secret { id, target, env, required, mode })
+        }
+        "bind" => {
+            let target = target.ok_or_else(|| format!("--mount=type=bind needs target=... (got `{spec}`)"))?;
+            let source = source.unwrap_or_else(|| ".".into());
+            let read_write = rw.unwrap_or_else(|| ro.map(|r| !r).unwrap_or(false));
+            Ok(RunMount::Bind { source, target, from, read_write })
+        }
+        "tmpfs" => {
+            let target = target.ok_or_else(|| format!("--mount=type=tmpfs needs target=... (got `{spec}`)"))?;
+            Ok(RunMount::Tmpfs { target })
+        }
+        other => Err(format!("RUN --mount=type={other} isn't supported (use cache, secret, bind, or tmpfs)")),
+    }
+}
+
+fn split_csv(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for c in s.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => {
+                quote = None;
+                cur.push(c);
+            }
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            (None, ',') => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
     }
     out
 }
 
-fn heredoc(rest: &str) -> bool {
-    rest.split_whitespace().any(|w| w.strip_prefix("<<").is_some_and(|tag| {
-        let tag = tag.trim_start_matches('-').trim_matches(['"', '\'']);
-        !tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    }))
+#[derive(Debug, Clone)]
+struct RawHeredoc {
+    delimiter: String,
+    /// Processed content (with leading tabs stripped when `<<-` was used).
+    content: String,
+    /// Raw lines as written (for inline shell heredocs passed to `/bin/sh -c`).
+    raw_body: String,
+    expand: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LogicalLine {
+    line: usize,
+    text: String,
+    heredocs: Vec<RawHeredoc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeredocMarker {
+    delimiter: String,
+    chomp_tabs: bool,
+    expand: bool,
+}
+
+/// Join continuation lines (`\` at the end), drop comments/blanks, and attach
+/// any heredoc bodies belonging to `RUN`, `COPY`, or `ADD` instructions.
+fn logical_lines(text: &str) -> Result<Vec<LogicalLine>, ParseError> {
+    let raw_lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+
+    while idx < raw_lines.len() {
+        let mut current: Option<(usize, String)> = None;
+        while idx < raw_lines.len() {
+            let line = raw_lines[idx];
+            let line_no = idx + 1;
+            idx += 1;
+
+            let t = line.trim();
+            if t.starts_with('#') || (t.is_empty() && current.is_none()) {
+                continue; // comments may sit inside a continued instruction
+            }
+            let (content, continued) = match line.trim_end().strip_suffix('\\') {
+                Some(c) => (c.to_string(), true),
+                None => (line.to_string(), false),
+            };
+            match current.as_mut() {
+                Some((_, acc)) => {
+                    acc.push(' ');
+                    acc.push_str(content.trim());
+                }
+                None => current = Some((line_no, content.trim().to_string())),
+            }
+            if !continued {
+                break;
+            }
+        }
+        let Some((start_line, joined)) = current.filter(|(_, s)| !s.trim().is_empty()) else {
+            continue;
+        };
+
+        let (word, rest) = joined.trim().split_once(char::is_whitespace).unwrap_or((joined.trim(), ""));
+        let instr = word.to_ascii_uppercase();
+        let mut heredocs = Vec::new();
+        if matches!(instr.as_str(), "RUN" | "COPY" | "ADD") {
+            let allow_filenames = instr != "RUN";
+            let markers = find_heredoc_markers(rest, allow_filenames);
+            for m in markers {
+                let mut content = String::new();
+                let mut raw_body = String::new();
+                let mut closed = false;
+                while idx < raw_lines.len() {
+                    let body_line = raw_lines[idx].strip_suffix('\r').unwrap_or(raw_lines[idx]);
+                    idx += 1;
+                    let candidate = if m.chomp_tabs { body_line.trim_start_matches('\t') } else { body_line };
+                    if candidate == m.delimiter {
+                        closed = true;
+                        break;
+                    }
+                    raw_body.push_str(body_line);
+                    raw_body.push('\n');
+                    content.push_str(candidate);
+                    content.push('\n');
+                }
+                if !closed {
+                    return Err(ParseError {
+                        line: start_line,
+                        message: format!("unterminated heredoc `<<{}`", m.delimiter),
+                    });
+                }
+                heredocs.push(RawHeredoc { delimiter: m.delimiter, content, raw_body, expand: m.expand });
+            }
+        }
+        out.push(LogicalLine { line: start_line, text: joined, heredocs });
+    }
+    Ok(out)
+}
+
+/// Find heredoc markers (`<<EOF`, `<<-EOF`, `<<'EOF'`, `<<"EOF"`) in `rest`,
+/// ignoring quoted strings, `<<<` here-strings, and arithmetic bit-shifts (`1 << 2`).
+fn find_heredoc_markers(rest: &str, allow_filenames: bool) -> Vec<HeredocMarker> {
+    let mut out = Vec::new();
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        match (quote, b) {
+            (Some(q), c) if c == q => {
+                quote = None;
+                i += 1;
+            }
+            (Some(b'"'), b'\\') if i + 1 < bytes.len() => i += 2,
+            (Some(_), _) => i += 1,
+            (None, b'\'' | b'"') => {
+                quote = Some(b);
+                i += 1;
+            }
+            (None, b'\\') if i + 1 < bytes.len() => i += 2,
+            (None, b'<') if bytes.get(i + 1) == Some(&b'<') => {
+                let prev_ok = i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b';' | b'&' | b'|' | b'(');
+                let not_herestring = bytes.get(i + 2) != Some(&b'<');
+                if prev_ok && not_herestring {
+                    // Extract the token starting at `i` up to whitespace or shell separator.
+                    let start = i;
+                    let mut j = i + 2;
+                    if bytes.get(j) == Some(&b'-') {
+                        j += 1;
+                    }
+                    if let Some(&q @ (b'\'' | b'"')) = bytes.get(j) {
+                        j += 1;
+                        while j < bytes.len() && bytes[j] != q {
+                            j += 1;
+                        }
+                        if j < bytes.len() {
+                            j += 1;
+                        }
+                    } else {
+                        while j < bytes.len() && !matches!(bytes[j], b' ' | b'\t' | b';' | b'&' | b'|' | b'>' | b'<' | b')' | b'(') {
+                            j += 1;
+                        }
+                    }
+                    let token = &rest[start..j];
+                    if let Some(m) = parse_heredoc_marker(token, allow_filenames) {
+                        out.push(m);
+                        i = j;
+                        continue;
+                    }
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+fn parse_heredoc_marker(token: &str, allow_filenames: bool) -> Option<HeredocMarker> {
+    let rest = token.strip_prefix("<<")?;
+    if rest.starts_with('<') {
+        return None;
+    }
+    let (chomp_tabs, rest) = match rest.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, rest),
+    };
+    let (expand, delim) = if let Some(inner) = rest.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+        (false, inner)
+    } else if let Some(inner) = rest.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        (false, inner)
+    } else {
+        (true, rest)
+    };
+    if delim.is_empty() {
+        return None;
+    }
+    let valid = if allow_filenames {
+        delim.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)) && !delim.starts_with('.')
+    } else {
+        let first = delim.as_bytes()[0];
+        (first.is_ascii_alphabetic() || first == b'_') && delim.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    };
+    valid.then(|| HeredocMarker { delimiter: delim.to_string(), chomp_tabs, expand })
+}
+
+/// Like `split_words`, except `<<'EOF'` / `<<"EOF"` tokens keep their quotes so
+/// COPY/ADD can distinguish heredoc markers from ordinary filenames.
+fn split_words_keeping_heredoc_tokens(s: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut in_word = false;
+    let mut preserve_quotes = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if quote.is_none() && !in_word && c == '<' && chars.peek() == Some(&'<') {
+            preserve_quotes = true;
+        }
+        match (quote, c) {
+            (Some(q), c) if c == q => {
+                if preserve_quotes {
+                    cur.push(c);
+                }
+                quote = None;
+            }
+            (Some('"'), '\\') => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            (Some(_), c) => cur.push(c),
+            (None, '"' | '\'') => {
+                if preserve_quotes {
+                    cur.push(c);
+                }
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, '\\') => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                    in_word = true;
+                }
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                    preserve_quotes = false;
+                }
+            }
+            (None, c) => {
+                cur.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    words
 }
 
 fn json_array(s: &str) -> Option<Vec<String>> {
@@ -360,7 +794,7 @@ RUN --mount=type=cache,target=/root/.cache \
     pip install --upgrade pip && \
     # comments inside continuations are dropped
     echo done
-COPY --chown=app:app requirements.txt ./
+COPY --chown=app:app --chmod=0644 requirements.txt ./
 COPY ["src dir/", "/src/"]
 
 FROM alpine:3.22
@@ -381,13 +815,41 @@ CMD python3 -m http.server
         assert_eq!((build.base.as_str(), build.name.as_deref()), ("python:${PY}-slim", Some("build")));
         assert_eq!(build.instructions[0].kind, Kind::Workdir("/src".into()));
         assert_eq!(build.instructions[1].kind, Kind::Env(vec![("PIP_NO_CACHE_DIR".into(), "1".into()), ("APP_HOME".into(), "/srv/my app".into())]));
-        assert_eq!(build.instructions[2].kind, Kind::Run(Command::Shell("pip install --upgrade pip && echo done".into())));
+        assert_eq!(
+            build.instructions[2].kind,
+            Kind::Run {
+                command: Command::Shell("pip install --upgrade pip && echo done".into()),
+                mounts: vec![RunMount::Cache { target: "/root/.cache".into(), id: None, read_only: false, mode: None }],
+                stdin: None,
+            }
+        );
         assert_eq!(build.instructions[2].line, 9);
         assert_eq!(
             build.instructions[3].kind,
-            Kind::Copy { sources: vec!["requirements.txt".into()], dest: "./".into(), from: None, chown: Some("app:app".into()), add: false }
+            Kind::Copy {
+                sources: vec!["requirements.txt".into()],
+                heredocs: vec![],
+                dest: "./".into(),
+                from: None,
+                chown: Some("app:app".into()),
+                chmod: Some("0644".into()),
+                checksum: None,
+                add: false,
+            }
         );
-        assert_eq!(build.instructions[4].kind, Kind::Copy { sources: vec!["src dir/".into()], dest: "/src/".into(), from: None, chown: None, add: false });
+        assert_eq!(
+            build.instructions[4].kind,
+            Kind::Copy {
+                sources: vec!["src dir/".into()],
+                heredocs: vec![],
+                dest: "/src/".into(),
+                from: None,
+                chown: None,
+                chmod: None,
+                checksum: None,
+                add: false,
+            }
+        );
         let fin = &df.stages[1];
         assert_eq!(fin.instructions[0].kind, Kind::Label(vec![("org.opencontainers.image.title".into(), "demo".into()), ("version".into(), "1".into())]));
         assert!(matches!(&fin.instructions[1].kind, Kind::Copy { from: Some(f), .. } if f == "build"));
@@ -399,17 +861,97 @@ CMD python3 -m http.server
     }
 
     #[test]
+    fn parses_heredocs_mounts_urls_and_chmod() {
+        let raw = r#"
+FROM alpine
+RUN --mount=type=cache,id=apk,target=/var/cache/apk,sharing=locked \
+    --mount=type=secret,id=tok,target=/run/secrets/tok,required=true,env=TOKEN \
+    --mount=type=bind,source=scripts,target=/mnt/s,ro \
+    --mount=type=tmpfs,target=/tmp/scratch \
+    <<-EOF
+	set -eu
+	# comments inside heredocs stay intact
+	echo "hi"
+	EOF
+RUN <<PY
+#!/usr/bin/env python3
+print(1 + 2)
+PY
+RUN cat <<MSG > /etc/msg
+hello world
+MSG
+COPY --chmod=755 <<EOF /usr/local/bin/greet
+echo "hello $WHO"
+EOF
+COPY <<'RAW' <<a.txt /etc/conf/
+$LITERAL
+RAW
+second file
+a.txt
+ADD --chmod=0644 --checksum=sha256:abcdef https://example.com/app.tar.gz /opt/
+"#;
+        let df = Dockerfile::parse(raw).unwrap();
+        let ins = &df.stages[0].instructions;
+        assert_eq!(ins.len(), 6);
+
+        let Kind::Run { command, mounts, stdin } = &ins[0].kind else { panic!("not run") };
+        assert_eq!(*command, Command::Shell("set -eu\n# comments inside heredocs stay intact\necho \"hi\"\n".into()));
+        assert_eq!(*stdin, None);
+        assert_eq!(mounts.len(), 4);
+        assert_eq!(mounts[0], RunMount::Cache { target: "/var/cache/apk".into(), id: Some("apk".into()), read_only: false, mode: None });
+        assert_eq!(
+            mounts[1],
+            RunMount::Secret { id: "tok".into(), target: Some("/run/secrets/tok".into()), env: Some("TOKEN".into()), required: true, mode: None }
+        );
+        assert_eq!(mounts[2], RunMount::Bind { source: "scripts".into(), target: "/mnt/s".into(), from: None, read_write: false });
+        assert_eq!(mounts[3], RunMount::Tmpfs { target: "/tmp/scratch".into() });
+
+        let Kind::Run { command, stdin, .. } = &ins[1].kind else { panic!("not shebang run") };
+        assert_eq!(*command, Command::Exec(vec!["/usr/bin/env".into(), "python3".into(), "/proc/self/fd/0".into()]));
+        assert_eq!(stdin.as_deref(), Some("#!/usr/bin/env python3\nprint(1 + 2)\n"));
+
+        let Kind::Run { command, stdin, .. } = &ins[2].kind else { panic!("not inline heredoc") };
+        assert_eq!(*command, Command::Shell("cat <<MSG > /etc/msg\nhello world\nMSG\n".into()));
+        assert_eq!(*stdin, None);
+
+        let Kind::Copy { sources, heredocs, dest, chmod, .. } = &ins[3].kind else { panic!("not copy heredoc") };
+        assert!(sources.is_empty());
+        assert_eq!(dest, "/usr/local/bin/greet");
+        assert_eq!(chmod.as_deref(), Some("755"));
+        assert_eq!(heredocs, &[Heredoc { name: "EOF".into(), content: "echo \"hello $WHO\"\n".into(), expand: true }]);
+
+        let Kind::Copy { heredocs, dest, .. } = &ins[4].kind else { panic!("not multi copy heredoc") };
+        assert_eq!(dest, "/etc/conf/");
+        assert_eq!(
+            heredocs,
+            &[
+                Heredoc { name: "RAW".into(), content: "$LITERAL\n".into(), expand: false },
+                Heredoc { name: "a.txt".into(), content: "second file\n".into(), expand: true },
+            ]
+        );
+
+        let Kind::Copy { sources, dest, chmod, checksum, add, .. } = &ins[5].kind else { panic!("not add url") };
+        assert!(*add);
+        assert_eq!(sources, &["https://example.com/app.tar.gz"]);
+        assert_eq!(dest, "/opt/");
+        assert_eq!(chmod.as_deref(), Some("0644"));
+        assert_eq!(checksum.as_deref(), Some("sha256:abcdef"));
+    }
+
+    #[test]
     fn refuses_what_it_cannot_do() {
-        let e = Dockerfile::parse("FROM alpine\nRUN <<EOF\necho hi\nEOF\n").unwrap_err();
+        let e = Dockerfile::parse("FROM alpine\nRUN <<EOF\necho hi\n").unwrap_err();
         assert_eq!(e.line, 2);
-        assert!(e.message.contains("heredocs"));
+        assert!(e.message.contains("unterminated heredoc"));
         assert!(Dockerfile::parse("RUN echo\n").unwrap_err().message.contains("before the first FROM"));
-        assert!(Dockerfile::parse("FROM a\nADD https://x/y.tgz /\n").unwrap_err().message.contains("URL"));
-        assert!(Dockerfile::parse("FROM a\nRUN --mount=type=secret,id=x cat\n").is_err());
+        assert!(Dockerfile::parse("FROM a\nCOPY https://x/y.tgz /\n").unwrap_err().message.contains("URL"));
+        assert!(Dockerfile::parse("FROM a\nADD ftp://x/y.tgz /\n").unwrap_err().message.contains("http"));
+        assert!(Dockerfile::parse("FROM a\nCOPY --chmod=999 a b\n").unwrap_err().message.contains("octal"));
+        assert!(Dockerfile::parse("FROM a\nRUN --mount=type=ssh cat\n").is_err());
         assert!(Dockerfile::parse("FROM a\nFROBNICATE\n").unwrap_err().message.contains("unknown"));
         assert!(Dockerfile::parse("# only a comment\n").is_err());
-        // A bit-shift isn't a heredoc.
-        assert!(Dockerfile::parse("FROM a\nRUN echo $((1 << 2))\n").is_ok());
+        // Bit-shifts and here-strings are not heredocs.
+        assert!(Dockerfile::parse("FROM a\nRUN echo $((1 << 2)) && echo $((1<<2)) && cat <<<hi\n").is_ok());
     }
 
     #[test]

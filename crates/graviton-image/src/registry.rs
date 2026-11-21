@@ -368,6 +368,43 @@ impl<'a> Session<'a> {
     }
 }
 
+/// Download an HTTP/HTTPS URL directly to `dest`, returning `(bytes, sha256_digest)`.
+pub fn fetch_url(url: &str, dest: &std::path::Path) -> Result<(u64, Digest)> {
+    use std::io::{Read, Write};
+    use sha2::{Digest as _, Sha256};
+
+    let agent: Agent = Agent::config_builder()
+        .http_status_as_error(false)
+        .user_agent(concat!("graviton/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .into();
+    let response = agent.get(url).call().map_err(http_err)?;
+    let status = response.status().as_u16();
+    if status != 200 {
+        return Err(ImageError::Registry(format!("GET {url} returned HTTP {status}")));
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut reader = response.into_body().into_with_config().limit(u64::MAX).reader();
+    let mut file = std::fs::File::create(dest)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])?;
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    file.flush()?;
+    let hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    Ok((total, Digest::parse(&format!("sha256:{hex}"))?))
+}
+
 /// Canonicalize a registry name (e.g. `https://index.docker.io/v1/` → `docker.io`).
 pub fn normalize_registry(input: &str) -> String {
     let trimmed = input.trim();

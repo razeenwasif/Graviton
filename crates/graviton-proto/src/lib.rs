@@ -299,6 +299,23 @@ impl EventKind {
     }
 }
 
+/// One secret passed via `grav build --secret id=...,src=...` (kept in memory,
+/// never written to the image or build cache, never printed in debug output).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildSecret {
+    pub id: String,
+    pub data: Vec<u8>,
+}
+
+impl std::fmt::Debug for BuildSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuildSecret")
+            .field("id", &self.id)
+            .field("data", &"[redacted]")
+            .finish()
+    }
+}
+
 /// What `grav build` asks for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildSpec {
@@ -323,6 +340,9 @@ pub struct BuildSpec {
     /// many bytes of tar (gzipped or not), and `context` is ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload: Option<u64>,
+    /// Secrets for `RUN --mount=type=secret,id=...` (in memory only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<BuildSecret>,
 }
 
 /// Where an uploaded build folder's Dockerfile goes when it lives outside the folder.
@@ -656,6 +676,58 @@ pub struct HostEntry {
     pub ip: String,
 }
 
+/// Inline file content for `COPY <<EOF ...` heredocs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlineFile {
+    pub name: String,
+    pub content: Vec<u8>,
+}
+
+/// File downloaded on the host (e.g. `ADD https://...`) and exposed in the
+/// builder VM's `staged` virtiofs share.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedFile {
+    /// Path relative to the `staged` virtiofs share root.
+    pub staged_path: String,
+    /// Destination file name when copying into a directory.
+    pub name: String,
+    /// Default permission mode (overridden by `Copy.chmod`).
+    pub mode: u32,
+}
+
+/// Kind of ephemeral mount attached for a single `RUN --mount=...` execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecMountKind {
+    /// Persistent directory in the `cache` virtiofs share.
+    Cache,
+    /// Single secret file in the `secrets` virtiofs share (read-only).
+    Secret,
+    /// File or folder from the build context (`context` share) or another stage's container rootfs.
+    Bind,
+    /// Ephemeral in-memory tmpfs.
+    Tmpfs,
+}
+
+/// Ephemeral mount applied only inside an `Exec` child's private mount namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecMount {
+    pub kind: ExecMountKind,
+    /// Relative path in the share (`cache`, `secrets`, `context`) or container rootfs (`bind` with `from_container`).
+    #[serde(default)]
+    pub source: String,
+    /// For `Bind` from another build stage/image container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_container: Option<String>,
+    /// Absolute path inside the container where the mount appears.
+    pub target: String,
+    #[serde(default)]
+    pub read_only: bool,
+    /// Optional mode (octal bits) applied to created cache/tmpfs/secret targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum AgentRequest {
@@ -689,6 +761,12 @@ pub enum AgentRequest {
         rows: u16,
         #[serde(default)]
         cols: u16,
+        /// Optional bytes written to the non-TTY child's stdin (used for `#!` heredoc scripts).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stdin: Option<Vec<u8>>,
+        /// Ephemeral per-RUN mounts (cache, secret, bind, tmpfs), visible only inside this process's mount namespace.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mounts: Vec<ExecMount>,
     },
     Signal { pid: i32, signal: i32 },
     Stdin { pid: i32, data: Vec<u8> },
@@ -721,12 +799,21 @@ pub enum AgentRequest {
         /// `user[:group]`; files are owned by root otherwise.
         #[serde(default)]
         chown: Option<String>,
+        /// Optional `--chmod` permission bits (e.g. `0o755`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chmod: Option<u32>,
         /// ADD: unpack local tar archives instead of copying them.
         #[serde(default)]
         extract: bool,
         /// .dockerignore patterns (context copies only).
         #[serde(default)]
         ignore: Vec<String>,
+        /// Inline files from `COPY <<EOF` heredocs.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        inline: Vec<InlineFile>,
+        /// Pre-downloaded files from `ADD <url>` in the `staged` share.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        staged: Vec<StagedFile>,
     },
     /// Create a directory (and its parents) in a container (WORKDIR).
     Mkdir { container: String, path: String },
@@ -986,6 +1073,42 @@ mod tests {
         let logins = Response::Logins(vec![RegistryLoginInfo { registry: "ghcr.io".into(), username: "octocat".into() }]);
         let encoded = encode_line(&logins);
         assert_eq!(decode_line::<Response>(&encoded).unwrap(), logins);
+    }
+
+    #[test]
+    fn build_secrets_and_mounts_round_trip() {
+        let secret = BuildSecret { id: "npm".into(), data: b"super-secret".to_vec() };
+        let dbg = format!("{secret:?}");
+        assert!(dbg.contains("npm"));
+        assert!(!dbg.contains("super-secret"));
+
+        // Swift's BuildSpec omits `secrets`; Rust defaults it to empty.
+        let from_swift = br#"{"method":"build","params":{"build_args":["PY=3.12"],"context":"/Users/me/app","no_cache":true,"tag":"app:1"}}"#;
+        let Request::Build(spec) = decode_line::<Request>(from_swift).unwrap() else { panic!("not build") };
+        assert!(spec.secrets.is_empty());
+
+        let exec = AgentRequest::Exec {
+            argv: vec!["/bin/sh".into()],
+            env: vec![],
+            cwd: "/".into(),
+            tty: false,
+            container: Some("b1".into()),
+            user: None,
+            hostname: None,
+            rows: 0,
+            cols: 0,
+            stdin: Some(b"echo hi\n".to_vec()),
+            mounts: vec![ExecMount {
+                kind: ExecMountKind::Cache,
+                source: "pip".into(),
+                from_container: None,
+                target: "/root/.cache/pip".into(),
+                read_only: false,
+                mode: Some(0o755),
+            }],
+        };
+        let encoded = encode_line(&exec);
+        assert_eq!(decode_line::<AgentRequest>(&encoded).unwrap(), exec);
     }
 
     #[test]

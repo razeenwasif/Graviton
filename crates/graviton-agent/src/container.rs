@@ -274,6 +274,16 @@ fn unpack_layer(blob: &Path, root: &Path) -> io::Result<u64> {
                 fs::remove_dir_all(&dest)?;
             } else if !meta.is_dir() && kind.is_dir() {
                 fs::remove_file(&dest)?;
+            } else if !meta.is_dir() && kind.is_hard_link() {
+                let same_target = entry
+                    .link_name()
+                    .ok()
+                    .flatten()
+                    .and_then(|l| clean(&l))
+                    .is_some_and(|l| l == rel);
+                if !same_target {
+                    fs::remove_file(&dest)?;
+                }
             }
         }
         entry.unpack_in(root)?;
@@ -354,8 +364,24 @@ pub fn resolve_user(root: &Path, spec: Option<&str>) -> io::Result<(u32, u32, St
     Ok((uid, gid, home))
 }
 
+/// One pre-validated ephemeral mount to attach inside a child's private mount namespace.
+pub struct PreparedMount {
+    pub src: CString,
+    pub dst: CString,
+    pub is_tmpfs: bool,
+    pub read_only: bool,
+}
+
 /// A `Command` that runs `argv` inside container `id`.
-pub fn command(id: &str, argv: &[String], env: &[String], cwd: &str, user: Option<&str>, hostname: &str) -> io::Result<Command> {
+pub fn command(
+    id: &str,
+    argv: &[String],
+    env: &[String],
+    cwd: &str,
+    user: Option<&str>,
+    hostname: &str,
+    mounts: Vec<PreparedMount>,
+) -> io::Result<Command> {
     let root = rootfs(id)?;
     if !root.join("proc").is_dir() {
         return Err(io::Error::other(format!("container {id} has no root filesystem (prepare it first)")));
@@ -385,12 +411,12 @@ pub fn command(id: &str, argv: &[String], env: &[String], cwd: &str, user: Optio
     // SAFETY: the closure runs in the forked child before exec and only makes
     // raw syscalls on data prepared above (no allocation, no locks).
     unsafe {
-        cmd.pre_exec(move || enter(&root_c, &dev_dst, &cwd_c, &host, uid, gid));
+        cmd.pre_exec(move || enter(&root_c, &dev_dst, &cwd_c, &host, uid, gid, &mounts));
     }
     Ok(cmd)
 }
 
-fn enter(root: &CString, dev_dst: &CString, cwd: &CString, hostname: &[u8], uid: u32, gid: u32) -> io::Result<()> {
+fn enter(root: &CString, dev_dst: &CString, cwd: &CString, hostname: &[u8], uid: u32, gid: u32, mounts: &[PreparedMount]) -> io::Result<()> {
     fn check(rc: libc::c_int) -> io::Result<()> {
         if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
     }
@@ -400,6 +426,26 @@ fn enter(root: &CString, dev_dst: &CString, cwd: &CString, hostname: &[u8], uid:
         check(libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC))?;
         check(libc::mount(null, c"/".as_ptr(), null, libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()))?;
         check(libc::mount(c"/dev".as_ptr(), dev_dst.as_ptr(), null, libc::MS_BIND | libc::MS_REC, std::ptr::null()))?;
+        for m in mounts {
+            if m.is_tmpfs {
+                let mut flags = libc::MS_NOSUID | libc::MS_NODEV;
+                if m.read_only {
+                    flags |= libc::MS_RDONLY;
+                }
+                check(libc::mount(c"tmpfs".as_ptr(), m.dst.as_ptr(), c"tmpfs".as_ptr(), flags, std::ptr::null()))?;
+            } else {
+                check(libc::mount(m.src.as_ptr(), m.dst.as_ptr(), null, libc::MS_BIND, std::ptr::null()))?;
+                if m.read_only {
+                    check(libc::mount(
+                        null,
+                        m.dst.as_ptr(),
+                        null,
+                        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
+                        std::ptr::null(),
+                    ))?;
+                }
+            }
+        }
         check(libc::chdir(root.as_ptr()))?;
         check(libc::mount(root.as_ptr(), c"/".as_ptr(), null, libc::MS_MOVE, std::ptr::null()))?;
         check(libc::chroot(c".".as_ptr()))?;

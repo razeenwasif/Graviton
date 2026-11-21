@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use graviton_proto::frame::{Decoder, Frame};
 use remote::Target;
 use graviton_proto::{
-    BuildSpec, ContainerStatus, ContainerSummary, ExecSpec, FileKind, LogStream, PullProgress, Request, Response, RestartPolicy, RunSpec, decode_line,
-    encode_line,
+    BuildSecret, BuildSpec, ContainerStatus, ContainerSummary, ExecSpec, FileKind, LogStream, PullProgress, Request, Response, RestartPolicy, RunSpec,
+    decode_line, encode_line,
 };
 
 #[derive(Parser, Debug)]
@@ -125,6 +125,9 @@ enum Command {
         /// Set an ARG (KEY=value); repeatable.
         #[arg(long = "build-arg")]
         build_arg: Vec<String>,
+        /// Expose a secret to `RUN --mount=type=secret`: id=ID,src=FILE or id=ID,env=VAR; repeatable.
+        #[arg(long = "secret")]
+        secret: Vec<String>,
         /// Build up to this stage.
         #[arg(long)]
         target: Option<String>,
@@ -478,14 +481,24 @@ fn run(cli: Cli) -> Result<()> {
             Response::Details(d) => println!("{}", serde_json::to_string_pretty(&d)?),
             other => unexpected(other)?,
         },
-        Command::Build { tag, file, build_arg, target: build_target, no_cache, path } => {
+        Command::Build { tag, file, build_arg, secret, target: build_target, no_cache, path } => {
             let context = std::fs::canonicalize(&path).with_context(|| format!("{} doesn't exist", path.display()))?;
             let dockerfile = match file {
                 // A path given on the command line is relative to where you are.
                 Some(f) => Some(std::fs::canonicalize(&f).with_context(|| format!("{f} doesn't exist"))?.display().to_string()),
                 None => None,
             };
-            let mut spec = BuildSpec { context: context.display().to_string(), dockerfile, tag, build_args: build_arg, target: build_target, no_cache, upload: None };
+            let secrets = secret.iter().map(|s| parse_build_secret(s)).collect::<Result<Vec<_>>>()?;
+            let mut spec = BuildSpec {
+                context: context.display().to_string(),
+                dockerfile,
+                tag,
+                build_args: build_arg,
+                target: build_target,
+                no_cache,
+                upload: None,
+                secrets,
+            };
             if let Target::Remote(host) = &target {
                 // That Mac can't see this folder: send it along.
                 let archive = pack_context(&context, &mut spec)?;
@@ -1252,9 +1265,56 @@ fn clock(ms: u64) -> String {
     format!("{:02}:{:02}:{:02}.{:03}", tm.tm_hour, tm.tm_min, tm.tm_sec, ms % 1000)
 }
 
+/// Parse `--secret id=ID,src=FILE` or `--secret id=ID,env=VAR` (or `--secret id=ID`
+/// reading from the host env var named `ID`).
+fn parse_build_secret(spec: &str) -> Result<BuildSecret> {
+    let mut id: Option<String> = None;
+    let mut src: Option<String> = None;
+    let mut env_name: Option<String> = None;
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (k, v) = part.split_once('=').ok_or_else(|| anyhow::anyhow!("bad --secret `{spec}`: expected id=ID,src=FILE or id=ID,env=VAR"))?;
+        match k.trim() {
+            "id" => id = Some(v.trim().to_string()),
+            "src" | "source" => src = Some(v.trim().to_string()),
+            "env" => env_name = Some(v.trim().to_string()),
+            "type" if v.trim() == "file" || v.trim() == "env" => {}
+            other => bail!("unknown option `{other}` in --secret `{spec}`"),
+        }
+    }
+    let id = id.filter(|s| !s.is_empty()).ok_or_else(|| anyhow::anyhow!("--secret `{spec}` needs id=..."))?;
+    let data = match (src, env_name) {
+        (Some(_), Some(_)) => bail!("--secret `{spec}` can't set both src= and env="),
+        (Some(path), None) => std::fs::read(&path).with_context(|| format!("reading secret `{id}` from {path}"))?,
+        (None, Some(var)) => std::env::var(&var)
+            .with_context(|| format!("reading secret `{id}` from environment variable {var}"))?
+            .into_bytes(),
+        (None, None) => std::env::var(&id)
+            .with_context(|| format!("--secret id={id}: pass src=FILE or env=VAR, or set ${id}"))?
+            .into_bytes(),
+    };
+    Ok(BuildSecret { id, data })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_build_secrets() {
+        let tmp = std::env::temp_dir().join(format!("grav-secret-test-{}", std::process::id()));
+        std::fs::write(&tmp, b"top-secret-key\n").unwrap();
+        let s = parse_build_secret(&format!("id=mykey,src={}", tmp.display())).unwrap();
+        assert_eq!(s.id, "mykey");
+        assert_eq!(s.data, b"top-secret-key\n");
+        let _ = std::fs::remove_file(&tmp);
+
+        assert!(parse_build_secret("src=/tmp/x").is_err());
+        assert!(parse_build_secret("id=a,src=/x,env=Y").is_err());
+    }
 
     #[test]
     fn formats_sizes_and_durations() {

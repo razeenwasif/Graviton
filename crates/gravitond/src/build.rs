@@ -2,29 +2,31 @@
 //!
 //! gravitond parses the Dockerfile and walks the stages the target needs,
 //! giving every step a cache key (the previous key, the step as written, and
-//! for COPY a hash of the files it takes). Steps with a cached layer reuse it
-//! without running anything. At the first miss in a stage the cache is off
-//! for the rest of that stage (as in Docker), and a builder VM boots: one VM
-//! for the whole build, with the build context shared read-only and an `out`
-//! folder for layers. Each stage gets a container in it with the layers so
-//! far; RUN runs there, COPY and ADD copy from the context (or another
-//! stage's container), and after each step the agent writes what changed as
-//! a layer. Layers go into the blob store; the result gets an OCI config and
-//! manifest and joins the image index like a pulled image.
+//! for COPY/ADD a hash of the files, heredocs or downloaded URLs it takes).
+//! Steps with a cached layer reuse it without running anything. At the first
+//! miss in a stage the cache is off for the rest of that stage (as in Docker),
+//! and a builder VM boots: one VM for the whole build, with the build context
+//! shared read-only, persistent `RUN --mount=type=cache` directories in the
+//! `cache` share, per-build `RUN --mount=type=secret` files in a `0700`
+//! read-only `secrets` share, downloaded `ADD <url>` files in `staged`, and an
+//! `out` folder for committed layers.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use graviton_core::{ImageReference, paths};
-use graviton_image::dockerfile::{Command, Dockerfile, Kind, expand};
+use graviton_image::dockerfile::{Command, Dockerfile, Heredoc, Kind, RunMount, expand, parse_octal_mode};
 use graviton_image::{Digest, Layer, LocalImage};
 use graviton_proto::build::{Ignore, expand_source, walk};
-use graviton_proto::{AGENT_VSOCK_PORT, AgentEvent, AgentRequest, BuildSpec, ImageSummary, LayerInfo, encode_line};
+use graviton_proto::{
+    AGENT_VSOCK_PORT, AgentEvent, AgentRequest, BuildSpec, ExecMount, ExecMountKind, ImageSummary, InlineFile, LayerInfo, StagedFile, encode_line,
+};
 use graviton_vmm::apple::{AppleHypervisor, AppleVm};
 use graviton_vmm::{NetworkMode, SharedDirectory, VmConfig, VmHandle};
 use serde::{Deserialize, Serialize};
@@ -85,6 +87,71 @@ pub(crate) fn cache_contents() -> (std::collections::HashSet<String>, u32) {
 /// Forget every cached step (`grav prune`); their layers are then unreferenced.
 pub(crate) fn clear_cache() {
     Cache { version: 1, ..Cache::default() }.save();
+}
+
+/// Persistent `RUN --mount=type=cache` directories live here across builds.
+fn cache_mounts_dir() -> PathBuf {
+    paths::support_dir().join("build-cache-mounts")
+}
+
+/// Total disk bytes used by persistent `RUN --mount=type=cache` directories.
+pub(crate) fn cache_mounts_bytes() -> u64 {
+    dir_size(&cache_mounts_dir())
+}
+
+/// Remove all persistent `RUN --mount=type=cache` directories (`grav prune`).
+pub(crate) fn clear_cache_mounts() {
+    let _ = fs::remove_dir_all(cache_mounts_dir());
+}
+
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&p) else { continue };
+        for e in entries.flatten() {
+            let path = e.path();
+            if let Ok(m) = fs::symlink_metadata(&path) {
+                if m.is_dir() {
+                    stack.push(path);
+                } else if m.is_file() {
+                    total += m.len();
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Stable, filesystem-safe directory name for a `RUN --mount=type=cache` key.
+fn cache_mount_key(id_or_target: &str) -> String {
+    let slug: String = id_or_target
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(32)
+        .collect();
+    let slug = slug.trim_matches('_');
+    let digest = hash(&["cache-mount", id_or_target]);
+    if slug.is_empty() {
+        digest[..16].to_string()
+    } else {
+        format!("{slug}-{}", &digest[..12])
+    }
+}
+
+/// Ensure a persistent cache mount folder exists on the host with permissions
+/// usable by both root and non-root container users over virtiofs, inside a
+/// `0700` parent owned by this Mac user.
+fn ensure_cache_mount_dir(key: &str) -> Result<PathBuf> {
+    let root = cache_mounts_dir();
+    fs::create_dir_all(&root)?;
+    let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
+    let dir = root.join(key);
+    if !dir.is_dir() {
+        fs::create_dir_all(&dir)?;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o777));
+    }
+    Ok(dir)
 }
 
 /// Where a stage has got to.
@@ -166,6 +233,17 @@ impl Builder {
     }
 }
 
+/// Pre-prepared copy inputs (local paths, expanded inline heredocs, staged URL files).
+struct PreparedCopy {
+    local_sources: Vec<String>,
+    inline: Vec<InlineFile>,
+    staged: Vec<StagedFile>,
+    chmod: Option<u32>,
+    chown: Option<String>,
+    dest: String,
+    source_key: String,
+}
+
 pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> Result<ImageSummary> {
     let t0 = Instant::now();
     let context = PathBuf::from(&spec.context);
@@ -197,15 +275,25 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
         Some(t) => df.stage_index(t).ok_or_else(|| anyhow!("no stage named {t} in the Dockerfile"))?,
         None => df.stages.len() - 1,
     };
-    // Stages the target needs, through FROM <stage> and COPY --from=<stage>.
+    // Stages the target needs, through FROM <stage>, COPY --from=<stage>, and RUN --mount=type=bind,from=<stage>.
     let mut needed = BTreeSet::from([target]);
     let mut queue = vec![target];
     while let Some(i) = queue.pop() {
         let stage = &df.stages[i];
         let mut deps: Vec<usize> = df.stage_index(&expand(&stage.base, &global)).filter(|d| *d < i).into_iter().collect();
         for ins in &stage.instructions {
-            if let Kind::Copy { from: Some(f), .. } = &ins.kind {
-                deps.extend(df.stage_index(f).filter(|d| *d < i));
+            match &ins.kind {
+                Kind::Copy { from: Some(f), .. } => {
+                    deps.extend(df.stage_index(f).filter(|d| *d < i));
+                }
+                Kind::Run { mounts, .. } => {
+                    for m in mounts {
+                        if let RunMount::Bind { from: Some(f), .. } = m {
+                            deps.extend(df.stage_index(f).filter(|d| *d < i));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         for d in deps {
@@ -219,12 +307,39 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
     let steps: usize = needed.iter().map(|&i| df.stages[i].instructions.len() + 1).sum();
     log(format!("Building {} from {} ({} stage{}, {steps} steps)", display(&reference), dockerfile_path.display(), needed.len(), if needed.len() == 1 { "" } else { "s" }));
 
+    // Per-build working folder (always deleted on exit so secrets & downloads never linger).
+    let build_id = new_id();
+    let build_dir = paths::support_dir().join("builds").join(&build_id);
+    let out_dir = build_dir.join("out");
+    let staged_dir = build_dir.join("staged");
+    let secrets_dir = build_dir.join("secrets");
+    fs::create_dir_all(&out_dir)?;
+    fs::create_dir_all(&staged_dir)?;
+    fs::create_dir_all(&secrets_dir)?;
+    let _ = fs::set_permissions(&secrets_dir, fs::Permissions::from_mode(0o700));
+
+    // Write build secrets into the 0700 per-build secrets share; file mode 0644
+    // inside that private directory lets non-root container USERs read them over virtiofs.
+    let mut secrets_map: HashMap<String, (String, Vec<u8>)> = HashMap::new();
+    for s in &spec.secrets {
+        let file_name = hash(&["secret", &s.id]);
+        let path = secrets_dir.join(&file_name);
+        fs::write(&path, &s.data)?;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+        secrets_map.insert(s.id.clone(), (file_name, s.data.clone()));
+    }
+
+    // Ensure the persistent cache-mounts directory exists before booting the builder VM.
+    let cache_root = cache_mounts_dir();
+    fs::create_dir_all(&cache_root)?;
+    let _ = fs::set_permissions(&cache_root, fs::Permissions::from_mode(0o700));
+
     // --no-cache skips lookups but still records what it builds.
     let mut cache = Cache::load();
-    let build_id = new_id();
     let mut builder: Option<Builder> = None;
     let mut finished: HashMap<usize, (State, Option<String>)> = HashMap::new();
     let mut step = 0;
+    let mut staged_seq = 0usize;
 
     let result = (|| -> Result<State> {
         let mut last = None;
@@ -249,21 +364,58 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
                 step += 1;
                 log(format!("Step {step}/{steps} : {}", ins.text));
                 let vars = state.vars();
+                let mut prepared_copy: Option<PreparedCopy> = None;
+
                 let fs_step: Option<String> = match &ins.kind {
-                    Kind::Run(_) => {
+                    Kind::Run { command, mounts, stdin } => {
                         let args: Vec<String> = state.args.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                        Some(format!("{}|args:{}", ins.text, args.join(",")))
-                    }
-                    Kind::Copy { sources, dest, from, chown, add } => {
-                        let source_key = match from {
-                            Some(f) => match df.stage_index(f) {
-                                Some(d) => finished.get(&d).map(|(s, _)| s.key.clone()).ok_or_else(|| anyhow!("COPY --from={f}: that stage comes later"))?,
-                                None => engine.image_for(f)?.manifest_digest,
-                            },
-                            None => content_hash(&context, sources, &vars, &ignore).with_context(|| format!("Dockerfile line {}: {}", ins.line, ins.text))?,
+                        let cmd_key = match command {
+                            Command::Exec(v) => format!("exec:{}", serde_json::to_string(v).unwrap_or_default()),
+                            Command::Shell(s) => format!("shell:{s}"),
                         };
-                        let _ = (dest, chown, add);
-                        Some(format!("{}|{source_key}|wd:{}", ins.text, state.workdir))
+                        let stdin_key = stdin.as_deref().map(|s| hash(&["stdin", s])).unwrap_or_default();
+                        let mount_key = run_mounts_cache_key(engine, &df, mounts, &context, &vars, &ignore, &finished)
+                            .with_context(|| format!("Dockerfile line {}: {}", ins.line, ins.text))?;
+                        Some(format!(
+                            "{}|cmd:{cmd_key}|in:{stdin_key}|mnt:{mount_key}|args:{}|wd:{}|u:{}",
+                            ins.text,
+                            args.join(","),
+                            state.workdir,
+                            state.user.as_deref().unwrap_or("")
+                        ))
+                    }
+                    Kind::Copy { sources, heredocs, dest, from, chown, chmod, checksum, add } => {
+                        let prep = prepare_copy(
+                            engine,
+                            &df,
+                            &context,
+                            &staged_dir,
+                            &mut staged_seq,
+                            sources,
+                            heredocs,
+                            dest,
+                            from.as_deref(),
+                            chown.as_deref(),
+                            chmod.as_deref(),
+                            checksum.as_deref(),
+                            *add,
+                            &vars,
+                            &ignore,
+                            &finished,
+                            log,
+                        )
+                        .with_context(|| format!("Dockerfile line {}: {}", ins.line, ins.text))?;
+                        let material = format!(
+                            "{}|{}|dest:{}|wd:{}|chown:{}|chmod:{:?}",
+                            ins.text,
+                            prep.source_key,
+                            prep.dest,
+                            state.workdir,
+                            prep.chown.as_deref().unwrap_or(""),
+                            prep.chmod
+                        );
+                        prepared_copy = Some(prep);
+                        Some(material)
                     }
                     Kind::Workdir(_) => Some(ins.text.clone()),
                     _ => None,
@@ -296,7 +448,7 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
                 // Run the step in the builder VM.
                 let b = match builder.as_mut() {
                     Some(b) => b,
-                    None => builder.insert(boot_builder(engine, &context, &build_id, log)?),
+                    None => builder.insert(boot_builder(engine, &context, &build_dir, &out_dir, &staged_dir, &secrets_dir, &cache_root, log)?),
                 };
                 if !live {
                     prepare(b, &container, &state.layers)?;
@@ -304,21 +456,39 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
                 }
                 b.request(&AgentRequest::Snapshot { container: container.clone() })?;
                 match &ins.kind {
-                    Kind::Run(c) => run(b, &container, &state, c, log).with_context(|| format!("Dockerfile line {}: {}", ins.line, ins.text))?,
-                    Kind::Copy { sources, dest, from, chown, add } => {
+                    Kind::Run { command, mounts, stdin } => {
+                        let (exec_mounts, extra_env) = resolve_exec_mounts(
+                            engine,
+                            b,
+                            &df,
+                            mounts,
+                            &vars,
+                            &build_id,
+                            &mut finished,
+                            &secrets_map,
+                        )
+                        .with_context(|| format!("Dockerfile line {}: {}", ins.line, ins.text))?;
+                        run(b, &container, &state, command, stdin.as_deref(), exec_mounts, &extra_env, log)
+                            .with_context(|| format!("Dockerfile line {}: {}", ins.line, ins.text))?;
+                    }
+                    Kind::Copy { from, add, .. } => {
+                        let prep = prepared_copy.take().unwrap();
                         let from_container = match from {
                             None => None,
                             Some(f) => Some(source_container(engine, b, &df, f, &build_id, &mut finished)?),
                         };
                         let copied = b.request(&AgentRequest::Copy {
                             container: container.clone(),
-                            sources: sources.iter().map(|s| expand(s, &vars)).collect(),
-                            dest: expand(dest, &vars),
+                            sources: prep.local_sources,
+                            dest: prep.dest,
                             cwd: state.workdir.clone(),
                             from_container,
-                            chown: chown.as_ref().map(|c| expand(c, &vars)),
+                            chown: prep.chown,
+                            chmod: prep.chmod,
                             extract: *add,
                             ignore: if from.is_some() { vec![] } else { ignore_lines.clone() },
+                            inline: prep.inline,
+                            staged: prep.staged,
                         });
                         let files = match copied.with_context(|| format!("Dockerfile line {}: {}", ins.line, ins.text))? {
                             AgentEvent::Copied { files } => files,
@@ -355,12 +525,9 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
 
     cache.save();
     if let Some(b) = builder.take() {
-        let out = b.out_dir.parent().map(Path::to_path_buf);
         b.shutdown();
-        if let Some(dir) = out {
-            let _ = fs::remove_dir_all(dir);
-        }
     }
+    let _ = fs::remove_dir_all(&build_dir);
     let state = result?;
     let image = write_image(engine, &reference, &state)?;
     engine.index.lock().unwrap().insert(image.clone())?;
@@ -368,6 +535,253 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
     log(format!("Built {} ({}, {} layers) in {:.1} s", display(&reference), human(image.size()), image.layers.len(), t0.elapsed().as_secs_f64()));
     let used_by = 0;
     Ok(image.summary(used_by))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_copy(
+    engine: &Engine,
+    df: &Dockerfile,
+    context: &Path,
+    staged_dir: &Path,
+    staged_seq: &mut usize,
+    sources: &[String],
+    heredocs: &[Heredoc],
+    dest: &str,
+    from: Option<&str>,
+    chown: Option<&str>,
+    chmod: Option<&str>,
+    checksum: Option<&str>,
+    add: bool,
+    vars: &BTreeMap<String, String>,
+    ignore: &Ignore,
+    finished: &HashMap<usize, (State, Option<String>)>,
+    log: &mut dyn FnMut(String),
+) -> Result<PreparedCopy> {
+    let dest = expand(dest, vars);
+    let chown = chown.map(|c| expand(c, vars));
+    let chmod = match chmod {
+        Some(m) => Some(parse_octal_mode(&expand(m, vars)).map_err(|e| anyhow!("{e}"))?),
+        None => None,
+    };
+    let checksum = checksum.map(|c| expand(c, vars));
+
+    let mut local_sources = Vec::new();
+    let mut url_sources = Vec::new();
+    for s in sources {
+        let expanded = expand(s, vars);
+        if expanded.starts_with("http://") || expanded.starts_with("https://") {
+            if !add {
+                bail!("COPY doesn't accept URLs; use ADD <url> instead");
+            }
+            url_sources.push(expanded);
+        } else {
+            local_sources.push(expanded);
+        }
+    }
+
+    if checksum.is_some() && url_sources.len() != 1 {
+        bail!("ADD --checksum requires exactly one HTTP(S) URL source");
+    }
+
+    let mut key_parts = Vec::new();
+
+    // 1. Local context or --from stage/image sources.
+    if !local_sources.is_empty() {
+        let h = match from {
+            Some(f) => match df.stage_index(f) {
+                Some(d) => finished.get(&d).map(|(s, _)| s.key.clone()).ok_or_else(|| anyhow!("COPY --from={f}: that stage comes later"))?,
+                None => engine.image_for(f)?.manifest_digest,
+            },
+            None => content_hash(context, &local_sources, ignore)?,
+        };
+        key_parts.push(format!("src:{h}"));
+    }
+
+    // 2. Inline heredoc files (`COPY <<EOF /dest`).
+    let mut inline = Vec::with_capacity(heredocs.len());
+    for hd in heredocs {
+        let content = if hd.expand { expand(&hd.content, vars) } else { hd.content.clone() };
+        key_parts.push(format!("hd:{}:{}", hd.name, hash(&[&hd.name, &content])));
+        inline.push(InlineFile { name: hd.name.clone(), content: content.into_bytes() });
+    }
+
+    // 3. Remote URLs (`ADD https://... /dest`), downloaded on the host and staged read-only.
+    let mut staged = Vec::with_capacity(url_sources.len());
+    for url in url_sources {
+        let name = url_filename(&url);
+        *staged_seq += 1;
+        let rel = format!("{}/{name}", *staged_seq);
+        let target = staged_dir.join(&rel);
+        log(format!(" ---> downloading {url}"));
+        let (bytes, digest) = graviton_image::fetch_url(&url, &target).with_context(|| format!("ADD {url}"))?;
+        if let Some(expected) = &checksum {
+            let norm = expected.trim().to_ascii_lowercase();
+            let norm = if norm.starts_with("sha256:") { norm } else { format!("sha256:{norm}") };
+            if digest.as_str() != norm {
+                let _ = fs::remove_file(&target);
+                bail!("ADD --checksum mismatch for {url}: expected {norm}, got {digest}");
+            }
+        }
+        log(format!(" ---> downloaded {name} ({}, {})", human(bytes), digest.short()));
+        key_parts.push(format!("url:{name}:{digest}"));
+        staged.push(StagedFile { staged_path: rel, name, mode: 0o600 });
+    }
+
+    Ok(PreparedCopy {
+        local_sources,
+        inline,
+        staged,
+        chmod,
+        chown,
+        dest,
+        source_key: key_parts.join("|"),
+    })
+}
+
+fn url_filename(url: &str) -> String {
+    let without_query = url.split(['?', '#']).next().unwrap_or(url);
+    let after_scheme = without_query.split_once("://").map(|(_, r)| r).unwrap_or(without_query);
+    let path_part = after_scheme.split_once('/').map(|(_, p)| p).unwrap_or("");
+    let candidate = path_part.rsplit('/').find(|s| !s.is_empty()).unwrap_or("download");
+    let clean: String = candidate.chars().filter(|&c| c != '/' && c != '\0').collect();
+    if clean.is_empty() || clean == "." || clean == ".." {
+        "download".into()
+    } else {
+        clean
+    }
+}
+
+fn run_mounts_cache_key(
+    engine: &Engine,
+    df: &Dockerfile,
+    mounts: &[RunMount],
+    context: &Path,
+    vars: &BTreeMap<String, String>,
+    ignore: &Ignore,
+    finished: &HashMap<usize, (State, Option<String>)>,
+) -> Result<String> {
+    let mut parts = Vec::new();
+    for m in mounts {
+        match m {
+            RunMount::Cache { target, id, read_only, mode } => {
+                let t = expand(target, vars);
+                let i = id.as_deref().map(|s| expand(s, vars)).unwrap_or_else(|| t.clone());
+                parts.push(format!("cache:{i}:{t}:{read_only}:{}", mode.as_deref().unwrap_or("")));
+            }
+            RunMount::Secret { id, target, env, required, .. } => {
+                // Never hash secret values into the cache key (matches BuildKit).
+                parts.push(format!(
+                    "secret:{}:{}:{}:{required}",
+                    expand(id, vars),
+                    target.as_deref().map(|s| expand(s, vars)).unwrap_or_default(),
+                    env.as_deref().map(|s| expand(s, vars)).unwrap_or_default()
+                ));
+            }
+            RunMount::Bind { source, target, from, read_write } => {
+                let src = expand(source, vars);
+                let tgt = expand(target, vars);
+                let h = match from {
+                    Some(f) => match df.stage_index(f) {
+                        Some(d) => finished.get(&d).map(|(s, _)| s.key.clone()).ok_or_else(|| anyhow!("--mount=type=bind,from={f}: that stage comes later"))?,
+                        None => engine.image_for(f)?.manifest_digest,
+                    },
+                    None => content_hash(context, std::slice::from_ref(&src), ignore)?,
+                };
+                parts.push(format!("bind:{src}:{tgt}:{read_write}:{h}"));
+            }
+            RunMount::Tmpfs { target } => {
+                parts.push(format!("tmpfs:{}", expand(target, vars)));
+            }
+        }
+    }
+    Ok(parts.join(";"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_exec_mounts(
+    engine: &Engine,
+    b: &mut Builder,
+    df: &Dockerfile,
+    mounts: &[RunMount],
+    vars: &BTreeMap<String, String>,
+    build_id: &str,
+    finished: &mut HashMap<usize, (State, Option<String>)>,
+    secrets: &HashMap<String, (String, Vec<u8>)>,
+) -> Result<(Vec<ExecMount>, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut extra_env = Vec::new();
+
+    for m in mounts {
+        match m {
+            RunMount::Cache { target, id, read_only, mode } => {
+                let target = expand(target, vars);
+                let key_input = id.as_deref().map(|s| expand(s, vars)).unwrap_or_else(|| target.clone());
+                let key = cache_mount_key(&key_input);
+                ensure_cache_mount_dir(&key)?;
+                let mode = mode.as_deref().map(|s| parse_octal_mode(&expand(s, vars)).map_err(|e| anyhow!("{e}"))).transpose()?;
+                out.push(ExecMount {
+                    kind: ExecMountKind::Cache,
+                    source: key,
+                    from_container: None,
+                    target,
+                    read_only: *read_only,
+                    mode,
+                });
+            }
+            RunMount::Secret { id, target, env, required, mode } => {
+                let id = expand(id, vars);
+                let Some((file_name, raw)) = secrets.get(&id) else {
+                    if *required {
+                        bail!("RUN requires secret `{id}` (pass `grav build --secret id={id},src=FILE`)");
+                    }
+                    continue;
+                };
+                if let Some(env_var) = env {
+                    let var_name = expand(env_var, vars);
+                    let val = String::from_utf8_lossy(raw);
+                    extra_env.push(format!("{var_name}={val}"));
+                }
+                let target = target.as_deref().map(|t| expand(t, vars)).unwrap_or_else(|| format!("/run/secrets/{id}"));
+                let mode = mode.as_deref().map(|s| parse_octal_mode(&expand(s, vars)).map_err(|e| anyhow!("{e}"))).transpose()?;
+                out.push(ExecMount {
+                    kind: ExecMountKind::Secret,
+                    source: file_name.clone(),
+                    from_container: None,
+                    target,
+                    read_only: true,
+                    mode,
+                });
+            }
+            RunMount::Bind { source, target, from, read_write } => {
+                let source = expand(source, vars);
+                let target = expand(target, vars);
+                let from_container = match from {
+                    None => None,
+                    Some(f) => Some(source_container(engine, b, df, f, build_id, finished)?),
+                };
+                out.push(ExecMount {
+                    kind: ExecMountKind::Bind,
+                    source,
+                    from_container,
+                    target,
+                    read_only: !*read_write,
+                    mode: None,
+                });
+            }
+            RunMount::Tmpfs { target } => {
+                out.push(ExecMount {
+                    kind: ExecMountKind::Tmpfs,
+                    source: String::new(),
+                    from_container: None,
+                    target: expand(target, vars),
+                    read_only: false,
+                    mode: None,
+                });
+            }
+        }
+    }
+
+    Ok((out, extra_env))
 }
 
 fn display(reference: &str) -> String {
@@ -496,7 +910,7 @@ fn apply_config(s: &mut State, kind: &Kind, vars: &BTreeMap<String, String>, bui
         }
         Kind::Volume(v) => s.volumes.extend(v.iter().map(|p| expand(p, vars))),
         Kind::StopSignal(sig) => s.stop_signal = Some(expand(sig, vars)),
-        Kind::Run(_) | Kind::Copy { .. } | Kind::Workdir(_) => unreachable!(),
+        Kind::Run { .. } | Kind::Copy { .. } | Kind::Workdir(_) => unreachable!(),
     }
     Ok(())
 }
@@ -509,18 +923,16 @@ fn push_layer(s: &mut State, layer: Option<BuiltLayer>, text: &str) {
     s.history.push(json!({"created_by": text, "empty_layer": empty}));
 }
 
-/// What COPY from the context would take: paths, kinds, modes and contents.
-fn content_hash(context: &Path, sources: &[String], vars: &BTreeMap<String, String>, ignore: &Ignore) -> Result<String> {
+/// What COPY/bind from the context would take: paths, kinds, modes and contents.
+fn content_hash(context: &Path, sources: &[String], ignore: &Ignore) -> Result<String> {
     let mut h = Sha256::new();
     for src in sources {
-        let src = expand(src, vars);
         let rel = src.trim_start_matches('/');
         for top in expand_source(context, if rel.is_empty() { "." } else { rel }, ignore)? {
             for p in walk(context, &top, ignore)? {
                 let abs = context.join(&p);
                 let meta = fs::symlink_metadata(&abs)?;
                 h.update(p.to_string_lossy().as_bytes());
-                use std::os::unix::fs::PermissionsExt;
                 h.update(format!("|{:o}|", meta.permissions().mode()).as_bytes());
                 if meta.is_file() {
                     let mut f = File::open(&abs)?;
@@ -542,13 +954,20 @@ fn content_hash(context: &Path, sources: &[String], vars: &BTreeMap<String, Stri
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-fn boot_builder(engine: &Engine, context: &Path, build_id: &str, log: &mut dyn FnMut(String)) -> Result<Builder> {
+#[allow(clippy::too_many_arguments)]
+fn boot_builder(
+    engine: &Engine,
+    context: &Path,
+    dir: &Path,
+    out_dir: &Path,
+    staged_dir: &Path,
+    secrets_dir: &Path,
+    cache_root: &Path,
+    log: &mut dyn FnMut(String),
+) -> Result<Builder> {
     let t0 = Instant::now();
-    let dir = paths::support_dir().join("builds").join(build_id);
-    let out_dir = dir.join("out");
-    fs::create_dir_all(&out_dir)?;
     let guest = paths::guest_dir();
-    let mut config = VmConfig::new(guest.join("vmlinux"), guest.join("initrd.img"), crate::runtime::scratch_disk(&dir)?);
+    let mut config = VmConfig::new(guest.join("vmlinux"), guest.join("initrd.img"), crate::runtime::scratch_disk(dir)?);
     let host_cpus = std::thread::available_parallelism().map_or(2, |n| n.get() as u32);
     config.cpus = host_cpus.clamp(1, 4);
     config.memory_mib = 4096;
@@ -557,7 +976,10 @@ fn boot_builder(engine: &Engine, context: &Path, build_id: &str, log: &mut dyn F
     config.shares = vec![
         SharedDirectory { host_path: engine.blobs.root().to_path_buf(), tag: "blobs".into(), read_only: true },
         SharedDirectory { host_path: context.to_path_buf(), tag: "context".into(), read_only: true },
-        SharedDirectory { host_path: out_dir.clone(), tag: "out".into(), read_only: false },
+        SharedDirectory { host_path: out_dir.to_path_buf(), tag: "out".into(), read_only: false },
+        SharedDirectory { host_path: cache_root.to_path_buf(), tag: "cache".into(), read_only: false },
+        SharedDirectory { host_path: staged_dir.to_path_buf(), tag: "staged".into(), read_only: true },
+        SharedDirectory { host_path: secrets_dir.to_path_buf(), tag: "secrets".into(), read_only: true },
     ];
     let vm = Arc::new(AppleHypervisor::new().boot_vm(&config).context("booting the builder VM")?);
     let mut conn = File::from(vm.connect(AGENT_VSOCK_PORT).context("connecting to the builder VM")?);
@@ -567,7 +989,7 @@ fn boot_builder(engine: &Engine, context: &Path, build_id: &str, log: &mut dyn F
     }
     let events = Events::new(BufReader::new(conn.try_clone()?));
     log(format!(" ---> builder VM up in {} ms ({} vCPU, 4 GiB)", t0.elapsed().as_millis(), config.cpus));
-    Ok(Builder { vm, writer: conn, events, out_dir, prepared: BTreeSet::new(), seq: 0 })
+    Ok(Builder { vm, writer: conn, events, out_dir: out_dir.to_path_buf(), prepared: BTreeSet::new(), seq: 0 })
 }
 
 fn prepare(b: &mut Builder, container: &str, layers: &[BuiltLayer]) -> Result<()> {
@@ -615,14 +1037,26 @@ fn source_container(
     Ok(name)
 }
 
-fn run(b: &mut Builder, container: &str, s: &State, c: &Command, log: &mut dyn FnMut(String)) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn run(
+    b: &mut Builder,
+    container: &str,
+    s: &State,
+    c: &Command,
+    stdin: Option<&str>,
+    mounts: Vec<ExecMount>,
+    extra_env: &[String],
+    log: &mut dyn FnMut(String),
+) -> Result<()> {
     let argv = match c {
         Command::Exec(v) => v.clone(),
         Command::Shell(line) => s.shell.iter().cloned().chain([line.clone()]).collect(),
     };
-    // ARGs are environment variables for RUN only; ENV wins over an ARG of the same name.
+    // ARGs are environment variables for RUN only; ENV wins over an ARG of the same name;
+    // secret `env=` vars apply to this single RUN only.
     let mut env: Vec<String> = s.args.iter().filter(|(k, _)| !s.env.iter().any(|e| e.starts_with(&format!("{k}=")))).map(|(k, v)| format!("{k}={v}")).collect();
     env.extend(s.env.iter().cloned());
+    env.extend(extra_env.iter().cloned());
     b.writer.write_all(&encode_line(&AgentRequest::Exec {
         argv,
         env,
@@ -633,6 +1067,8 @@ fn run(b: &mut Builder, container: &str, s: &State, c: &Command, log: &mut dyn F
         hostname: Some("graviton-build".into()),
         rows: 0,
         cols: 0,
+        stdin: stdin.map(|s| s.as_bytes().to_vec()),
+        mounts,
     }))?;
     let (mut out, mut err) = (LineBuffer::default(), LineBuffer::default());
     loop {
@@ -769,11 +1205,24 @@ mod tests {
         assert_eq!(absolute("app", "/"), "/app");
         assert_eq!(absolute("../x", "/srv/app"), "/srv/x");
         assert_eq!(absolute("/opt/./y/", "/srv"), "/opt/y");
+        assert_eq!(url_filename("https://example.com/a/b/tool.tar.gz?sig=1"), "tool.tar.gz");
+        assert_eq!(url_filename("https://example.com/"), "download");
+        assert_eq!(cache_mount_key("/root/.cache/pip"), cache_mount_key("/root/.cache/pip"));
+        assert_ne!(cache_mount_key("/root/.cache/pip"), cache_mount_key("/var/cache/apk"));
     }
 
     #[test]
     fn names_images_after_the_folder() {
-        let spec = |tag: Option<&str>| BuildSpec { context: "/x".into(), dockerfile: None, tag: tag.map(String::from), build_args: vec![], target: None, no_cache: false, upload: None };
+        let spec = |tag: Option<&str>| BuildSpec {
+            context: "/x".into(),
+            dockerfile: None,
+            tag: tag.map(String::from),
+            build_args: vec![],
+            target: None,
+            no_cache: false,
+            upload: None,
+            secrets: vec![],
+        };
         assert_eq!(image_reference(&spec(None), Path::new("/Users/me/My App")).unwrap(), "docker.io/library/my-app:latest");
         assert_eq!(image_reference(&spec(Some("web:1.2")), Path::new("/x")).unwrap(), "docker.io/library/web:1.2");
         assert!(image_reference(&spec(Some("Bad Name")), Path::new("/x")).is_err());

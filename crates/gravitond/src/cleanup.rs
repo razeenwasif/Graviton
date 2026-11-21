@@ -115,6 +115,7 @@ pub fn disk_usage(engine: &Engine) -> DiskUsage {
         }
     }
     usage.build_cache_steps = refs.build_cache_steps;
+    usage.build_cache_bytes += crate::build::cache_mounts_bytes();
     usage
 }
 
@@ -212,12 +213,15 @@ pub fn prune(engine: &Engine, spec: &PruneSpec) -> Result<PruneReport> {
         engine.refresh_images();
     }
 
-    // 3. The build cache.
+    // 3. The build cache (step index + persistent RUN --mount=type=cache dirs).
     let (_, steps) = crate::build::cache_contents();
     report.build_cache_steps = steps;
+    let cache_mounts = crate::build::cache_mounts_bytes();
     if !spec.dry_run {
         crate::build::clear_cache();
+        crate::build::clear_cache_mounts();
     }
+    report.freed_bytes += cache_mounts;
 
     // 4. Blobs nothing refers to any more (and old enough not to belong to a pull or build in progress).
     for (digest, size, old) in blobs(engine) {

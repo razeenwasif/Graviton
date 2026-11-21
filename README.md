@@ -88,6 +88,14 @@ cargo run -p grav -- stop web && cargo run -p grav -- rm web
   container on exit with exponential backoff (1 s to 60 s) and bring it back
   when `gravitond` starts (after a deploy or reboot); containers with the
   default `no` stay stopped until `grav start`.
+- `grav build` supports multi-stage Dockerfiles, heredocs (`RUN <<EOF` /
+  `RUN <<-EOF` with optional `#!` shebangs, inline shell heredocs, and
+  `COPY <<EOF` / `<<'EOF'`), `ADD <http(s)://url>` (with `--checksum`),
+  `--chmod` and `--chown`, persistent `RUN --mount=type=cache`, ephemeral
+  `RUN --mount=type=secret` (via `grav build --secret id=...,src=...` or
+  `env=...`), `type=bind` and `type=tmpfs` mounts, and hard links preserved as
+  tar link entries in layers. `grav df` counts persistent cache mounts and
+  `grav prune` reclaims them.
 - `scripts/install-launch-agent.sh` installs gravitond as a launch agent so it
   starts at login (`--remote` to accept phones, `--uninstall` to remove it).
 

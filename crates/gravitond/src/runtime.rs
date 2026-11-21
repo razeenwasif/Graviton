@@ -869,6 +869,8 @@ impl Engine {
             hostname: Some(name),
             rows: 0,
             cols: 0,
+            stdin: None,
+            mounts: vec![],
         })?;
 
         let mut out = LineBuffer::default();
@@ -1119,6 +1121,8 @@ impl Engine {
             hostname: Some(name),
             rows: spec.rows,
             cols: spec.cols,
+            stdin: None,
+            mounts: vec![],
         }))?;
         match read_event_unbuffered(&mut conn)? {
             AgentEvent::Started { .. } => Ok(conn),

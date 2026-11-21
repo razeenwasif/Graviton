@@ -140,20 +140,34 @@ pub(crate) mod linux {
                         Err(err) => send(&writer, &AgentEvent::Error { message: format!("preparing {container}: {err}") }),
                     }
                 }
-                Ok(AgentRequest::Exec { argv, env, cwd, tty, container, user, hostname, rows, cols }) => {
+                Ok(AgentRequest::Exec { argv, env, cwd, tty, container, user, hostname, rows, cols, stdin, mounts }) => {
                     let has_term = env.iter().any(|e| e.starts_with("TERM="));
-                    let cmd = match &container {
-                        Some(id) => crate::container::command(id, &argv, &env, &cwd, user.as_deref(), hostname.as_deref().unwrap_or(id)),
-                        None => plain_command(&argv, &env, &cwd),
+                    let prepared: io::Result<(Command, Option<crate::build::MountCleanup>)> = match &container {
+                        Some(id) => {
+                            let (pm, cleanup) = if mounts.is_empty() {
+                                (Vec::new(), None)
+                            } else {
+                                match crate::build::prepare_exec_mounts(id, &mounts) {
+                                    Ok((pm, cl)) => (pm, Some(cl)),
+                                    Err(err) => {
+                                        send(&writer, &AgentEvent::Error { message: format!("exec mounts: {err}") });
+                                        continue;
+                                    }
+                                }
+                            };
+                            crate::container::command(id, &argv, &env, &cwd, user.as_deref(), hostname.as_deref().unwrap_or(id), pm)
+                                .map(|cmd| (cmd, cleanup))
+                        }
+                        None => plain_command(&argv, &env, &cwd).map(|cmd| (cmd, None)),
                     };
-                    match cmd {
-                        Ok(cmd) if tty => {
+                    match prepared {
+                        Ok((cmd, _cleanup)) if tty => {
                             // The connection now belongs to the terminal session.
                             let pending = reader.buffer().to_vec();
                             drop(writer);
                             return crate::tty::run(cmd, reader.into_inner(), pending, rows, cols, has_term);
                         }
-                        Ok(cmd) => exec(cmd, argv.first().cloned().unwrap_or_default(), Arc::clone(&writer)),
+                        Ok((cmd, cleanup)) => exec(cmd, argv.first().cloned().unwrap_or_default(), stdin, cleanup, Arc::clone(&writer)),
                         Err(err) => send(&writer, &AgentEvent::Error { message: format!("exec: {err}") }),
                     }
                 }
@@ -187,7 +201,7 @@ pub(crate) mod linux {
                     Ok(()) => send(&writer, &AgentEvent::Done),
                     Err(err) => send(&writer, &AgentEvent::Error { message: err.to_string() }),
                 },
-                Ok(AgentRequest::Copy { container, sources, dest, cwd, from_container, chown, extract, ignore }) => {
+                Ok(AgentRequest::Copy { container, sources, dest, cwd, from_container, chown, chmod, extract, ignore, inline, staged }) => {
                     let req = crate::build::CopyRequest {
                         container: &container,
                         sources: &sources,
@@ -195,8 +209,11 @@ pub(crate) mod linux {
                         cwd: &cwd,
                         from_container: from_container.as_deref(),
                         chown: chown.as_deref(),
+                        chmod,
                         extract,
                         ignore: &ignore,
+                        inline: &inline,
+                        staged: &staged,
                     };
                     match crate::build::copy(&req) {
                         Ok(files) => send(&writer, &AgentEvent::Copied { files }),
@@ -212,6 +229,21 @@ pub(crate) mod linux {
         }
     }
 
+    /// Unlinked seekable file in the guest's `/tmp` (outside any container
+    /// rootfs) so `/proc/self/fd/0` works cleanly for `#!` heredoc scripts.
+    fn make_stdin_file(bytes: &[u8]) -> io::Result<File> {
+        use std::io::{Seek, SeekFrom};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = format!("/tmp/.graviton-stdin-{}-{n}", std::process::id());
+        let mut file = fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
+        let _ = fs::remove_file(&path);
+        file.write_all(bytes)?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(file)
+    }
+
     fn plain_command(argv: &[String], env: &[String], cwd: &str) -> io::Result<Command> {
         let (program, args) = argv.split_first().ok_or_else(|| io::Error::other("empty argv"))?;
         let mut cmd = Command::new(program);
@@ -224,11 +256,29 @@ pub(crate) mod linux {
         Ok(cmd)
     }
 
-    fn exec(mut cmd: Command, program: String, writer: Writer) {
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    fn exec(
+        mut cmd: Command,
+        program: String,
+        stdin_bytes: Option<Vec<u8>>,
+        cleanup: Option<crate::build::MountCleanup>,
+        writer: Writer,
+    ) {
+        let stdin_stdio = match stdin_bytes {
+            Some(bytes) => match make_stdin_file(&bytes) {
+                Ok(file) => Stdio::from(file),
+                Err(err) => {
+                    drop(cleanup);
+                    send(&writer, &AgentEvent::Error { message: format!("preparing stdin for {program}: {err}") });
+                    return;
+                }
+            },
+            None => Stdio::null(),
+        };
+        cmd.stdin(stdin_stdio).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = match crate::reap::spawn(&mut cmd) {
             Ok(child) => child,
             Err(err) => {
+                drop(cleanup);
                 send(&writer, &AgentEvent::Error { message: format!("exec {program}: {err}") });
                 return;
             }
@@ -241,10 +291,12 @@ pub(crate) mod linux {
         thread::spawn(move || {
             let status = child.wait();
             crate::reap::release(pid);
-            // Drain output before announcing the exit so clients see it in order.
+            // Drain output and remove ephemeral secret/bind mountpoints BEFORE
+            // announcing Exited so a following Commit never sees them.
             for t in [out, err].into_iter().flatten() {
                 let _ = t.join();
             }
+            drop(cleanup);
             let code = match status {
                 Ok(s) => s.code().unwrap_or_else(|| {
                     use std::os::unix::process::ExitStatusExt;
