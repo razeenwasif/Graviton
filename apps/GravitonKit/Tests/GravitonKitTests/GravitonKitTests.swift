@@ -228,11 +228,16 @@ import Testing
         // Exactly what grav writes.
         try #"{"default":"mini","hosts":[{"name":"mini","address":"10.0.0.5","port":7843,"fingerprint":"ab","token":"t","device_id":"d1","host_name":"My Mac mini"}]}"#
             .write(to: url, atomically: true, encoding: .utf8)
-        let defaults = UserDefaults(suiteName: "graviton-tests-\(UUID().uuidString)")!
-        let hosts = SharedHosts(url: url, defaults: defaults)
+        let hosts = SharedHosts(url: url)
         #expect(hosts.hosts.map(\.name) == ["mini"])
         #expect(hosts.hosts.first?.remoteHost.address == "10.0.0.5")
-        #expect(hosts.selected == nil)  // the app's choice is its own
+        #expect(hosts.selected == "mini")  // grav's default is the Mac the app shows
+        hosts.select(nil)
+        #expect((try String(contentsOf: url, encoding: .utf8)).contains(#""hosts""#))
+        #expect(!(try String(contentsOf: url, encoding: .utf8)).contains(#""default" : "mini""#))
+        #expect(SharedHosts(url: url).selected == nil)
+        hosts.select("mini")
+        #expect(SharedHosts(url: url).selected == "mini")
 
         let result = PairingResult(host: RemoteHost(deviceID: "d2", name: "Razeen's MacBook", serviceName: nil, address: "10.0.0.9", port: 7843, fingerprint: "cd"), token: "t2")
         try hosts.add(result)

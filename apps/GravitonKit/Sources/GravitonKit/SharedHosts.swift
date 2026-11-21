@@ -34,23 +34,22 @@ public struct PairedMac: Identifiable, Hashable, Sendable {
 
 /// The Macs `grav hosts` knows, from `hosts.json` in Graviton's support folder
 /// (readable only by you). The Mac app and `grav` share it, so pairing in
-/// either shows up in both. Which Mac the app shows is the app's own choice.
+/// either shows up in both, and so does the default: the Mac `grav` sends
+/// commands to without `--host` is the one the app shows, and picking a Mac
+/// in the app's Host menu is `grav hosts use`.
 @MainActor
 @Observable
 public final class SharedHosts {
     public private(set) var hosts: [PairedMac] = []
-    /// The Mac the app shows; `nil` is this Mac.
+    /// The Mac the app shows and grav's default; `nil` is this Mac.
     public private(set) var selected: String?
 
     private let url: URL
-    private let defaults: UserDefaults
-    private static let selectedKey = "graviton.mac.host"
 
-    public init(url: URL = SharedHosts.defaultURL, defaults: UserDefaults = .standard) {
+    public init(url: URL = SharedHosts.defaultURL) {
         self.url = url
-        self.defaults = defaults
         reload()
-        selected = defaults.string(forKey: Self.selectedKey).flatMap { name in hosts.contains { $0.name == name } ? name : nil }
+        selected = (try? File.read(url).default).flatMap { name in hosts.contains { $0.name == name } ? name : nil }
     }
 
     public nonisolated static var defaultURL: URL {
@@ -65,9 +64,12 @@ public final class SharedHosts {
         if let selected, !hosts.contains(where: { $0.name == selected }) { self.selected = nil }
     }
 
+    /// Show `name` (`nil`: this Mac) and make it grav's default too.
     public func select(_ name: String?) {
         selected = name
-        defaults.set(name, forKey: Self.selectedKey)
+        guard var file = try? File.read(url), file.default != name else { return }
+        file.default = name
+        try? file.write(url)
     }
 
     /// Remember a newly paired Mac under `name` (replacing one with the same name or certificate).
