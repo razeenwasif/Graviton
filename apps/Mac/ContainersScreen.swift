@@ -57,9 +57,15 @@ struct ContainersScreen: View {
         }
     }
 
+    private var headerSubtitle: String {
+        let base = "\(store.runningCount) running · \(store.containers.count - store.runningCount) stopped"
+        guard !store.stacks.isEmpty else { return base }
+        return "\(base) · \(store.stacks.count) \(store.stacks.count == 1 ? "stack" : "stacks")"
+    }
+
     private var list: some View {
         VStack(spacing: 0) {
-            ScreenHeader("Containers", subtitle: "\(store.runningCount) running · \(store.containers.count - store.runningCount) stopped") {
+            ScreenHeader("Containers", subtitle: headerSubtitle) {
                 HeaderSearch(prompt: "Search containers", text: $search)
                 Button {
                     showRun = true
@@ -126,6 +132,7 @@ struct ContainerTable: View {
     var open: (Container.ID) -> Void
     @State private var sort: Column = .name
     @State private var ascending = true
+    @State private var collapsed: Set<String> = []
     @FocusState private var focused: Bool
 
     enum Column: Hashable { case name, ports, cpu, memory, uptime }
@@ -143,6 +150,21 @@ struct ContainerTable: View {
         return ascending ? out : out.reversed()
     }
 
+    private var grouped: (stacks: [ContainerStack], standalone: [Container]) {
+        ContainerStack.group(sorted)
+    }
+
+    private var visibleContainers: [Container] {
+        let g = grouped
+        guard !g.stacks.isEmpty else { return sorted }
+        var out: [Container] = []
+        for stack in g.stacks where !collapsed.contains(stack.name) {
+            out.append(contentsOf: stack.containers)
+        }
+        out.append(contentsOf: g.standalone)
+        return out
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
@@ -158,9 +180,40 @@ struct ContainerTable: View {
             .overlay(alignment: .bottom) { Rectangle().fill(G.border).frame(height: 1) }
 
             ScrollView {
+                let g = grouped
                 LazyVStack(spacing: 2) {
-                    ForEach(sorted) { c in
-                        row(c)
+                    if g.stacks.isEmpty {
+                        ForEach(sorted) { c in
+                            row(c, indented: false)
+                        }
+                    } else {
+                        ForEach(g.stacks) { stack in
+                            stackHeader(stack)
+                            if !collapsed.contains(stack.name) {
+                                ForEach(stack.containers) { c in
+                                    row(c, indented: true)
+                                }
+                            }
+                        }
+                        if !g.standalone.isEmpty {
+                            HStack(spacing: 6) {
+                                Text("STANDALONE")
+                                    .font(.system(size: 10.5, weight: .semibold))
+                                    .kerning(0.6)
+                                    .foregroundStyle(G.faint)
+                                Text("\(g.standalone.count)")
+                                    .font(G.mono(10.5))
+                                    .foregroundStyle(G.faint)
+                                Spacer()
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.top, 10)
+                            .padding(.bottom, 4)
+
+                            ForEach(g.standalone) { c in
+                                row(c, indented: false)
+                            }
+                        }
                     }
                 }
                 .padding(6)
@@ -179,15 +232,98 @@ struct ContainerTable: View {
         }
     }
 
-    private func row(_ c: Container) -> some View {
+    private func stackHeader(_ stack: ContainerStack) -> some View {
+        let isCollapsed = collapsed.contains(stack.name)
+        let portCount = stack.containers.reduce(0) { $0 + $1.ports.count }
+        return HStack(spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(G.muted)
+                    .frame(width: 12)
+                Image(systemName: "square.stack.3d.up.fill")
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(stack.anyRunning ? G.accent : G.muted)
+                Text(stack.name)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(G.text)
+                    .lineLimit(1)
+                Text("\(stack.runningCount)/\(stack.containers.count)")
+                    .font(G.mono(11, weight: .medium))
+                    .foregroundStyle(stack.anyRunning ? G.running : G.muted)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background((stack.anyRunning ? G.running : G.muted).opacity(0.12), in: Capsule())
+            }
+            .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
+
+            Text(portCount > 0 ? "\(portCount) \(portCount == 1 ? "port" : "ports")" : "—")
+                .font(G.mono(11.5)).foregroundStyle(G.muted).lineLimit(1)
+                .frame(width: 104, alignment: .leading)
+
+            Text(stack.anyRunning ? Format.percent(stack.totalCPU) : "—")
+                .font(G.mono(12)).foregroundStyle(G.textSecondary)
+                .frame(width: 64, alignment: .trailing)
+
+            Text(stack.totalMemory > 0 ? Format.bytes(stack.totalMemory) : "—")
+                .font(G.mono(12)).foregroundStyle(G.textSecondary)
+                .frame(width: 80, alignment: .trailing)
+
+            HStack(spacing: 6) {
+                Button {
+                    Task {
+                        if stack.anyRunning {
+                            await store.stopStack(stack.name)
+                        } else {
+                            await store.startStack(stack.name)
+                        }
+                    }
+                } label: {
+                    Label(stack.anyRunning ? "Stop" : "Start", systemImage: stack.anyRunning ? "stop.fill" : "play.fill")
+                        .font(.system(size: 11.5, weight: .medium))
+                }
+                .buttonStyle(.g(stack.anyRunning ? .secondary : .primary, size: .small))
+                .help(stack.anyRunning ? "Stop all running containers in \(stack.name)" : "Start all containers in \(stack.name)")
+            }
+            .frame(width: 92, alignment: .leading)
+
+            StackMenu(stack: stack).frame(width: 28)
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 40)
+        .background(G.raised.opacity(0.55), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .contentShape(Rectangle())
+        .onTapGesture {
+            withAnimation(.snappy(duration: 0.2)) {
+                if isCollapsed { collapsed.remove(stack.name) } else { collapsed.insert(stack.name) }
+            }
+        }
+        .contextMenu {
+            StackLifecycleButtons(stack: stack)
+        }
+    }
+
+    private func row(_ c: Container, indented: Bool) -> some View {
         HStack(spacing: 12) {
             HStack(spacing: 12) {
                 StatusDot(running: c.isRunning)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(c.name).font(.system(size: 13, weight: .medium)).foregroundStyle(G.text).lineLimit(1)
+                    HStack(spacing: 6) {
+                        Text(c.name).font(.system(size: 13, weight: .medium)).foregroundStyle(G.text).lineLimit(1)
+                        if indented, let svc = c.service, !svc.isEmpty, svc != c.name {
+                            Text(svc)
+                                .font(G.mono(10.5))
+                                .foregroundStyle(G.muted)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(G.raised, in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                                .lineLimit(1)
+                        }
+                    }
                     Text(c.image).font(G.mono(11.5)).foregroundStyle(G.muted).lineLimit(1).truncationMode(.middle)
                 }
             }
+            .padding(.leading, indented ? 18 : 0)
             .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
             Text(c.ports.isEmpty ? "—" : c.ports.map(\.compactLabel).joined(separator: ", "))
                 .font(G.mono(12)).foregroundStyle(G.textSecondary).lineLimit(1)
@@ -216,11 +352,44 @@ struct ContainerTable: View {
     }
 
     private func move(_ by: Int) -> KeyPress.Result {
-        let list = sorted
+        let list = visibleContainers
         guard !list.isEmpty else { return .ignored }
         let index = list.firstIndex { $0.id == selection } ?? (by > 0 ? -1 : list.count)
         selection = list[min(max(index + by, 0), list.count - 1)].id
         return .handled
+    }
+}
+
+struct StackMenu: View {
+    var stack: ContainerStack
+
+    var body: some View {
+        Menu {
+            StackLifecycleButtons(stack: stack)
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(G.muted)
+                .frame(width: 26, height: 26)
+                .contentShape(Rectangle())
+        }
+        .gravitonMenu()
+        .accessibilityLabel("More actions for stack \(stack.name)")
+    }
+}
+
+struct StackLifecycleButtons: View {
+    @Environment(EngineStore.self) private var store
+    var stack: ContainerStack
+
+    var body: some View {
+        if !stack.allRunning {
+            Button("Start All") { Task { await store.startStack(stack.name) } }
+        }
+        if stack.anyRunning {
+            Button("Stop All") { Task { await store.stopStack(stack.name) } }
+        }
+        Button("Restart Stack") { Task { await store.restartStack(stack.name) } }
     }
 }
 
@@ -297,6 +466,9 @@ struct Inspector: View {
 
             Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
                 DetailRow("ID", container.id)
+                if let project = container.project {
+                    DetailRow("Stack", container.service.map { "\(project) / \($0)" } ?? project)
+                }
                 DetailRow("Ports", container.ports.isEmpty ? "—" : container.ports.map(\.label).joined(separator: "\n"))
                 DetailRow("IP address", container.ipAddress ?? "—")
                 DetailRow("Mounts", container.mounts.isEmpty ? "—" : container.mounts.map { "\($0.source) → \($0.target)" }.joined(separator: "\n"))

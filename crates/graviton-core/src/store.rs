@@ -198,7 +198,7 @@ impl Store {
         let tcp = |host_port, container_port| PortMapping { host_ip: None, host_port, container_port, protocol: PortProtocol::Tcp };
         let mut store = Store::new();
 
-        let mut add = |id: &str, name: &str, image: &str, running: Option<(u64, f64, u64)>, exit: Option<i32>, ports: Vec<PortMapping>, mounts: Vec<Mount>, ip: Option<&str>| {
+        let mut add = |id: &str, name: &str, image: &str, running: Option<(u64, f64, u64)>, exit: Option<i32>, ports: Vec<PortMapping>, mounts: Vec<Mount>, ip: Option<&str>, project: Option<&str>, service: Option<&str>| {
             store.containers.push(ContainerSummary {
                 id: id.into(),
                 name: name.into(),
@@ -213,17 +213,19 @@ impl Store {
                 memory_limit_bytes: Some(1024 * mib),
                 created_at: now - 4 * 3600,
                 started_at: running.map(|r| now - r.0),
+                project: project.map(Into::into),
+                service: service.map(Into::into),
             });
         };
         add("a3f9c2e81b07", "api-gateway", "storefront/api:0.4.2", Some((11_520, 12.4, 412)), None, vec![tcp(8080, 80)],
-            vec![Mount { source: "~/code/storefront".into(), target: "/app".into(), read_only: false }], Some("192.168.64.4"));
+            vec![Mount { source: "~/code/storefront".into(), target: "/app".into(), read_only: false }], Some("192.168.64.4"), Some("storefront"), Some("api"));
         add("5d10e7b3c4aa", "postgres", "postgres:17-alpine", Some((11_520, 3.1, 286)), None, vec![tcp(5432, 5432)],
-            vec![Mount { source: "pgdata".into(), target: "/var/lib/postgresql/data".into(), read_only: false }], Some("192.168.64.2"));
-        add("9be2041f6d33", "redis-cache", "redis:7.4", Some((11_520, 0.6, 24)), None, vec![tcp(6379, 6379)], vec![], Some("192.168.64.3"));
+            vec![Mount { source: "pgdata".into(), target: "/var/lib/postgresql/data".into(), read_only: false }], Some("192.168.64.2"), Some("storefront"), Some("postgres"));
+        add("9be2041f6d33", "redis-cache", "redis:7.4", Some((11_520, 0.6, 24)), None, vec![tcp(6379, 6379)], vec![], Some("192.168.64.3"), Some("storefront"), Some("redis"));
         add("c71a88e09f12", "web", "node:22-slim", Some((2_460, 7.8, 538)), None, vec![tcp(3000, 3000)],
-            vec![Mount { source: "~/code/storefront/web".into(), target: "/srv".into(), read_only: false }], Some("192.168.64.5"));
-        add("e4c5d6f7a8b9", "worker", "storefront/worker:0.4.2", None, Some(0), vec![], vec![], None);
-        add("1f2e3d4c5b6a", "minio", "minio/minio:latest", None, Some(137), vec![tcp(9000, 9000), tcp(9001, 9001)], vec![], None);
+            vec![Mount { source: "~/code/storefront/web".into(), target: "/srv".into(), read_only: false }], Some("192.168.64.5"), Some("storefront"), Some("web"));
+        add("e4c5d6f7a8b9", "worker", "storefront/worker:0.4.2", None, Some(0), vec![], vec![], None, Some("storefront"), Some("worker"));
+        add("1f2e3d4c5b6a", "minio", "minio/minio:latest", None, Some(137), vec![tcp(9000, 9000), tcp(9001, 9001)], vec![], None, None, None);
 
         let image = |r: &str, size_mb: u64, arch: &str, used_by: u32, digest: &str| {
             let parsed = ImageReference::parse(r).expect("demo references are valid");

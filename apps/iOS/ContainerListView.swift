@@ -8,8 +8,10 @@ struct ContainerListView: View {
     @State private var search = ""
     @State private var running = false
     @State private var path: [String] = []
+    @State private var collapsed: Set<String> = []
 
     private var rows: [Container] { filter.apply(store.containers, search: search) }
+    private var grouped: (stacks: [ContainerStack], standalone: [Container]) { ContainerStack.group(rows) }
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -52,16 +54,18 @@ struct ContainerListView: View {
                         GEmptyState("Nothing matches", symbol: "magnifyingglass",
                                     detail: search.isEmpty ? "No \(filter.rawValue.lowercased()) containers." : "No container's name or image contains “\(search)”.")
                             .frame(minHeight: 260)
+                    } else if grouped.stacks.isEmpty {
+                        containerCard(rows)
                     } else {
-                        VStack(spacing: 0) {
-                            ForEach(Array(rows.enumerated()), id: \.element.id) { index, c in
-                                if index > 0 { RowDivider(inset: 36) }
-                                NavigationLink(value: c.id) { ContainerRow(container: c) }
-                                    .buttonStyle(PressRowStyle())
-                                    .contextMenu { LifecycleMenu(container: c) }
+                        ForEach(grouped.stacks) { stack in
+                            stackCard(stack)
+                        }
+                        if !grouped.standalone.isEmpty {
+                            VStack(alignment: .leading, spacing: 8) {
+                                GCaption("Standalone").padding(.horizontal, 4)
+                                containerCard(grouped.standalone)
                             }
                         }
-                        .mobileCard()
                     }
                 }
                 .padding(.horizontal, 20)
@@ -87,6 +91,101 @@ struct ContainerListView: View {
                 MobileRunSheet { c in path = [c.id] }
             }
         }
+    }
+
+    private func containerCard(_ items: [Container]) -> some View {
+        VStack(spacing: 0) {
+            ForEach(Array(items.enumerated()), id: \.element.id) { index, c in
+                if index > 0 { RowDivider(inset: 36) }
+                NavigationLink(value: c.id) { ContainerRow(container: c) }
+                    .buttonStyle(PressRowStyle())
+                    .contextMenu { LifecycleMenu(container: c) }
+            }
+        }
+        .mobileCard()
+    }
+
+    private func stackCard(_ stack: ContainerStack) -> some View {
+        let isCollapsed = collapsed.contains(stack.name)
+        return VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Button {
+                    withAnimation(.snappy(duration: 0.2)) {
+                        if isCollapsed { collapsed.remove(stack.name) } else { collapsed.insert(stack.name) }
+                    }
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(G.muted)
+                            .frame(width: 12)
+                        Image(systemName: "square.stack.3d.up.fill")
+                            .font(.system(size: 14))
+                            .foregroundStyle(stack.anyRunning ? G.accent : G.muted)
+                            .frame(width: 28, height: 28)
+                            .background((stack.anyRunning ? G.accent : G.muted).opacity(0.14), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(stack.name).font(.system(size: 15, weight: .semibold)).foregroundStyle(G.text).lineLimit(1)
+                            Text("\(stack.runningCount)/\(stack.containers.count) running")
+                                .font(.system(size: 11.5)).foregroundStyle(stack.anyRunning ? G.running : G.muted)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    Task {
+                        if stack.anyRunning {
+                            await store.stopStack(stack.name)
+                        } else {
+                            await store.startStack(stack.name)
+                        }
+                    }
+                } label: {
+                    Image(systemName: stack.anyRunning ? "stop.fill" : "play.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(stack.anyRunning ? G.text : G.accent)
+                        .frame(width: 30, height: 30)
+                        .background(G.control, in: Circle())
+                        .overlay(Circle().strokeBorder(G.borderStrong))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(stack.anyRunning ? "Stop stack \(stack.name)" : "Start stack \(stack.name)")
+
+                Menu {
+                    if !stack.allRunning {
+                        Button("Start all", systemImage: "play.fill") { Task { await store.startStack(stack.name) } }
+                    }
+                    if stack.anyRunning {
+                        Button("Stop all", systemImage: "stop.fill", role: .destructive) { Task { await store.stopStack(stack.name) } }
+                    }
+                    Button("Restart stack", systemImage: "arrow.clockwise") { Task { await store.restartStack(stack.name) } }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(G.muted)
+                        .frame(width: 28, height: 30)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("More actions for stack \(stack.name)")
+            }
+            .padding(.horizontal, 14)
+            .frame(minHeight: 54)
+            .background(G.raised.opacity(0.45))
+
+            if !isCollapsed {
+                RowDivider(inset: 0)
+                ForEach(Array(stack.containers.enumerated()), id: \.element.id) { index, c in
+                    if index > 0 { RowDivider(inset: 36) }
+                    NavigationLink(value: c.id) { ContainerRow(container: c) }
+                        .buttonStyle(PressRowStyle())
+                        .contextMenu { LifecycleMenu(container: c) }
+                }
+            }
+        }
+        .mobileCard()
     }
 }
 

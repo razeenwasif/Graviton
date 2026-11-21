@@ -88,6 +88,7 @@ public final class EngineStore {
     public var runningCount: Int { containers.filter(\.isRunning).count }
     public var totalCPU: Double { containers.compactMap(\.cpuPercent).reduce(0, +) }
     public var totalMemory: UInt64 { containers.compactMap(\.memoryBytes).reduce(0, +) }
+    public var stacks: [ContainerStack] { ContainerStack.group(containers).stacks }
 
     public func container(_ id: String?) -> Container? {
         guard let id else { return nil }
@@ -335,6 +336,53 @@ public final class EngineStore {
     public func stop(_ c: Container) async { await lifecycle { try await $0.stop(id: c.id) } }
     public func restart(_ c: Container) async { await lifecycle { try await $0.restart(id: c.id) } }
 
+    /// Start all stopped containers belonging to Compose project `project`.
+    public func startStack(_ project: String) async {
+        let targets = containers.filter { $0.project == project && !$0.isRunning }
+        guard !targets.isEmpty else { return }
+        for c in targets {
+            do {
+                let updated = try await service.start(id: c.id)
+                if let i = containers.firstIndex(where: { $0.id == updated.id }) { containers[i] = updated }
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
+        await refresh()
+    }
+
+    /// Stop all running containers belonging to Compose project `project`.
+    public func stopStack(_ project: String) async {
+        let targets = containers.filter { $0.project == project && $0.isRunning }
+        guard !targets.isEmpty else { return }
+        for c in targets {
+            do {
+                let updated = try await service.stop(id: c.id)
+                if let i = containers.firstIndex(where: { $0.id == updated.id }) { containers[i] = updated }
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
+        await refresh()
+    }
+
+    /// Restart all running containers in Compose project `project` (or start all if none are running).
+    public func restartStack(_ project: String) async {
+        let members = containers.filter { $0.project == project }
+        guard !members.isEmpty else { return }
+        let running = members.filter(\.isRunning)
+        let targets = running.isEmpty ? members : running
+        for c in targets {
+            do {
+                let updated = c.isRunning ? try await service.restart(id: c.id) : try await service.start(id: c.id)
+                if let i = containers.firstIndex(where: { $0.id == updated.id }) { containers[i] = updated }
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
+        await refresh()
+    }
+
     private func lifecycle(_ action: (any EngineService) async throws -> Container) async {
         do {
             let updated = try await action(service)
@@ -372,7 +420,13 @@ public enum ContainerFilter: String, CaseIterable, Identifiable, Sendable {
             case .stopped: !c.isRunning
             }
             let q = search.trimmingCharacters(in: .whitespaces).lowercased()
-            return statusOK && (q.isEmpty || c.name.lowercased().contains(q) || c.image.lowercased().contains(q))
+            return statusOK && (
+                q.isEmpty
+                    || c.name.lowercased().contains(q)
+                    || c.image.lowercased().contains(q)
+                    || (c.project?.lowercased().contains(q) ?? false)
+                    || (c.service?.lowercased().contains(q) ?? false)
+            )
         }
     }
 }

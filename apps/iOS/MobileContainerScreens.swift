@@ -343,14 +343,26 @@ struct MobileInspectView: View {
                     GStatusLine(.failure, problem)
                 }
                 if let d = details {
+                    if let project = d.project {
+                        section("Stack") {
+                            row("Project", project)
+                            if let service = d.service {
+                                row("Service", service)
+                            }
+                        }
+                    }
                     section("Process") {
                         row("Command", d.command.joined(separator: " "))
                         row("Working directory", d.workingDir.isEmpty ? "/" : d.workingDir)
                         row("User", d.user ?? "root")
+                        row("Hostname", d.hostname)
                     }
                     section("Image") {
                         row("Reference", d.imageReference)
                         row("Digest", String(d.imageDigest.prefix(19)) + "…")
+                        if let arch = d.architecture {
+                            row("Architecture", d.rosetta == true ? "\(arch) · Rosetta" : arch)
+                        }
                     }
                     section("Virtual machine") {
                         row("vCPUs", "\(d.cpus)")
@@ -381,6 +393,13 @@ struct MobileInspectView: View {
                             }
                         }
                         .mobileCard()
+                    }
+                    if let labels = d.labels, !labels.isEmpty {
+                        section("Labels") {
+                            ForEach(labels.sorted { $0.key < $1.key }, id: \.key) { key, value in
+                                row(key, value)
+                            }
+                        }
                     }
                     section("Lifecycle") {
                         row("ID", d.container.id)

@@ -73,6 +73,10 @@ public struct Container: Codable, Identifiable, Hashable, Sendable {
     public var createdAt: UInt64
     /// Unix seconds; set while running.
     public var startedAt: UInt64?
+    /// Docker Compose project (stack) name, if created via `grav compose`.
+    public var project: String? = nil
+    /// Service name inside `project`.
+    public var service: String? = nil
 
     public var isRunning: Bool { status == .running }
 
@@ -86,6 +90,41 @@ public struct Container: Codable, Identifiable, Hashable, Sendable {
         case .paused: return "Paused"
         case .created: return "Created"
         }
+    }
+}
+
+/// A Docker Compose project grouping one or more containers.
+public struct ContainerStack: Identifiable, Hashable, Sendable {
+    public var name: String
+    public var containers: [Container]
+
+    public init(name: String, containers: [Container]) {
+        self.name = name
+        self.containers = containers
+    }
+
+    public var id: String { name }
+    public var runningCount: Int { containers.filter(\.isRunning).count }
+    public var allRunning: Bool { !containers.isEmpty && runningCount == containers.count }
+    public var anyRunning: Bool { runningCount > 0 }
+    public var totalCPU: Double { containers.compactMap(\.cpuPercent).reduce(0, +) }
+    public var totalMemory: UInt64 { containers.compactMap(\.memoryBytes).reduce(0, +) }
+
+    /// Group containers into Compose stacks (sorted by project name) and standalone containers.
+    public static func group(_ containers: [Container]) -> (stacks: [ContainerStack], standalone: [Container]) {
+        var grouped: [String: [Container]] = [:]
+        var standalone: [Container] = []
+        for c in containers {
+            if let project = c.project, !project.isEmpty {
+                grouped[project, default: []].append(c)
+            } else {
+                standalone.append(c)
+            }
+        }
+        let stacks = grouped
+            .map { ContainerStack(name: $0.key, containers: $0.value) }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        return (stacks, standalone)
     }
 }
 
@@ -158,9 +197,28 @@ public struct RunSpec: Codable, Hashable, Sendable {
     public var restart: RestartPolicy?
     /// Target platform when pulling the image (`linux/amd64`, `linux/arm64`).
     public var platform: String?
+    /// Replaces the image's Entrypoint when set.
+    public var entrypoint: [String]?
+    /// Overrides the container's working directory.
+    public var workingDir: String?
+    /// Overrides the container's user (`uid`, `uid:gid`, or name).
+    public var user: String?
+    /// Overrides the container's hostname.
+    public var hostname: String?
+    /// Compose project (stack) name.
+    public var project: String?
+    /// Service name inside `project`.
+    public var service: String?
+    /// Arbitrary metadata labels.
+    public var labels: [String: String]?
+    /// Extra project-scoped DNS aliases.
+    public var dnsAliases: [String]?
 
     public init(image: String, name: String? = nil, command: [String]? = nil, env: [String] = [], cpus: UInt32? = nil,
-                memoryMib: UInt64? = nil, ports: [String] = [], volumes: [String] = [], restart: RestartPolicy? = nil, platform: String? = nil) {
+                memoryMib: UInt64? = nil, ports: [String] = [], volumes: [String] = [], restart: RestartPolicy? = nil,
+                platform: String? = nil, entrypoint: [String]? = nil, workingDir: String? = nil, user: String? = nil,
+                hostname: String? = nil, project: String? = nil, service: String? = nil, labels: [String: String]? = nil,
+                dnsAliases: [String]? = nil) {
         self.image = image
         self.name = name
         self.command = command
@@ -171,6 +229,14 @@ public struct RunSpec: Codable, Hashable, Sendable {
         self.volumes = volumes
         self.restart = restart
         self.platform = platform
+        self.entrypoint = entrypoint
+        self.workingDir = workingDir
+        self.user = user
+        self.hostname = hostname
+        self.project = project
+        self.service = service
+        self.labels = labels
+        self.dnsAliases = dnsAliases
     }
 
     /// Split a list typed as "8080:80, 5432" or one per line.
@@ -340,6 +406,9 @@ public struct ContainerDetails: Codable, Hashable, Sendable {
     public var restart: RestartPolicy?
     public var architecture: String? = nil
     public var rosetta: Bool? = nil
+    public var project: String? = nil
+    public var service: String? = nil
+    public var labels: [String: String]? = nil
 }
 
 /// What `grav exec` asks for.
@@ -738,13 +807,21 @@ public struct NetworkInfo: Codable, Hashable, Sendable {
             return ("\(prefix).0/24", "\(prefix).1")
         }.first ?? ("192.168.64.0/24", "192.168.64.1")
         let endpoints = containers.map { c in
-            NetworkEndpoint(
+            var dns: [String] = []
+            if c.isRunning && c.ipAddress != nil {
+                dns = [c.name, "\(c.name).graviton", c.id]
+                if let svc = c.service, !svc.isEmpty, svc.lowercased() != c.name.lowercased() {
+                    dns.append(svc)
+                    dns.append("\(svc).graviton")
+                }
+            }
+            return NetworkEndpoint(
                 containerId: c.id,
                 containerName: c.name,
                 image: c.image,
                 status: c.status,
                 ipAddress: c.isRunning ? c.ipAddress : nil,
-                dnsNames: (c.isRunning && c.ipAddress != nil) ? [c.name, "\(c.name).graviton", c.id] : [],
+                dnsNames: dns,
                 dnsEnabled: c.isRunning && c.ipAddress != nil,
                 ports: c.ports
             )

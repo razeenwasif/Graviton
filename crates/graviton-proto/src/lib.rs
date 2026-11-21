@@ -9,6 +9,8 @@
 //!   VM over vsock, again as newline-delimited JSON ([`AgentRequest`] /
 //!   [`AgentEvent`]).
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub mod build;
@@ -179,6 +181,12 @@ pub struct ContainerSummary {
     pub created_at: u64,
     /// Unix seconds; set while running.
     pub started_at: Option<u64>,
+    /// Compose stack/project name when created by `grav compose`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Compose service name within `project`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +295,30 @@ pub struct RunSpec {
     /// Target platform when pulling the image (e.g. `linux/amd64` or `linux/arm64`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
+    /// Replaces the image's Entrypoint (and clears image Cmd unless `command` is also given).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Vec<String>>,
+    /// Overrides the image's WorkingDir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// Overrides the image's User (`uid[:gid]` or `name[:group]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Overrides the container hostname (defaults to the container name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// Compose project/stack name (for grouping and project-scoped service DNS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Compose service name (automatically registered as a project-scoped DNS alias).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    /// Arbitrary key-value metadata (`grav run -l K=V`, Compose `labels:`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    /// Additional project-scoped DNS aliases (Compose `networks.<net>.aliases`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_aliases: Vec<String>,
 }
 
 fn is_zero_u16(n: &u16) -> bool {
@@ -609,6 +641,15 @@ pub struct ContainerDetails {
     /// True when running an x86_64 image through Rosetta for Linux.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rosetta: bool,
+    /// Compose project/stack name, if part of a stack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Compose service name, if part of a stack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    /// Container labels.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1201,6 +1242,34 @@ mod tests {
         let with_restart = br#"{"method":"run","params":{"env":[],"image":"redis","ports":[],"restart":"on-failure","volumes":[]}}"#;
         let Request::Run(spec) = decode_line::<Request>(with_restart).unwrap() else { panic!("not a run") };
         assert_eq!(spec.restart, Some(RestartPolicy::OnFailure));
+        assert_eq!(spec.project, None);
+        assert!(spec.labels.is_empty());
+
+        let compose_run = Request::Run(RunSpec {
+            image: "postgres:17-alpine".into(),
+            name: Some("myapp-db-1".into()),
+            command: None,
+            env: vec!["POSTGRES_PASSWORD=dev".into()],
+            cpus: Some(2),
+            memory_mib: Some(1024),
+            ports: vec!["5432:5432".into()],
+            volumes: vec!["myapp_pgdata:/var/lib/postgresql/data".into()],
+            restart: Some(RestartPolicy::Always),
+            tty: false,
+            rows: 0,
+            cols: 0,
+            auto_remove: false,
+            platform: None,
+            entrypoint: Some(vec!["docker-entrypoint.sh".into()]),
+            working_dir: Some("/var/lib/postgresql".into()),
+            user: Some("postgres".into()),
+            hostname: Some("db".into()),
+            project: Some("myapp".into()),
+            service: Some("db".into()),
+            labels: BTreeMap::from([("com.docker.compose.project".into(), "myapp".into())]),
+            dns_aliases: vec!["database".into()],
+        });
+        assert_eq!(decode_line::<Request>(&encode_line(&compose_run)).unwrap(), compose_run);
         assert_eq!("always".parse::<RestartPolicy>().unwrap(), RestartPolicy::Always);
         assert_eq!("on-failure".parse::<RestartPolicy>().unwrap(), RestartPolicy::OnFailure);
         assert_eq!("no".parse::<RestartPolicy>().unwrap(), RestartPolicy::No);

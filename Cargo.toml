@@ -18,3 +18,4 @@ thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "fs", "time"] }
+yaml-rust2 = { version = "0.13", default-features = false }

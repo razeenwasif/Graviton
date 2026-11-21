@@ -1,5 +1,6 @@
 //! Engine-side building blocks shared by `gravitond` and `grav`.
 
+pub mod compose;
 pub mod paths;
 pub mod reference;
 pub mod store;

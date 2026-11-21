@@ -17,7 +17,7 @@
 //! Containers, their run settings and their logs are saved under
 //! `~/Library/Application Support/Graviton`, so they survive a restart.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{BuildHasher, RandomState};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -88,6 +88,21 @@ pub(crate) struct ContainerSpec {
     /// Remove the container automatically after it stops (`grav run --rm -it`).
     #[serde(default)]
     auto_remove: bool,
+    /// Optional explicit hostname (defaults to the container's name).
+    #[serde(default)]
+    hostname: Option<String>,
+    /// Compose stack/project name, if created by `grav compose`.
+    #[serde(default)]
+    project: Option<String>,
+    /// Compose service name within `project`.
+    #[serde(default)]
+    service: Option<String>,
+    /// Arbitrary key-value labels (`-l KEY=VALUE`, Compose `labels:`).
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+    /// Additional project-scoped DNS aliases.
+    #[serde(default)]
+    dns_aliases: Vec<String>,
 }
 
 /// Interactive `grav run -it` handle returned to the control connection.
@@ -124,6 +139,9 @@ struct SavedState {
 
 struct Running {
     name: String,
+    project: Option<String>,
+    service: Option<String>,
+    dns_aliases: Vec<String>,
     vm: Arc<AppleVm>,
     agent: Arc<Mutex<File>>,
     pid: Option<i32>,
@@ -499,17 +517,34 @@ impl Engine {
             );
         }
         let config = image.config(&self.blobs)?.config;
-        let argv = config.argv(spec.command.as_deref());
+        let argv = match &spec.entrypoint {
+            Some(ep) => ep
+                .iter()
+                .cloned()
+                .chain(spec.command.clone().unwrap_or_default())
+                .collect(),
+            None => config.argv(spec.command.as_deref()),
+        };
         if argv.is_empty() {
             bail!("{} has no entrypoint or command; pass one after the image name", spec.image);
         }
         let display = ImageReference::parse(&image.reference).map(|r| r.display_name()).unwrap_or(image.reference.clone());
         let restart = spec.restart.unwrap_or_default();
+        let cwd = spec
+            .working_dir
+            .clone()
+            .filter(|w| !w.is_empty())
+            .unwrap_or_else(|| config.working_dir());
+        let user = spec
+            .user
+            .clone()
+            .filter(|u| !u.is_empty())
+            .or_else(|| config.user.clone().filter(|u| !u.is_empty()));
         let cs = ContainerSpec {
             argv,
             env: config.env(&spec.env),
-            cwd: config.working_dir(),
-            user: config.user.clone().filter(|u| !u.is_empty()),
+            cwd,
+            user,
             cpus: spec.cpus.unwrap_or(DEFAULT_CPUS),
             memory_mib: spec.memory_mib.unwrap_or(DEFAULT_MEMORY_MIB),
             image,
@@ -518,6 +553,11 @@ impl Engine {
             restart,
             want_running: !spec.tty && restart != RestartPolicy::No,
             auto_remove: spec.auto_remove && spec.tty,
+            hostname: spec.hostname.filter(|h| !h.is_empty()),
+            project: spec.project.filter(|p| !p.is_empty()),
+            service: spec.service.filter(|s| !s.is_empty()),
+            labels: spec.labels,
+            dns_aliases: spec.dns_aliases,
         };
 
         let id = new_id();
@@ -543,6 +583,8 @@ impl Engine {
             memory_limit_bytes: Some(cs.memory_mib << 20),
             created_at: now_secs(),
             started_at: None,
+            project: cs.project.clone(),
+            service: cs.service.clone(),
         };
         self.store.lock().unwrap().insert(summary)?;
         self.specs.lock().unwrap().insert(id.clone(), cs);
@@ -973,6 +1015,9 @@ impl Engine {
             id.to_string(),
             Running {
                 name: name.clone(),
+                project: spec.project.clone(),
+                service: spec.service.clone(),
+                dns_aliases: spec.dns_aliases.clone(),
                 vm: Arc::clone(&vm),
                 agent: Arc::clone(&agent),
                 pid: None,
@@ -984,12 +1029,13 @@ impl Engine {
             },
         );
         let booted = t0.elapsed();
+        let host_name = spec.hostname.clone().unwrap_or_else(|| name.clone());
 
         send(&agent, &AgentRequest::Prepare {
             container: id.into(),
             layers: spec.image.layers.iter().map(|l| l.digest.clone()).collect(),
             mounts,
-            hostname: Some(name.clone()),
+            hostname: Some(host_name.clone()),
             now_secs: from_snapshot.then(now_secs),
         })?;
         let (files, unpack_ms, ip, reused, dns) = match events.next()? {
@@ -1060,7 +1106,7 @@ impl Engine {
                 tty: true,
                 container: Some(id.into()),
                 user: spec.user.clone(),
-                hostname: Some(name),
+                hostname: Some(host_name),
                 rows,
                 cols,
                 stdin: None,
@@ -1095,7 +1141,7 @@ impl Engine {
             tty: false,
             container: Some(id.into()),
             user: spec.user.clone(),
-            hostname: Some(name),
+            hostname: Some(host_name),
             rows: 0,
             cols: 0,
             stdin: None,
@@ -1147,33 +1193,73 @@ impl Engine {
     }
 
     /// Push the current container name → IP table to every running guest with DNS enabled.
+    /// Containers in the same Compose project also resolve each other by service name
+    /// and any configured `dns_aliases`, without colliding across projects.
     fn sync_hosts(&self) {
+        struct LivePeer {
+            id: String,
+            name: String,
+            ip: String,
+            project: Option<String>,
+            service: Option<String>,
+            dns_aliases: Vec<String>,
+        }
+        struct SyncTarget {
+            project: Option<String>,
+            agent: Arc<Mutex<File>>,
+        }
         let _turn = self.hosts_sync.lock().unwrap();
-        let (hosts, targets): (Vec<HostEntry>, Vec<Arc<Mutex<File>>>) = {
+        let (peers, targets): (Vec<LivePeer>, Vec<SyncTarget>) = {
             let running = self.running.lock().unwrap();
-            let hosts = running
+            let peers = running
                 .iter()
                 .filter_map(|(id, r)| {
-                    r.ip.as_ref().map(|ip| HostEntry {
-                        name: r.name.clone(),
+                    r.ip.as_ref().map(|ip| LivePeer {
                         id: id.clone(),
+                        name: r.name.clone(),
                         ip: ip.clone(),
+                        project: r.project.clone(),
+                        service: r.service.clone(),
+                        dns_aliases: r.dns_aliases.clone(),
                     })
                 })
                 .collect();
             let targets = running
                 .values()
                 .filter(|r| r.dns && r.ip.is_some())
-                .map(|r| Arc::clone(&r.agent))
+                .map(|r| SyncTarget { project: r.project.clone(), agent: Arc::clone(&r.agent) })
                 .collect();
-            (hosts, targets)
+            (peers, targets)
         };
         if targets.is_empty() {
             return;
         }
         let generation = self.hosts_gen.fetch_add(1, Ordering::Relaxed) + 1;
-        let msg = encode_line(&AgentRequest::SetHosts { generation, hosts });
-        for agent in targets {
+        // Canonical entries (first so reverse PTR keeps the container's real name).
+        let base_hosts: Vec<HostEntry> = peers
+            .iter()
+            .map(|p| HostEntry { name: p.name.clone(), id: p.id.clone(), ip: p.ip.clone() })
+            .collect();
+        for SyncTarget { project: target_project, agent } in targets {
+            let mut hosts = base_hosts.clone();
+            if let Some(proj) = target_project.as_deref() {
+                for p in &peers {
+                    if p.project.as_deref() != Some(proj) {
+                        continue;
+                    }
+                    if let Some(svc) = p.service.as_deref() {
+                        if !svc.eq_ignore_ascii_case(&p.name) {
+                            hosts.push(HostEntry { name: svc.to_string(), id: String::new(), ip: p.ip.clone() });
+                        }
+                    }
+                    for alias in &p.dns_aliases {
+                        if !alias.eq_ignore_ascii_case(&p.name) {
+                            hosts.push(HostEntry { name: alias.clone(), id: String::new(), ip: p.ip.clone() });
+                        }
+                    }
+                }
+            }
+            let msg = encode_line(&AgentRequest::SetHosts { generation, hosts });
             let _ = agent.lock().unwrap().write_all(&msg);
         }
     }
@@ -1337,7 +1423,7 @@ impl Engine {
             env: spec.env,
             working_dir: spec.cwd,
             user: spec.user,
-            hostname: container.name.clone(),
+            hostname: spec.hostname.unwrap_or_else(|| container.name.clone()),
             cpus: spec.cpus,
             memory_mib: spec.memory_mib,
             kernel: detect_guest_kernel(),
@@ -1345,6 +1431,9 @@ impl Engine {
             restart: spec.restart,
             architecture: Some(spec.image.architecture.clone()),
             rosetta: spec.image.architecture == "amd64" && graviton_image::guest_arch() != "amd64",
+            project: spec.project,
+            service: spec.service,
+            labels: spec.labels,
             container,
         })
     }
@@ -1448,12 +1537,25 @@ impl Engine {
 
     pub fn network_info(&self) -> NetworkInfo {
         let sw = self.switch.stats();
-        let running: HashMap<String, (Option<String>, bool)> = self
+        let running: HashMap<String, (Option<String>, bool, Vec<String>)> = self
             .running
             .lock()
             .unwrap()
             .iter()
-            .map(|(id, r)| (id.clone(), (r.ip.clone(), r.dns)))
+            .map(|(id, r)| {
+                let mut aliases = Vec::new();
+                if let Some(svc) = &r.service {
+                    if !svc.eq_ignore_ascii_case(&r.name) {
+                        aliases.push(svc.clone());
+                    }
+                }
+                for a in &r.dns_aliases {
+                    if !a.eq_ignore_ascii_case(&r.name) && !aliases.contains(a) {
+                        aliases.push(a.clone());
+                    }
+                }
+                (id.clone(), (r.ip.clone(), r.dns, aliases))
+            })
             .collect();
         let containers = self.store.lock().unwrap().containers().to_vec();
         let (subnet, gateway) = containers
@@ -1466,13 +1568,18 @@ impl Engine {
             .into_iter()
             .map(|c| {
                 let is_running = c.status == ContainerStatus::Running;
-                let (live_ip, dns_enabled) = running.get(&c.id).cloned().unwrap_or((None, false));
+                let (live_ip, dns_enabled, aliases) = running.get(&c.id).cloned().unwrap_or((None, false, vec![]));
                 let ip = if is_running { live_ip.or(c.ip_address) } else { None };
-                let dns_names = if is_running && ip.is_some() {
+                let mut dns_names = if is_running && ip.is_some() {
                     vec![c.name.clone(), format!("{}.graviton", c.name), c.id.clone()]
                 } else {
                     vec![]
                 };
+                if is_running && ip.is_some() {
+                    for alias in aliases {
+                        dns_names.push(alias);
+                    }
+                }
                 NetworkEndpoint {
                     container_id: c.id,
                     container_name: c.name,

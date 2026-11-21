@@ -30,6 +30,14 @@ struct InspectPanel: View {
                     .buttonStyle(.g(.secondary, size: .small))
                     .fixedSize(horizontal: false, vertical: true)
 
+                    if let project = d.project {
+                        InspectSection("Stack") {
+                            InspectRow("Project", project)
+                            if let service = d.service {
+                                InspectRow("Service", service)
+                            }
+                        }
+                    }
                     InspectSection("Process") {
                         InspectRow("Command", d.command.map(quote).joined(separator: " "))
                         InspectRow("Working directory", d.workingDir.isEmpty ? "/" : d.workingDir)
@@ -57,6 +65,13 @@ struct InspectPanel: View {
                         InspectRow("Volumes", d.container.mounts.isEmpty ? "—" : d.container.mounts.map { "\($0.source) → \($0.target)\($0.readOnly ? " (read-only)" : "")" }.joined(separator: "\n"))
                     }
                     environment(d.env)
+                    if let labels = d.labels, !labels.isEmpty {
+                        InspectSection("Labels") {
+                            ForEach(labels.sorted { $0.key < $1.key }, id: \.key) { key, value in
+                                InspectRow(key, value)
+                            }
+                        }
+                    }
                     InspectSection("Lifecycle") {
                         InspectRow("ID", d.container.id)
                         InspectRow("Created", Date(timeIntervalSince1970: Double(d.container.createdAt)).formatted(date: .abbreviated, time: .standard))

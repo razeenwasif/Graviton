@@ -24,7 +24,7 @@ SwiftUI apps for macOS and iOS.
 ```
 crates/
   graviton-proto   Wire types (control API + guest agent channel), JSON lines
-  graviton-core    Image references, engine store, well-known paths
+  graviton-core    Image references, Compose parser & dependency planner, engine store, well-known paths
   graviton-image   Registry client, blob store, local image index, Dockerfile parser
   graviton-vmm     VM config + Hypervisor trait; Virtualization.framework backend
   graviton-agent   PID 1 inside each guest VM: unpacks images, runs containers, writes build layers
@@ -68,6 +68,10 @@ cargo run -p grav -- exec -it web sh
 cargo run -p grav -- cp ./notes.txt web:/tmp/   # copy files or folders in or out (`-` for stdout tar)
 cargo run -p grav -- cp web:/tmp/notes.txt ./notes-copy.txt
 cargo run -p grav -- stop web && cargo run -p grav -- rm web
+cargo run -p grav -- compose up -d              # multi-service stack from compose.yaml / docker-compose.yml
+cargo run -p grav -- compose ps -a              # services in this stack (or `grav compose ls` for all stacks)
+cargo run -p grav -- compose logs -f api        # multiplexed color-coded service logs
+cargo run -p grav -- compose down -v            # tear down stack and project-owned named volumes
 ```
 
 - `grav login [REGISTRY]` / `grav logout [REGISTRY]` authenticate with Docker
@@ -125,6 +129,21 @@ cargo run -p grav -- stop web && cargo run -p grav -- rm web
   Manage snapshots with `grav snapshot [status|warm|clear]` (or disable with
   `GRAVITON_NO_SNAPSHOTS=1`); `grav df` reports snapshot disk usage and
   `grav prune` clears idle snapshots.
+- **Docker Compose & Stacks (`grav compose`)**: run multi-service stacks from
+  `compose.yaml` / `docker-compose.yml` (with automatic `compose.override.yaml`,
+  multiple `-f` files, YAML merge keys `<<:`, `.env` + `env_file`, `${VAR}`
+  interpolation, `--profile`, `build:` contexts, named & bind volumes,
+  `ports`, `entrypoint`, `working_dir`, `user`, `hostname`, `labels`, `cpus` /
+  `mem_limit` / `deploy.resources.limits`, and `depends_on` topological
+  ordering including `condition: service_completed_successfully`). Services in
+  the same stack automatically resolve each other by service name (e.g. `db`,
+  `db.graviton`) and `networks.<net>.aliases` without colliding across separate
+  projects. Commands: `up [-d] [--build] [--no-build] [--force-recreate]`,
+  `down [-v]`, `ps [-a]`, `logs [-f] [-n N]`, `stop`, `start`, `restart`,
+  `build [--no-cache]`, offline `config [--json]`, and `ls`. Both the Mac and
+  iPhone apps group Compose containers into collapsible **Stacks** with
+  one-click stack Start/Stop/Restart controls and show Stack/Service/Labels in
+  Inspect.
 - `scripts/install-launch-agent.sh` installs gravitond as a launch agent so it
   starts at login (`--remote` to accept phones, `--uninstall` to remove it).
 

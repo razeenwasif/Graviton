@@ -412,3 +412,79 @@ import Testing
         #expect(net.endpoints.first?.isRunning == true)
     }
 }
+
+@Suite struct ComposeStacksTests {
+    @Test func wireDecodesComposeFieldsAndEncodesRunSpec() throws {
+        let json = #"""
+        {"type":"containers","data":[{"id":"a3f9c2e81b07","name":"shop-api-1","image":"shop/api:1",
+        "status":"running","exit_code":null,"ports":[],"mounts":[],"ip_address":"192.168.64.4",
+        "cpu_percent":4.0,"memory_bytes":104857600,"memory_limit_bytes":1073741824,
+        "created_at":1700000000,"started_at":1700000100,"project":"shop","service":"api"}]}
+        """#
+        guard case let .containers(list) = try Wire.decoder.decode(EngineResponse.self, from: Data(json.utf8)) else {
+            Issue.record("expected containers"); return
+        }
+        #expect(list.first?.project == "shop" && list.first?.service == "api")
+
+        let detailsJSON = #"""
+        {"type":"details","data":{"container":{"id":"a3f9c2e81b07","name":"shop-api-1","image":"shop/api:1",
+        "status":"running","exit_code":null,"ports":[],"mounts":[],"ip_address":"192.168.64.4",
+        "cpu_percent":4.0,"memory_bytes":104857600,"memory_limit_bytes":1073741824,
+        "created_at":1700000000,"started_at":1700000100,"project":"shop","service":"api"},
+        "image_reference":"docker.io/shop/api:1","image_digest":"sha256:abc","command":["api"],
+        "env":[],"working_dir":"/app","user":"app","hostname":"api-host","cpus":2,"memory_mib":1024,
+        "kernel":"Linux 6.12","vm_dir":"/tmp/vm","restart":"on-failure",
+        "project":"shop","service":"api","labels":{"env":"dev"}}}
+        """#
+        guard case let .details(d) = try Wire.decoder.decode(EngineResponse.self, from: Data(detailsJSON.utf8)) else {
+            Issue.record("expected details"); return
+        }
+        #expect(d.project == "shop" && d.service == "api" && d.labels?["env"] == "dev")
+
+        let spec = RunSpec(
+            image: "alpine:3.22",
+            name: "shop-api-1",
+            entrypoint: ["/bin/sh"],
+            workingDir: "/app",
+            user: "1000:1000",
+            hostname: "api-host",
+            project: "shop",
+            service: "api",
+            labels: ["tier": "web"],
+            dnsAliases: ["backend"]
+        )
+        let encoded = String(decoding: try Wire.line(.run(spec)), as: UTF8.self)
+        #expect(encoded.contains(#""project":"shop""#))
+        #expect(encoded.contains(#""service":"api""#))
+        #expect(encoded.contains(#""working_dir":"/app""#))
+        #expect(encoded.contains(#""dns_aliases":["backend"]"#))
+        #expect(encoded.contains(#""labels":{"tier":"web"}"#))
+    }
+
+    @MainActor @Test func demoGroupsStacksAndControlsLifecycle() async {
+        let store = EngineStore(useDaemon: false)
+        await store.refresh()
+        let grouped = ContainerStack.group(store.containers)
+        #expect(grouped.stacks.map(\.name) == ["storefront"])
+        #expect(grouped.stacks.first?.containers.count == 5)
+        #expect(grouped.stacks.first?.runningCount == 4)
+        #expect(grouped.standalone.map(\.name) == ["minio"])
+
+        // Search matches project and service names too.
+        #expect(ContainerFilter.all.apply(store.containers, search: "storefront").count == 5)
+
+        // Start stack starts the stopped worker too.
+        await store.startStack("storefront")
+        #expect(store.stacks.first?.runningCount == 5)
+        #expect(store.stacks.first?.allRunning == true)
+
+        // Stop stack stops all 5 services without touching standalone minio.
+        await store.stopStack("storefront")
+        #expect(store.stacks.first?.runningCount == 0)
+        #expect(store.stacks.first?.anyRunning == false)
+
+        // Restart stack when none running brings them all up.
+        await store.restartStack("storefront")
+        #expect(store.stacks.first?.runningCount == 5)
+    }
+}

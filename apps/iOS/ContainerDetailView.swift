@@ -82,6 +82,10 @@ struct ContainerDetailView: View {
                     .mobileCard()
 
                     VStack(spacing: 0) {
+                        if let project = c.project {
+                            InfoRow(label: "Stack", value: c.service.map { "\(project) / \($0)" } ?? project)
+                            RowDivider()
+                        }
                         InfoRow(label: "Port", value: c.ports.first?.label ?? "—")
                         RowDivider()
                         InfoRow(label: "IP address", value: c.ipAddress ?? "—")

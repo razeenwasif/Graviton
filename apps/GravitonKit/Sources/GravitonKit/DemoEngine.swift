@@ -18,20 +18,27 @@ public actor DemoEngine: EngineService {
         let mib: UInt64 = 1024 * 1024
         func tcp(_ h: UInt16, _ c: UInt16) -> PortMapping { PortMapping(hostPort: h, containerPort: c, protocol: .tcp) }
         func make(_ id: String, _ name: String, _ image: String, up: (UInt64, Double, UInt64)?, exit: Int32? = nil,
-                  ports: [PortMapping] = [], mounts: [Mount] = [], ip: String? = nil) -> Container {
+                  ports: [PortMapping] = [], mounts: [Mount] = [], ip: String? = nil,
+                  project: String? = nil, service: String? = nil) -> Container {
             Container(id: id, name: name, image: image, status: up == nil ? .exited : .running, exitCode: exit,
                       ports: ports, mounts: mounts, ipAddress: ip, cpuPercent: up?.1, memoryBytes: up.map { $0.2 * mib },
-                      memoryLimitBytes: 1024 * mib, createdAt: now - 4 * 3600, startedAt: up.map { now - $0.0 })
+                      memoryLimitBytes: 1024 * mib, createdAt: now - 4 * 3600, startedAt: up.map { now - $0.0 },
+                      project: project, service: service)
         }
         list = [
             make("a3f9c2e81b07", "api-gateway", "storefront/api:0.4.2", up: (11_520, 12.4, 412), ports: [tcp(8080, 80)],
-                 mounts: [Mount(source: "~/code/storefront", target: "/app", readOnly: false)], ip: "192.168.64.4"),
+                 mounts: [Mount(source: "~/code/storefront", target: "/app", readOnly: false)], ip: "192.168.64.4",
+                 project: "storefront", service: "api"),
             make("5d10e7b3c4aa", "postgres", "postgres:17-alpine", up: (11_520, 3.1, 286), ports: [tcp(5432, 5432)],
-                 mounts: [Mount(source: "pgdata", target: "/var/lib/postgresql/data", readOnly: false)], ip: "192.168.64.2"),
-            make("9be2041f6d33", "redis-cache", "redis:7.4", up: (11_520, 0.6, 24), ports: [tcp(6379, 6379)], ip: "192.168.64.3"),
+                 mounts: [Mount(source: "pgdata", target: "/var/lib/postgresql/data", readOnly: false)], ip: "192.168.64.2",
+                 project: "storefront", service: "postgres"),
+            make("9be2041f6d33", "redis-cache", "redis:7.4", up: (11_520, 0.6, 24), ports: [tcp(6379, 6379)], ip: "192.168.64.3",
+                 project: "storefront", service: "redis"),
             make("c71a88e09f12", "web", "node:22-slim", up: (2_460, 7.8, 538), ports: [tcp(3000, 3000)],
-                 mounts: [Mount(source: "~/code/storefront/web", target: "/srv", readOnly: false)], ip: "192.168.64.5"),
-            make("e4c5d6f7a8b9", "worker", "storefront/worker:0.4.2", up: nil, exit: 0),
+                 mounts: [Mount(source: "~/code/storefront/web", target: "/srv", readOnly: false)], ip: "192.168.64.5",
+                 project: "storefront", service: "web"),
+            make("e4c5d6f7a8b9", "worker", "storefront/worker:0.4.2", up: nil, exit: 0,
+                 project: "storefront", service: "worker"),
             make("1f2e3d4c5b6a", "minio", "minio/minio:latest", up: nil, exit: 137, ports: [tcp(9000, 9000), tcp(9001, 9001)]),
         ]
 
@@ -345,11 +352,15 @@ public actor DemoEngine: EngineService {
         case "web": .onFailure
         default: .no
         }
+        var labels: [String: String] = [:]
+        if let project = c.project { labels["com.docker.compose.project"] = project }
+        if let service = c.service { labels["com.docker.compose.service"] = service }
         return ContainerDetails(container: c, imageReference: image?.reference ?? c.image, imageDigest: image?.digest ?? "sha256:…",
                                 command: command, env: ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "APP_ENV=development", "LOG_LEVEL=info"],
                                 workingDir: c.name == "web" ? "/srv" : "/app", user: c.name == "postgres" ? "postgres" : nil,
                                 hostname: c.name, cpus: 2, memoryMib: (c.memoryLimitBytes ?? 1 << 30) >> 20,
-                                kernel: "Linux 6.12 (demo)", vmDir: "~/Library/Application Support/Graviton/vms/\(c.id)", restart: restart)
+                                kernel: "Linux 6.12 (demo)", vmDir: "~/Library/Application Support/Graviton/vms/\(c.id)", restart: restart,
+                                project: c.project, service: c.service, labels: labels.isEmpty ? nil : labels)
     }
 
     public func openTerminal(_ spec: ExecSpec) throws -> any TerminalSession {

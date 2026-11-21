@@ -1,8 +1,10 @@
 //! `grav`: command-line client for gravitond, on this Mac or a paired one.
 
+mod compose;
 mod remote;
 mod service;
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -126,6 +128,21 @@ enum Command {
         /// Target platform when pulling the image (e.g. linux/amd64, linux/arm64).
         #[arg(long)]
         platform: Option<String>,
+        /// Override the image's entrypoint.
+        #[arg(long)]
+        entrypoint: Option<String>,
+        /// Working directory inside the container.
+        #[arg(short = 'w', long = "workdir")]
+        workdir: Option<String>,
+        /// User (`uid[:gid]` or `name[:group]`).
+        #[arg(short = 'u', long = "user")]
+        user: Option<String>,
+        /// Container hostname.
+        #[arg(long)]
+        hostname: Option<String>,
+        /// Set container label (`KEY=value`); repeatable.
+        #[arg(short = 'l', long = "label")]
+        label: Vec<String>,
         image: String,
         /// Command (replaces the image's default command).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -231,6 +248,8 @@ enum Command {
         #[command(subcommand)]
         action: Option<SnapshotAction>,
     },
+    /// Multi-container stacks from `compose.yaml` / `docker-compose.yml` (`up`, `down`, `ps`, `logs`, `ls`).
+    Compose(compose::ComposeArgs),
     /// What happened recently: containers started, stopped and failed, pulls and builds.
     Events {
         /// How many (default 30).
@@ -370,6 +389,39 @@ fn run(cli: Cli) -> Result<()> {
         println!("{r}");
         return Ok(());
     }
+    if let Command::Compose(compose::ComposeArgs { file, project_name, env_file, action: compose::ComposeAction::Config { json }, .. }) = &cli.command {
+        let cwd = std::env::current_dir()?;
+        let proj = graviton_core::compose::ComposeProject::load(
+            &cwd,
+            &graviton_core::compose::LoadOptions {
+                files: file.clone(),
+                project_name: project_name.clone(),
+                env_file: env_file.clone(),
+            },
+        )?;
+        if *json {
+            println!("{}", serde_json::to_string_pretty(&proj)?);
+        } else {
+            println!("Project: {}", proj.name);
+            println!("Files:   {}", proj.files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "));
+            if !proj.volumes.is_empty() {
+                let vols: Vec<String> = proj
+                    .volumes
+                    .iter()
+                    .map(|(k, v)| if v.external { format!("{k} -> {} (external)", v.volume_name) } else { format!("{k} -> {}", v.volume_name) })
+                    .collect();
+                println!("Volumes: {}", vols.join(", "));
+            }
+            println!();
+            println!("{:<18} {:<24} {:<28} DEPENDS ON", "SERVICE", "CONTAINER", "IMAGE");
+            for svc in proj.services.values() {
+                let deps = if svc.depends_on.is_empty() { "—".into() } else { svc.depends_on.keys().cloned().collect::<Vec<_>>().join(", ") };
+                let img = if svc.build.is_some() { format!("{} (build)", svc.image) } else { svc.image.clone() };
+                println!("{:<18} {:<24} {:<28} {deps}", svc.name, svc.container_name, img);
+            }
+        }
+        return Ok(());
+    }
 
     match &cli.command {
         Command::Hosts { action } => return hosts(action.as_ref()),
@@ -474,12 +526,37 @@ fn run(cli: Cli) -> Result<()> {
                 other => unexpected(other)?,
             }
         }
-        Command::Run { name, env, cpus, memory, publish, volume, restart, detach, interactive, tty, rm, platform, image, command } => {
+        Command::Run {
+            name,
+            env,
+            cpus,
+            memory,
+            publish,
+            volume,
+            restart,
+            detach,
+            interactive,
+            tty,
+            rm,
+            platform,
+            entrypoint,
+            workdir,
+            user,
+            hostname,
+            label,
+            image,
+            command,
+        } => {
             if detach && (tty || interactive) {
                 bail!("can't combine -d/--detach with -i or -t");
             }
             if detach && rm {
                 bail!("can't combine -d/--detach with --rm");
+            }
+            let mut labels = BTreeMap::new();
+            for pair in label {
+                let (k, v) = pair.split_once('=').unwrap_or((&pair, ""));
+                labels.insert(k.to_string(), v.to_string());
             }
             let spec = RunSpec {
                 image,
@@ -496,6 +573,14 @@ fn run(cli: Cli) -> Result<()> {
                 cols: 0,
                 auto_remove: rm,
                 platform,
+                entrypoint: entrypoint.map(|e| graviton_core::compose::split_shell_words(&e)),
+                working_dir: workdir,
+                user,
+                hostname,
+                project: None,
+                service: None,
+                labels,
+                dns_aliases: vec![],
             };
             if tty {
                 let code = run_tty(&target, spec, interactive)?;
@@ -695,6 +780,7 @@ fn run(cli: Cli) -> Result<()> {
                 other => unexpected(other)?,
             }
         }
+        Command::Compose(args) => compose::run(args, &mut client, &target)?,
         Command::Build { tag, file, build_arg, secret, target: build_target, no_cache, platform, path } => {
             let context = std::fs::canonicalize(&path).with_context(|| format!("{} doesn't exist", path.display()))?;
             let dockerfile = match file {
@@ -703,7 +789,7 @@ fn run(cli: Cli) -> Result<()> {
                 None => None,
             };
             let secrets = secret.iter().map(|s| parse_build_secret(s)).collect::<Result<Vec<_>>>()?;
-            let mut spec = BuildSpec {
+            let spec = BuildSpec {
                 context: context.display().to_string(),
                 dockerfile,
                 tag,
@@ -714,33 +800,7 @@ fn run(cli: Cli) -> Result<()> {
                 secrets,
                 platform,
             };
-            if let Target::Remote(host) = &target {
-                // That Mac can't see this folder: send it along.
-                let archive = pack_context(&context, &mut spec)?;
-                let size = archive.path().metadata()?.len();
-                eprintln!("Sending {} to {} ({:.1} MB)…", context.display(), host.name, size as f64 / 1048576.0);
-                spec.upload = Some(size);
-                client.writer.write_all(&encode_line(&Request::Build(spec)))?;
-                std::io::copy(&mut std::fs::File::open(archive.path())?, &mut client.writer)?;
-            } else {
-                client.writer.write_all(&encode_line(&Request::Build(spec)))?;
-            }
-            let mut line = String::new();
-            loop {
-                line.clear();
-                if client.reader.read_line(&mut line)? == 0 {
-                    bail!("gravitond closed the connection");
-                }
-                match decode_line::<Response>(line.as_bytes())? {
-                    Response::BuildLog { line } => println!("{line}"),
-                    Response::Image(i) => {
-                        println!("{}:{}  {}", i.repository, i.tag, &i.digest[..i.digest.len().min(19)]);
-                        break;
-                    }
-                    Response::Error { message } => bail!(message),
-                    other => return unexpected(other),
-                }
-            }
+            run_build_spec(&mut client, &target, &context, spec)?;
         }
         Command::Events { tail, follow } => {
             let mut last = None;
@@ -870,7 +930,7 @@ fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-struct Client {
+pub(crate) struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
 }
@@ -881,7 +941,7 @@ impl Client {
         Ok(Self { reader: BufReader::new(stream.try_clone()?), writer: stream })
     }
 
-    fn call(&mut self, request: &Request) -> Result<Response> {
+    pub(crate) fn call(&mut self, request: &Request) -> Result<Response> {
         self.writer.write_all(&encode_line(request))?;
         let mut line = String::new();
         if self.reader.read_line(&mut line)? == 0 {
@@ -890,6 +950,35 @@ impl Client {
         match decode_line::<Response>(line.as_bytes())? {
             Response::Error { message } => bail!(message),
             response => Ok(response),
+        }
+    }
+}
+
+pub(crate) fn run_build_spec(client: &mut Client, target: &Target, context: &std::path::Path, mut spec: BuildSpec) -> Result<()> {
+    if let Target::Remote(host) = target {
+        let archive = pack_context(context, &mut spec)?;
+        let size = archive.path().metadata()?.len();
+        eprintln!("Sending {} to {} ({:.1} MB)…", context.display(), host.name, size as f64 / 1048576.0);
+        spec.upload = Some(size);
+        client.writer.write_all(&encode_line(&Request::Build(spec)))?;
+        std::io::copy(&mut std::fs::File::open(archive.path())?, &mut client.writer)?;
+    } else {
+        client.writer.write_all(&encode_line(&Request::Build(spec)))?;
+    }
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if client.reader.read_line(&mut line)? == 0 {
+            bail!("gravitond closed the connection");
+        }
+        match decode_line::<Response>(line.as_bytes())? {
+            Response::BuildLog { line } => println!("{line}"),
+            Response::Image(i) => {
+                println!("{}:{}  {}", i.repository, i.tag, &i.digest[..i.digest.len().min(19)]);
+                return Ok(());
+            }
+            Response::Error { message } => bail!(message),
+            other => return unexpected(other),
         }
     }
 }
@@ -1674,7 +1763,7 @@ fn follow(client: &mut Client, id: &str) -> Result<i32> {
     }
 }
 
-fn unexpected(response: Response) -> Result<()> {
+pub(crate) fn unexpected(response: Response) -> Result<()> {
     bail!("unexpected response from gravitond: {response:?}")
 }
 
@@ -1728,7 +1817,7 @@ fn bytes(n: u64) -> String {
     if unit == 0 { format!("{n} B") } else if v >= 100.0 { format!("{v:.0} {}", UNITS[unit]) } else { format!("{v:.1} {}", UNITS[unit]) }
 }
 
-fn uptime(secs: u64) -> String {
+pub(crate) fn uptime(secs: u64) -> String {
     match secs {
         s if s < 60 => format!("{s}s"),
         s if s < 3600 => format!("{}m", s / 60),
@@ -1786,6 +1875,12 @@ fn parse_build_secret(spec: &str) -> Result<BuildSecret> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
 
     #[test]
     fn parses_build_secrets() {
