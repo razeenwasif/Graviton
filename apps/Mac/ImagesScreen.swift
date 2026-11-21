@@ -3,64 +3,86 @@ import SwiftUI
 
 struct ImagesScreen: View {
     @Environment(EngineStore.self) private var store
+    @Environment(Dialogs.self) private var dialogs
     @State private var showPull = false
     @State private var showBuild = false
     @State private var showCleanUp = false
-    @State private var removing: ImageInfo?
-    @State private var removeError: String?
     @State private var runImage: ImageInfo?
+    @State private var search = ""
 
     private var totalSize: UInt64 { store.images.map(\.sizeBytes).reduce(0, +) }
+    private var shown: [ImageInfo] {
+        let q = search.trimmingCharacters(in: .whitespaces).lowercased()
+        return q.isEmpty ? store.images : store.images.filter { "\($0.repository):\($0.tag)".lowercased().contains(q) }
+    }
 
     var body: some View {
-        ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 14)], spacing: 14) {
-                ForEach(store.images) { image in
-                    ImageCard(image: image, onRun: { runImage = $0 }, onRemove: { removing = $0 })
+        VStack(spacing: 0) {
+            ScreenHeader("Images", subtitle: "\(store.images.count) images · \(Format.bytes(totalSize)) on disk") {
+                HeaderSearch(prompt: "Search images", text: $search)
+                Button {
+                    showCleanUp = true
+                } label: {
+                    Label("Clean Up", systemImage: "sparkles")
                 }
-            }
-            .padding(.horizontal, 28)
-            .padding(.vertical, 22)
-        }
-        .background(G.background)
-        .navigationTitle("Images")
-        .navigationSubtitle("\(store.images.count) images · \(Format.bytes(totalSize)) on disk")
-        .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button("Clean Up…") { showCleanUp = true }
-                    .help("Free disk space: the build cache, unused layers, images and stopped containers")
-                    .disabled(!store.canManage)
-                Button("Build…") { showBuild = true }
-                    .help(store.canBuild ? "Build an image from a folder with a Dockerfile" : "Start gravitond (grav service install) to build images")
+                .buttonStyle(.gSecondary)
+                .help("Free disk space: the build cache, unused layers, images and stopped containers")
+                .disabled(!store.canManage)
+                Button {
+                    showBuild = true
+                } label: {
+                    Label("Build", systemImage: "hammer")
+                }
+                .buttonStyle(.gSecondary)
+                .keyboardShortcut("b")
+                .help(store.canBuild ? "Build an image from a folder with a Dockerfile (⌘B)" : "Start gravitond (grav service install) to build images")
                 Button {
                     showPull = true
                 } label: {
-                    Label("Pull image", systemImage: "arrow.down.circle")
+                    Label("Pull image", systemImage: "arrow.down")
                 }
-                .buttonStyle(.borderedProminent)
-                .help(store.canManage ? "Pull an image from a registry" : "Start gravitond to pull images")
+                .buttonStyle(.gPrimary)
+                .keyboardShortcut("n")
+                .help(store.canManage ? "Pull an image from a registry (⌘N)" : "Start gravitond to pull images")
+            }
+
+            if store.images.isEmpty {
+                GEmptyState("No images yet", symbol: "square.stack.3d.up",
+                            detail: "Pull one from Docker Hub, GHCR or any OCI registry, or build one from a Dockerfile.",
+                            actionTitle: store.canManage ? "Pull an image" : nil) { showPull = true }
+            } else if shown.isEmpty {
+                GEmptyState("Nothing matches", symbol: "magnifyingglass", detail: "No image's name contains “\(search)”.")
+            } else {
+                ScrollView {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 14)], spacing: 14) {
+                        ForEach(shown) { image in
+                            ImageCard(image: image, onRun: { runImage = $0 }, onRemove: confirmRemove)
+                        }
+                    }
+                    .padding(.horizontal, 28)
+                    .padding(.top, 6)
+                    .padding(.bottom, 22)
+                }
             }
         }
+        .background(G.background)
         .sheet(isPresented: $showPull) { PullImageSheet() }
         .sheet(isPresented: $showBuild) { BuildImageSheet() }
         .sheet(isPresented: $showCleanUp) { CleanUpSheet() }
-        .confirmationDialog("Remove \(removing.map { "\($0.repository):\($0.tag)" } ?? "")?", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } })) {
-            Button("Remove", role: .destructive) {
-                guard let image = removing else { return }
-                Task {
-                    do { try await store.removeImage(image) } catch { removeError = error.localizedDescription }
-                }
-            }
-        } message: {
-            Text("Its layers go too, unless another image or the build cache uses them. You can pull it again later.")
-        }
-        .alert("Couldn't remove the image", isPresented: Binding(get: { removeError != nil }, set: { if !$0 { removeError = nil } })) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(removeError ?? "")
-        }
         .sheet(item: $runImage) { image in
             RunContainerSheet(initialImage: "\(image.repository):\(image.tag)")
+        }
+    }
+
+    private func confirmRemove(_ image: ImageInfo) {
+        dialogs.confirm("Remove \(image.repository):\(image.tag)?",
+                        message: "Its layers go too, unless another image or the build cache uses them. You can pull it again later.",
+                        confirm: "Remove") {
+            Task {
+                do { try await store.removeImage(image) } catch {
+                    dialogs.alert("Couldn't remove the image", message: error.localizedDescription)
+                }
+            }
         }
     }
 }
@@ -69,6 +91,7 @@ struct ImageCard: View {
     var image: ImageInfo
     var onRun: (ImageInfo) -> Void = { _ in }
     var onRemove: (ImageInfo) -> Void = { _ in }
+    @State private var hovering = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -82,18 +105,37 @@ struct ImageCard: View {
                     Text(image.repository).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
                     Text(image.tag).font(G.mono(12)).foregroundStyle(G.muted)
                 }
+                Spacer(minLength: 0)
+                if hovering {
+                    HStack(spacing: 2) {
+                        Button { onRun(image) } label: { Image(systemName: "play.fill") }
+                            .help("Run a container from it")
+                        Button { onRemove(image) } label: { Image(systemName: "trash") }
+                            .disabled(image.usedBy > 0)
+                            .help(image.usedBy > 0 ? "A container uses it: remove the container first" : "Remove this image")
+                    }
+                    .buttonStyle(.gIcon)
+                    .transition(.opacity)
+                }
             }
             HStack(spacing: 14) {
                 Text(Format.bytes(image.sizeBytes))
                 Text(image.architecture == "amd64" ? "amd64 · Rosetta" : image.architecture)
                 Spacer()
-                Text(image.usedBy == 0 ? "Unused" : "\(image.usedBy) container\(image.usedBy == 1 ? "" : "s")")
+                if image.usedBy == 0 {
+                    Text("Unused")
+                } else {
+                    GBadge("\(image.usedBy) container\(image.usedBy == 1 ? "" : "s")", color: G.running)
+                }
             }
             .font(.system(size: 12))
             .foregroundStyle(G.muted)
         }
         .padding(16)
-        .gravitonCard()
+        .gravitonCard(hovering ? G.card : G.surface)
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(hovering ? Color.white.opacity(0.09) : .clear))
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovering)
         .contextMenu {
             Button("Run…") { onRun(image) }
             Button("Copy Reference") {
@@ -128,69 +170,42 @@ struct PullImageSheet: View {
     private var trimmed: String { reference.trimmingCharacters(in: .whitespaces) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Pull image").font(.system(size: 16, weight: .semibold))
-                Text("From Docker Hub, GHCR or any OCI registry.").font(.system(size: 12.5)).foregroundStyle(G.muted)
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Reference").font(.system(size: 12, weight: .medium)).foregroundStyle(G.textSecondary)
-                TextField("e.g. postgres:17-alpine", text: $reference)
-                    .textFieldStyle(.plain)
-                    .font(G.mono(13))
-                    .padding(.horizontal, 12)
-                    .frame(height: 38)
-                    .background(G.background, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(G.accent.opacity(focused ? 0.9 : 0.35)))
+        GSheet("Pull image", subtitle: "From Docker Hub, GHCR or any OCI registry.", symbol: "arrow.down.circle") {
+            GFormRow("Reference", hint: "A name and tag; Docker Hub is the default registry.") {
+                GTextField("e.g. postgres:17-alpine", text: $reference)
                     .focused($focused)
                     .disabled(pulling)
                     .onSubmit(startPull)
+                    .gravitonField(mono: true, height: 36)
             }
 
-            Group {
-                switch phase {
-                case .idle:
-                    if !store.canManage {
-                        Label("Start gravitond to pull images: scripts/dev-gravitond.sh", systemImage: "exclamationmark.triangle")
-                            .foregroundStyle(G.warning)
-                    }
-                case let .pulling(since):
-                    HStack(spacing: 10) {
-                        ProgressView().controlSize(.small)
-                        TimelineView(.periodic(from: since, by: 1)) { context in
-                            Text("Pulling \(trimmed)… \(Int(context.date.timeIntervalSince(since))) s")
-                        }
-                    }
-                    .foregroundStyle(G.textSecondary)
-                case let .done(image):
-                    Label("Pulled \(image.repository):\(image.tag) · \(Format.bytes(image.sizeBytes)) · \(image.architecture)", systemImage: "checkmark.circle.fill")
-                        .foregroundStyle(G.running)
-                case let .failed(message):
-                    Label(message, systemImage: "xmark.octagon.fill")
-                        .foregroundStyle(G.danger)
-                        .textSelection(.enabled)
+            switch phase {
+            case .idle:
+                if !store.canManage {
+                    GStatusLine(.warning, "Start gravitond to pull images: scripts/dev-gravitond.sh")
                 }
-            }
-            .font(.system(size: 12.5))
-            .fixedSize(horizontal: false, vertical: true)
-
-            HStack {
-                if pulling {
-                    Text("You can close this; the pull carries on.").font(.system(size: 11.5)).foregroundStyle(G.faint)
+            case let .pulling(since):
+                TimelineView(.periodic(from: since, by: 1)) { context in
+                    GStatusLine(.working, "Pulling \(trimmed)… \(Int(context.date.timeIntervalSince(since))) s")
                 }
-                Spacer()
-                Button("Close") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                Button("Pull", action: startPull)
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(pulling || trimmed.isEmpty || !store.canManage)
+            case let .done(image):
+                GStatusLine(.success, "Pulled \(image.repository):\(image.tag) · \(Format.bytes(image.sizeBytes)) · \(image.architecture)")
+            case let .failed(message):
+                GStatusLine(.failure, message)
             }
+        } footer: {
+            if pulling {
+                Text("You can close this; the pull carries on.").font(.system(size: 11.5)).foregroundStyle(G.faint)
+            }
+            Spacer()
+            Button("Close") { dismiss() }
+                .buttonStyle(.gSecondary)
+                .keyboardShortcut(.cancelAction)
+            Button("Pull", action: startPull)
+                .buttonStyle(.gPrimary)
+                .keyboardShortcut(.defaultAction)
+                .disabled(pulling || trimmed.isEmpty || !store.canManage)
         }
-        .padding(22)
-        .frame(width: 520)
-        .background(Color(hex: 0x15161A))
         .onAppear { focused = true }
     }
 

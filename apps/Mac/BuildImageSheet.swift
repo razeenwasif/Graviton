@@ -37,47 +37,35 @@ struct BuildImageSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Build image").font(.system(size: 16, weight: .semibold))
-                Text(store.isLocal
-                     ? "From a folder with a Dockerfile. Each build runs in its own VM; unchanged steps come from the cache."
-                     : "From a folder on this Mac, built on \(store.liveName ?? "the other Mac"): the folder is sent there first, minus what .dockerignore leaves out.")
-                    .font(.system(size: 12.5)).foregroundStyle(G.muted)
-            }
-
-            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
-                GridRow {
-                    label("Folder")
+        GSheet("Build image",
+               subtitle: store.isLocal
+                   ? "From a folder with a Dockerfile. Each build runs in its own VM; unchanged steps come from the cache."
+                   : "From a folder on this Mac, built on \(store.liveName ?? "the other Mac"): the folder is sent there first, minus what .dockerignore leaves out.",
+               symbol: "hammer", width: 660) {
+            GFormRow("Folder", error: !folder.isEmpty && !hasDockerfile ? "No \(dockerfile.isEmpty ? "Dockerfile" : dockerfile) in this folder." : nil) {
+                HStack(spacing: 8) {
                     HStack(spacing: 8) {
+                        Image(systemName: "folder").font(.system(size: 12)).foregroundStyle(folder.isEmpty ? G.faint : G.accent)
                         Text(folder.isEmpty ? "Choose a folder…" : (folder as NSString).abbreviatingWithTildeInPath)
                             .font(G.mono(12.5))
                             .foregroundStyle(folder.isEmpty ? G.faint : G.text)
                             .lineLimit(1).truncationMode(.middle)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 10).frame(height: 30)
-                            .background(G.background, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        Button("Choose…", action: choose).disabled(building)
                     }
-                }
-                GridRow {
-                    label("Name")
-                    field(defaultName, text: $tag)
-                }
-                GridRow {
-                    label("Dockerfile")
-                    field("Dockerfile", text: $dockerfile)
-                }
-                GridRow {
-                    label("Build args")
-                    field("KEY=value, KEY2=value", text: $buildArgs)
-                }
-                GridRow {
-                    Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
-                    Toggle("Rebuild every step (no cache)", isOn: $noCache).toggleStyle(.checkbox).disabled(building)
+                    .padding(.horizontal, 11)
+                    .frame(maxWidth: .infinity, minHeight: 32, alignment: .leading)
+                    .background(G.background, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(G.borderStrong))
+                    .contentShape(Rectangle())
+                    .onTapGesture { if !building { choose() } }
+                    Button("Choose…", action: choose).buttonStyle(.gSecondary).disabled(building)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(alignment: .top, spacing: 12) {
+                GFormRow("Name") { field(defaultName, text: $tag) }
+                GFormRow("Dockerfile") { field("Dockerfile", text: $dockerfile) }.frame(width: 190)
+            }
+            GFormRow("Build args") { field("KEY=value, KEY2=value", text: $buildArgs) }
+            Toggle("Rebuild every step (no cache)", isOn: $noCache).toggleStyle(.gCheckbox).disabled(building)
 
             ScrollViewReader { proxy in
                 ScrollView {
@@ -91,78 +79,57 @@ struct BuildImageSheet: View {
                                 .id(i)
                         }
                         if lines.isEmpty {
-                            Text(hasDockerfile || folder.isEmpty ? "The build log shows here." : "No Dockerfile in this folder.")
-                                .font(G.mono(11.5)).foregroundStyle(hasDockerfile || folder.isEmpty ? G.faint : G.warning)
+                            Text("The build log shows here.").font(G.mono(11.5)).foregroundStyle(G.faint)
                         }
                     }
                     .padding(12)
                 }
-                .frame(height: 230)
+                .frame(height: 210)
                 .background(G.console, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(G.border))
                 .onChange(of: lines.count) { proxy.scrollTo(lines.count - 1, anchor: .bottom) }
             }
 
-            status.font(.system(size: 12.5)).fixedSize(horizontal: false, vertical: true)
-
-            HStack {
-                if building {
-                    Text("Closing this window stops watching; the build carries on.").font(.system(size: 11.5)).foregroundStyle(G.faint)
-                }
-                Spacer()
-                Button("Close") {
-                    job?.cancel()
-                    dismiss()
-                }
-                .keyboardShortcut(.cancelAction)
-                Button("Build", action: start)
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(building || !hasDockerfile || !store.canBuild)
+            status
+        } footer: {
+            if building {
+                Text("Closing this window stops watching; the build carries on.").font(.system(size: 11.5)).foregroundStyle(G.faint)
             }
+            Spacer()
+            Button("Close") {
+                job?.cancel()
+                dismiss()
+            }
+            .buttonStyle(.gSecondary)
+            .keyboardShortcut(.cancelAction)
+            Button("Build", action: start)
+                .buttonStyle(.gPrimary)
+                .keyboardShortcut(.defaultAction)
+                .disabled(building || !hasDockerfile || !store.canBuild)
         }
-        .padding(22)
-        .frame(width: 640)
-        .background(Color(hex: 0x15161A))
     }
 
     @ViewBuilder private var status: some View {
         switch phase {
         case .idle:
             if !store.canBuild {
-                Label("Builds need gravitond running (grav service install), here or on a paired Mac", systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(G.warning)
+                GStatusLine(.warning, "Builds need gravitond running (grav service install), here or on a paired Mac")
             }
         case let .building(since):
-            HStack(spacing: 10) {
-                ProgressView().controlSize(.small)
-                TimelineView(.periodic(from: since, by: 1)) { context in
-                    Text("Building… \(Int(context.date.timeIntervalSince(since))) s")
-                }
+            TimelineView(.periodic(from: since, by: 1)) { context in
+                GStatusLine(.working, "Building… \(Int(context.date.timeIntervalSince(since))) s")
             }
-            .foregroundStyle(G.textSecondary)
         case let .built(image, seconds):
-            Label("Built \(image.repository):\(image.tag) · \(Format.bytes(image.sizeBytes)) in \(seconds) s. It's in Images, ready to run.", systemImage: "checkmark.circle.fill")
-                .foregroundStyle(G.running)
+            GStatusLine(.success, "Built \(image.repository):\(image.tag) · \(Format.bytes(image.sizeBytes)) in \(seconds) s. It's in Images, ready to run.")
         case let .failed(message):
-            Label(message, systemImage: "xmark.octagon.fill")
-                .foregroundStyle(G.danger)
-                .textSelection(.enabled)
+            GStatusLine(.failure, message)
         }
     }
 
-    private func label(_ text: String) -> some View {
-        Text(text).font(.system(size: 12, weight: .medium)).foregroundStyle(G.textSecondary).gridColumnAlignment(.trailing)
-    }
-
     private func field(_ placeholder: String, text: Binding<String>) -> some View {
-        TextField(placeholder, text: text)
-            .textFieldStyle(.plain)
-            .font(G.mono(12.5))
-            .padding(.horizontal, 10)
-            .frame(maxWidth: .infinity, minHeight: 30, maxHeight: 30)
-            .background(G.background, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        GTextField(placeholder, text: text)
             .disabled(building)
+            .gravitonField(mono: true)
     }
 
     /// Step headers stand out; Graviton's own notes are dimmer than the program's output.

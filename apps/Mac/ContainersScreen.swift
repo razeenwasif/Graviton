@@ -12,146 +12,215 @@ struct ContainersScreen: View {
     @State private var filter: ContainerFilter = .all
     @State private var search = ""
     @State private var selection: Container.ID?
-    @State private var path: [ContainerRoute] = []
+    @State private var route: ContainerRoute?
     @State private var showRun = false
+    @State private var width: CGFloat = 1200
 
     private var rows: [Container] { filter.apply(store.containers, search: search) }
 
     var body: some View {
-        NavigationStack(path: $path) {
-            HStack(alignment: .top, spacing: 24) {
-                VStack(alignment: .leading, spacing: 14) {
-                    Picker("Filter", selection: $filter) {
-                        ForEach(ContainerFilter.allCases) { Text($0.rawValue).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .fixedSize()
+        ZStack {
+            if let route {
+                ContainerDetailScreen(containerID: route.id, initialTab: route.tab) { self.route = nil }
+                    .id(route)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+            } else {
+                list.transition(.move(edge: .leading).combined(with: .opacity))
+            }
+        }
+        .animation(.snappy(duration: 0.25), value: route)
+        .sheet(isPresented: $showRun) {
+            RunContainerSheet { container in
+                filter = .all
+                selection = container.id
+            }
+        }
+        .onChange(of: router.pending, initial: true) { _, request in
+            switch request {
+            case .runContainer:
+                route = nil
+                showRun = true
+            case let .container(id, tab):
+                filter = .all
+                selection = id
+                route = ContainerRoute(id: id, tab: tab)
+            case .images, .pairMac, nil:
+                return
+            }
+            router.pending = nil
+        }
+        .onAppear {
+            if selection == nil { selection = store.containers.first(where: \.isRunning)?.id }
+        }
+        .onChange(of: store.containers.map(\.id)) {
+            if selection == nil { selection = store.containers.first(where: \.isRunning)?.id }
+        }
+    }
 
-                    ContainerTable(rows: rows, selection: $selection) { id in
-                        path.append(ContainerRoute(id: id))
+    private var list: some View {
+        VStack(spacing: 0) {
+            ScreenHeader("Containers", subtitle: "\(store.runningCount) running · \(store.containers.count - store.runningCount) stopped") {
+                HeaderSearch(prompt: "Search containers", text: $search)
+                Button {
+                    showRun = true
+                } label: {
+                    Label("Run container", systemImage: "plus")
+                }
+                .buttonStyle(.gPrimary)
+                .keyboardShortcut("n")
+                .disabled(!store.canManage)
+                .help(store.canManage ? "Run a new container (⌘N)" : "Start gravitond to run containers")
+            }
+
+            HStack(alignment: .top, spacing: 20) {
+                VStack(alignment: .leading, spacing: 14) {
+                    GSegmented(selection: $filter, options: ContainerFilter.allCases.map { ($0, label(for: $0)) })
+
+                    if store.containers.isEmpty {
+                        GEmptyState("No containers yet", symbol: "shippingbox",
+                                    detail: "Run one from an image: it boots in its own small VM in a second or two.",
+                                    actionTitle: store.canManage ? "Run a container" : nil) { showRun = true }
+                            .gravitonCard()
+                    } else if rows.isEmpty {
+                        GEmptyState("Nothing matches", symbol: "magnifyingglass",
+                                    detail: search.isEmpty ? "No \(filter.rawValue.lowercased()) containers." : "No container's name or image contains “\(search)”.")
+                            .gravitonCard()
+                    } else {
+                        ContainerTable(rows: rows, selection: $selection) { id in
+                            route = ContainerRoute(id: id)
+                        }
                     }
                 }
-                .frame(maxWidth: .infinity)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
-                if let selected = store.container(selection) {
-                    Inspector(container: selected) { path.append(ContainerRoute(id: selected.id)) }
+                if width >= 940, let selected = store.container(selection) {
+                    Inspector(container: selected) { route = ContainerRoute(id: selected.id) }
                         .frame(width: 330)
                         .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
             .padding(.horizontal, 28)
-            .padding(.vertical, 20)
+            .padding(.top, 6)
+            .padding(.bottom, 22)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-            .background(G.background)
-            .navigationTitle("Containers")
-            .navigationSubtitle("\(store.runningCount) running · \(store.containers.count - store.runningCount) stopped")
-            .searchable(text: $search, placement: .toolbar, prompt: "Search containers")
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        showRun = true
-                    } label: {
-                        Label("Run container", systemImage: "plus")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut("n")
-                    .help(store.canManage ? "Run a new container (⌘N)" : "Start gravitond to run containers")
-                }
-            }
-            .sheet(isPresented: $showRun) {
-                RunContainerSheet { container in
-                    filter = .all
-                    selection = container.id
-                }
-            }
-            .navigationDestination(for: ContainerRoute.self) { route in
-                ContainerDetailScreen(containerID: route.id, initialTab: route.tab)
-            }
-            .onChange(of: router.pending, initial: true) { _, request in
-                switch request {
-                case .runContainer:
-                    path = []
-                    showRun = true
-                case let .container(id, tab):
-                    filter = .all
-                    selection = id
-                    path = [ContainerRoute(id: id, tab: tab)]
-                case .images, .pairMac, nil:
-                    return
-                }
-                router.pending = nil
-            }
             .animation(.snappy(duration: 0.2), value: selection)
-            .onAppear {
-                if selection == nil { selection = store.containers.first(where: \.isRunning)?.id }
-            }
-            .onChange(of: store.containers.map(\.id)) {
-                if selection == nil { selection = store.containers.first(where: \.isRunning)?.id }
-            }
+        }
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
+    }
+
+    private func label(for filter: ContainerFilter) -> String {
+        switch filter {
+        case .all: "All  \(store.containers.count)"
+        case .running: "Running  \(store.runningCount)"
+        case .stopped: "Stopped  \(store.containers.count - store.runningCount)"
         }
     }
 }
 
+/// The container list: Graviton's own table, with hover, selection, a menu
+/// per row, arrow keys to move and Return to open.
 struct ContainerTable: View {
     @Environment(EngineStore.self) private var store
     var rows: [Container]
     @Binding var selection: Container.ID?
     var open: (Container.ID) -> Void
+    @State private var sort: Column = .name
+    @State private var ascending = true
+    @FocusState private var focused: Bool
+
+    enum Column: Hashable { case name, ports, cpu, memory, uptime }
+
+    private var sorted: [Container] {
+        let out = rows.sorted { a, b in
+            switch sort {
+            case .name: a.name.localizedStandardCompare(b.name) == .orderedAscending
+            case .ports: (a.ports.first?.hostPort ?? .max) < (b.ports.first?.hostPort ?? .max)
+            case .cpu: (a.cpuPercent ?? -1) < (b.cpuPercent ?? -1)
+            case .memory: (a.memoryBytes ?? 0) < (b.memoryBytes ?? 0)
+            case .uptime: (a.startedAt ?? 0) > (b.startedAt ?? 0)
+            }
+        }
+        return ascending ? out : out.reversed()
+    }
 
     var body: some View {
-        Table(rows, selection: $selection) {
-            TableColumn("Name") { c in
-                HStack(spacing: 12) {
-                    StatusDot(running: c.isRunning)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(c.name).fontWeight(.medium).foregroundStyle(G.text)
-                        Text(c.image).font(G.mono(11.5)).foregroundStyle(G.muted)
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                GColumnHeader("Name", key: Column.name, sort: $sort, ascending: $ascending).frame(minWidth: 120, maxWidth: .infinity)
+                GColumnHeader("Ports", key: Column.ports, sort: $sort, ascending: $ascending).frame(width: 104)
+                GColumnHeader("CPU", key: Column.cpu, sort: $sort, ascending: $ascending, alignment: .trailing).frame(width: 64)
+                GColumnHeader("Memory", key: Column.memory, sort: $sort, ascending: $ascending, alignment: .trailing).frame(width: 80)
+                GColumnHeader("Uptime", key: Column.uptime, sort: $sort, ascending: $ascending).frame(width: 92)
+                Color.clear.frame(width: 28)
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 34)
+            .overlay(alignment: .bottom) { Rectangle().fill(G.border).frame(height: 1) }
+
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(sorted) { c in
+                        row(c)
                     }
                 }
-                .padding(.vertical, 6)
+                .padding(6)
             }
-            .width(min: 200, ideal: 260)
-
-            TableColumn("Ports") { c in
-                Text(c.ports.isEmpty ? "—" : c.ports.map { "\($0.hostPort)→\($0.containerPort)" }.joined(separator: ", "))
-                    .font(G.mono(12)).foregroundStyle(G.textSecondary)
-            }
-            .width(min: 90, ideal: 120)
-
-            TableColumn("CPU") { c in
-                Text(Format.percent(c.cpuPercent)).font(G.mono(12)).foregroundStyle(G.textSecondary).monospacedDigit()
-            }
-            .width(min: 60, ideal: 70)
-
-            TableColumn("Memory") { c in
-                Text(c.memoryBytes.map(Format.bytes) ?? "—").font(G.mono(12)).foregroundStyle(G.textSecondary)
-            }
-            .width(min: 70, ideal: 84)
-
-            TableColumn("Uptime") { c in
-                Text(c.statusText()).foregroundStyle(G.muted)
-            }
-            .width(min: 80, ideal: 100)
-
-            TableColumn("") { c in
-                RowMenu(container: c, open: { open(c.id) })
-            }
-            .width(32)
         }
-        .tableStyle(.inset)
-        .alternatingRowBackgrounds(.disabled)
-        .scrollContentBackground(.hidden)
-        .contextMenu(forSelectionType: Container.ID.self) { ids in
-            if let id = ids.first, let c = store.container(id) {
-                LifecycleButtons(container: c)
-                Divider()
-                Button("Show Logs") { open(id) }
-            }
-        } primaryAction: { ids in
-            if let id = ids.first { open(id) }
+        .gravitonCard(G.surface)
+        .focusable()
+        .focused($focused)
+        .focusEffectDisabled()
+        .onKeyPress(.downArrow) { move(1) }
+        .onKeyPress(.upArrow) { move(-1) }
+        .onKeyPress(.return) {
+            guard let selection else { return .ignored }
+            open(selection)
+            return .handled
         }
-        .gravitonCard()
+    }
+
+    private func row(_ c: Container) -> some View {
+        HStack(spacing: 12) {
+            HStack(spacing: 12) {
+                StatusDot(running: c.isRunning)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(c.name).font(.system(size: 13, weight: .medium)).foregroundStyle(G.text).lineLimit(1)
+                    Text(c.image).font(G.mono(11.5)).foregroundStyle(G.muted).lineLimit(1).truncationMode(.middle)
+                }
+            }
+            .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
+            Text(c.ports.isEmpty ? "—" : c.ports.map { "\($0.hostPort)→\($0.containerPort)" }.joined(separator: ", "))
+                .font(G.mono(12)).foregroundStyle(G.textSecondary).lineLimit(1)
+                .frame(width: 104, alignment: .leading)
+            Text(Format.percent(c.cpuPercent)).font(G.mono(12)).foregroundStyle(G.textSecondary)
+                .frame(width: 64, alignment: .trailing)
+            Text(c.memoryBytes.map(Format.bytes) ?? "—").font(G.mono(12)).foregroundStyle(G.textSecondary)
+                .frame(width: 80, alignment: .trailing)
+            Text(c.statusText()).font(.system(size: 12.5)).foregroundStyle(G.muted).lineLimit(1)
+                .frame(width: 92, alignment: .leading)
+            RowMenu(container: c, open: { open(c.id) }).frame(width: 28)
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 50)
+        .gravitonRow(selected: selection == c.id)
+        .onTapGesture(count: 2) { open(c.id) }
+        .simultaneousGesture(TapGesture().onEnded {
+            selection = c.id
+            focused = true
+        })
+        .contextMenu {
+            LifecycleButtons(container: c)
+            Divider()
+            Button("Show Logs") { open(c.id) }
+        }
+    }
+
+    private func move(_ by: Int) -> KeyPress.Result {
+        let list = sorted
+        guard !list.isEmpty else { return .ignored }
+        let index = list.firstIndex { $0.id == selection } ?? (by > 0 ? -1 : list.count)
+        selection = list[min(max(index + by, 0), list.count - 1)].id
+        return .handled
     }
 }
 
@@ -166,11 +235,12 @@ struct RowMenu: View {
             Button("Show Logs", action: open)
         } label: {
             Image(systemName: "ellipsis")
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(G.muted)
+                .frame(width: 26, height: 26)
+                .contentShape(Rectangle())
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .foregroundStyle(G.muted)
+        .gravitonMenu()
         .accessibilityLabel("More actions for \(container.name)")
     }
 }
@@ -208,15 +278,14 @@ struct Inspector: View {
 
             HStack(spacing: 8) {
                 if container.isRunning {
-                    Button("Stop") { Task { await store.stop(container) } }
-                    Button("Restart") { Task { await store.restart(container) } }
+                    Button("Stop") { Task { await store.stop(container) } }.buttonStyle(.g(.danger, fullWidth: true))
+                    Button("Restart") { Task { await store.restart(container) } }.buttonStyle(.g(.secondary, fullWidth: true))
                 } else {
-                    Button("Start") { Task { await store.start(container) } }
-                    Button("Remove") { Task { await store.remove(container) } }
+                    Button("Start") { Task { await store.start(container) } }.buttonStyle(.g(.primary, fullWidth: true))
+                    Button("Remove") { Task { await store.remove(container) } }.buttonStyle(.g(.danger, fullWidth: true))
                 }
-                Button("Logs", action: openLogs)
+                Button("Open", action: openLogs).buttonStyle(.g(.secondary, fullWidth: true))
             }
-            .buttonStyle(QuietButtonStyle())
 
             HStack(spacing: 10) {
                 MetricTile(title: "CPU", value: container.cpuPercent.map { String(format: "%.1f", $0) } ?? "—",
@@ -301,20 +370,5 @@ struct DetailRow: View {
             Text(label).foregroundStyle(G.muted).gridColumnAlignment(.leading)
             Text(value).font(mono ? G.mono(12) : .system(size: 12.5)).textSelection(.enabled)
         }
-    }
-}
-
-struct QuietButtonStyle: ButtonStyle {
-    var tint: Color = G.text
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 13, weight: .medium))
-            .foregroundStyle(tint)
-            .padding(.horizontal, 12)
-            .frame(maxWidth: .infinity, minHeight: 32)
-            .background(G.control.opacity(configuration.isPressed ? 0.6 : 1), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.white.opacity(0.08)))
-            .contentShape(Rectangle())
     }
 }

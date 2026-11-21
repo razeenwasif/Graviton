@@ -47,7 +47,7 @@ struct HostMenu: View {
     @Environment(SharedHosts.self) private var hosts
     @Environment(ShellSessions.self) private var shells
     @Environment(AppRouter.self) private var router
-    @State private var forgetting: PairedMac?
+    @Environment(Dialogs.self) private var dialogs
 
     var body: some View {
         Menu {
@@ -69,27 +69,25 @@ struct HostMenu: View {
             Divider()
             Button("Pair a Mac…", systemImage: "plus") { router.pending = .pairMac }
             if let current = hosts.current {
-                Button("Forget \(current.name)…", systemImage: "trash") { forgetting = current }
+                Button("Forget \(current.name)…", systemImage: "trash") { confirmForget(current) }
             }
         } label: {
-            HStack(spacing: 6) {
-                Image(systemName: hosts.selected == nil ? "laptopcomputer" : "desktopcomputer").foregroundStyle(G.accent)
-                Text(hosts.current?.name ?? "This Mac").fontWeight(.medium).lineLimit(1)
-                Image(systemName: "chevron.up.chevron.down").font(.system(size: 9, weight: .semibold)).foregroundStyle(G.faint)
-            }
+            GDropdownLabel(hosts.current?.name ?? "This Mac", icon: hosts.selected == nil ? "laptopcomputer" : "desktopcomputer")
+                .frame(maxWidth: .infinity)
         }
-        .menuStyle(.borderlessButton)
+        .menuStyle(.button)
+        .buttonStyle(.plain)
         .menuIndicator(.hidden)
-        .fixedSize()
         .help("Choose the Mac this window shows")
         .onAppear(perform: hosts.reload)
-        .confirmationDialog("Forget \(forgetting?.name ?? "")?", isPresented: Binding(get: { forgetting != nil }, set: { if !$0 { forgetting = nil } })) {
-            Button("Forget", role: .destructive) {
-                if let mac = forgetting { try? hosts.forget(mac.name) }
-                switchTo(nil)
-            }
-        } message: {
-            Text("This Mac and grav stop using it. On \(forgetting?.hostName ?? "that Mac"), `grav devices revoke` also cancels its token.")
+    }
+
+    private func confirmForget(_ mac: PairedMac) {
+        dialogs.confirm("Forget \(mac.name)?",
+                        message: "This Mac and grav stop using it. On \(mac.hostName), grav devices revoke also cancels its token.",
+                        confirm: "Forget") {
+            try? hosts.forget(mac.name)
+            switchTo(nil)
         }
     }
 
@@ -119,83 +117,59 @@ struct PairMacSheet: View {
     private var normalizedCode: String { (link?.code ?? code).uppercased().filter { $0.isLetter || $0.isNumber } }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Pair a Mac").font(.system(size: 16, weight: .semibold))
-                Text("On the other Mac, run `grav service install --remote` once, then `grav pair` for a code.")
-                    .font(.system(size: 12.5)).foregroundStyle(G.muted)
+        GSheet("Pair a Mac", subtitle: "On the other Mac, run grav service install --remote once, then grav pair for a code.", symbol: "desktopcomputer.and.arrow.down") {
+            GFormRow("Address", hint: link != nil ? "A pairing link: its code and certificate fingerprint are filled in." : nil) {
+                field("mini.local, 192.168.1.20, or the graviton://pair link", text: $address)
             }
-            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
-                GridRow {
-                    label("Address")
-                    field("mini.local, 192.168.1.20, or the graviton://pair link", text: $address)
-                }
+            HStack(alignment: .top, spacing: 12) {
                 if link == nil {
-                    GridRow {
-                        label("Code")
-                        field("XXXX-XXXX", text: $code)
-                    }
+                    GFormRow("Code") { field("XXXX-XXXX", text: $code) }.frame(width: 170)
                 }
-                GridRow {
-                    label("Name")
-                    field("Optional, e.g. mini (used with grav --host)", text: $name)
-                }
+                GFormRow("Name", hint: "Optional; used with grav --host") { field("e.g. mini", text: $name) }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
 
-            Group {
-                switch phase {
-                case .idle:
-                    if link != nil {
-                        Label("A pairing link: its code and certificate fingerprint are filled in.", systemImage: "link").foregroundStyle(G.muted)
-                    }
-                case .pairing:
-                    HStack(spacing: 8) { ProgressView().controlSize(.small); Text("Pairing…") }.foregroundStyle(G.textSecondary)
-                case let .confirm(result):
-                    VStack(alignment: .leading, spacing: 6) {
-                        Label("Paired with \(result.host.name)", systemImage: "checkmark.circle.fill").foregroundStyle(G.running)
-                        Text("Check this matches the fingerprint `grav pair` showed on it:").foregroundStyle(G.muted)
-                        Text(result.host.shortFingerprint).font(G.mono(16, weight: .semibold))
-                    }
-                case let .failed(message):
-                    Label(message, systemImage: "xmark.octagon.fill").foregroundStyle(G.danger).textSelection(.enabled)
+            switch phase {
+            case .idle:
+                EmptyView()
+            case .pairing:
+                GStatusLine(.working, "Pairing…")
+            case let .confirm(result):
+                VStack(alignment: .leading, spacing: 10) {
+                    GStatusLine(.success, "Paired with \(result.host.name)")
+                    Text("Check this matches the fingerprint grav pair showed on it:").font(.system(size: 12.5)).foregroundStyle(G.muted)
+                    Text(result.host.shortFingerprint)
+                        .font(G.mono(18, weight: .semibold))
+                        .kerning(1)
+                        .foregroundStyle(G.text)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .frame(maxWidth: .infinity)
+                        .background(G.background, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(G.accent.opacity(0.4), style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
                 }
+            case let .failed(message):
+                GStatusLine(.failure, message)
             }
-            .font(.system(size: 12.5))
-            .fixedSize(horizontal: false, vertical: true)
-
-            HStack {
-                Spacer()
-                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-                if case let .confirm(result) = phase {
-                    Button("It matches") { save(result) }
-                        .buttonStyle(.borderedProminent)
-                        .keyboardShortcut(.defaultAction)
-                } else {
-                    Button("Pair", action: pair)
-                        .buttonStyle(.borderedProminent)
-                        .keyboardShortcut(.defaultAction)
-                        .disabled(busy || address.trimmingCharacters(in: .whitespaces).isEmpty || normalizedCode.count != 8)
-                }
+        } footer: {
+            Spacer()
+            Button("Cancel") { dismiss() }.buttonStyle(.gSecondary).keyboardShortcut(.cancelAction)
+            if case let .confirm(result) = phase {
+                Button("It matches") { save(result) }
+                    .buttonStyle(.gPrimary)
+                    .keyboardShortcut(.defaultAction)
+            } else {
+                Button("Pair", action: pair)
+                    .buttonStyle(.gPrimary)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(busy || address.trimmingCharacters(in: .whitespaces).isEmpty || normalizedCode.count != 8)
             }
         }
-        .padding(22)
-        .frame(width: 540)
-        .background(Color(hex: 0x15161A))
-    }
-
-    private func label(_ text: String) -> some View {
-        Text(text).font(.system(size: 12, weight: .medium)).foregroundStyle(G.textSecondary).gridColumnAlignment(.trailing)
     }
 
     private func field(_ placeholder: String, text: Binding<String>) -> some View {
-        TextField(placeholder, text: text)
-            .textFieldStyle(.plain)
-            .font(G.mono(12.5))
-            .padding(.horizontal, 10)
-            .frame(maxWidth: .infinity, minHeight: 30, maxHeight: 30)
-            .background(G.background, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        GTextField(placeholder, text: text)
             .disabled(busy)
+            .gravitonField(mono: true)
     }
 
     private func pair() {

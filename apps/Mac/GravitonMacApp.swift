@@ -7,13 +7,16 @@ struct GravitonMacApp: App {
     @State private var shells = ShellSessions()
     @State private var hosts: SharedHosts
     @State private var router = AppRouter()
+    @State private var dialogs = Dialogs()
     @AppStorage("showsMenuBarExtra") private var showsMenuBarExtra = true
 
     init() {
-        let store = EngineStore(useDaemon: true)
+        // GRAVITON_DEMO=1 shows demo data and leaves the engine and paired Macs alone (for screenshots).
+        let demo = ProcessInfo.processInfo.environment["GRAVITON_DEMO"] == "1"
+        let store = EngineStore(useDaemon: !demo)
         let hosts = SharedHosts()
         // Show the Mac picked last time.
-        if let mac = hosts.current {
+        if !demo, let mac = hosts.current {
             store.use(RemoteEngine(host: mac.remoteHost, token: mac.token), named: mac.name)
         }
         _store = State(initialValue: store)
@@ -29,12 +32,13 @@ struct GravitonMacApp: App {
                 .environment(shells)
                 .environment(router)
                 .environment(hosts)
+                .environment(dialogs)
                 .preferredColorScheme(.dark)
                 .tint(G.accent)
                 .frame(minWidth: 980, minHeight: 620)
         }
         .defaultSize(width: 1440, height: 900)
-        .windowToolbarStyle(.unified(showsTitle: true))
+        .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(after: .toolbar) {
                 Button("Refresh") { Task { await store.refresh() } }
@@ -73,30 +77,37 @@ enum Section: String, Hashable, CaseIterable, Identifiable {
 struct RootView: View {
     @Environment(EngineStore.self) private var store
     @Environment(AppRouter.self) private var router
-    @State private var section: Section? = .containers
+    @Environment(Dialogs.self) private var dialogs
+    @State private var section: Section = .containers
     @State private var pairing = false
     @Environment(SharedHosts.self) private var hosts
     @Environment(ShellSessions.self) private var shells
 
     var body: some View {
-        NavigationSplitView {
+        HStack(spacing: 0) {
             Sidebar(selection: $section)
-                .navigationSplitViewColumnWidth(min: 210, ideal: 232, max: 280)
-        } detail: {
+                .frame(width: 232)
+                .fixedSize(horizontal: true, vertical: false)
+            Rectangle().fill(G.border).frame(width: 1)
             Group {
-                switch section ?? .containers {
+                switch section {
                 case .containers: ContainersScreen()
                 case .images: ImagesScreen()
                 case .volumes:
                     ComingSoon(title: "Volumes", symbol: Section.volumes.symbol,
-                               detail: "Named volumes and bind mounts arrive with milestone 3.")
+                               detail: "Named volumes work from grav and the Run sheet (-v name:/path). A screen to browse them is on the plan.")
                 case .networks:
                     ComingSoon(title: "Networks", symbol: Section.networks.symbol,
-                               detail: "NAT networks and port forwarding arrive with milestone 3.")
+                               detail: "Every container gets NAT, DNS and the shared container network. A screen to manage them is on the plan.")
                 }
             }
+            .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+            .clipped()
             .background(G.background)
         }
+        .background(G.background)
+        .ignoresSafeArea()
+        .gravitonDialogs(dialogs)
         .onChange(of: router.pending, initial: true) { _, request in
             switch request {
             case .images:
@@ -114,51 +125,100 @@ struct RootView: View {
         .sheet(isPresented: $pairing) {
             PairMacSheet { mac in switchHost(to: mac, store: store, hosts: hosts, shells: shells) }
         }
-        .alert("Something went wrong", isPresented: Binding(
-            get: { store.lastError != nil },
-            set: { if !$0 { store.lastError = nil } }
-        )) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(store.lastError ?? "")
+        .onChange(of: store.lastError, initial: true) { _, error in
+            guard let error else { return }
+            dialogs.alert("Something went wrong", message: error)
+            store.lastError = nil
         }
     }
 }
 
 struct Sidebar: View {
     @Environment(EngineStore.self) private var store
-    @Binding var selection: Section?
+    @Binding var selection: Section
 
     var body: some View {
-        List(selection: $selection) {
-            HStack(spacing: 10) {
-                GravitonMark(size: 24)
-                Text("Graviton").font(.system(size: 14, weight: .semibold))
-            }
-            .padding(.vertical, 6)
-            .selectionDisabled()
+        VStack(alignment: .leading, spacing: 0) {
+            // Room for the window's traffic lights, which sit over the sidebar.
+            Color.clear.frame(height: 40).windowDraggable()
 
-            SwiftUI.Section("Workspace") {
-                ForEach(Section.allCases) { item in
-                    Label(item.rawValue, systemImage: item.symbol)
-                        .badge(count(for: item))
-                        .tag(item)
+            HStack(spacing: 10) {
+                GravitonMark(size: 26)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Graviton").font(.system(size: 14, weight: .semibold)).foregroundStyle(G.text)
+                    Text("Containers on your Macs").font(.system(size: 11)).foregroundStyle(G.faint)
                 }
             }
-        }
-        .scrollContentBackground(.hidden)
-        .background(G.sidebar)
-        .safeAreaInset(edge: .bottom) {
+            .padding(.horizontal, 16)
+            .padding(.bottom, 22)
+            .windowDraggable()
+
+            GCaption("Workspace").padding(.horizontal, 18).padding(.bottom, 8)
+            VStack(spacing: 2) {
+                ForEach(Array(Section.allCases.enumerated()), id: \.element) { i, item in
+                    SidebarItem(item: item, count: count(for: item), selected: selection == item) {
+                        selection = item
+                    }
+                    .keyboardShortcut(KeyEquivalent(Character("\(i + 1)")), modifiers: .command)
+                }
+            }
+            .padding(.horizontal, 10)
+
+            Spacer(minLength: 12)
             EngineCard().padding(12)
         }
+        .frame(maxHeight: .infinity, alignment: .top)
+        .background(G.sidebar)
     }
 
-    private func count(for item: Section) -> Int {
+    private func count(for item: Section) -> Int? {
         switch item {
         case .containers: store.containers.count
         case .images: store.images.count
-        case .volumes, .networks: 0
+        case .volumes, .networks: nil
         }
+    }
+}
+
+private struct SidebarItem: View {
+    var item: Section
+    var count: Int?
+    var selected: Bool
+    var action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: item.symbol)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(selected ? G.accent : G.muted)
+                    .frame(width: 18)
+                Text(item.rawValue)
+                    .font(.system(size: 13, weight: selected ? .semibold : .medium))
+                    .foregroundStyle(selected ? G.text : G.textSecondary)
+                Spacer()
+                if let count, count > 0 {
+                    GBadge("\(count)", color: selected ? G.accent : G.muted)
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 32)
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(selected ? Color(hex: 0x1B1D24) : (hovering ? Color.white.opacity(0.035) : .clear))
+                    .overlay {
+                        if selected {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.white.opacity(0.06))
+                        }
+                    }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovering)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 
@@ -177,7 +237,7 @@ struct EngineCard: View {
                     Circle().fill(G.warning).frame(width: 8, height: 8)
                     Text("Demo data").fontWeight(.medium)
                 case .connecting:
-                    ProgressView().controlSize(.mini)
+                    GSpinner(size: 10)
                     Text("Connecting…").fontWeight(.medium)
                 case .unreachable:
                     Circle().fill(G.danger).frame(width: 8, height: 8)
@@ -218,7 +278,9 @@ struct ComingSoon: View {
     var detail: String
 
     var body: some View {
-        ContentUnavailableView(title, systemImage: symbol, description: Text(detail))
-            .navigationTitle(title)
+        VStack(spacing: 0) {
+            ScreenHeader(title, subtitle: "Coming later")
+            GEmptyState("\(title) aren't here yet", symbol: symbol, detail: detail)
+        }
     }
 }

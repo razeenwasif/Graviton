@@ -23,69 +23,83 @@ struct CleanUpSheet: View {
     private var spec: PruneSpec { PruneSpec(images: images, containers: containers) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Clean up").font(.system(size: 16, weight: .semibold))
-                Text("Free disk space on \(store.liveName ?? "this Mac"). Layers a container or an image you keep still needs always stay.")
-                    .font(.system(size: 12.5)).foregroundStyle(G.muted)
-            }
-
+        GSheet("Clean up", subtitle: "Free disk space on \(store.liveName ?? "this Mac"). Layers a container or an image you keep still needs always stay.",
+               symbol: "sparkles") {
             if let u = usage {
                 VStack(spacing: 0) {
                     row("Build cache and unreferenced layers", detail: "\(u.buildCacheSteps) cached build steps", bytes: u.alwaysReclaimable, toggle: nil)
-                    Divider().overlay(G.border)
+                    Rectangle().fill(G.border).frame(height: 1)
                     row("Unused images", detail: "\(u.unusedImages) of \(u.images) images no container uses", bytes: u.unusedImagesBytes, toggle: $images)
-                    Divider().overlay(G.border)
+                    Rectangle().fill(G.border).frame(height: 1)
                     row("Stopped containers", detail: "\(u.stoppedContainers) stopped, with the files on their disks", bytes: u.stoppedDisksBytes, toggle: $containers)
                 }
                 .background(G.background, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(G.border))
 
-                Text("Images take \(Format.bytes(u.blobsBytes)); container disks \(Format.bytes(u.containerDisksBytes)).")
-                    .font(.system(size: 12)).foregroundStyle(G.faint)
+                usageBar(u)
             } else if case .failed = phase {
             } else {
-                ProgressView().controlSize(.small).frame(maxWidth: .infinity, minHeight: 120)
+                GSpinner(size: 20).frame(maxWidth: .infinity, minHeight: 120)
             }
 
-            Group {
-                switch phase {
-                case .idle, .working:
-                    if let p = preview {
-                        Text(summary(p)).foregroundStyle(G.textSecondary)
-                    }
-                case let .done(r):
-                    Label("Freed \(Format.bytes(r.freedBytes))" + (r.images.isEmpty && r.containers.isEmpty ? "" : ": \(removed(r))"), systemImage: "checkmark.circle.fill")
-                        .foregroundStyle(G.running)
-                case let .failed(message):
-                    Label(message, systemImage: "xmark.octagon.fill").foregroundStyle(G.danger).textSelection(.enabled)
+            switch phase {
+            case .idle, .working:
+                if let p = preview {
+                    GStatusLine(working ? .working : .info, working ? "Cleaning up…" : summary(p))
                 }
+            case let .done(r):
+                GStatusLine(.success, "Freed \(Format.bytes(r.freedBytes))" + (r.images.isEmpty && r.containers.isEmpty ? "" : ": \(removed(r))"))
+            case let .failed(message):
+                GStatusLine(.failure, message)
             }
-            .font(.system(size: 12.5))
-            .fixedSize(horizontal: false, vertical: true)
-
-            HStack {
-                Spacer()
-                Button("Close") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button(preview.map { "Free \(Format.bytes($0.freedBytes))" } ?? "Clean Up", action: clean)
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(working || usage == nil || !store.canManage || (preview?.freedBytes ?? 1) == 0 && preview?.containers.isEmpty != false && preview?.images.isEmpty != false)
-            }
+        } footer: {
+            Spacer()
+            Button("Close") { dismiss() }
+                .buttonStyle(.gSecondary)
+                .keyboardShortcut(.cancelAction)
+            Button(preview.map { "Free \(Format.bytes($0.freedBytes))" } ?? "Clean Up", action: clean)
+                .buttonStyle(.gPrimary)
+                .keyboardShortcut(.defaultAction)
+                .disabled(working || usage == nil || !store.canManage || (preview?.freedBytes ?? 1) == 0 && preview?.containers.isEmpty != false && preview?.images.isEmpty != false)
         }
-        .padding(22)
-        .frame(width: 520)
-        .background(Color(hex: 0x15161A))
         .task { await load() }
         .onChange(of: spec) { Task { await refreshPreview() } }
+    }
+
+    /// What's on disk, and how much of it this clean-up frees.
+    private func usageBar(_ u: DiskUsage) -> some View {
+        let total = Double(max(u.blobsBytes + u.containerDisksBytes, 1))
+        let freeing = Double(preview?.freedBytes ?? 0)
+        return VStack(alignment: .leading, spacing: 8) {
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.06))
+                    Capsule().fill(G.accent.opacity(0.35)).frame(width: geo.size.width * Double(u.blobsBytes + u.containerDisksBytes) / total)
+                    Capsule().fill(G.accent).frame(width: max(geo.size.width * min(freeing / total, 1), freeing > 0 ? 4 : 0))
+                }
+            }
+            .frame(height: 6)
+            .animation(.snappy(duration: 0.25), value: preview?.freedBytes)
+            HStack(spacing: 14) {
+                legend(G.accent, "Frees \(Format.bytes(preview?.freedBytes ?? 0))")
+                legend(G.accent.opacity(0.35), "Images \(Format.bytes(u.blobsBytes)) · container disks \(Format.bytes(u.containerDisksBytes))")
+            }
+        }
+    }
+
+    private func legend(_ color: Color, _ text: String) -> some View {
+        HStack(spacing: 6) {
+            Circle().fill(color).frame(width: 7, height: 7)
+            Text(text).font(.system(size: 11.5)).foregroundStyle(G.muted)
+        }
     }
 
     private func row(_ title: String, detail: String, bytes: UInt64, toggle: Binding<Bool>?) -> some View {
         HStack(spacing: 12) {
             if let toggle {
-                Toggle("", isOn: toggle).toggleStyle(.checkbox).labelsHidden().disabled(working)
+                Toggle("", isOn: toggle).toggleStyle(.gCheckbox).labelsHidden().disabled(working)
             } else {
-                Image(systemName: "checkmark").font(.system(size: 11, weight: .bold)).foregroundStyle(G.faint).frame(width: 14)
+                Image(systemName: "lock.fill").font(.system(size: 9.5, weight: .bold)).foregroundStyle(G.faint).frame(width: 16).help("Always cleaned")
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.system(size: 13, weight: .medium))

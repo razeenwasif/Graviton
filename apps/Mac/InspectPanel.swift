@@ -14,7 +14,8 @@ struct InspectPanel: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 if let problem {
-                    ContentUnavailableView("Can't inspect \(container.name)", systemImage: "exclamationmark.triangle", description: Text(problem))
+                    GEmptyState("Can't inspect \(container.name)", symbol: "exclamationmark.triangle", detail: problem)
+                        .frame(minHeight: 300)
                 } else if let d = details {
                     HStack {
                         Spacer()
@@ -26,7 +27,7 @@ struct InspectPanel: View {
                             .fixedSize()
                         }
                     }
-                    .buttonStyle(QuietButtonStyle())
+                    .buttonStyle(.g(.secondary, size: .small))
                     .fixedSize(horizontal: false, vertical: true)
 
                     InspectSection("Process") {
@@ -60,7 +61,7 @@ struct InspectPanel: View {
                         InspectRow("Status", d.container.statusText())
                     }
                 } else {
-                    ProgressView().frame(maxWidth: .infinity, minHeight: 200)
+                    GSpinner(size: 20).frame(maxWidth: .infinity, minHeight: 200)
                 }
             }
             .frame(maxWidth: 820, alignment: .leading)
@@ -83,9 +84,9 @@ struct InspectPanel: View {
     private func environment(_ env: [String]) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("Environment").font(.system(size: 13, weight: .medium))
+                GCaption("Environment")
                 Spacer()
-                Toggle("Show values", isOn: $showValues).toggleStyle(.switch).controlSize(.mini).font(.system(size: 11.5))
+                Toggle("Show values", isOn: $showValues).toggleStyle(.gSwitch)
             }
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
                 ForEach(env, id: \.self) { pair in
@@ -134,7 +135,7 @@ private struct InspectSection<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(title).font(.system(size: 13, weight: .medium))
+            GCaption(title)
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 10) { content }
         }
         .padding(20)

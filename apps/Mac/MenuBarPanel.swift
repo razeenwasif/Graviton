@@ -153,7 +153,7 @@ private struct PanelHeader: View {
         case .live: StatusDot(running: true, size: 6)
         case .demo: Circle().fill(G.warning).frame(width: 6, height: 6)
         case .unreachable: Circle().fill(G.danger).frame(width: 6, height: 6)
-        case .connecting: ProgressView().controlSize(.mini).scaleEffect(0.6).frame(width: 6, height: 6)
+        case .connecting: GSpinner(size: 8, color: G.warning)
         }
     }
 
@@ -279,7 +279,7 @@ private struct ContainerQuickRow: View {
     private var actions: some View {
         HStack(spacing: 2) {
             if busy {
-                ProgressView().controlSize(.small).frame(width: 24)
+                GSpinner(size: 14).frame(width: 24)
             } else if container.isRunning {
                 if let port = webPorts.first {
                     IconButton("safari", help: "Open localhost:\(port.hostPort)") { openInBrowser(port) }
@@ -353,12 +353,13 @@ private struct PanelFooter: View {
                 Button("Quit Graviton") { NSApp.terminate(nil) }
                     .keyboardShortcut("q")
             } label: {
-                Image(systemName: "ellipsis.circle").font(.system(size: 13))
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(G.muted)
+                    .frame(width: 26, height: 24)
+                    .contentShape(Rectangle())
             }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .foregroundStyle(G.muted)
+            .gravitonMenu()
             .padding(.trailing, 4)
         }
     }

@@ -15,18 +15,33 @@ struct FilesPanel: View {
     @State private var previewProblem: String?
     @State private var loading = false
     @State private var goTo = ""
-    @State private var order = [KeyPathComparator(\FileEntry.name)]
+    @State private var sort: Column = .name
+    @State private var ascending = true
+    @FocusState private var listFocused: Bool
+
+    enum Column: Hashable { case name, size, modified, mode }
 
     private var entries: [FileEntry] {
         let all = listing?.entries ?? []
+        func ordered(_ list: [FileEntry]) -> [FileEntry] {
+            let out = list.sorted { a, b in
+                switch sort {
+                case .name: a.name.localizedStandardCompare(b.name) == .orderedAscending
+                case .size: a.size < b.size
+                case .modified: a.modified < b.modified
+                case .mode: a.mode < b.mode
+                }
+            }
+            return ascending ? out : out.reversed()
+        }
         // Folders stay first whichever column sorts.
-        return all.filter(\.isDirectory).sorted(using: order) + all.filter { !$0.isDirectory }.sorted(using: order)
+        return ordered(all.filter(\.isDirectory)) + ordered(all.filter { !$0.isDirectory })
     }
 
     var body: some View {
         if !container.isRunning {
-            ContentUnavailableView("Not running", systemImage: "folder",
-                                   description: Text("Start \(container.name) to browse its files."))
+            GEmptyState("Not running", symbol: "folder", detail: "Start \(container.name) to browse its files.",
+                        actionTitle: "Start \(container.name)") { Task { await store.start(container) } }
         } else {
             VStack(alignment: .leading, spacing: 12) {
                 toolbar
@@ -50,7 +65,6 @@ struct FilesPanel: View {
             Button { open(parent(of: path)) } label: { Image(systemName: "chevron.up") }
                 .disabled(path == "/")
                 .help("Enclosing folder")
-                .fixedSize()
             HStack(spacing: 2) {
                 ForEach(Array(crumbs.enumerated()), id: \.offset) { i, crumb in
                     if i > 0 { Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(G.faint) }
@@ -61,22 +75,24 @@ struct FilesPanel: View {
                         .padding(.horizontal, 4)
                 }
             }
+            .padding(.horizontal, 8)
+            .frame(height: 32)
+            .background(G.surface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(G.border))
             Spacer()
-            TextField("Go to path", text: $goTo)
-                .textFieldStyle(.roundedBorder)
-                .font(G.mono(12))
-                .frame(width: 200)
+            GTextField("Go to path", text: $goTo)
                 .onSubmit {
                     let target = goTo.trimmingCharacters(in: .whitespaces)
                     guard !target.isEmpty else { return }
                     open(target.hasPrefix("/") ? target : join(path, target))
                     goTo = ""
                 }
+                .gravitonField(mono: true, icon: "arrow.turn.down.right")
+                .frame(width: 220)
             Button { Task { await load() } } label: { Image(systemName: "arrow.clockwise") }
                 .help("Refresh")
-                .fixedSize()
         }
-        .buttonStyle(QuietButtonStyle())
+        .buttonStyle(.gIconBordered)
     }
 
     private var crumbs: [(name: String, path: String)] {
@@ -92,49 +108,91 @@ struct FilesPanel: View {
     // MARK: List
 
     private var list: some View {
-        Table(entries, selection: $selection, sortOrder: $order) {
-            TableColumn("Name", value: \.name) { e in
-                HStack(spacing: 7) {
-                    Image(systemName: icon(e)).foregroundStyle(e.isDirectory ? Color(hex: 0x6E7EF2) : G.muted).frame(width: 16)
-                    Text(e.name).lineLimit(1)
-                    if let target = e.linkTarget {
-                        Text("→ \(target)").foregroundStyle(G.faint).lineLimit(1).truncationMode(.middle)
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                GColumnHeader("Name", key: Column.name, sort: $sort, ascending: $ascending).frame(maxWidth: .infinity)
+                GColumnHeader("Size", key: Column.size, sort: $sort, ascending: $ascending, alignment: .trailing).frame(width: 64)
+                GColumnHeader("Modified", key: Column.modified, sort: $sort, ascending: $ascending).frame(width: 130)
+                GColumnHeader("Mode", key: Column.mode, sort: $sort, ascending: $ascending).frame(width: 84)
+            }
+            .padding(.horizontal, 16)
+            .frame(height: 32)
+            .overlay(alignment: .bottom) { Rectangle().fill(G.border).frame(height: 1) }
+
+            ScrollView {
+                LazyVStack(spacing: 1) {
+                    ForEach(entries) { e in
+                        fileRow(e)
                     }
                 }
+                .padding(6)
             }
-            TableColumn("Size", value: \.size) { e in
-                Text(e.isDirectory ? "—" : Format.bytes(e.size)).foregroundStyle(G.muted).monospacedDigit()
+            .overlay {
+                if let problem {
+                    GEmptyState("Can't open \(path)", symbol: "exclamationmark.triangle", detail: problem)
+                } else if listing?.entries.isEmpty == true {
+                    GEmptyState("Empty folder", symbol: "folder")
+                } else if loading && listing == nil {
+                    GSpinner(size: 18)
+                }
             }
-            .width(72)
-            TableColumn("Modified", value: \.modified) { e in
-                Text(e.modifiedDate, format: .dateTime.day().month(.abbreviated).year().hour().minute()).foregroundStyle(G.muted)
-            }
-            .width(min: 110, ideal: 140)
-            TableColumn("Permissions", value: \.mode) { e in
-                Text(e.permissions).font(G.mono(11.5)).foregroundStyle(G.muted)
-            }
-            .width(90)
         }
-        .contextMenu(forSelectionType: FileEntry.ID.self) { ids in
-            if let name = ids.first {
-                Button("Copy Path") { copy(join(path, name)) }
-            }
-        } primaryAction: { ids in
-            if let name = ids.first, let e = entries.first(where: { $0.id == name }) { activate(e) }
+        .focusable()
+        .focused($listFocused)
+        .focusEffectDisabled()
+        .onKeyPress(.downArrow) { move(1) }
+        .onKeyPress(.upArrow) { move(-1) }
+        .onKeyPress(.return) {
+            guard let name = selection, let e = entries.first(where: { $0.id == name }) else { return .ignored }
+            activate(e)
+            return .handled
         }
         .onChange(of: selection) { _, name in
             guard let name, let e = entries.first(where: { $0.id == name }) else { return }
             if !e.isDirectory { Task { await loadPreview(join(path, e.name)) } }
         }
-        .overlay {
-            if let problem {
-                ContentUnavailableView("Can't open \(path)", systemImage: "exclamationmark.triangle", description: Text(problem))
-            } else if listing?.entries.isEmpty == true {
-                Text("Empty folder").foregroundStyle(G.faint)
-            } else if loading && listing == nil {
-                ProgressView().controlSize(.small)
+    }
+
+    private func fileRow(_ e: FileEntry) -> some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: icon(e))
+                    .font(.system(size: 12))
+                    .foregroundStyle(e.isDirectory ? G.chartPrimary : G.muted)
+                    .frame(width: 16)
+                Text(e.name).font(.system(size: 12.5)).foregroundStyle(G.text).lineLimit(1)
+                if let target = e.linkTarget {
+                    Text("→ \(target)").font(.system(size: 12)).foregroundStyle(G.faint).lineLimit(1).truncationMode(.middle)
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Text(e.isDirectory ? "—" : Format.bytes(e.size)).font(.system(size: 12)).foregroundStyle(G.muted).monospacedDigit()
+                .frame(width: 64, alignment: .trailing)
+            Text(e.modifiedDate, format: .dateTime.day().month(.abbreviated).year().hour().minute())
+                .font(.system(size: 12)).foregroundStyle(G.muted).lineLimit(1)
+                .frame(width: 130, alignment: .leading)
+            Text(e.permissions).font(G.mono(11.5)).foregroundStyle(G.faint)
+                .frame(width: 84, alignment: .leading)
         }
+        .padding(.horizontal, 10)
+        .frame(height: 30)
+        .gravitonRow(selected: selection == e.id)
+        .onTapGesture(count: 2) { activate(e) }
+        .simultaneousGesture(TapGesture().onEnded {
+            selection = e.id
+            listFocused = true
+        })
+        .contextMenu {
+            Button("Copy Path") { copy(join(path, e.name)) }
+        }
+    }
+
+    private func move(_ by: Int) -> KeyPress.Result {
+        let list = entries
+        guard !list.isEmpty else { return .ignored }
+        let index = list.firstIndex { $0.id == selection } ?? (by > 0 ? -1 : list.count)
+        selection = list[min(max(index + by, 0), list.count - 1)].id
+        return .handled
     }
 
     // MARK: Preview
@@ -150,11 +208,11 @@ struct FilesPanel: View {
                     }
                     Spacer()
                     if let text = preview.text {
-                        Button("Copy") { copy(text) }.buttonStyle(QuietButtonStyle()).fixedSize()
+                        Button("Copy", systemImage: "doc.on.doc") { copy(text) }.buttonStyle(.g(.secondary, size: .small))
                     }
                 }
                 .padding(12)
-                Divider().overlay(G.border)
+                Rectangle().fill(G.border).frame(height: 1)
                 ScrollView([.vertical, .horizontal]) {
                     Text(preview.text ?? hexDump(preview.data))
                         .font(G.mono(12))
@@ -166,8 +224,8 @@ struct FilesPanel: View {
                 .background(G.console)
             }
         } else {
-            ContentUnavailableView(previewProblem == nil ? "No file selected" : "Can't preview", systemImage: "doc.text",
-                                   description: Text(previewProblem ?? "Select a file to see what's in it."))
+            GEmptyState(previewProblem == nil ? "No file selected" : "Can't preview", symbol: "doc.text",
+                        detail: previewProblem ?? "Select a file to see what's in it.")
         }
     }
 

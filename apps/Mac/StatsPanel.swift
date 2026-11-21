@@ -23,12 +23,13 @@ struct StatsPanel: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 if let problem {
-                    Label(problem, systemImage: "exclamationmark.triangle").foregroundStyle(G.danger).font(.system(size: 13))
+                    GStatusLine(.failure, problem)
                 }
                 if !container.isRunning && samples.isEmpty {
-                    ContentUnavailableView("Not running", systemImage: "chart.xyaxis.line",
-                                           description: Text("Start \(container.name) to see its CPU, memory and network use."))
-                        .frame(maxWidth: .infinity, minHeight: 300)
+                    GEmptyState("Not running", symbol: "chart.xyaxis.line",
+                                detail: "Start \(container.name) to see its CPU, memory and network use.",
+                                actionTitle: "Start \(container.name)") { Task { await store.start(container) } }
+                        .frame(minHeight: 340)
                 } else {
                     tiles
                     HStack(alignment: .top, spacing: 16) {
@@ -296,25 +297,77 @@ private struct LegendKey: View {
 private struct ProcessTable: View {
     var processes: [ContainerProcess]
     var running: Bool
-    @State private var order = [KeyPathComparator(\ContainerProcess.rssBytes, order: .reverse)]
+    @State private var sort: Column = .memory
+    @State private var ascending = false
+
+    enum Column: Hashable { case pid, user, state, memory, cpu, command }
+
+    private var sorted: [ContainerProcess] {
+        let out = processes.sorted { a, b in
+            switch sort {
+            case .pid: a.pid < b.pid
+            case .user: a.uid < b.uid
+            case .state: a.state < b.state
+            case .memory: a.rssBytes < b.rssBytes
+            case .cpu: a.cpuMs < b.cpuMs
+            case .command: a.command < b.command
+            }
+        }
+        return ascending ? out : out.reversed()
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Processes").font(.system(size: 13, weight: .medium))
-            Table(processes.sorted(using: order), sortOrder: $order) {
-                TableColumn("PID", value: \.pid) { Text("\($0.pid)").monospacedDigit() }.width(60)
-                TableColumn("User", value: \.uid) { Text($0.uid == 0 ? "root" : "\($0.uid)") }.width(60)
-                TableColumn("State", value: \.state) { Text(stateName($0.state)) }.width(80)
-                TableColumn("Memory", value: \.rssBytes) { Text(Format.bytes($0.rssBytes)).monospacedDigit() }.width(80)
-                TableColumn("CPU time", value: \.cpuMs) { Text(cpuTime($0.cpuMs)).monospacedDigit() }.width(80)
-                TableColumn("Command", value: \.command) { Text($0.command).font(G.mono(12)).help($0.command) }
+            HStack {
+                GCaption("Processes")
+                Spacer()
+                if !processes.isEmpty { GBadge("\(processes.count)") }
             }
-            .frame(minHeight: 160, idealHeight: CGFloat(60 + 26 * max(processes.count, 3)))
-            .overlay {
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    GColumnHeader("PID", key: Column.pid, sort: $sort, ascending: $ascending).frame(width: 56)
+                    GColumnHeader("User", key: Column.user, sort: $sort, ascending: $ascending).frame(width: 56)
+                    GColumnHeader("State", key: Column.state, sort: $sort, ascending: $ascending).frame(width: 84)
+                    GColumnHeader("Memory", key: Column.memory, sort: $sort, ascending: $ascending, alignment: .trailing).frame(width: 74)
+                    GColumnHeader("CPU time", key: Column.cpu, sort: $sort, ascending: $ascending, alignment: .trailing).frame(width: 74)
+                    GColumnHeader("Command", key: Column.command, sort: $sort, ascending: $ascending).frame(maxWidth: .infinity)
+                }
+                .padding(.horizontal, 10)
+                .frame(height: 28)
+                .overlay(alignment: .bottom) { Rectangle().fill(G.border).frame(height: 1) }
                 if processes.isEmpty {
-                    Text(running ? "Waiting for the first sample…" : "Not running").foregroundStyle(G.faint).font(.system(size: 12))
+                    Text(running ? "Waiting for the first sample…" : "Not running")
+                        .foregroundStyle(G.faint).font(.system(size: 12))
+                        .frame(maxWidth: .infinity, minHeight: 90)
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(sorted, id: \.pid) { p in
+                            HStack(spacing: 10) {
+                                Text("\(p.pid)").frame(width: 56, alignment: .leading)
+                                Text(p.uid == 0 ? "root" : "\(p.uid)").frame(width: 56, alignment: .leading)
+                                HStack(spacing: 6) {
+                                    Circle().fill(p.state == "R" ? G.running : (p.state == "Z" ? G.danger : G.stopped)).frame(width: 6, height: 6)
+                                    Text(stateName(p.state))
+                                }
+                                .frame(width: 84, alignment: .leading)
+                                Text(Format.bytes(p.rssBytes)).frame(width: 74, alignment: .trailing)
+                                Text(cpuTime(p.cpuMs)).frame(width: 74, alignment: .trailing)
+                                Text(p.command).font(G.mono(12)).foregroundStyle(G.text).lineLimit(1).truncationMode(.tail)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .help(p.command)
+                            }
+                            .font(.system(size: 12))
+                            .monospacedDigit()
+                            .foregroundStyle(G.textSecondary)
+                            .padding(.horizontal, 10)
+                            .frame(height: 28)
+                            .gravitonRow(selected: false)
+                        }
+                    }
+                    .padding(.vertical, 4)
                 }
             }
+            .background(G.background.opacity(0.5), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
         }
         .padding(16)
         .gravitonCard()

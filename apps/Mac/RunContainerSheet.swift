@@ -33,127 +33,90 @@ struct RunContainerSheet: View {
     private var canRun: Bool { running == nil && !trimmedImage.isEmpty && badEnv == nil && store.canManage }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Run container").font(.system(size: 16, weight: .semibold))
-                Text("Each container boots its own VM. Its output goes to its logs.").font(.system(size: 12.5)).foregroundStyle(G.muted)
+        GSheet("Run container", subtitle: "Each container boots its own VM. Its output goes to its logs.", symbol: "play.circle", width: 600) {
+            GFormRow("Image") {
+                HStack(spacing: 8) {
+                    GTextField("e.g. python:3.13-slim", text: $image)
+                        .focused($imageFocused)
+                        .gravitonField(mono: true, height: 34, icon: "square.stack.3d.up")
+                    Menu {
+                        if store.images.isEmpty {
+                            Text("No images pulled yet")
+                        }
+                        ForEach(store.images) { img in
+                            Button("\(img.repository):\(img.tag)") { image = "\(img.repository):\(img.tag)" }
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Text("Pulled")
+                            Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold))
+                        }
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(G.textSecondary)
+                        .padding(.horizontal, 12)
+                        .frame(height: 34)
+                        .background(G.control, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(G.borderStrong))
+                    }
+                    .gravitonMenu()
+                    .help("Images already pulled")
+                }
             }
-
-            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 12) {
-                GridRow {
-                    FieldLabel("Image")
-                    HStack(spacing: 6) {
-                        SheetField(placeholder: "e.g. python:3.13-slim", text: $image, mono: true)
-                            .focused($imageFocused)
-                        Menu {
-                            if store.images.isEmpty {
-                                Text("No images pulled yet")
-                            }
-                            ForEach(store.images) { img in
-                                Button("\(img.repository):\(img.tag)") { image = "\(img.repository):\(img.tag)" }
-                            }
-                        } label: {
-                            Image(systemName: "chevron.down")
-                        }
-                        .menuStyle(.borderlessButton)
-                        .menuIndicator(.hidden)
-                        .fixedSize()
-                        .help("Images already pulled")
-                    }
+            HStack(alignment: .top, spacing: 12) {
+                GFormRow("Name") { field("Optional", text: $name, mono: false) }
+                GFormRow("Command") { field("The image's default", text: $command) }
+            }
+            HStack(alignment: .top, spacing: 12) {
+                GFormRow("Ports", hint: "On 127.0.0.1") { field("8080:80, 5432", text: $portsText) }
+                GFormRow("Volumes",
+                         hint: !store.isLocal && !volumesText.isEmpty ? "Folders are on \(store.liveName ?? "that Mac"), not this one." : "Folders or named volumes") {
+                    field("~/code:/app, pgdata:/data", text: $volumesText)
                 }
-                GridRow {
-                    FieldLabel("Name")
-                    SheetField(placeholder: "Optional: the image name plus a short suffix", text: $name, mono: false)
-                }
-                GridRow {
-                    FieldLabel("Command")
-                    SheetField(placeholder: "Optional: the image's default command", text: $command, mono: true)
-                }
-                GridRow {
-                    FieldLabel("Ports")
-                    SheetField(placeholder: "Optional: 8080:80, 5432 (on 127.0.0.1)", text: $portsText, mono: true)
-                }
-                GridRow {
-                    FieldLabel("Volumes")
-                    SheetField(placeholder: "Optional: ~/code:/app, pgdata:/var/lib/data", text: $volumesText, mono: true)
-                    if !store.isLocal && !volumesText.isEmpty {
-                        Text("Folders are on \(store.liveName ?? "that Mac"), not this one. Named volumes live there too.")
-                            .font(.system(size: 11.5)).foregroundStyle(G.warning)
-                    }
-                }
-                GridRow(alignment: .top) {
-                    FieldLabel("Environment").padding(.top, 8)
-                    VStack(alignment: .leading, spacing: 4) {
-                        TextEditor(text: $envText)
-                            .font(G.mono(12.5))
-                            .scrollContentBackground(.hidden)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
-                            .frame(height: 64)
-                            .background(G.background, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                            .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(badEnv == nil ? G.borderStrong : G.danger))
-                        Text(badEnv.map { "“\($0)” isn't KEY=value" } ?? "One KEY=value per line, added to the image's own.")
-                            .font(.system(size: 11.5))
-                            .foregroundStyle(badEnv == nil ? G.faint : G.danger)
-                    }
-                }
-                GridRow {
-                    FieldLabel("VM")
-                    HStack(spacing: 18) {
-                        Stepper("\(cpus) vCPU", value: $cpus, in: 1...maxCPUs)
-                            .fixedSize()
-                        Picker("Memory", selection: $memoryMib) {
-                            ForEach(Self.memoryChoices, id: \.self) { mib in
-                                Text(mib < 1024 ? "\(mib) MB" : "\(mib / 1024) GB").tag(mib)
-                            }
-                        }
-                        .labelsHidden()
-                        .fixedSize()
-                        Text("memory").foregroundStyle(G.muted)
-                    }
-                    .font(.system(size: 13))
+            }
+            GFormRow("Environment",
+                     hint: "One KEY=value per line, added to the image's own.",
+                     error: badEnv.map { "“\($0)” isn't KEY=value" }) {
+                TextEditor(text: $envText)
+                    .scrollContentBackground(.hidden)
+                    .frame(height: 58)
+                    .gravitonField(mono: true, height: nil, invalid: badEnv != nil)
+            }
+            GFormRow("Virtual machine") {
+                HStack(spacing: 14) {
+                    GStepper(value: $cpus, in: 1...maxCPUs) { "\($0) vCPU" }
+                    GSegmented(selection: $memoryMib, options: Self.memoryChoices.map { ($0, $0 < 1024 ? "\($0) MB" : "\($0 / 1024) GB") })
+                    Text("memory").font(.system(size: 12)).foregroundStyle(G.faint)
                 }
             }
 
-            Group {
-                if let since = running {
-                    HStack(spacing: 10) {
-                        ProgressView().controlSize(.small)
-                        TimelineView(.periodic(from: since, by: 1)) { context in
-                            Text("Pulling if needed and booting a VM… \(Int(context.date.timeIntervalSince(since))) s")
-                        }
-                    }
-                    .foregroundStyle(G.textSecondary)
-                } else if let failure {
-                    Label(failure, systemImage: "xmark.octagon.fill")
-                        .foregroundStyle(G.danger)
-                        .textSelection(.enabled)
-                } else if !store.canManage {
-                    Label("Start gravitond to run containers: scripts/dev-gravitond.sh", systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(G.warning)
+            if let since = running {
+                TimelineView(.periodic(from: since, by: 1)) { context in
+                    GStatusLine(.working, "Pulling if needed and booting a VM… \(Int(context.date.timeIntervalSince(since))) s")
                 }
+            } else if let failure {
+                GStatusLine(.failure, failure)
+            } else if !store.canManage {
+                GStatusLine(.warning, "Start gravitond to run containers: scripts/dev-gravitond.sh")
             }
-            .font(.system(size: 12.5))
-            .fixedSize(horizontal: false, vertical: true)
-
-            HStack {
-                Spacer()
-                Button("Cancel") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                    .disabled(running != nil)
-                Button("Run", action: run)
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!canRun)
-            }
+        } footer: {
+            Spacer()
+            Button("Cancel") { dismiss() }
+                .buttonStyle(.gSecondary)
+                .keyboardShortcut(.cancelAction)
+                .disabled(running != nil)
+            Button("Run", action: run)
+                .buttonStyle(.gPrimary)
+                .keyboardShortcut(.defaultAction)
+                .disabled(!canRun)
         }
-        .padding(22)
-        .frame(width: 560)
-        .background(Color(hex: 0x15161A))
         .onAppear {
             if image.isEmpty { image = initialImage }
             imageFocused = image.isEmpty
         }
+    }
+
+    private func field(_ placeholder: String, text: Binding<String>, mono: Bool = true) -> some View {
+        GTextField(placeholder, text: text).gravitonField(mono: mono, height: 34)
     }
 
     private func run() {
@@ -183,31 +146,5 @@ struct RunContainerSheet: View {
                 failure = error.localizedDescription
             }
         }
-    }
-}
-
-private struct FieldLabel: View {
-    var text: String
-    init(_ text: String) { self.text = text }
-
-    var body: some View {
-        Text(text).font(.system(size: 12, weight: .medium)).foregroundStyle(G.textSecondary)
-            .gridColumnAlignment(.trailing)
-    }
-}
-
-private struct SheetField: View {
-    var placeholder: String
-    @Binding var text: String
-    var mono: Bool
-
-    var body: some View {
-        TextField(placeholder, text: $text)
-            .textFieldStyle(.plain)
-            .font(mono ? G.mono(13) : .system(size: 13))
-            .padding(.horizontal, 12)
-            .frame(height: 34)
-            .background(G.background, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(G.borderStrong))
     }
 }

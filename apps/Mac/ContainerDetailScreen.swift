@@ -10,40 +10,55 @@ enum DetailTab: String, CaseIterable, Identifiable {
 struct ContainerDetailScreen: View {
     @Environment(EngineStore.self) private var store
     var containerID: String
+    var onBack: () -> Void
     @State private var tab: DetailTab
 
-    init(containerID: String, initialTab: DetailTab = .logs) {
+    init(containerID: String, initialTab: DetailTab = .logs, onBack: @escaping () -> Void) {
         self.containerID = containerID
+        self.onBack = onBack
         _tab = State(initialValue: initialTab)
     }
 
     var body: some View {
         if let c = store.container(containerID) {
             VStack(alignment: .leading, spacing: 0) {
-                VStack(alignment: .leading, spacing: 14) {
-                    HStack(spacing: 12) {
-                        Text(c.name).font(.system(size: 20, weight: .semibold)).kerning(-0.4)
+                VStack(alignment: .leading, spacing: 0) {
+                    ScreenHeader(c.name, subtitle: c.image, back: ("Containers", onBack)) {
                         StatusPill(c, showUptime: true)
-                        Spacer()
-                        HStack(spacing: 8) {
-                            Button("Open terminal") { tab = .terminal }
-                                .disabled(!c.isRunning)
-                            if c.isRunning {
-                                Button("Restart") { Task { await store.restart(c) } }
-                                Button("Stop") { Task { await store.stop(c) } }
-                                    .buttonStyle(QuietButtonStyle(tint: G.danger))
-                            } else {
-                                Button("Start") { Task { await store.start(c) } }
-                            }
+                        Rectangle().fill(G.border).frame(width: 1, height: 20).padding(.horizontal, 4)
+                        Button {
+                            tab = .terminal
+                        } label: {
+                            Label("Terminal", systemImage: "terminal")
                         }
-                        .buttonStyle(QuietButtonStyle())
-                        .fixedSize()
+                        .buttonStyle(.gSecondary)
+                        .disabled(!c.isRunning)
+                        if c.isRunning {
+                            Button {
+                                Task { await store.restart(c) }
+                            } label: {
+                                Label("Restart", systemImage: "arrow.clockwise")
+                            }
+                            .buttonStyle(.gSecondary)
+                            Button {
+                                Task { await store.stop(c) }
+                            } label: {
+                                Label("Stop", systemImage: "stop.fill")
+                            }
+                            .buttonStyle(.gDanger)
+                        } else {
+                            Button {
+                                Task { await store.start(c) }
+                            } label: {
+                                Label("Start", systemImage: "play.fill")
+                            }
+                            .buttonStyle(.gPrimary)
+                        }
                     }
                     TabStrip(selection: $tab)
+                        .padding(.horizontal, 28)
                 }
-                .padding(.horizontal, 28)
-                .padding(.top, 18)
-                .overlay(alignment: .bottom) { Divider().overlay(G.border) }
+                .overlay(alignment: .bottom) { Rectangle().fill(G.border).frame(height: 1) }
 
                 Group {
                     switch tab {
@@ -58,11 +73,12 @@ struct ContainerDetailScreen: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .background(G.background)
-            .navigationTitle(c.name)
-            .navigationSubtitle(c.image)
         } else {
-            ContentUnavailableView("Container not found", systemImage: "shippingbox",
-                                   description: Text("It may have been removed."))
+            VStack(spacing: 0) {
+                ScreenHeader("Not found", back: ("Containers", onBack))
+                GEmptyState("Container not found", symbol: "shippingbox", detail: "It may have been removed.",
+                            actionTitle: "Back to Containers", action: onBack)
+            }
         }
     }
 }
@@ -117,26 +133,12 @@ struct LogsPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
-                HStack(spacing: 8) {
-                    Image(systemName: "magnifyingglass").foregroundStyle(G.faint)
-                    TextField("Filter logs (regex supported)", text: $query)
-                        .textFieldStyle(.plain)
-                }
-                .padding(.horizontal, 12)
-                .frame(height: 32)
-                .gravitonCard(Color(hex: 0x15161A), radius: 8)
+                GTextField("Filter logs (regex supported)", text: $query)
+                    .gravitonField(mono: true, icon: "line.3.horizontal.decrease")
 
-                Picker("Level", selection: $level) {
-                    Text("All").tag(LogLevel?.none)
-                    Text("Info").tag(LogLevel?.some(.info))
-                    Text("Warn").tag(LogLevel?.some(.warn))
-                    Text("Error").tag(LogLevel?.some(.error))
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .fixedSize()
+                GSegmented(selection: $level, options: [(nil, "All"), (.info, "Info"), (.warn, "Warn"), (.error, "Error")])
 
-                Toggle("Follow", isOn: $follow).toggleStyle(.switch).controlSize(.small)
+                Toggle("Follow", isOn: $follow).toggleStyle(.gSwitch)
             }
 
             ScrollViewReader { proxy in
@@ -228,10 +230,10 @@ struct TerminalPanel: View {
                 .padding(.horizontal, 28)
                 .padding(.vertical, 18)
             } else if !container.isRunning {
-                ContentUnavailableView("Not running", systemImage: "terminal",
-                                       description: Text("Start \(container.name) to open a shell in it."))
+                GEmptyState("Not running", symbol: "terminal", detail: "Start \(container.name) to open a shell in it.",
+                            actionTitle: "Start \(container.name)") { Task { await store.start(container) } }
             } else {
-                ProgressView()
+                GSpinner(size: 22).frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .task(id: "\(container.id)|\(container.isRunning)") {
@@ -246,7 +248,7 @@ struct TerminalPanel: View {
             Circle().fill(dot(shell.phase)).frame(width: 7, height: 7)
             Text(status(shell)).font(.system(size: 12.5)).foregroundStyle(G.muted).lineLimit(1)
             Spacer()
-            Button(copied ? "Copied" : "Copy grav command") {
+            Button(copied ? "Copied" : "Copy grav command", systemImage: copied ? "checkmark" : "doc.on.doc") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString("grav exec -it \(container.name) sh", forType: .string)
                 copied = true
@@ -254,12 +256,13 @@ struct TerminalPanel: View {
             .help("The same shell from Terminal: grav exec -it \(container.name) sh")
             .fixedSize()
             if !shell.isLive {
-                Button("New shell") { shell.start(using: store) }
+                Button("New shell", systemImage: "plus") { shell.start(using: store) }
+                    .buttonStyle(.gPrimary)
                     .disabled(!container.isRunning)
                     .fixedSize()
             }
         }
-        .buttonStyle(QuietButtonStyle())
+        .buttonStyle(.g(.secondary, size: .small))
     }
 
     private func status(_ shell: ShellSession) -> String {
