@@ -244,7 +244,12 @@ impl Engine {
                     eprintln!("  layer {} {} (cached)", index + 1, &digest[7..19]);
                 } else if done == total || last_report.elapsed() > Duration::from_secs(1) {
                     last_report = Instant::now();
-                    eprintln!("  layer {} {} {:>3}%", index + 1, &digest[7..19], if total > 0 { done * 100 / total } else { 100 });
+                    eprintln!(
+                        "  layer {} {} {:>3}%",
+                        index + 1,
+                        &digest[7..19],
+                        (done * 100).checked_div(total).unwrap_or(100)
+                    );
                 }
             }
         })?;

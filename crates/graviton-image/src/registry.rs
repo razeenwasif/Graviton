@@ -227,7 +227,7 @@ impl Session<'_> {
             }
         }
         if !params.iter().any(|(k, _)| k == "scope") {
-            req = req.query("scope", &format!("repository:{}:pull", self.repo));
+            req = req.query("scope", format!("repository:{}:pull", self.repo));
         }
         let mut response = req.call().map_err(http_err)?;
         if response.status().as_u16() != 200 {

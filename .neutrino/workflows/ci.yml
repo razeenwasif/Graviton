@@ -1,0 +1,52 @@
+# CI for Graviton on atlas (Neutrino).
+#
+# Runs on atlas itself (runs-on: host) because graviton-vmm, gravitond, grav
+# and GravitonKit are macOS-native (Virtualization.framework, Security.framework,
+# SwiftPM on macOS). The guest agent cross-compiles to aarch64-unknown-linux-musl
+# using Rust's bundled rust-lld (see .cargo/config.toml), just like
+# scripts/build-guest.sh.
+
+name: ci
+
+on:
+  push: {}
+  pull_request: {}
+  workflow_dispatch: {}
+
+jobs:
+  rust:
+    runs-on: host
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - name: Check shell scripts
+        run: |
+          for s in scripts/*.sh design/*.sh; do
+            case "$(head -n 1 "$s")" in
+              *bash*) bash -n "$s" ;;
+              *) sh -n "$s" ;;
+            esac
+          done
+      - name: Workspace tests
+        run: |
+          export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+          cargo test --workspace --locked
+      - name: Workspace clippy
+        run: |
+          export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Guest agent (Linux arm64 musl)
+        run: |
+          export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+          rustup target add aarch64-unknown-linux-musl
+          cargo clippy -p graviton-agent --target aarch64-unknown-linux-musl --locked -- -D warnings
+          cargo build -p graviton-agent --target aarch64-unknown-linux-musl --locked
+
+  swift:
+    runs-on: host
+    timeout-minutes: 15
+    steps:
+      - name: GravitonKit tests
+        run: swift test --package-path apps/GravitonKit
