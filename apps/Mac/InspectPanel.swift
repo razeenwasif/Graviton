@@ -48,7 +48,7 @@ struct InspectPanel: View {
                     }
                     InspectSection("Network") {
                         InspectRow("IP address", d.container.ipAddress ?? "—")
-                        InspectRow("Ports", d.container.ports.isEmpty ? "—" : d.container.ports.map { "127.0.0.1:\($0.label)" }.joined(separator: "\n"))
+                        InspectRow("Ports", d.container.ports.isEmpty ? "—" : d.container.ports.map(\.fullLabel).joined(separator: "\n"))
                     }
                     InspectSection("Mounts") {
                         InspectRow("Volumes", d.container.mounts.isEmpty ? "—" : d.container.mounts.map { "\($0.source) → \($0.target)\($0.readOnly ? " (read-only)" : "")" }.joined(separator: "\n"))

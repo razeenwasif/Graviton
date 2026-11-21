@@ -325,7 +325,11 @@ private struct ContainerQuickRow: View {
     }
 
     private func openInBrowser(_ port: PortMapping) {
-        if let url = URL(string: "http://localhost:\(port.hostPort)") { NSWorkspace.shared.open(url) }
+        let host = switch port.hostIp {
+        case nil, "127.0.0.1", "0.0.0.0", "::", "::1": "localhost"
+        case let ip?: ip.contains(":") ? "[\(ip)]" : ip
+        }
+        if let url = URL(string: "http://\(host):\(port.hostPort)") { NSWorkspace.shared.open(url) }
     }
 
     private func copy(_ text: String) {

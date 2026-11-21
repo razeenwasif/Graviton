@@ -194,7 +194,7 @@ impl Store {
     pub fn demo() -> Self {
         let now = now_secs();
         let mib = 1024 * 1024;
-        let tcp = |host_port, container_port| PortMapping { host_port, container_port, protocol: PortProtocol::Tcp };
+        let tcp = |host_port, container_port| PortMapping { host_ip: None, host_port, container_port, protocol: PortProtocol::Tcp };
         let mut store = Store::new();
 
         let mut add = |id: &str, name: &str, image: &str, running: Option<(u64, f64, u64)>, exit: Option<i32>, ports: Vec<PortMapping>, mounts: Vec<Mount>, ip: Option<&str>| {

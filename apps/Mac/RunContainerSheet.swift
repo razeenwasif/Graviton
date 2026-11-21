@@ -68,7 +68,7 @@ struct RunContainerSheet: View {
                 GFormRow("Command") { field("The image's default", text: $command) }
             }
             HStack(alignment: .top, spacing: 12) {
-                GFormRow("Ports", hint: "On 127.0.0.1") { field("8080:80, 5432", text: $portsText) }
+                GFormRow("Ports", hint: "Default 127.0.0.1; add IP: or /udp") { field("8080:80, 0.0.0.0:8080:80, 5353:53/udp", text: $portsText) }
                 GFormRow("Volumes",
                          hint: !store.isLocal && !volumesText.isEmpty ? "Folders are on \(store.liveName ?? "that Mac"), not this one." : "Folders or named volumes") {
                     field("~/code:/app, pgdata:/data", text: $volumesText)

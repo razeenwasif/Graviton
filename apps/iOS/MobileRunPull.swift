@@ -49,7 +49,7 @@ struct MobileRunSheet: View {
             }
             GFormRow("Name") { MobileField(placeholder: "Optional", text: $name, mono: false) }
             GFormRow("Command") { MobileField(placeholder: "Optional: replaces the image's", text: $command) }
-            GFormRow("Ports", hint: "On 127.0.0.1 on the Mac") { MobileField(placeholder: "8080:80, 5432", text: $ports, keyboard: .numbersAndPunctuation) }
+            GFormRow("Ports", hint: "Default 127.0.0.1 on the Mac; add IP: or /udp") { MobileField(placeholder: "8080:80, 0.0.0.0:8080:80, 5353/udp", text: $ports, keyboard: .numbersAndPunctuation) }
             GFormRow("Environment") { MobileField(placeholder: "KEY=value, KEY2=value", text: $env) }
             GFormRow("Memory") {
                 GSegmented(selection: $memory, options: Self.memoryChoices.map { ($0, $0 < 1024 ? "\(Int($0)) MB" : "\(Int($0) / 1024) GB") }, stretch: true)

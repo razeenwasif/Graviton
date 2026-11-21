@@ -359,7 +359,7 @@ struct MobileInspectView: View {
                     }
                     section("Network") {
                         row("IP address", d.container.ipAddress ?? "—")
-                        row("Ports", d.container.ports.isEmpty ? "—" : d.container.ports.map(\.label).joined(separator: "\n"))
+                        row("Ports", d.container.ports.isEmpty ? "—" : d.container.ports.map(\.fullLabel).joined(separator: "\n"))
                     }
                     if !d.container.mounts.isEmpty {
                         section("Volumes") {

@@ -88,9 +88,20 @@ impl std::str::FromStr for RestartPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortMapping {
+    /// Interface address on the Mac to bind (`None` means `127.0.0.1`).
+    /// Use `0.0.0.0` (or `::`) for every interface, or a specific IP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip: Option<String>,
     pub host_port: u16,
     pub container_port: u16,
     pub protocol: PortProtocol,
+}
+
+impl PortMapping {
+    /// The host IP this mapping binds on the Mac (defaults to `127.0.0.1`).
+    pub fn bind_ip(&self) -> &str {
+        self.host_ip.as_deref().unwrap_or("127.0.0.1")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,7 +187,7 @@ pub struct RunSpec {
     pub cpus: Option<u32>,
     #[serde(default)]
     pub memory_mib: Option<u64>,
-    /// `host:container[/tcp]` or `port`, published on 127.0.0.1.
+    /// `[ip:]host:container[/tcp|udp]` or `port[/tcp|udp]` (default bind IP: 127.0.0.1).
     #[serde(default)]
     pub ports: Vec<String>,
     /// `/host/dir:/container/path[:ro]` or `name:/container/path[:ro]` (a named volume).

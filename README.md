@@ -64,8 +64,10 @@ cargo run -p grav -- exec -it web sh
 cargo run -p grav -- stop web && cargo run -p grav -- rm web
 ```
 
-- `-p HOST:CONTAINER` publishes a TCP port on 127.0.0.1 (forwarded to the
-  container's VM on Virtualization.framework's NAT network).
+- `-p [IP:]HOST:CONTAINER[/tcp|udp]` (or `-p PORT[/udp]`) publishes a TCP or
+  UDP port forwarded to the container's VM. Without `IP:`, it binds `127.0.0.1`;
+  pass `0.0.0.0:8080:80` (or `[::]:8080:80` / a specific interface IP) to accept
+  connections from other machines on the network.
 - Containers on the same Mac reach each other directly over the container
   network (TCP, UDP and ICMP) and resolve each other by name, `<name>.graviton`
   or container ID via the guest's embedded DNS resolver (`127.0.0.11:53`),

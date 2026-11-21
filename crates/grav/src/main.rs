@@ -75,7 +75,7 @@ enum Command {
         /// Memory for the container's VM, in MiB.
         #[arg(long)]
         memory: Option<u64>,
-        /// Publish a port on 127.0.0.1: HOST:CONTAINER (or one port for both); repeatable.
+        /// Publish a port: [IP:]HOST:CONTAINER[/tcp|udp] or PORT (default IP: 127.0.0.1); repeatable.
         #[arg(short, long = "publish")]
         publish: Vec<String>,
         /// Mount a folder or named volume: /host/dir:/path[:ro] or name:/path; repeatable.
@@ -989,7 +989,23 @@ fn print_containers<'a>(list: impl Iterator<Item = &'a ContainerSummary>) {
             (ContainerStatus::Exited, _, Some(code)) => format!("Exited ({code})"),
             (s, _, _) => format!("{s:?}"),
         };
-        let ports = c.ports.iter().map(|p| format!("{}->{}", p.host_port, p.container_port)).collect::<Vec<_>>().join(", ");
+        let ports = c
+            .ports
+            .iter()
+            .map(|p| {
+                let prefix = match p.host_ip.as_deref() {
+                    Some(ip) if ip.contains(':') => format!("[{ip}]:"),
+                    Some(ip) => format!("{ip}:"),
+                    None => String::new(),
+                };
+                let proto = match p.protocol {
+                    graviton_proto::PortProtocol::Tcp => "",
+                    graviton_proto::PortProtocol::Udp => "/udp",
+                };
+                format!("{prefix}{}->{}{proto}", p.host_port, p.container_port)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         println!(
             "{:<13} {:<14} {:<26} {:<14} {:>6} {:>9}  {}",
             c.id,

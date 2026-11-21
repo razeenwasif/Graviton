@@ -21,7 +21,7 @@ import Testing
 
         let json = #"""
         {"type":"containers","data":[{"id":"a3f9c2e81b07","name":"api-gateway","image":"storefront/api:0.4.2",
-        "status":"running","exit_code":null,"ports":[{"host_port":8080,"container_port":80,"protocol":"tcp"}],
+        "status":"running","exit_code":null,"ports":[{"host_port":8080,"container_port":80,"protocol":"tcp"},{"host_ip":"0.0.0.0","host_port":5353,"container_port":53,"protocol":"udp"}],
         "mounts":[],"ip_address":"192.168.64.4","cpu_percent":12.4,"memory_bytes":432013312,
         "memory_limit_bytes":1073741824,"created_at":1700000000,"started_at":1700000100}]}
         """#
@@ -30,6 +30,11 @@ import Testing
         }
         #expect(list.first?.name == "api-gateway")
         #expect(list.first?.ports.first?.hostPort == 8080)
+        #expect(list.first?.ports.first?.bindIp == "127.0.0.1")
+        #expect(list.first?.ports.last?.hostIp == "0.0.0.0")
+        #expect(list.first?.ports.last?.protocol == .udp)
+        #expect(list.first?.ports.last?.fullLabel == "0.0.0.0:5353 → 53/udp")
+        #expect(list.first?.ports.last?.compactLabel == "0.0.0.0:5353→53/udp")
         #expect(list.first?.isRunning == true)
 
         let err = try Wire.decoder.decode(EngineResponse.self, from: Data(#"{"type":"error","data":{"message":"no such container: x"}}"#.utf8))

@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{BuildHasher, RandomState};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -54,6 +54,16 @@ const STATS_INTERVAL: Duration = Duration::from_secs(2);
 const STATS_KEPT: usize = 150;
 /// The Files tab previews this much of a file.
 const READ_LIMIT: u64 = 256 * 1024;
+/// UDP port-forwarding limits (max datagram payload, idle NAT session TTL, max clients per port).
+const UDP_BUF_SIZE: usize = 65_535;
+const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const UDP_MAX_SESSIONS: usize = 256;
+
+/// A host socket bound before the VM boots, ready to forward to the guest once DHCP completes.
+enum BoundPort {
+    Tcp { listener: TcpListener, container_port: u16 },
+    Udp { socket: UdpSocket, container_port: u16 },
+}
 
 /// How to start a container (again).
 #[derive(Clone, Serialize, Deserialize)]
@@ -543,13 +553,25 @@ impl Engine {
 
     fn launch_inner(self: &Arc<Self>, id: &str, attempt: u32, wait_for_start: bool) -> Result<Option<ContainerSummary>> {
         let ports = self.specs.lock().unwrap().get(id).map(|s| s.ports.clone()).unwrap_or_default();
-        // Bind the published ports first, so a port in use fails before a VM boots.
-        let mut listeners = Vec::new();
+        // Bind the published ports first, so a port in use or invalid interface fails before a VM boots.
+        let mut bound = Vec::new();
         for p in &ports {
-            match TcpListener::bind(("127.0.0.1", p.host_port)) {
-                Ok(listener) => listeners.push((listener, p.container_port)),
+            let bind_ip = p.bind_ip();
+            let res = match p.protocol {
+                PortProtocol::Tcp => TcpListener::bind((bind_ip, p.host_port))
+                    .map(|listener| BoundPort::Tcp { listener, container_port: p.container_port }),
+                PortProtocol::Udp => UdpSocket::bind((bind_ip, p.host_port))
+                    .map(|socket| BoundPort::Udp { socket, container_port: p.container_port }),
+            };
+            match res {
+                Ok(port) => bound.push(port),
                 Err(err) => {
-                    let message = format!("port {} is already in use on this Mac ({err})", p.host_port);
+                    let proto = match p.protocol {
+                        PortProtocol::Tcp => "tcp",
+                        PortProtocol::Udp => "udp",
+                    };
+                    let host = if bind_ip.contains(':') { format!("[{bind_ip}]:{}", p.host_port) } else { format!("{bind_ip}:{}", p.host_port) };
+                    let message = format!("couldn't bind {host}/{proto} on this Mac ({err})");
                     self.log(id, LogLevel::Error, LogStream::System, message.clone());
                     self.store.lock().unwrap().update(id, |c| {
                         c.status = ContainerStatus::Exited;
@@ -572,7 +594,7 @@ impl Engine {
         });
         let engine = Arc::clone(self);
         let owned = id.to_string();
-        std::thread::Builder::new().name(format!("container-{id}")).spawn(move || engine.supervise(&owned, listeners, attempt))?;
+        std::thread::Builder::new().name(format!("container-{id}")).spawn(move || engine.supervise(&owned, bound, attempt))?;
 
         if !wait_for_start {
             return Ok(None);
@@ -626,9 +648,9 @@ impl Engine {
         );
     }
 
-    fn supervise(self: &Arc<Self>, id: &str, listeners: Vec<(TcpListener, u16)>, attempt: u32) {
+    fn supervise(self: &Arc<Self>, id: &str, bound: Vec<BoundPort>, attempt: u32) {
         let mut started_at: Option<Instant> = None;
-        let result = self.run_in_vm(id, listeners, &mut started_at);
+        let result = self.run_in_vm(id, bound, &mut started_at);
         if self.shutting_down.load(Ordering::SeqCst) {
             // `Engine::shutdown` is tearing VMs down cleanly; preserve saved state.
             return;
@@ -699,12 +721,12 @@ impl Engine {
         }
     }
 
-    fn run_in_vm(self: &Arc<Self>, id: &str, listeners: Vec<(TcpListener, u16)>, started_at: &mut Option<Instant>) -> Result<i32> {
+    fn run_in_vm(self: &Arc<Self>, id: &str, bound: Vec<BoundPort>, started_at: &mut Option<Instant>) -> Result<i32> {
         // The container's disk stays for its next start; `grav rm` deletes it.
-        self.run_in_vm_inner(id, listeners, started_at)
+        self.run_in_vm_inner(id, bound, started_at)
     }
 
-    fn run_in_vm_inner(self: &Arc<Self>, id: &str, listeners: Vec<(TcpListener, u16)>, started_at: &mut Option<Instant>) -> Result<i32> {
+    fn run_in_vm_inner(self: &Arc<Self>, id: &str, bound: Vec<BoundPort>, started_at: &mut Option<Instant>) -> Result<i32> {
         let spec = self.specs.lock().unwrap().get(id).cloned().ok_or_else(|| anyhow!("unknown container {id}"))?;
         let name = self.store.lock().unwrap().container(id)?.name.clone();
         let t0 = Instant::now();
@@ -791,12 +813,16 @@ impl Engine {
         );
 
         // Publish ports now that the guest has an address.
-        if !listeners.is_empty() {
+        if !bound.is_empty() {
             match address {
                 Some(ip) => {
                     let mut handles = Vec::new();
-                    for (listener, container_port) in listeners {
-                        handles.push(self.forward(listener, SocketAddr::new(ip, container_port))?);
+                    for port in bound {
+                        let handle = match port {
+                            BoundPort::Tcp { listener, container_port } => self.forward_tcp(listener, SocketAddr::new(ip, container_port))?,
+                            BoundPort::Udp { socket, container_port } => self.forward_udp(socket, SocketAddr::new(ip, container_port))?,
+                        };
+                        handles.push(handle);
                     }
                     if let Some(r) = self.running.lock().unwrap().get_mut(id) {
                         r.forwards = handles;
@@ -894,8 +920,8 @@ impl Engine {
         }
     }
 
-    /// Forward connections on `listener` (127.0.0.1) to `target` in the guest.
-    fn forward(&self, listener: TcpListener, target: SocketAddr) -> Result<tokio::task::JoinHandle<()>> {
+    /// Forward TCP connections on `listener` to `target` in the guest.
+    fn forward_tcp(&self, listener: TcpListener, target: SocketAddr) -> Result<tokio::task::JoinHandle<()>> {
         listener.set_nonblocking(true)?;
         let _guard = self.rt.enter();
         let listener = tokio::net::TcpListener::from_std(listener)?;
@@ -909,6 +935,13 @@ impl Engine {
                 });
             }
         }))
+    }
+
+    /// Forward UDP datagrams on `socket` to `target` in the guest, giving each
+    /// external client its own ephemeral guest-facing socket so replies route
+    /// back cleanly and stateful protocols see distinct client endpoints.
+    fn forward_udp(&self, socket: UdpSocket, target: SocketAddr) -> Result<tokio::task::JoinHandle<()>> {
+        spawn_udp_forward(&self.rt, socket, target)
     }
 
     // -- Stats ------------------------------------------------------------
@@ -1136,19 +1169,130 @@ fn should_restart(policy: RestartPolicy, requested: bool, exit_code: i32, failed
     }
 }
 
-/// `8080:80`, `8080:80/tcp` or `80` (same port on both sides).
-fn parse_port(spec: &str) -> Result<PortMapping> {
-    let (ports, proto) = spec.split_once('/').unwrap_or((spec, "tcp"));
-    if proto != "tcp" {
-        bail!("`{spec}`: only TCP ports can be published so far");
+struct UdpSession {
+    back: Arc<tokio::net::UdpSocket>,
+    last_active_ms: Arc<AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Owns every per-client reverse-pump task for one published UDP port so
+/// aborting the parent forwarder immediately aborts every child task too.
+#[derive(Default)]
+struct UdpSessions(Arc<Mutex<HashMap<SocketAddr, UdpSession>>>);
+
+impl Drop for UdpSessions {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.0.lock() {
+            for (_, session) in map.drain() {
+                session.task.abort();
+            }
+        }
     }
-    let parse = |s: &str| s.trim().parse::<u16>().ok().filter(|p| *p > 0).ok_or_else(|| anyhow!("`{spec}` isn't a valid port mapping (try 8080:80)"));
-    let (host_port, container_port) = match ports.split(':').collect::<Vec<_>>()[..] {
-        [one] => (parse(one)?, parse(one)?),
-        [host, container] => (parse(host)?, parse(container)?),
-        _ => bail!("`{spec}` isn't a valid port mapping (try 8080:80)"),
+}
+
+fn spawn_udp_forward(rt: &tokio::runtime::Handle, socket: UdpSocket, target: SocketAddr) -> Result<tokio::task::JoinHandle<()>> {
+    socket.set_nonblocking(true)?;
+    let _guard = rt.enter();
+    let front = Arc::new(tokio::net::UdpSocket::from_std(socket)?);
+    let back_bind: &str = if target.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    Ok(rt.spawn(async move {
+        let sessions = UdpSessions::default();
+        let epoch = Instant::now();
+        let mut buf = vec![0u8; UDP_BUF_SIZE];
+        loop {
+            let Ok((n, client)) = front.recv_from(&mut buf).await else { continue };
+            let now_ms = epoch.elapsed().as_millis() as u64;
+            let existing = {
+                let map = sessions.0.lock().unwrap();
+                map.get(&client).map(|s| {
+                    s.last_active_ms.store(now_ms, Ordering::Relaxed);
+                    Arc::clone(&s.back)
+                })
+            };
+            let back = match existing {
+                Some(b) => b,
+                None => {
+                    let Ok(sock) = tokio::net::UdpSocket::bind(back_bind).await else { continue };
+                    if sock.connect(target).await.is_err() {
+                        continue;
+                    }
+                    let back = Arc::new(sock);
+                    let last_active = Arc::new(AtomicU64::new(now_ms));
+                    let front_reply = Arc::clone(&front);
+                    let back_recv = Arc::clone(&back);
+                    let active_reply = Arc::clone(&last_active);
+                    let map_ref = Arc::clone(&sessions.0);
+                    let task = tokio::spawn(async move {
+                        let mut rbuf = vec![0u8; UDP_BUF_SIZE];
+                        loop {
+                            match tokio::time::timeout(UDP_IDLE_TIMEOUT, back_recv.recv(&mut rbuf)).await {
+                                Ok(Ok(m)) => {
+                                    active_reply.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                                    let _ = front_reply.send_to(&rbuf[..m], client).await;
+                                }
+                                Ok(Err(_)) => break,
+                                Err(_) => {
+                                    let idle = epoch.elapsed().as_millis() as u64 - active_reply.load(Ordering::Relaxed);
+                                    if idle >= UDP_IDLE_TIMEOUT.as_millis() as u64 {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if let Ok(mut map) = map_ref.lock() {
+                            if map.get(&client).is_some_and(|s| Arc::ptr_eq(&s.back, &back_recv)) {
+                                map.remove(&client);
+                            }
+                        }
+                    });
+                    let mut map = sessions.0.lock().unwrap();
+                    if map.len() >= UDP_MAX_SESSIONS {
+                        if let Some(oldest) = map.iter().min_by_key(|(_, s)| s.last_active_ms.load(Ordering::Relaxed)).map(|(k, _)| *k) {
+                            if let Some(evicted) = map.remove(&oldest) {
+                                evicted.task.abort();
+                            }
+                        }
+                    }
+                    map.insert(client, UdpSession { back: Arc::clone(&back), last_active_ms: last_active, task });
+                    back
+                }
+            };
+            let _ = back.send(&buf[..n]).await;
+        }
+    }))
+}
+
+/// `[IP:]HOST:CONTAINER[/tcp|udp]` or `PORT[/tcp|udp]` (default bind IP: `127.0.0.1`).
+/// IPv6 bind addresses use brackets, e.g. `[::]:8080:80` or `[::1]:5353:53/udp`.
+fn parse_port(spec: &str) -> Result<PortMapping> {
+    let (ports, proto_raw) = spec.rsplit_once('/').unwrap_or((spec, "tcp"));
+    let protocol = match proto_raw.trim().to_ascii_lowercase().as_str() {
+        "tcp" => PortProtocol::Tcp,
+        "udp" => PortProtocol::Udp,
+        other => bail!("`{spec}`: unknown protocol `{other}` (use tcp or udp)"),
     };
-    Ok(PortMapping { host_port, container_port, protocol: PortProtocol::Tcp })
+    let bad = || anyhow!("`{spec}` isn't a valid port mapping (try 8080:80, 0.0.0.0:8080:80 or 5353:53/udp)");
+    let parse_num = |s: &str| s.trim().parse::<u16>().ok().filter(|p| *p > 0).ok_or_else(bad);
+
+    let ports = ports.trim();
+    let (host_ip, host_port, container_port) = if let Some(rest) = ports.strip_prefix('[') {
+        let (ip_str, tail) = rest.split_once("]:").ok_or_else(bad)?;
+        let ip: Ipv6Addr = ip_str.parse().map_err(|_| anyhow!("`{spec}`: `{ip_str}` isn't a valid IPv6 address"))?;
+        let (host, container) = tail.split_once(':').ok_or_else(bad)?;
+        (Some(ip.to_string()), parse_num(host)?, parse_num(container)?)
+    } else {
+        match ports.split(':').collect::<Vec<_>>()[..] {
+            [one] => (None, parse_num(one)?, parse_num(one)?),
+            [host, container] => (None, parse_num(host)?, parse_num(container)?),
+            [ip_str, host, container] => {
+                let ip: Ipv4Addr = ip_str.trim().parse().map_err(|_| anyhow!("`{spec}`: `{ip_str}` isn't a valid IPv4 address"))?;
+                let host_ip = (ip != Ipv4Addr::LOCALHOST).then(|| ip.to_string());
+                (host_ip, parse_num(host)?, parse_num(container)?)
+            }
+            _ => return Err(bad()),
+        }
+    };
+    Ok(PortMapping { host_ip, host_port, container_port, protocol })
 }
 
 /// `/host/dir:/path[:ro]`, `~/dir:/path` or `name:/path[:ro]`.
@@ -1391,12 +1535,88 @@ mod tests {
 
     #[test]
     fn parses_ports() {
-        assert_eq!(parse_port("8080:80").unwrap(), PortMapping { host_port: 8080, container_port: 80, protocol: PortProtocol::Tcp });
+        assert_eq!(
+            parse_port("8080:80").unwrap(),
+            PortMapping { host_ip: None, host_port: 8080, container_port: 80, protocol: PortProtocol::Tcp }
+        );
+        assert_eq!(parse_port("127.0.0.1:8080:80").unwrap(), parse_port("8080:80").unwrap());
         assert_eq!(parse_port("5432").unwrap().container_port, 5432);
         assert_eq!(parse_port("3000:3000/tcp").unwrap().host_port, 3000);
-        assert!(parse_port("53:53/udp").is_err());
+        assert_eq!(
+            parse_port("5353:53/udp").unwrap(),
+            PortMapping { host_ip: None, host_port: 5353, container_port: 53, protocol: PortProtocol::Udp }
+        );
+        assert_eq!(
+            parse_port("5353/UDP").unwrap(),
+            PortMapping { host_ip: None, host_port: 5353, container_port: 5353, protocol: PortProtocol::Udp }
+        );
+        assert_eq!(
+            parse_port("0.0.0.0:8080:80").unwrap(),
+            PortMapping { host_ip: Some("0.0.0.0".into()), host_port: 8080, container_port: 80, protocol: PortProtocol::Tcp }
+        );
+        assert_eq!(
+            parse_port("192.0.2.62:5353:53/udp").unwrap(),
+            PortMapping { host_ip: Some("192.0.2.62".into()), host_port: 5353, container_port: 53, protocol: PortProtocol::Udp }
+        );
+        assert_eq!(
+            parse_port("[::]:8080:80").unwrap(),
+            PortMapping { host_ip: Some("::".into()), host_port: 8080, container_port: 80, protocol: PortProtocol::Tcp }
+        );
+        assert_eq!(
+            parse_port("[::1]:5353:53/udp").unwrap(),
+            PortMapping { host_ip: Some("::1".into()), host_port: 5353, container_port: 53, protocol: PortProtocol::Udp }
+        );
+        assert!(parse_port("53:53/sctp").is_err());
         assert!(parse_port("0:80").is_err());
         assert!(parse_port("a:b:c").is_err());
+        assert!(parse_port("[::]:80").is_err());
+    }
+
+    #[tokio::test]
+    async fn udp_forward_isolates_clients_and_cleans_up() {
+        // Mock guest UDP echo server returning "<peer_port>:<payload>".
+        let backend = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            while let Ok((n, peer)) = backend.recv_from(&mut buf).await {
+                let reply = format!("{}:{}", peer.port(), String::from_utf8_lossy(&buf[..n]));
+                let _ = backend.send_to(reply.as_bytes(), peer).await;
+            }
+        });
+
+        let front_std = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let front_addr = front_std.local_addr().unwrap();
+        let fwd = spawn_udp_forward(&tokio::runtime::Handle::current(), front_std, backend_addr).unwrap();
+
+        let c1 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let c2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        c1.send_to(b"one", front_addr).await.unwrap();
+        c2.send_to(b"two", front_addr).await.unwrap();
+
+        let mut b1 = [0u8; 64];
+        let mut b2 = [0u8; 64];
+        let n1 = tokio::time::timeout(Duration::from_secs(2), c1.recv(&mut b1)).await.unwrap().unwrap();
+        let n2 = tokio::time::timeout(Duration::from_secs(2), c2.recv(&mut b2)).await.unwrap().unwrap();
+        let r1 = String::from_utf8(b1[..n1].to_vec()).unwrap();
+        let r2 = String::from_utf8(b2[..n2].to_vec()).unwrap();
+        assert!(r1.ends_with(":one"), "unexpected r1: {r1}");
+        assert!(r2.ends_with(":two"), "unexpected r2: {r2}");
+        // Each client got its own guest-facing source port.
+        assert_ne!(r1.split(':').next(), r2.split(':').next());
+
+        // Second packet from c1 reuses its existing session (same source port).
+        c1.send_to(b"again", front_addr).await.unwrap();
+        let n3 = tokio::time::timeout(Duration::from_secs(2), c1.recv(&mut b1)).await.unwrap().unwrap();
+        let r3 = String::from_utf8(b1[..n3].to_vec()).unwrap();
+        assert!(r3.ends_with(":again"));
+        assert_eq!(r1.split(':').next(), r3.split(':').next());
+
+        // Aborting the forwarder frees the bound port immediately.
+        fwd.abort();
+        let _ = fwd.await;
+        server.abort();
+        assert!(UdpSocket::bind(front_addr).is_ok());
     }
 
     #[test]

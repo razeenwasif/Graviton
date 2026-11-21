@@ -27,11 +27,28 @@ public enum RestartPolicy: String, Codable, CaseIterable, Hashable, Sendable {
 }
 
 public struct PortMapping: Codable, Hashable, Sendable {
+    /// Interface address on the Mac to bind (`nil` means `127.0.0.1`).
+    public var hostIp: String?
     public var hostPort: UInt16
     public var containerPort: UInt16
     public var `protocol`: PortProtocol
 
+    public init(hostIp: String? = nil, hostPort: UInt16, containerPort: UInt16, protocol: PortProtocol) {
+        self.hostIp = hostIp
+        self.hostPort = hostPort
+        self.containerPort = containerPort
+        self.protocol = `protocol`
+    }
+
+    public var bindIp: String { hostIp ?? "127.0.0.1" }
+    public var hostAddress: String { bindIp.contains(":") ? "[\(bindIp)]:\(hostPort)" : "\(bindIp):\(hostPort)" }
     public var label: String { "\(hostPort) → \(containerPort)/\(`protocol`.rawValue)" }
+    public var fullLabel: String { "\(hostAddress) → \(containerPort)/\(`protocol`.rawValue)" }
+    public var compactLabel: String {
+        let prefix = hostIp.map { $0.contains(":") ? "[\($0)]:" : "\($0):" } ?? ""
+        let proto = `protocol` == .udp ? "/udp" : ""
+        return "\(prefix)\(hostPort)→\(containerPort)\(proto)"
+    }
 }
 
 public struct Mount: Codable, Hashable, Sendable {
@@ -132,7 +149,7 @@ public struct RunSpec: Codable, Hashable, Sendable {
     public var env: [String]
     public var cpus: UInt32?
     public var memoryMib: UInt64?
-    /// `host:container` or `port`, published on 127.0.0.1.
+    /// `[ip:]host:container[/tcp|udp]` or `port[/tcp|udp]` (default bind IP: 127.0.0.1).
     public var ports: [String]
     /// `/host/dir:/path[:ro]`, `~/dir:/path` or `name:/path`.
     public var volumes: [String]

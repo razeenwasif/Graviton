@@ -189,7 +189,7 @@ struct ContainerTable: View {
                 }
             }
             .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
-            Text(c.ports.isEmpty ? "—" : c.ports.map { "\($0.hostPort)→\($0.containerPort)" }.joined(separator: ", "))
+            Text(c.ports.isEmpty ? "—" : c.ports.map(\.compactLabel).joined(separator: ", "))
                 .font(G.mono(12)).foregroundStyle(G.textSecondary).lineLimit(1)
                 .frame(width: 104, alignment: .leading)
             Text(Format.percent(c.cpuPercent)).font(G.mono(12)).foregroundStyle(G.textSecondary)
