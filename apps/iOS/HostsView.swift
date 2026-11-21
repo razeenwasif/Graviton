@@ -10,10 +10,9 @@ struct HostsView: View {
     @Environment(EngineStore.self) private var store
     @Environment(HostStore.self) private var hosts
     @Environment(HostBrowser.self) private var browser
+    @Environment(Dialogs.self) private var dialogs
     @Binding var pairTarget: PairingTarget?
     @State private var askAddress = false
-    @State private var address = ""
-    @State private var linkProblem: String?
 
     private var unpaired: [HostBrowser.Found] {
         browser.found.filter { found in !hosts.hosts.contains { $0.serviceName == found.name || $0.name == found.name } }
@@ -21,72 +20,96 @@ struct HostsView: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                Section("Showing") {
-                    HostRow(title: "Demo data", detail: "The sample containers from the design", symbol: "sparkles",
-                            selected: hosts.selectedID == nil) { choose(nil) }
-                    ForEach(hosts.hosts) { host in
-                        HostRow(title: host.name, detail: detail(for: host), symbol: "desktopcomputer",
-                                selected: hosts.selectedID == host.id) { choose(host) }
-                            .swipeActions {
-                                Button("Forget", role: .destructive) { forget(host) }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        GCaption("Showing").padding(.horizontal, 4)
+                        VStack(spacing: 0) {
+                            HostRow(title: "Demo data", detail: "The sample containers from the design", symbol: "sparkles",
+                                    selected: hosts.selectedID == nil) { choose(nil) }
+                            ForEach(hosts.hosts) { host in
+                                RowDivider(inset: 62)
+                                HostRow(title: host.name, detail: detail(for: host), symbol: "desktopcomputer",
+                                        selected: hosts.selectedID == host.id) { choose(host) }
+                                    .contextMenu {
+                                        Button("Forget \(host.name)", systemImage: "trash", role: .destructive) { confirmForget(host) }
+                                    }
                             }
+                        }
+                        .mobileCard()
+                        if !hosts.hosts.isEmpty {
+                            Text("Touch and hold a Mac to forget it.").font(.system(size: 12)).foregroundStyle(G.faint).padding(.horizontal, 4)
+                        }
                     }
-                }
 
-                Section {
-                    if unpaired.isEmpty {
-                        HStack(spacing: 10) {
-                            ProgressView()
-                            Text(browser.problem ?? "Looking for Macs running gravitond --remote…")
-                                .foregroundStyle(G.muted)
-                        }
-                    }
-                    ForEach(unpaired) { found in
-                        Button {
-                            pairTarget = PairingTarget(name: found.name, serviceName: found.name)
-                        } label: {
-                            HStack {
-                                Label(found.name, systemImage: "desktopcomputer")
-                                    .foregroundStyle(G.text)
-                                Spacer()
-                                Text("Pair").foregroundStyle(G.accent).fontWeight(.semibold)
+                    VStack(alignment: .leading, spacing: 8) {
+                        GCaption("On this network").padding(.horizontal, 4)
+                        VStack(spacing: 0) {
+                            if unpaired.isEmpty {
+                                HStack(spacing: 12) {
+                                    GSpinner(size: 16).frame(width: 34)
+                                    Text(browser.problem ?? "Looking for Macs running gravitond --remote…")
+                                        .font(.system(size: 14)).foregroundStyle(G.muted)
+                                }
+                                .padding(.horizontal, 14)
+                                .frame(maxWidth: .infinity, minHeight: 58, alignment: .leading)
+                            }
+                            ForEach(Array(unpaired.enumerated()), id: \.element.id) { i, found in
+                                if i > 0 { RowDivider(inset: 62) }
+                                HStack(spacing: 12) {
+                                    HostIcon(symbol: "desktopcomputer", selected: false)
+                                    Text(found.name).font(.system(size: 15, weight: .medium)).foregroundStyle(G.text)
+                                    Spacer()
+                                    Button("Pair") { pairTarget = PairingTarget(name: found.name, serviceName: found.name) }
+                                        .buttonStyle(.g(.primary, size: .small))
+                                }
+                                .padding(.horizontal, 14)
+                                .frame(minHeight: 58)
                             }
                         }
+                        .mobileCard()
                     }
-                    Button("Add a Mac by address…", systemImage: "number") { askAddress = true }
-                    Button("Paste a pairing link", systemImage: "doc.on.clipboard") { pasteLink() }
-                } header: {
-                    Text("On this network")
-                } footer: {
-                    Text("On the Mac, start gravitond with --remote, then run grav pair for a code. Or scan its QR code with the Camera.")
+
+                    VStack(spacing: 10) {
+                        Button { askAddress = true } label: { Label("Add a Mac by address", systemImage: "number") }
+                            .buttonStyle(.g(.secondary, size: .touch, fullWidth: true))
+                        Button { pasteLink() } label: { Label("Paste a pairing link", systemImage: "doc.on.clipboard") }
+                            .buttonStyle(.g(.secondary, size: .touch, fullWidth: true))
+                    }
+
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "info.circle").foregroundStyle(G.accent)
+                        Text("On the Mac, start gravitond with --remote, then run grav pair for a code. Or scan its QR code with the Camera.")
+                            .font(.system(size: 13)).foregroundStyle(G.muted).fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(14)
+                    .mobileCard(G.surface, radius: 14)
                 }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 24)
             }
-            .scrollContentBackground(.hidden)
-            .background(G.background)
-            .navigationTitle("Hosts")
+            .safeAreaInset(edge: .top, spacing: 0) {
+                MobileHeader("Hosts", subtitle: "The Macs this phone runs containers on", large: true).background(G.background)
+            }
+            .mobileScreen(pushed: false)
             .onAppear { browser.start() }
-            .alert("Add a Mac", isPresented: $askAddress) {
-                TextField("192.168.1.20", text: $address)
-                    .keyboardType(.numbersAndPunctuation)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                Button("Cancel", role: .cancel) {}
-                Button("Next") {
-                    let trimmed = address.trimmingCharacters(in: .whitespaces)
-                    guard !trimmed.isEmpty else { return }
-                    let parts = trimmed.split(separator: ":")
-                    let port = parts.count == 2 ? UInt16(parts[1]) ?? RemoteHost.defaultPort : RemoteHost.defaultPort
-                    pairTarget = PairingTarget(name: String(parts[0]), address: String(parts[0]), port: port)
+            .sheet(isPresented: $askAddress) {
+                AddressSheet { target in
+                    askAddress = false
+                    // Let this sheet go before the pairing one comes up.
+                    Task {
+                        try? await Task.sleep(for: .milliseconds(450))
+                        pairTarget = target
+                    }
                 }
-            } message: {
-                Text("Its address on your network, shown by grav pair.")
+                .presentationDetents([.height(300)])
             }
-            .alert("That isn't a pairing link", isPresented: Binding(get: { linkProblem != nil }, set: { if !$0 { linkProblem = nil } })) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(linkProblem ?? "")
-            }
+        }
+    }
+
+    private func confirmForget(_ host: RemoteHost) {
+        dialogs.confirm("Forget \(host.name)?", message: "This phone stops showing it. Pair again with a new code from grav pair.", confirm: "Forget") {
+            forget(host)
         }
     }
 
@@ -108,7 +131,7 @@ struct HostsView: View {
 
     private func pasteLink() {
         guard let text = UIPasteboard.general.string, let target = PairingTarget(link: text) else {
-            linkProblem = "Copy the line starting graviton://pair that grav pair prints, then try again."
+            dialogs.alert("That isn't a pairing link", message: "Copy the line starting graviton://pair that grav pair prints, then try again.", symbol: "link")
             return
         }
         pairTarget = target
@@ -125,18 +148,64 @@ private struct HostRow: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 12) {
-                Image(systemName: symbol).foregroundStyle(G.accent).frame(width: 24)
+                HostIcon(symbol: symbol, selected: selected)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(title).foregroundStyle(G.text)
-                    Text(detail).font(G.mono(11)).foregroundStyle(G.muted)
+                    Text(title).font(.system(size: 15, weight: .medium)).foregroundStyle(G.text)
+                    Text(detail).font(G.mono(11)).foregroundStyle(G.muted).lineLimit(1)
                 }
                 Spacer()
-                if selected {
-                    Image(systemName: "checkmark").foregroundStyle(G.accent).fontWeight(.semibold)
+                ZStack {
+                    Circle().strokeBorder(selected ? G.accent : G.faint.opacity(0.6), lineWidth: 1.5)
+                    if selected { Circle().fill(G.accent).padding(5) }
                 }
+                .frame(width: 22, height: 22)
+            }
+            .padding(.horizontal, 14)
+            .frame(minHeight: 62)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(PressRowStyle())
+        .animation(.snappy(duration: 0.2), value: selected)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+private struct HostIcon: View {
+    var symbol: String
+    var selected: Bool
+
+    var body: some View {
+        Image(systemName: symbol)
+            .font(.system(size: 15, weight: .medium))
+            .foregroundStyle(selected ? G.accent : G.muted)
+            .frame(width: 36, height: 36)
+            .background((selected ? G.accent : G.muted).opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+/// Type a Mac's address, in place of a system alert with a field.
+private struct AddressSheet: View {
+    var next: (PairingTarget) -> Void
+    @State private var address = ""
+    @FocusState private var focused: Bool
+
+    private var target: PairingTarget? {
+        let trimmed = address.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        let parts = trimmed.split(separator: ":")
+        let port = parts.count == 2 ? UInt16(parts[1]) ?? RemoteHost.defaultPort : RemoteHost.defaultPort
+        return PairingTarget(name: String(parts[0]), address: String(parts[0]), port: port)
+    }
+
+    var body: some View {
+        MobileSheet("Add a Mac", actionTitle: "Next", actionEnabled: target != nil, action: { if let target { next(target) } }) {
+            GFormRow("Address", hint: "Its address on your network, shown by grav pair.") {
+                MobileField(placeholder: "192.168.1.20", text: $address, keyboard: .numbersAndPunctuation)
+                    .focused($focused)
+                    .onSubmit { if let target { next(target) } }
             }
         }
-        .accessibilityAddTraits(selected ? .isSelected : [])
+        .onAppear { focused = true }
     }
 }
 
@@ -166,62 +235,61 @@ struct PairSheet: View {
     private var finished: RemoteHost? { if case let .done(host) = phase { host } else { nil } }
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    LabeledContent("Mac", value: target.name)
-                    LabeledContent("Where", value: target.serviceName != nil ? "Found on this network" : "\(target.address ?? "?"):\(target.port)")
-                }
-                if finished == nil {
-                    Section {
-                        TextField("XXXX-XXXX", text: $code)
-                            .font(G.mono(22, weight: .medium))
-                            .textInputAutocapitalization(.characters)
-                            .autocorrectionDisabled()
-                            .focused($focused)
-                            .disabled(busy)
-                            .onSubmit(pair)
-                    } header: {
-                        Text("Code")
-                    } footer: {
-                        Text(target.fingerprint == nil
-                             ? "Run grav pair on the Mac. The code works once, for five minutes."
-                             : "From the Mac's pairing link, which also pins its certificate (\(RemoteHost.short(target.fingerprint!))).")
-                    }
-                }
-                Section {
-                    switch phase {
-                    case .idle:
-                        EmptyView()
-                    case .pairing:
-                        HStack(spacing: 10) { ProgressView(); Text("Pairing…") }
-                    case let .failed(message):
-                        Label(message, systemImage: "xmark.octagon.fill").foregroundStyle(G.danger)
-                    case let .done(host):
-                        VStack(alignment: .leading, spacing: 8) {
-                            Label("Paired with \(host.name)", systemImage: "checkmark.circle.fill").foregroundStyle(G.running)
-                            Text("Check this matches the fingerprint grav pair showed:").font(.footnote).foregroundStyle(G.muted)
-                            Text(host.shortFingerprint).font(G.mono(17, weight: .semibold))
-                        }
-                    }
+        MobileSheet("Pair a Mac", cancelTitle: finished == nil ? "Cancel" : "Done",
+                    actionTitle: finished == nil ? "Pair" : nil, actionEnabled: !busy && normalized.count == 8, action: pair) {
+            HStack(spacing: 12) {
+                Image(systemName: "desktopcomputer")
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundStyle(G.accent)
+                    .frame(width: 44, height: 44)
+                    .background(G.accent.opacity(0.13), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(target.name).font(.system(size: 16, weight: .semibold)).foregroundStyle(G.text)
+                    Text(target.serviceName != nil ? "Found on this network" : "\(target.address ?? "?"):\(target.port)")
+                        .font(G.mono(12)).foregroundStyle(G.muted)
                 }
             }
-            .scrollContentBackground(.hidden)
-            .background(G.background)
-            .navigationTitle("Pair a Mac")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                if finished != nil {
-                    ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
-                } else {
-                    ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() }.disabled(busy) }
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("Pair", action: pair).disabled(busy || normalized.count != 8)
-                    }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .mobileCard()
+
+            if finished == nil {
+                GFormRow("Code", hint: target.fingerprint == nil
+                         ? "Run grav pair on the Mac. The code works once, for five minutes."
+                         : "From the Mac's pairing link, which also pins its certificate (\(RemoteHost.short(target.fingerprint!))).") {
+                    GTextField("XXXX-XXXX", text: $code)
+                        .textInputAutocapitalization(.characters)
+                        .autocorrectionDisabled()
+                        .focused($focused)
+                        .disabled(busy)
+                        .onSubmit(pair)
+                        .gravitonField(mono: true, height: 58, size: 24)
                 }
             }
-            .onAppear { focused = target.code == nil }
+
+            switch phase {
+            case .idle:
+                EmptyView()
+            case .pairing:
+                GStatusLine(.working, "Pairing…")
+            case let .failed(message):
+                GStatusLine(.failure, message)
+            case let .done(host):
+                VStack(alignment: .leading, spacing: 10) {
+                    GStatusLine(.success, "Paired with \(host.name)")
+                    Text("Check this matches the fingerprint grav pair showed:").font(.system(size: 13)).foregroundStyle(G.muted)
+                    Text(host.shortFingerprint)
+                        .font(G.mono(19, weight: .semibold))
+                        .kerning(1)
+                        .foregroundStyle(G.text)
+                        .frame(maxWidth: .infinity, minHeight: 56)
+                        .background(G.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(G.accent.opacity(0.4), style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
+                }
+            }
         }
+        .interactiveDismissDisabled(busy)
+        .onAppear { focused = target.code == nil }
     }
 
     private func pair() {

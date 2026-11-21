@@ -18,27 +18,23 @@ struct MobileLogsView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    HStack(spacing: 8) {
-                        LevelChip(title: "All", tint: G.text, selected: level == nil) { level = nil }
-                        LevelChip(title: "Info", tint: G.textSecondary, selected: level == .info) { level = .info }
-                        LevelChip(title: "Warn", tint: G.warning, selected: level == .warn) { level = .warn }
-                        LevelChip(title: "Error", tint: G.danger, selected: level == .error) { level = .error }
-                    }
+                    MobileSearchField(prompt: "Filter lines", text: $query)
+                    GSegmented(selection: $level, options: [(nil, "All"), (.info, "Info"), (.warn, "Warn"), (.error, "Error")], stretch: true)
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(lines) { LogRow($0, compact: true) }
                     }
                     .padding(.vertical, 10)
                     .gravitonCard(G.console, radius: 16)
-                    // Room for the floating Follow button, and the scroll target when following.
-                    Color.clear.frame(height: 64).id("end")
+                    // The scroll target when following.
+                    Color.clear.frame(height: 1).id("end")
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 8)
             }
-            .background(G.background)
-            .navigationTitle("Logs")
-            .searchable(text: $query, prompt: "Filter")
-            .overlay(alignment: .bottom) {
+            .safeAreaInset(edge: .top, spacing: 0) {
+                MobileHeader("Logs", subtitle: store.container(containerID)?.name).background(G.background)
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
                 Button {
                     follow.toggle()
                     if follow { proxy.scrollTo("end", anchor: .bottom) }
@@ -54,8 +50,10 @@ struct MobileLogsView: View {
                     .background(follow ? G.accent : G.control, in: Capsule())
                     .shadow(color: .black.opacity(0.5), radius: 15, y: 10)
                 }
-                .padding(.bottom, 16)
+                .padding(.vertical, 12)
+                .frame(maxWidth: .infinity)
             }
+            .mobileScreen()
             .onChange(of: lines.last?.id) {
                 if follow { withAnimation { proxy.scrollTo("end", anchor: .bottom) } }
             }
@@ -66,26 +64,5 @@ struct MobileLogsView: View {
                 try? await Task.sleep(for: .seconds(1))
             }
         }
-    }
-}
-
-struct LevelChip: View {
-    var title: String
-    var tint: Color
-    var selected: Bool
-    var action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 13, weight: selected ? .semibold : .regular))
-                .foregroundStyle(selected ? G.background : tint)
-                .padding(.horizontal, 14)
-                .frame(height: 32)
-                .background(selected ? G.text : .clear, in: Capsule())
-                .overlay(Capsule().strokeBorder(selected ? .clear : tint.opacity(0.3)))
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }

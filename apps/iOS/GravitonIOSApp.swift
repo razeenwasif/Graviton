@@ -11,23 +11,29 @@ struct GravitonIOSApp: App {
     @State private var browser = HostBrowser()
     @State private var shells = ShellSessions()
     @State private var pairTarget: PairingTarget?
-    @State private var tab = 0
+    @State private var dialogs = Dialogs()
+    @State private var tab: AppTab = .containers
 
     var body: some Scene {
         WindowGroup {
-            TabView(selection: $tab) {
-                Tab("Containers", systemImage: "shippingbox", value: 0) { ContainerListView(openHosts: { tab = 3 }) }
-                Tab("Images", systemImage: "square.stack.3d.up", value: 1) { ImageListView() }
-                Tab("Activity", systemImage: "waveform.path.ecg", value: 2) { ActivityView() }
-                Tab("Hosts", systemImage: "desktopcomputer", value: 3) {
-                    HostsView(pairTarget: $pairTarget)
+            // Every tab stays alive, so each keeps its place when you switch back.
+            ZStack {
+                ForEach(AppTab.allCases) { t in
+                    screen(for: t)
+                        .opacity(tab == t ? 1 : 0)
+                        .allowsHitTesting(tab == t)
+                        .accessibilityHidden(tab != t)
                 }
             }
+            .safeAreaInset(edge: .bottom, spacing: 0) { GravitonTabBar(selection: $tab) }
+            .background(G.background.ignoresSafeArea())
+            .gravitonDialogs(dialogs)
+            .environment(dialogs)
             .sheet(item: $pairTarget) { PairSheet(target: $0) }
             .onOpenURL { url in
                 // The QR code from `grav pair` holds a graviton://pair link.
                 if let target = PairingTarget(link: url.absoluteString) {
-                    tab = 3
+                    tab = .hosts
                     pairTarget = target
                 }
             }
@@ -44,7 +50,7 @@ struct GravitonIOSApp: App {
             }
             .onChange(of: push.openActivity) { _, open in
                 if open {
-                    tab = 2
+                    tab = .activity
                     push.openActivity = false
                 }
             }
@@ -57,19 +63,13 @@ struct GravitonIOSApp: App {
             .task { await store.run() }
         }
     }
-}
 
-struct Placeholder: View {
-    var title: String
-    var symbol: String
-    var detail: String
-
-    var body: some View {
-        NavigationStack {
-            ContentUnavailableView(title, systemImage: symbol, description: Text(detail))
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(G.background)
-                .navigationTitle(title)
+    @ViewBuilder private func screen(for tab: AppTab) -> some View {
+        switch tab {
+        case .containers: ContainerListView(openHosts: { self.tab = .hosts })
+        case .images: ImageListView()
+        case .activity: ActivityView()
+        case .hosts: HostsView(pairTarget: $pairTarget)
         }
     }
 }
@@ -78,43 +78,107 @@ struct ImageListView: View {
     @Environment(EngineStore.self) private var store
     @State private var pulling = false
     @State private var runImage: ImageInfo?
+    @State private var search = ""
+
+    private var shown: [ImageInfo] {
+        let q = search.trimmingCharacters(in: .whitespaces).lowercased()
+        return q.isEmpty ? store.images : store.images.filter { "\($0.repository):\($0.tag)".lowercased().contains(q) }
+    }
+
+    private var totalSize: UInt64 { store.images.map(\.sizeBytes).reduce(0, +) }
 
     var body: some View {
         NavigationStack {
-            List(store.images) { image in
-                HStack(spacing: 12) {
-                    Text(image.monogram)
-                        .font(G.mono(13, weight: .medium))
-                        .foregroundStyle(G.accent)
-                        .frame(width: 36, height: 36)
-                        .background(G.control, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(image.repository).font(.system(size: 15, weight: .medium)).lineLimit(1)
-                        Text(image.tag).font(G.mono(11.5)).foregroundStyle(G.muted)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    if !store.images.isEmpty {
+                        MobileSearchField(prompt: "Search images", text: $search)
                     }
-                    Spacer()
-                    Text(Format.bytes(image.sizeBytes)).font(G.mono(12)).foregroundStyle(G.muted)
+                    if store.images.isEmpty {
+                        GEmptyState("No images yet", symbol: "square.stack.3d.up",
+                                    detail: "Pull one onto \(store.liveName ?? "the Mac") from Docker Hub, GHCR or any OCI registry.",
+                                    actionTitle: store.canManage ? "Pull an image" : nil) { pulling = true }
+                            .frame(minHeight: 420)
+                    } else if shown.isEmpty {
+                        GEmptyState("Nothing matches", symbol: "magnifyingglass", detail: "No image's name contains “\(search)”.")
+                            .frame(minHeight: 300)
+                    } else {
+                        VStack(spacing: 0) {
+                            ForEach(Array(shown.enumerated()), id: \.element.id) { i, image in
+                                if i > 0 { RowDivider(inset: 64) }
+                                ImageRow(image: image, canRun: store.canManage) { runImage = image }
+                            }
+                        }
+                        .mobileCard()
+                    }
                 }
-                .listRowBackground(G.card)
-                .contentShape(Rectangle())
-                .onTapGesture { if store.canManage { runImage = image } }
-                .contextMenu {
-                    Button("Run…", systemImage: "play.fill") { runImage = image }.disabled(!store.canManage)
-                }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 24)
             }
-            .scrollContentBackground(.hidden)
-            .background(G.background)
-            .navigationTitle("Images")
-            .refreshable { await store.refresh() }
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    Button { pulling = true } label: { Image(systemName: "arrow.down.circle") }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                MobileHeader("Images", subtitle: "\(store.images.count) on \(store.liveName ?? "the Mac") · \(Format.bytes(totalSize))", large: true) {
+                    Button { pulling = true } label: { Label("Pull image", systemImage: "arrow.down") }
+                        .buttonStyle(CircleIconStyle(prominent: true))
                         .disabled(!store.canManage)
-                        .accessibilityLabel("Pull image")
                 }
+                .background(G.background)
             }
+            .refreshable { await store.refresh() }
+            .mobileScreen(pushed: false)
             .sheet(isPresented: $pulling) { MobilePullSheet() }
             .sheet(item: $runImage) { image in MobileRunSheet(image: "\(image.repository):\(image.tag)") }
         }
+    }
+}
+
+private struct ImageRow: View {
+    var image: ImageInfo
+    var canRun: Bool
+    var run: () -> Void
+
+    var body: some View {
+        Button(action: run) {
+            HStack(spacing: 12) {
+                Text(image.monogram)
+                    .font(G.mono(13, weight: .medium))
+                    .foregroundStyle(G.accent)
+                    .frame(width: 38, height: 38)
+                    .background(G.control, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(image.repository).font(.system(size: 15, weight: .medium)).foregroundStyle(G.text).lineLimit(1)
+                    HStack(spacing: 6) {
+                        Text(image.tag).font(G.mono(11.5)).foregroundStyle(G.muted)
+                        Text("·").foregroundStyle(G.faint)
+                        Text(Format.bytes(image.sizeBytes)).font(.system(size: 12)).foregroundStyle(G.faint)
+                    }
+                }
+                Spacer()
+                if image.usedBy > 0 {
+                    GBadge("\(image.usedBy) in use", color: G.running)
+                }
+                Image(systemName: "play.fill")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(canRun ? G.accent : G.faint)
+                    .frame(width: 30, height: 30)
+                    .background(G.accent.opacity(canRun ? 0.13 : 0.05), in: Circle())
+            }
+            .padding(.horizontal, 14)
+            .frame(minHeight: 62)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(PressRowStyle())
+        .disabled(!canRun)
+        .contextMenu {
+            Button("Run…", systemImage: "play.fill", action: run).disabled(!canRun)
+            Button("Copy Reference", systemImage: "doc.on.doc") { UIPasteboard.general.string = image.reference }
+        }
+    }
+}
+
+/// Rows that dim a little while pressed.
+struct PressRowStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(configuration.isPressed ? Color.white.opacity(0.04) : .clear)
     }
 }

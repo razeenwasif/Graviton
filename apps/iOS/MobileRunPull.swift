@@ -10,7 +10,7 @@ struct MobileRunSheet: View {
     @State private var command = ""
     @State private var ports = ""
     @State private var env = ""
-    @State private var memory = 1024.0
+    @State private var memory: Double = 1024
     @State private var phase: Phase = .idle
     var onRun: (Container) -> Void = { _ in }
 
@@ -27,64 +27,44 @@ struct MobileRunSheet: View {
     private var busy: Bool { if case .running = phase { true } else { false } }
     private var trimmedImage: String { image.trimmingCharacters(in: .whitespaces) }
 
+    private static let memoryChoices: [Double] = [512, 1024, 2048, 4096, 8192]
+
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    TextField("e.g. postgres:17-alpine", text: $image)
-                        .font(G.mono(15))
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                } header: {
-                    Text("Image")
-                } footer: {
-                    Text("Pulled first if \(store.liveName ?? "the Mac") doesn't have it.")
-                }
-                Section("Options") {
-                    field("Name", "Optional", $name)
-                    field("Command", "Optional: replaces the image's", $command)
-                    field("Ports", "8080:80, 5432", $ports)
-                    field("Environment", "KEY=value, KEY2=value", $env)
-                    VStack(alignment: .leading) {
-                        HStack {
-                            Text("Memory")
-                            Spacer()
-                            Text(Format.bytes(UInt64(memory) << 20)).foregroundStyle(G.muted).monospacedDigit()
+        MobileSheet("Run container", actionTitle: "Run", actionEnabled: !busy && !trimmedImage.isEmpty && store.canManage, action: run) {
+            GFormRow("Image", hint: "Pulled first if \(store.liveName ?? "the Mac") doesn't have it.") {
+                MobileField(placeholder: "e.g. postgres:17-alpine", text: $image)
+            }
+            if !store.images.isEmpty && trimmedImage.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(store.images.prefix(8)) { img in
+                            Button("\(img.repository):\(img.tag)") { image = "\(img.repository):\(img.tag)" }
+                                .buttonStyle(.g(.secondary, size: .small))
+                                .font(G.mono(12))
                         }
-                        Slider(value: $memory, in: 256...8192, step: 256)
                     }
                 }
-                switch phase {
-                case .idle:
-                    EmptyView()
-                case .running:
-                    Section { HStack(spacing: 10) { ProgressView(); Text("Starting… (a pull can take a while)") } }
-                case let .failed(message):
-                    Section { Label(message, systemImage: "xmark.octagon.fill").foregroundStyle(G.danger) }
-                }
+                .scrollClipDisabled()
             }
-            .scrollContentBackground(.hidden)
-            .background(G.background)
-            .navigationTitle("Run container")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Run", action: run).disabled(busy || trimmedImage.isEmpty || !store.canManage)
-                }
+            GFormRow("Name") { MobileField(placeholder: "Optional", text: $name, mono: false) }
+            GFormRow("Command") { MobileField(placeholder: "Optional: replaces the image's", text: $command) }
+            GFormRow("Ports", hint: "On 127.0.0.1 on the Mac") { MobileField(placeholder: "8080:80, 5432", text: $ports, keyboard: .numbersAndPunctuation) }
+            GFormRow("Environment") { MobileField(placeholder: "KEY=value, KEY2=value", text: $env) }
+            GFormRow("Memory") {
+                GSegmented(selection: $memory, options: Self.memoryChoices.map { ($0, $0 < 1024 ? "\(Int($0)) MB" : "\(Int($0) / 1024) GB") }, stretch: true)
             }
-            .disabled(busy)
-        }
-    }
 
-    private func field(_ label: String, _ placeholder: String, _ text: Binding<String>) -> some View {
-        LabeledContent(label) {
-            TextField(placeholder, text: text)
-                .multilineTextAlignment(.trailing)
-                .font(G.mono(14))
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
+            switch phase {
+            case .idle:
+                EmptyView()
+            case .running:
+                GStatusLine(.working, "Starting… (a pull can take a while)")
+            case let .failed(message):
+                GStatusLine(.failure, message)
+            }
         }
+        .disabled(busy)
+        .interactiveDismissDisabled(busy)
     }
 
     private func run() {
@@ -122,53 +102,30 @@ struct MobilePullSheet: View {
     private var busy: Bool { if case .pulling = phase { true } else { false } }
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    TextField("e.g. redis:7-alpine", text: $reference)
-                        .font(G.mono(15))
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .focused($focused)
-                        .onSubmit(pull)
-                } header: {
-                    Text("Reference")
-                } footer: {
-                    Text("From Docker Hub, GHCR or any OCI registry, onto \(store.liveName ?? "the Mac").")
-                }
-                switch phase {
-                case .idle:
-                    EmptyView()
-                case let .pulling(since):
-                    Section {
-                        HStack(spacing: 10) {
-                            ProgressView()
-                            TimelineView(.periodic(from: since, by: 1)) { ctx in
-                                Text("Pulling… \(Int(ctx.date.timeIntervalSince(since))) s")
-                            }
-                        }
-                    }
-                case let .done(image):
-                    Section {
-                        Label("Pulled \(image.repository):\(image.tag) · \(Format.bytes(image.sizeBytes))", systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(G.running)
-                    }
-                case let .failed(message):
-                    Section { Label(message, systemImage: "xmark.octagon.fill").foregroundStyle(G.danger) }
-                }
+        MobileSheet("Pull image", subtitle: "From Docker Hub, GHCR or any OCI registry, onto \(store.liveName ?? "the Mac").",
+                    cancelTitle: isDone ? "Done" : "Cancel", actionTitle: "Pull",
+                    actionEnabled: !busy && !reference.trimmingCharacters(in: .whitespaces).isEmpty && store.canManage, action: pull) {
+            GFormRow("Reference") {
+                MobileField(placeholder: "e.g. redis:7-alpine", text: $reference)
+                    .focused($focused)
+                    .submitLabel(.go)
+                    .onSubmit(pull)
             }
-            .scrollContentBackground(.hidden)
-            .background(G.background)
-            .navigationTitle("Pull image")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button(isDone ? "Done" : "Cancel") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Pull", action: pull).disabled(busy || reference.trimmingCharacters(in: .whitespaces).isEmpty || !store.canManage)
+            switch phase {
+            case .idle:
+                EmptyView()
+            case let .pulling(since):
+                TimelineView(.periodic(from: since, by: 1)) { ctx in
+                    GStatusLine(.working, "Pulling… \(Int(ctx.date.timeIntervalSince(since))) s. You can close this; the pull carries on.")
                 }
+            case let .done(image):
+                GStatusLine(.success, "Pulled \(image.repository):\(image.tag) · \(Format.bytes(image.sizeBytes))")
+            case let .failed(message):
+                GStatusLine(.failure, message)
             }
-            .onAppear { focused = true }
         }
+        .presentationDetents([.medium, .large])
+        .onAppear { focused = true }
     }
 
     private var isDone: Bool { if case .done = phase { true } else { false } }

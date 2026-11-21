@@ -24,39 +24,50 @@ struct ActivityView: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                Picker("Show", selection: $problemsOnly) {
-                    Text("All").tag(false)
-                    Text("Problems").tag(true)
-                }
-                .pickerStyle(.segmented)
-                .listRowBackground(Color.clear)
-                .listRowInsets(EdgeInsets())
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    GSegmented(selection: $problemsOnly, options: [(false, "All"), (true, "Problems")], stretch: true)
 
-                ForEach(days, id: \.0) { day, events in
-                    Section(dayTitle(day)) {
-                        ForEach(events) { event in
-                            if let id = event.containerId, store.container(id) != nil {
-                                NavigationLink(value: id) { EventRow(event: event) }
-                            } else {
-                                EventRow(event: event)
+                    if shown.isEmpty {
+                        GEmptyState(problemsOnly ? "No problems" : "Nothing yet", symbol: problemsOnly ? "checkmark.shield" : "waveform.path.ecg",
+                                    detail: problemsOnly ? "Failed containers and builds show up here." : "Containers starting and stopping, pulls and builds show up here.")
+                            .frame(minHeight: 420)
+                    }
+
+                    ForEach(days, id: \.0) { day, events in
+                        VStack(alignment: .leading, spacing: 8) {
+                            GCaption(dayTitle(day)).padding(.horizontal, 4)
+                            VStack(spacing: 0) {
+                                ForEach(Array(events.enumerated()), id: \.element.id) { i, event in
+                                    if i > 0 { RowDivider(inset: 52) }
+                                    if let id = event.containerId, store.container(id) != nil {
+                                        NavigationLink(value: id) {
+                                            HStack {
+                                                EventRow(event: event)
+                                                Image(systemName: "chevron.right").font(.system(size: 11, weight: .semibold)).foregroundStyle(Color(hex: 0x5F6672))
+                                            }
+                                            .padding(.horizontal, 14)
+                                            .contentShape(Rectangle())
+                                        }
+                                        .buttonStyle(PressRowStyle())
+                                    } else {
+                                        EventRow(event: event).padding(.horizontal, 14)
+                                    }
+                                }
                             }
+                            .mobileCard()
                         }
                     }
-                    .listRowBackground(G.card)
                 }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 24)
             }
-            .scrollContentBackground(.hidden)
-            .background(G.background)
-            .overlay {
-                if shown.isEmpty {
-                    ContentUnavailableView(problemsOnly ? "No problems" : "Nothing yet", systemImage: "waveform.path.ecg",
-                                           description: Text(problemsOnly ? "Failed containers and builds show up here." : "Containers starting and stopping, pulls and builds show up here."))
-                }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                MobileHeader("Activity", subtitle: store.liveName.map { "On \($0)" }, large: true).background(G.background)
             }
-            .navigationTitle("Activity")
-            .navigationDestination(for: String.self) { ContainerDetailView(containerID: $0) }
             .refreshable { await store.refresh() }
+            .mobileScreen(pushed: false)
+            .navigationDestination(for: String.self) { ContainerDetailView(containerID: $0) }
         }
     }
 }
@@ -78,7 +89,11 @@ struct EventRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: symbol.0).foregroundStyle(symbol.1).frame(width: 22).padding(.top, 2)
+            Image(systemName: symbol.0)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(symbol.1)
+                .frame(width: 28, height: 28)
+                .background(symbol.1.opacity(0.13), in: Circle())
             VStack(alignment: .leading, spacing: 3) {
                 Text(event.message).font(.system(size: 14.5)).foregroundStyle(G.text).lineLimit(3)
                 HStack(spacing: 6) {
@@ -92,7 +107,8 @@ struct EventRow: View {
                 .foregroundStyle(G.faint)
             }
         }
-        .padding(.vertical, 3)
+        .padding(.vertical, 11)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
     }
 }

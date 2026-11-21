@@ -14,59 +14,74 @@ struct ContainerListView: View {
     var body: some View {
         NavigationStack(path: $path) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    HostChip(openHosts: openHosts)
+                VStack(alignment: .leading, spacing: 16) {
                     if store.connection == .unreachable {
-                        Label("Can't reach \(store.liveName ?? "the Mac"). Showing what it last sent. \(store.liveError ?? "")", systemImage: "wifi.exclamationmark")
-                            .font(.system(size: 13))
-                            .foregroundStyle(G.danger)
+                        GStatusLine(.failure, "Can't reach \(store.liveName ?? "the Mac"). Showing what it last sent. \(store.liveError ?? "")")
                     }
 
                     HStack(spacing: 10) {
-                        SummaryTile(title: "Running") {
+                        SummaryTile(title: "Running", symbol: "play.circle") {
                             MetricValue("\(store.runningCount)", unit: " / \(store.containers.count)", size: 22)
                         }
-                        SummaryTile(title: "CPU") {
+                        SummaryTile(title: "CPU", symbol: "cpu") {
                             MetricValue(String(format: "%.0f", store.totalCPU), unit: "%", size: 22)
                         }
-                        SummaryTile(title: "Memory") {
+                        SummaryTile(title: "Memory", symbol: "memorychip") {
                             let parts = Format.bytes(store.totalMemory).split(separator: " ")
                             MetricValue(String(parts.first ?? ""), unit: " " + String(parts.last ?? ""), size: 22)
                         }
                     }
 
-                    Picker("Filter", selection: $filter) {
-                        ForEach(ContainerFilter.allCases) { Text($0.rawValue).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
+                    MobileSearchField(prompt: "Search containers", text: $search)
 
-                    VStack(spacing: 0) {
-                        ForEach(Array(rows.enumerated()), id: \.element.id) { index, c in
-                            if index > 0 { Divider().overlay(G.border) }
-                            NavigationLink(value: c.id) { ContainerRow(container: c) }
-                                .buttonStyle(.plain)
-                                .contextMenu { LifecycleMenu(container: c) }
+                    GSegmented(selection: $filter, options: ContainerFilter.allCases.map { f in
+                        let n = switch f {
+                        case .all: store.containers.count
+                        case .running: store.runningCount
+                        case .stopped: store.containers.count - store.runningCount
                         }
-                        if rows.isEmpty {
-                            Text("No containers").foregroundStyle(G.muted).frame(maxWidth: .infinity, minHeight: 60)
+                        return (f, "\(f.rawValue) \(n)")
+                    }, stretch: true)
+
+                    if store.containers.isEmpty {
+                        GEmptyState("No containers yet", symbol: "shippingbox",
+                                    detail: "Run one on \(store.liveName ?? "the Mac"): it boots in its own small VM in a second or two.",
+                                    actionTitle: store.canManage ? "Run a container" : nil) { running = true }
+                            .frame(minHeight: 320)
+                    } else if rows.isEmpty {
+                        GEmptyState("Nothing matches", symbol: "magnifyingglass",
+                                    detail: search.isEmpty ? "No \(filter.rawValue.lowercased()) containers." : "No container's name or image contains “\(search)”.")
+                            .frame(minHeight: 260)
+                    } else {
+                        VStack(spacing: 0) {
+                            ForEach(Array(rows.enumerated()), id: \.element.id) { index, c in
+                                if index > 0 { RowDivider(inset: 36) }
+                                NavigationLink(value: c.id) { ContainerRow(container: c) }
+                                    .buttonStyle(PressRowStyle())
+                                    .contextMenu { LifecycleMenu(container: c) }
+                            }
                         }
+                        .mobileCard()
                     }
-                    .background(G.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 24)
             }
-            .background(G.background)
-            .navigationTitle("Containers")
-            .searchable(text: $search, prompt: "Search containers")
-            .refreshable { await store.refresh() }
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    Button { running = true } label: { Image(systemName: "plus") }
-                        .disabled(!store.canManage)
-                        .accessibilityLabel("Run container")
+            .safeAreaInset(edge: .top, spacing: 0) {
+                VStack(alignment: .leading, spacing: 0) {
+                    MobileHeader("Containers", large: true) {
+                        Button { running = true } label: { Label("Run container", systemImage: "plus") }
+                            .buttonStyle(CircleIconStyle(prominent: true))
+                            .disabled(!store.canManage)
+                    }
+                    HostChip(openHosts: openHosts)
+                        .padding(.horizontal, 20)
+                        .padding(.bottom, 12)
                 }
+                .background(G.background)
             }
+            .refreshable { await store.refresh() }
+            .mobileScreen(pushed: false)
             .navigationDestination(for: String.self) { ContainerDetailView(containerID: $0) }
             .sheet(isPresented: $running) {
                 MobileRunSheet { c in path = [c.id] }
@@ -123,25 +138,29 @@ struct HostChip: View {
             }
             .foregroundStyle(G.text)
             .padding(.horizontal, 12)
-            .frame(height: 34)
-            .background(Color(hex: 0x15161A), in: Capsule())
-            .overlay(Capsule().strokeBorder(Color.white.opacity(0.08)))
+            .frame(height: 32)
+            .background(G.control, in: Capsule())
+            .overlay(Capsule().strokeBorder(G.borderStrong))
         }
     }
 }
 
 struct SummaryTile<Content: View>: View {
     var title: String
+    var symbol: String
     @ViewBuilder var content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.system(size: 12)).foregroundStyle(G.muted)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 5) {
+                Image(systemName: symbol).font(.system(size: 10.5, weight: .semibold)).foregroundStyle(G.accent)
+                Text(title.uppercased()).font(.system(size: 10.5, weight: .semibold)).kerning(0.5).foregroundStyle(G.faint)
+            }
             content
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(G.card, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .mobileCard(radius: 14)
     }
 }
 
@@ -156,12 +175,17 @@ struct ContainerRow: View {
                 Text(container.image).font(G.mono(11.5)).foregroundStyle(G.muted).lineLimit(1)
             }
             Spacer()
-            Text(container.isRunning ? String(format: "%.0f%%", container.cpuPercent ?? 0) : "Exited")
-                .font(G.mono(12)).foregroundStyle(G.muted).monospacedDigit()
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(container.isRunning ? String(format: "%.0f%%", container.cpuPercent ?? 0) : "Exited")
+                    .font(G.mono(12.5, weight: .medium)).foregroundStyle(container.isRunning ? G.textSecondary : G.faint).monospacedDigit()
+                if container.isRunning, let mem = container.memoryBytes {
+                    Text(Format.bytes(mem)).font(G.mono(11)).foregroundStyle(G.faint)
+                }
+            }
             Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Color(hex: 0x5F6672))
         }
         .padding(.horizontal, 14)
-        .frame(minHeight: 60)
+        .frame(minHeight: 64)
         .contentShape(Rectangle())
     }
 }

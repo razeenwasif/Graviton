@@ -18,11 +18,12 @@ struct MobileStatsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 if let problem {
-                    Label(problem, systemImage: "exclamationmark.triangle").font(.system(size: 13)).foregroundStyle(G.danger)
+                    GStatusLine(.failure, problem)
                 }
                 if !container.isRunning && samples.isEmpty {
-                    ContentUnavailableView("Not running", systemImage: "chart.xyaxis.line", description: Text("Start \(container.name) to see its use."))
-                        .padding(.top, 60)
+                    GEmptyState("Not running", symbol: "chart.xyaxis.line", detail: "Start \(container.name) to see its use.",
+                                actionTitle: "Start \(container.name)") { Task { await store.start(container) } }
+                        .frame(minHeight: 420)
                 } else {
                     tiles
                     card("CPU", detail: "100% is one busy vCPU, of \(stats?.cpus ?? 0)") {
@@ -37,11 +38,11 @@ struct MobileStatsView: View {
                 }
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 12)
+            .padding(.vertical, 4)
+            .padding(.bottom, 20)
         }
-        .background(G.background)
-        .navigationTitle("Stats")
-        .navigationBarTitleDisplayMode(.inline)
+        .safeAreaInset(edge: .top, spacing: 0) { MobileHeader("Stats", subtitle: container.name).background(G.background) }
+        .mobileScreen()
         .task(id: container.id) {
             while !Task.isCancelled {
                 do {
@@ -72,24 +73,24 @@ struct MobileStatsView: View {
 
     private func tile(_ title: String, _ value: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(title).font(.system(size: 12)).foregroundStyle(G.muted)
-            Text(value).font(.system(size: 19, weight: .semibold)).monospacedDigit()
+            Text(title.uppercased()).font(.system(size: 10.5, weight: .semibold)).kerning(0.5).foregroundStyle(G.faint)
+            Text(value).font(.system(size: 19, weight: .semibold)).foregroundStyle(G.text).monospacedDigit()
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(G.card, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .mobileCard(radius: 14)
     }
 
     private func card<Content: View>(_ title: String, detail: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
-                Text(title).font(.system(size: 14, weight: .semibold))
+                Text(title).font(.system(size: 14, weight: .semibold)).foregroundStyle(G.text)
                 Text(detail).font(.system(size: 11.5)).foregroundStyle(G.faint)
             }
             content().frame(height: 140)
         }
         .padding(14)
-        .background(G.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .mobileCard()
     }
 
     /// One series with a touch readout; `floor` keeps the y-axis from hugging small values.
@@ -162,7 +163,12 @@ struct MobileStatsView: View {
 
     private var processes: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("Processes").font(.system(size: 14, weight: .semibold)).padding(.bottom, 8)
+            HStack {
+                Text("Processes").font(.system(size: 14, weight: .semibold)).foregroundStyle(G.text)
+                Spacer()
+                if let n = stats?.processes.count, n > 0 { GBadge("\(n)") }
+            }
+            .padding(.bottom, 8)
             ForEach((stats?.processes ?? []).sorted { $0.rssBytes > $1.rssBytes }) { p in
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -173,14 +179,14 @@ struct MobileStatsView: View {
                     Text(Format.bytes(p.rssBytes)).font(.system(size: 12)).foregroundStyle(G.muted).monospacedDigit()
                 }
                 .padding(.vertical, 8)
-                Divider().overlay(G.border)
+                RowDivider(inset: 0)
             }
             if stats?.processes.isEmpty ?? true {
                 Text(container.isRunning ? "Waiting for the first sample…" : "Not running").font(.system(size: 12)).foregroundStyle(G.faint)
             }
         }
         .padding(14)
-        .background(G.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .mobileCard()
     }
 }
 
@@ -195,40 +201,58 @@ struct MobileFilesView: View {
     @State private var problem: String?
 
     var body: some View {
-        List {
-            if let problem {
-                Label(problem, systemImage: "exclamationmark.triangle").foregroundStyle(G.danger).font(.system(size: 13))
-            }
-            ForEach(listing?.entries ?? []) { e in
-                let target = path == "/" ? "/" + e.name : path + "/" + e.name
-                NavigationLink {
-                    if e.isDirectory {
-                        MobileFilesView(container: container, path: target)
-                    } else {
-                        MobileFilePreview(container: container, path: target)
-                    }
-                } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: e.isDirectory ? "folder.fill" : e.kind == .symlink ? "arrow.turn.up.right" : "doc")
-                            .foregroundStyle(e.isDirectory ? G.chartPrimary : G.muted).frame(width: 22)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(e.name).font(.system(size: 15)).lineLimit(1)
-                            Text(e.linkTarget.map { "→ \($0)" } ?? "\(e.permissions)  \(e.isDirectory ? "" : Format.bytes(e.size))")
-                                .font(G.mono(11)).foregroundStyle(G.faint).lineLimit(1)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                if let problem {
+                    GStatusLine(.failure, problem)
+                }
+                if listing == nil && problem == nil {
+                    GSpinner(size: 22).frame(maxWidth: .infinity, minHeight: 300)
+                } else if listing?.entries.isEmpty == true {
+                    GEmptyState("Empty folder", symbol: "folder").frame(minHeight: 300)
+                } else if let entries = listing?.entries {
+                    VStack(spacing: 0) {
+                        ForEach(Array(entries.enumerated()), id: \.element.id) { i, e in
+                            if i > 0 { RowDivider(inset: 54) }
+                            let target = path == "/" ? "/" + e.name : path + "/" + e.name
+                            NavigationLink {
+                                if e.isDirectory {
+                                    MobileFilesView(container: container, path: target)
+                                } else {
+                                    MobileFilePreview(container: container, path: target)
+                                }
+                            } label: {
+                                HStack(spacing: 12) {
+                                    Image(systemName: e.isDirectory ? "folder.fill" : e.kind == .symlink ? "arrow.turn.up.right" : "doc")
+                                        .font(.system(size: 14))
+                                        .foregroundStyle(e.isDirectory ? G.chartPrimary : G.muted)
+                                        .frame(width: 30, height: 30)
+                                        .background((e.isDirectory ? G.chartPrimary : G.muted).opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(e.name).font(.system(size: 15)).foregroundStyle(G.text).lineLimit(1)
+                                        Text(e.linkTarget.map { "→ \($0)" } ?? "\(e.permissions)  \(e.isDirectory ? "" : Format.bytes(e.size))")
+                                            .font(G.mono(11)).foregroundStyle(G.faint).lineLimit(1)
+                                    }
+                                    Spacer()
+                                    Image(systemName: "chevron.right").font(.system(size: 11, weight: .semibold)).foregroundStyle(Color(hex: 0x5F6672))
+                                }
+                                .padding(.horizontal, 12)
+                                .frame(minHeight: 54)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(PressRowStyle())
                         }
                     }
+                    .mobileCard()
                 }
-                .listRowBackground(G.card)
             }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 20)
         }
-        .scrollContentBackground(.hidden)
-        .background(G.background)
-        .overlay {
-            if listing == nil && problem == nil { ProgressView() }
-            if listing?.entries.isEmpty == true { Text("Empty folder").foregroundStyle(G.faint) }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            MobileHeader(path == "/" ? "Files" : (path as NSString).lastPathComponent, subtitle: path).background(G.background)
         }
-        .navigationTitle(path == "/" ? "Files" : (path as NSString).lastPathComponent)
-        .navigationBarTitleDisplayMode(.inline)
+        .mobileScreen()
         .refreshable { await load() }
         .task(id: path) { await load() }
     }
@@ -255,7 +279,7 @@ struct MobileFilePreview: View {
         ScrollView([.vertical, .horizontal]) {
             VStack(alignment: .leading, spacing: 8) {
                 if let problem {
-                    Label(problem, systemImage: "exclamationmark.triangle").foregroundStyle(G.danger)
+                    GStatusLine(.failure, problem)
                 } else if let c = contents {
                     Text(c.truncated ? "First \(Format.bytes(UInt64(c.data.count))) of \(Format.bytes(c.size))" : Format.bytes(c.size))
                         .font(.system(size: 12)).foregroundStyle(G.faint)
@@ -264,22 +288,26 @@ struct MobileFilePreview: View {
                         .foregroundStyle(c.text == nil ? G.muted : G.textSecondary)
                         .textSelection(.enabled)
                 } else {
-                    ProgressView()
+                    GSpinner(size: 22).frame(maxWidth: .infinity, minHeight: 300)
                 }
             }
             .padding(14)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .background(G.console)
-        .navigationTitle((path as NSString).lastPathComponent)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            if let text = contents?.text {
-                ToolbarItem(placement: .primaryAction) {
+        .background(G.console.ignoresSafeArea())
+        .safeAreaInset(edge: .top, spacing: 0) {
+            MobileHeader((path as NSString).lastPathComponent, subtitle: path) {
+                if let text = contents?.text {
+                    Button { UIPasteboard.general.string = text } label: { Label("Copy", systemImage: "doc.on.doc") }
+                        .buttonStyle(CircleIconStyle())
                     ShareLink(item: text) { Image(systemName: "square.and.arrow.up") }
+                        .buttonStyle(CircleIconStyle())
                 }
             }
+            .background(G.background)
         }
+        .toolbar(.hidden, for: .navigationBar)
+        .safeAreaPadding(.bottom, GravitonTabBar.height)
         .task(id: path) {
             do {
                 contents = try await store.readFile(in: container.id, path: path)
@@ -309,57 +337,64 @@ struct MobileInspectView: View {
     @State private var showValues = false
 
     var body: some View {
-        List {
-            if let problem {
-                Label(problem, systemImage: "exclamationmark.triangle").foregroundStyle(G.danger)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                if let problem {
+                    GStatusLine(.failure, problem)
+                }
+                if let d = details {
+                    section("Process") {
+                        row("Command", d.command.joined(separator: " "))
+                        row("Working directory", d.workingDir.isEmpty ? "/" : d.workingDir)
+                        row("User", d.user ?? "root")
+                    }
+                    section("Image") {
+                        row("Reference", d.imageReference)
+                        row("Digest", String(d.imageDigest.prefix(19)) + "…")
+                    }
+                    section("Virtual machine") {
+                        row("vCPUs", "\(d.cpus)")
+                        row("Memory", Format.bytes(d.memoryMib << 20))
+                        row("Kernel", d.kernel)
+                    }
+                    section("Network") {
+                        row("IP address", d.container.ipAddress ?? "—")
+                        row("Ports", d.container.ports.isEmpty ? "—" : d.container.ports.map(\.label).joined(separator: "\n"))
+                    }
+                    if !d.container.mounts.isEmpty {
+                        section("Volumes") {
+                            ForEach(d.container.mounts, id: \.target) { m in row(m.target, m.source + (m.readOnly ? " (read-only)" : "")) }
+                        }
+                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            GCaption("Environment")
+                            Spacer()
+                            Toggle("Show values", isOn: $showValues).toggleStyle(.gSwitch)
+                        }
+                        .padding(.horizontal, 4)
+                        VStack(spacing: 0) {
+                            ForEach(Array(d.env.enumerated()), id: \.offset) { i, pair in
+                                if i > 0 { RowDivider() }
+                                let parts = pair.split(separator: "=", maxSplits: 1).map(String.init)
+                                row(parts.first ?? pair, showValues ? (parts.count > 1 ? parts[1] : "") : "••••••")
+                            }
+                        }
+                        .mobileCard()
+                    }
+                    section("Lifecycle") {
+                        row("ID", d.container.id)
+                        row("Status", d.container.statusText())
+                    }
+                } else if problem == nil {
+                    GSpinner(size: 22).frame(maxWidth: .infinity, minHeight: 300)
+                }
             }
-            if let d = details {
-                Section("Process") {
-                    row("Command", d.command.joined(separator: " "))
-                    row("Working directory", d.workingDir.isEmpty ? "/" : d.workingDir)
-                    row("User", d.user ?? "root")
-                }
-                Section("Image") {
-                    row("Reference", d.imageReference)
-                    row("Digest", String(d.imageDigest.prefix(19)) + "…")
-                }
-                Section("Virtual machine") {
-                    row("vCPUs", "\(d.cpus)")
-                    row("Memory", Format.bytes(d.memoryMib << 20))
-                    row("Kernel", d.kernel)
-                }
-                Section("Network") {
-                    row("IP address", d.container.ipAddress ?? "—")
-                    row("Ports", d.container.ports.isEmpty ? "—" : d.container.ports.map(\.label).joined(separator: "\n"))
-                }
-                if !d.container.mounts.isEmpty {
-                    Section("Volumes") {
-                        ForEach(d.container.mounts, id: \.target) { m in row(m.target, m.source + (m.readOnly ? " (read-only)" : "")) }
-                    }
-                }
-                Section {
-                    ForEach(d.env, id: \.self) { pair in
-                        let parts = pair.split(separator: "=", maxSplits: 1).map(String.init)
-                        row(parts.first ?? pair, showValues ? (parts.count > 1 ? parts[1] : "") : "••••••")
-                    }
-                } header: {
-                    HStack {
-                        Text("Environment")
-                        Spacer()
-                        Button(showValues ? "Hide values" : "Show values") { showValues.toggle() }.font(.system(size: 12)).textCase(nil)
-                    }
-                }
-                Section("Lifecycle") {
-                    row("ID", d.container.id)
-                    row("Status", d.container.statusText())
-                }
-            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 20)
         }
-        .scrollContentBackground(.hidden)
-        .background(G.background)
-        .overlay { if details == nil && problem == nil { ProgressView() } }
-        .navigationTitle("Inspect")
-        .navigationBarTitleDisplayMode(.inline)
+        .safeAreaInset(edge: .top, spacing: 0) { MobileHeader("Inspect", subtitle: container.name).background(G.background) }
+        .mobileScreen()
         .task(id: container.id) {
             do {
                 details = try await store.inspect(container.id)
@@ -369,11 +404,28 @@ struct MobileInspectView: View {
         }
     }
 
+    private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            GCaption(title).padding(.horizontal, 4)
+            VStack(spacing: 0) {
+                Group(subviews: content()) { rows in
+                    ForEach(Array(rows.enumerated()), id: \.offset) { i, r in
+                        if i > 0 { RowDivider() }
+                        r
+                    }
+                }
+            }
+            .mobileCard()
+        }
+    }
+
     private func row(_ label: String, _ value: String) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(label).font(.system(size: 12)).foregroundStyle(G.muted)
-            Text(value).font(G.mono(13)).textSelection(.enabled)
+            Text(value).font(G.mono(13)).foregroundStyle(G.text).textSelection(.enabled)
         }
-        .listRowBackground(G.card)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 11)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

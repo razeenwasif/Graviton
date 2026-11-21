@@ -15,25 +15,22 @@ struct MobileShellView: View {
                     .padding(.horizontal, 6)
                     .background(G.console)
             } else {
-                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+                GSpinner(size: 22).frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .background(G.console)
-        .navigationTitle(container.name)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .principal) {
-                VStack(spacing: 1) {
-                    Text(container.name).font(.system(size: 15, weight: .semibold))
-                    if let shell { Text(status(shell)).font(.system(size: 11)).foregroundStyle(G.muted) }
+        .background(G.console.ignoresSafeArea())
+        .safeAreaInset(edge: .top, spacing: 0) {
+            MobileHeader(container.name, subtitle: shell.map(status)) {
+                if let shell, !shell.isLive {
+                    Button("New shell") { shell.start(using: store) }
+                        .buttonStyle(.g(.primary, size: .small))
+                        .disabled(!container.isRunning)
                 }
             }
-            if let shell, !shell.isLive {
-                ToolbarItem(placement: .primaryAction) {
-                    Button("New shell") { shell.start(using: store) }.disabled(!container.isRunning)
-                }
-            }
+            .background(G.background)
         }
+        .toolbar(.hidden, for: .navigationBar)
+        .safeAreaPadding(.bottom, GravitonTabBar.height)
         .task(id: container.id) { shell = shells.shell(for: container.id, store: store) }
     }
 

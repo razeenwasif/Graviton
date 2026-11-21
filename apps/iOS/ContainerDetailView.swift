@@ -9,8 +9,8 @@ struct ContainerDetailView: View {
         if let c = store.container(containerID) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(c.name).font(.system(size: 28, weight: .bold)).kerning(-0.8)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(c.name).font(.system(size: 28, weight: .bold)).kerning(-0.8).foregroundStyle(G.text)
                         HStack(spacing: 10) {
                             StatusPill(c, showUptime: true)
                             Text(c.image).font(G.mono(12)).foregroundStyle(G.muted).lineLimit(1)
@@ -20,20 +20,20 @@ struct ContainerDetailView: View {
                     HStack(spacing: 10) {
                         if c.isRunning {
                             ActionTile(title: "Stop", symbol: "stop.fill", tint: G.danger) { Task { await store.stop(c) } }
-                            ActionTile(title: "Restart", symbol: "arrow.clockwise") { Task { await store.restart(c) } }
+                            ActionTile(title: "Restart", symbol: "arrow.clockwise", tint: G.warning) { Task { await store.restart(c) } }
                         } else {
                             ActionTile(title: "Start", symbol: "play.fill", tint: G.running) { Task { await store.start(c) } }
                         }
                         NavigationLink {
                             MobileLogsView(containerID: c.id)
                         } label: {
-                            ActionTileLabel(title: "Logs", symbol: "text.alignleft", tint: G.text)
+                            ActionTileLabel(title: "Logs", symbol: "text.alignleft", tint: G.accent)
                         }
                         .buttonStyle(.plain)
                         NavigationLink {
                             MobileShellView(container: c)
                         } label: {
-                            ActionTileLabel(title: "Shell", symbol: "terminal", tint: G.text)
+                            ActionTileLabel(title: "Shell", symbol: "terminal", tint: G.accent)
                         }
                         .buttonStyle(.plain)
                         .disabled(!c.isRunning)
@@ -49,7 +49,7 @@ struct ContainerDetailView: View {
                         Sparkline(store.cpuHistory[c.id] ?? [], filled: true, lineWidth: 2).frame(height: 90)
                     }
                     .padding(16)
-                    .background(G.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .mobileCard()
 
                     HStack(spacing: 10) {
                         VStack(alignment: .leading, spacing: 8) {
@@ -61,7 +61,7 @@ struct ContainerDetailView: View {
                         }
                         .padding(14)
                         .frame(maxWidth: .infinity, minHeight: 96, alignment: .topLeading)
-                        .background(G.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .mobileCard()
 
                         VStack(alignment: .leading, spacing: 8) {
                             Text("Limit").font(.system(size: 13)).foregroundStyle(G.muted)
@@ -69,36 +69,51 @@ struct ContainerDetailView: View {
                         }
                         .padding(14)
                         .frame(maxWidth: .infinity, minHeight: 96, alignment: .topLeading)
-                        .background(G.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .mobileCard()
                     }
 
                     VStack(spacing: 0) {
                         DetailLink(title: "Stats", symbol: "chart.xyaxis.line", detail: "CPU, memory, network, processes") { MobileStatsView(container: c) }
-                        Divider().overlay(G.border)
+                        RowDivider()
                         DetailLink(title: "Files", symbol: "folder", detail: c.isRunning ? "Browse and preview" : "Start it to browse", enabled: c.isRunning) { MobileFilesView(container: c) }
-                        Divider().overlay(G.border)
+                        RowDivider()
                         DetailLink(title: "Inspect", symbol: "info.circle", detail: "Command, image, VM, environment") { MobileInspectView(container: c) }
                     }
-                    .background(G.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .mobileCard()
 
                     VStack(spacing: 0) {
                         InfoRow(label: "Port", value: c.ports.first?.label ?? "—")
-                        Divider().overlay(G.border)
+                        RowDivider()
                         InfoRow(label: "IP address", value: c.ipAddress ?? "—")
-                        Divider().overlay(G.border)
+                        RowDivider()
                         InfoRow(label: "Mount", value: c.mounts.first?.source ?? "—")
-                        Divider().overlay(G.border)
+                        RowDivider()
                         InfoRow(label: "ID", value: c.id)
                     }
-                    .background(G.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .mobileCard()
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 24)
             }
-            .background(G.background)
-            .navigationBarTitleDisplayMode(.inline)
+            .safeAreaInset(edge: .top, spacing: 0) {
+                MobileHeader("", actions: {
+                    Menu {
+                        Button("Copy ID", systemImage: "doc.on.doc") { UIPasteboard.general.string = c.id }
+                        Button("Copy Image", systemImage: "square.stack.3d.up") { UIPasteboard.general.string = c.image }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                    }
+                    .buttonStyle(CircleIconStyle())
+                    .accessibilityLabel("More")
+                })
+                .background(G.background)
+            }
+            .refreshable { await store.refresh() }
+            .mobileScreen()
         } else {
-            ContentUnavailableView("Container not found", systemImage: "shippingbox")
+            GEmptyState("Container not found", symbol: "shippingbox", detail: "It may have been removed.")
+                .safeAreaInset(edge: .top, spacing: 0) { MobileHeader("") }
+                .mobileScreen()
         }
     }
 }
@@ -124,13 +139,16 @@ struct ActionTileLabel: View {
     var tint: Color
 
     var body: some View {
-        VStack(spacing: 6) {
-            Image(systemName: symbol).font(.system(size: 18, weight: .medium))
-            Text(title).font(.system(size: 12, weight: .medium))
+        VStack(spacing: 7) {
+            Image(systemName: symbol)
+                .font(.system(size: 16, weight: .semibold))
+                .frame(width: 36, height: 36)
+                .background(tint.opacity(0.13), in: Circle())
+            Text(title).font(.system(size: 12, weight: .medium)).foregroundStyle(G.textSecondary)
         }
         .foregroundStyle(tint)
-        .frame(maxWidth: .infinity, minHeight: 68)
-        .background(G.card, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .frame(maxWidth: .infinity, minHeight: 80)
+        .mobileCard(radius: 14)
         .contentShape(Rectangle())
     }
 }
@@ -162,7 +180,11 @@ struct DetailLink<Destination: View>: View {
     var body: some View {
         NavigationLink(destination: destination) {
             HStack(spacing: 12) {
-                Image(systemName: symbol).foregroundStyle(G.accent).frame(width: 24)
+                Image(systemName: symbol)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(G.accent)
+                    .frame(width: 32, height: 32)
+                    .background(G.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title).font(.system(size: 15, weight: .medium)).foregroundStyle(G.text)
                     Text(detail).font(.system(size: 12)).foregroundStyle(G.muted)
@@ -174,7 +196,7 @@ struct DetailLink<Destination: View>: View {
             .frame(minHeight: 56)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressRowStyle())
         .disabled(!enabled)
         .opacity(enabled ? 1 : 0.45)
     }

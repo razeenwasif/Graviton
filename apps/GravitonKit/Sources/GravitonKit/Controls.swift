@@ -20,10 +20,13 @@ public enum GButtonKind: Sendable {
 
 public enum GButtonSize: Sendable {
     case small, regular, large
+    /// 44 pt: the phone's touch target.
+    case touch
 
-    var height: CGFloat { switch self { case .small: 26; case .regular: 32; case .large: 38 } }
-    var font: CGFloat { switch self { case .small: 12; case .regular: 13; case .large: 13.5 } }
-    var padding: CGFloat { switch self { case .small: 10; case .regular: 13; case .large: 16 } }
+    var height: CGFloat { switch self { case .small: 26; case .regular: 32; case .large: 38; case .touch: 46 } }
+    var font: CGFloat { switch self { case .small: 12; case .regular: 13; case .large: 13.5; case .touch: 15 } }
+    var padding: CGFloat { switch self { case .small: 10; case .regular: 13; case .large: 16; case .touch: 18 } }
+    var radius: CGFloat { self == .touch ? 12 : 8 }
 }
 
 public struct GButtonStyle: ButtonStyle {
@@ -59,18 +62,18 @@ private struct GButtonBody: View {
             .lineLimit(1)
             .padding(.horizontal, size.padding)
             .frame(maxWidth: fullWidth ? .infinity : nil, minHeight: size.height)
-            .background(background(pressed: pressed), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(border))
+            .background(background(pressed: pressed), in: RoundedRectangle(cornerRadius: size.radius, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: size.radius, style: .continuous).strokeBorder(border))
             .overlay(alignment: .top) {
                 // A faint top highlight gives solid buttons some depth.
                 if kind == .primary || kind == .dangerSolid {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    RoundedRectangle(cornerRadius: size.radius, style: .continuous)
                         .strokeBorder(LinearGradient(colors: [.white.opacity(0.28), .clear], startPoint: .top, endPoint: .center), lineWidth: 1)
                 }
             }
             .scaleEffect(pressed && enabled ? 0.98 : 1)
             .opacity(enabled ? 1 : 0.45)
-            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: size.radius, style: .continuous))
             .onHover { hovering = $0 }
             .animation(.easeOut(duration: 0.12), value: hovering)
             .animation(.easeOut(duration: 0.08), value: pressed)
@@ -273,6 +276,7 @@ public struct GFieldModifier: ViewModifier {
     var height: CGFloat?
     var invalid: Bool
     var icon: String?
+    var size: CGFloat = 13
     @FocusState private var focused: Bool
     @State private var hovering = false
     @Environment(\.isEnabled) private var enabled
@@ -284,18 +288,18 @@ public struct GFieldModifier: ViewModifier {
             }
             content
                 .textFieldStyle(.plain)
-                .font(mono ? G.mono(12.5) : .system(size: 13))
+                .font(mono ? G.mono(size - 0.5) : .system(size: size))
                 .foregroundStyle(G.text)
                 .focused($focused)
         }
         .padding(.horizontal, 11)
         .padding(.vertical, height == nil ? 8 : 0)
         .frame(maxWidth: .infinity, minHeight: height, maxHeight: height)
-        .background(G.background, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(stroke, lineWidth: focused ? 1.4 : 1))
+        .background(G.background, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).strokeBorder(stroke, lineWidth: focused ? 1.4 : 1))
         .background {
             if focused {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                RoundedRectangle(cornerRadius: radius + 2, style: .continuous)
                     .fill((invalid ? G.danger : G.accent).opacity(0.14))
                     .padding(-3)
             }
@@ -304,6 +308,8 @@ public struct GFieldModifier: ViewModifier {
         .onHover { hovering = $0 }
         .animation(.easeOut(duration: 0.12), value: focused)
     }
+
+    private var radius: CGFloat { (height ?? 0) >= 40 ? 11 : 8 }
 
     private var stroke: Color {
         if invalid { return G.danger.opacity(0.85) }
@@ -314,8 +320,8 @@ public struct GFieldModifier: ViewModifier {
 
 public extension View {
     /// Graviton's field chrome for a `TextField` (or `TextEditor`, with `height: nil`).
-    func gravitonField(mono: Bool = false, height: CGFloat? = 32, invalid: Bool = false, icon: String? = nil) -> some View {
-        modifier(GFieldModifier(mono: mono, height: height, invalid: invalid, icon: icon))
+    func gravitonField(mono: Bool = false, height: CGFloat? = 32, invalid: Bool = false, icon: String? = nil, size: CGFloat = 13) -> some View {
+        modifier(GFieldModifier(mono: mono, height: height, invalid: invalid, icon: icon, size: size))
     }
 }
 
@@ -360,12 +366,17 @@ public struct GFormRow<Content: View>: View {
 public struct GSegmented<Value: Hashable>: View {
     @Binding var selection: Value
     var options: [(value: Value, label: String)]
+    /// Fill the width, segments sharing it equally (for the phone).
+    var stretch: Bool
     @Namespace private var pill
 
-    public init(selection: Binding<Value>, options: [(value: Value, label: String)]) {
+    public init(selection: Binding<Value>, options: [(value: Value, label: String)], stretch: Bool = false) {
         _selection = selection
         self.options = options
+        self.stretch = stretch
     }
+
+    private var height: CGFloat { stretch ? 32 : 24 }
 
     public var body: some View {
         HStack(spacing: 2) {
@@ -375,10 +386,12 @@ public struct GSegmented<Value: Hashable>: View {
                     withAnimation(.snappy(duration: 0.2)) { selection = option.value }
                 } label: {
                     Text(option.label)
-                        .font(.system(size: 12, weight: selected ? .semibold : .medium))
+                        .font(.system(size: stretch ? 13.5 : 12, weight: selected ? .semibold : .medium))
                         .foregroundStyle(selected ? G.text : G.muted)
+                        .lineLimit(1)
                         .padding(.horizontal, 11)
-                        .frame(height: 24)
+                        .frame(maxWidth: stretch ? .infinity : nil)
+                        .frame(height: height)
                         .background {
                             if selected {
                                 RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -395,9 +408,9 @@ public struct GSegmented<Value: Hashable>: View {
             }
         }
         .padding(3)
-        .background(G.control, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(G.border))
-        .fixedSize()
+        .background(G.control, in: RoundedRectangle(cornerRadius: stretch ? 11 : 9, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: stretch ? 11 : 9, style: .continuous).strokeBorder(G.border))
+        .fixedSize(horizontal: !stretch, vertical: true)
     }
 }
 
