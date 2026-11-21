@@ -235,6 +235,19 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
             build_stream(Arc::clone(engine), spec.clone(), lines.get_mut(), &mut write).await?;
             continue;
         }
+        if let (Request::Run(spec), Backend::Engine(engine)) = (&request, &backend) {
+            if spec.tty {
+                let reader = lines.into_inner();
+                return run_tty(Arc::clone(engine), spec.clone(), reader, write).await;
+            }
+        }
+        if let (Request::GetArchive { id, path }, Backend::Engine(engine)) = (&request, &backend) {
+            return get_archive_stream(Arc::clone(engine), id.clone(), path.clone(), write).await;
+        }
+        if let (Request::PutArchive { id, path, size }, Backend::Engine(engine)) = (&request, &backend) {
+            put_archive_stream(Arc::clone(engine), id.clone(), path.clone(), *size, lines.get_mut(), &mut write).await?;
+            continue;
+        }
         if let (Request::Exec(spec), Backend::Engine(engine)) = (&request, &backend) {
             if spec.tty {
                 // The connection becomes a raw terminal stream.
@@ -385,6 +398,156 @@ where
     Ok(())
 }
 
+/// `grav run -it`: boot a container with its main process on a PTY, splice
+/// terminal frames, and wait for the VM to stop before delivering `Frame::Exit`.
+pub(crate) async fn run_tty<R, W>(engine: Arc<Engine>, spec: graviton_proto::RunSpec, mut client_in: R, mut client_out: W) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use graviton_proto::frame::{self, Decoder, Frame};
+    use tokio::io::AsyncReadExt;
+
+    let attached = match tokio::task::spawn_blocking(move || engine.run_tty(spec)).await? {
+        Ok(a) => a,
+        Err(err) => {
+            client_out.write_all(&encode_line(&Response::Error { message: format!("{err:#}") })).await?;
+            let _ = client_out.flush().await;
+            return Ok(());
+        }
+    };
+    client_out.write_all(&encode_line(&Response::Attached)).await?;
+    client_out.flush().await?;
+
+    let guest = std::os::unix::net::UnixStream::from(attached.guest_fd);
+    guest.set_nonblocking(true)?;
+    let guest = UnixStream::from_std(guest)?;
+    let (mut guest_in, mut guest_out) = guest.into_split();
+
+    let keys = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut client_in, &mut guest_out).await;
+        let _ = guest_out.shutdown().await;
+    });
+
+    let mut decoder = Decoder::default();
+    let mut buf = [0u8; 16 * 1024];
+    let mut exit_code: Option<i32> = None;
+    'read: loop {
+        match guest_in.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => decoder.push(&buf[..n]),
+        }
+        loop {
+            match decoder.next_frame() {
+                Ok(Some(Frame::Data(bytes))) => {
+                    if client_out.write_all(&frame::data_frame(frame::DATA, &bytes)).await.is_err() {
+                        break 'read;
+                    }
+                    let _ = client_out.flush().await;
+                }
+                Ok(Some(Frame::Exit(code))) => {
+                    exit_code = Some(code);
+                    break 'read;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => break 'read,
+            }
+        }
+    }
+
+    keys.abort();
+    let _ = attached.exit_tx.send(exit_code.unwrap_or(129));
+    let _ = attached.stopped_rx.await;
+    if let Some(code) = exit_code {
+        let _ = client_out.write_all(&Frame::Exit(code).encode()).await;
+        let _ = client_out.flush().await;
+    }
+    let _ = client_out.shutdown().await;
+    Ok(())
+}
+
+/// `grav cp CONTAINER:PATH LOCAL` and Mac Files tab downloads: answer `Archive`
+/// and then stream raw tar bytes until EOF.
+pub(crate) async fn get_archive_stream<W>(engine: Arc<Engine>, id: String, path: String, mut write: W) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let (is_dir, name, fd) = match tokio::task::spawn_blocking(move || engine.get_archive_open(&id, &path)).await? {
+        Ok(res) => res,
+        Err(err) => {
+            write.write_all(&encode_line(&Response::Error { message: format!("{err:#}") })).await?;
+            let _ = write.flush().await;
+            return Ok(());
+        }
+    };
+    write.write_all(&encode_line(&Response::Archive { is_dir, name })).await?;
+    write.flush().await?;
+    let guest = std::os::unix::net::UnixStream::from(fd);
+    guest.set_nonblocking(true)?;
+    let mut guest = UnixStream::from_std(guest)?;
+    let _ = tokio::io::copy(&mut guest, &mut write).await;
+    let _ = write.flush().await;
+    let _ = write.shutdown().await;
+    Ok(())
+}
+
+/// `grav cp LOCAL CONTAINER:PATH` and Mac Files tab uploads: stream `size` raw
+/// tar bytes from `read` into the running container and answer `Copied`.
+pub(crate) async fn put_archive_stream(
+    engine: Arc<Engine>,
+    id: String,
+    path: String,
+    size: u64,
+    read: &mut (impl tokio::io::AsyncRead + Unpin),
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    if size > upload::MAX_UPLOAD {
+        write
+            .write_all(&encode_line(&Response::Error {
+                message: format!("archive is {} GB; limit is {} GB", size >> 30, upload::MAX_UPLOAD >> 30),
+            }))
+            .await?;
+        anyhow::bail!("archive too large ({size} bytes)");
+    }
+    let fd = match tokio::task::spawn_blocking(move || engine.put_archive_open(&id, &path, size)).await? {
+        Ok(fd) => fd,
+        Err(err) => {
+            // Remaining raw archive bytes follow on `read`: hang up after telling the client.
+            write.write_all(&encode_line(&Response::Error { message: format!("{err:#}") })).await?;
+            anyhow::bail!("put_archive rejected: {err:#}");
+        }
+    };
+    let guest = std::os::unix::net::UnixStream::from(fd);
+    guest.set_nonblocking(true)?;
+    let guest = UnixStream::from_std(guest)?;
+    let (guest_in, mut guest_out) = guest.into_split();
+
+    let mut limited = read.take(size);
+    let copied = tokio::io::copy(&mut limited, &mut guest_out).await.context("streaming archive to container")?;
+    guest_out.flush().await?;
+    if copied != size {
+        let msg = format!("upload ended early ({copied} of {size} bytes)");
+        let _ = write.write_all(&encode_line(&Response::Error { message: msg.clone() })).await;
+        anyhow::bail!(msg);
+    }
+
+    let mut lines = BufReader::new(guest_in).lines();
+    let reply = match lines.next_line().await? {
+        Some(line) => match decode_line::<graviton_proto::AgentEvent>(line.as_bytes())? {
+            graviton_proto::AgentEvent::Copied { files } => Response::Copied { files },
+            graviton_proto::AgentEvent::Error { message } => Response::Error { message },
+            other => Response::Error { message: format!("unexpected answer from agent: {other:?}") },
+        },
+        None => Response::Error { message: "guest agent closed the connection while unpacking".into() },
+    };
+    write.write_all(&encode_line(&reply)).await?;
+    write.flush().await?;
+    Ok(())
+}
+
 pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
     // Reads answer straight from the store.
     {
@@ -441,7 +604,9 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                     Request::ReadFile { id, path } => Response::File(engine.read_file(&id, &path)?),
                     Request::Inspect { id } => Response::Details(Box::new(engine.inspect(&id)?)),
                     Request::Events { since, limit } => Response::Events(engine.events.since(since, limit)),
-                    Request::Exec(_) => unreachable!("exec is handled by serve()"),
+                    Request::Exec(_) | Request::GetArchive { .. } | Request::PutArchive { .. } => {
+                        unreachable!("handled by serve()")
+                    }
                     Request::Build(_) => Response::Error { message: "builds run on the Mac itself: use grav build there".into() },
                     Request::PairBegin | Request::ListDevices | Request::RevokeDevice { .. } | Request::Pair { .. } | Request::Auth { .. }
                     | Request::PushSetup { .. } | Request::PushStatus | Request::PushTest | Request::RegisterPush { .. } => {

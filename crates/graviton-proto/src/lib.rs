@@ -221,6 +221,22 @@ pub struct RunSpec {
     /// Automatic restart policy (`no`, `on-failure`, `always`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart: Option<RestartPolicy>,
+    /// Run the container's main process attached to a pseudo-terminal (`grav run -it`);
+    /// the daemon answers `Attached` and the connection then carries terminal [`frame`]s.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tty: bool,
+    /// Initial terminal size when `tty` is set.
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub rows: u16,
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub cols: u16,
+    /// Automatically remove the container after it exits (`grav run --rm`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_remove: bool,
+}
+
+fn is_zero_u16(n: &u16) -> bool {
+    *n == 0
 }
 
 /// Push alert set-up on this Mac.
@@ -586,6 +602,12 @@ pub enum Request {
     ListFiles { id: String, path: String },
     /// Read the start of a file inside a running container.
     ReadFile { id: String, path: String },
+    /// Stream a file or folder out of a running container as a tar archive.
+    /// Answers `Archive { is_dir, name }` followed by raw tar bytes until EOF.
+    GetArchive { id: String, path: String },
+    /// Unpack `size` bytes of tar (following the request line) into a directory
+    /// inside a running container; answers `Copied { files }`.
+    PutArchive { id: String, path: String, size: u64 },
     /// How a container is configured.
     Inspect { id: String },
     /// Recent events, oldest first: those after `since` (a `seq`), at most `limit`.
@@ -643,6 +665,10 @@ pub enum Response {
     Stats(ContainerStats),
     Files(DirectoryListing),
     File(FileContents),
+    /// Sent before streaming raw tar bytes for `Request::GetArchive`.
+    Archive { is_dir: bool, name: String },
+    /// Sent after `Request::PutArchive` unpacks into the container.
+    Copied { files: u64 },
     Details(Box<ContainerDetails>),
     Events(Vec<EngineEvent>),
     Push(PushInfo),
@@ -779,6 +805,12 @@ pub enum AgentRequest {
     ListDir { container: String, path: String },
     /// Read up to `limit` bytes from the start of a file in the container.
     ReadFile { container: String, path: String, limit: u64 },
+    /// Stream a file or folder out of `container` as a raw tar archive on this
+    /// dedicated vsock connection (preceded by `AgentEvent::ArchiveReady`).
+    GetArchive { container: String, path: String },
+    /// Unpack `size` raw tar (or tar.gz) bytes following this request into
+    /// directory `path` inside `container`; answers `AgentEvent::Copied`.
+    PutArchive { container: String, path: String, size: u64 },
     /// Remember the state of a container's files, for the next `commit`.
     Snapshot { container: String },
     /// Write what changed since the snapshot as a gzipped layer tar named
@@ -852,6 +884,8 @@ pub enum AgentEvent {
     Stats(GuestStats),
     Dir(DirectoryListing),
     File(FileContents),
+    /// Precedes raw tar bytes for `AgentRequest::GetArchive`.
+    ArchiveReady { is_dir: bool, name: String },
     /// A step finished that has nothing else to report (snapshot, mkdir).
     Done,
     /// `copy` placed this many files.
@@ -1109,6 +1143,15 @@ mod tests {
         };
         let encoded = encode_line(&exec);
         assert_eq!(decode_line::<AgentRequest>(&encoded).unwrap(), exec);
+
+        let get = Request::GetArchive { id: "web".into(), path: "/etc/nginx".into() };
+        assert_eq!(decode_line::<Request>(&encode_line(&get)).unwrap(), get);
+        let put = Request::PutArchive { id: "web".into(), path: "/app".into(), size: 1024 };
+        assert_eq!(decode_line::<Request>(&encode_line(&put)).unwrap(), put);
+        let arch = Response::Archive { is_dir: true, name: "nginx".into() };
+        assert_eq!(decode_line::<Response>(&encode_line(&arch)).unwrap(), arch);
+        let copied = Response::Copied { files: 4 };
+        assert_eq!(decode_line::<Response>(&encode_line(&copied)).unwrap(), copied);
     }
 
     #[test]

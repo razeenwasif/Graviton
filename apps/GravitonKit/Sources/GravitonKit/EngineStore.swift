@@ -247,6 +247,42 @@ public final class EngineStore {
     public func inspect(_ id: String) async throws -> ContainerDetails { try await service.inspect(id: id) }
     public func openTerminal(_ spec: ExecSpec) async throws -> any TerminalSession { try await service.openTerminal(spec) }
 
+    /// File uploads and downloads need a real gravitond (local or remote).
+    public var canTransferFiles: Bool { connection == .live && (live is SocketEngine || live is RemoteEngine) }
+
+    /// Pack local files or folders into a tar and unpack them inside `destinationDir` of a running container.
+    @discardableResult
+    public func uploadFiles(to id: String, destinationDir: String, urls: [URL]) async throws -> UInt64 {
+        guard canTransferFiles, !urls.isEmpty else {
+            throw EngineError.daemon("File transfers need gravitond running, here or on a paired Mac.")
+        }
+        let (archive, size) = try await Task.detached { try BuildUpload.packItems(urls) }.value
+        defer { try? FileManager.default.removeItem(at: archive) }
+        switch live {
+        case let local as SocketEngine:
+            return try await local.putArchive(id: id, path: destinationDir, archiveFile: archive, size: size)
+        case let remote as RemoteEngine:
+            return try await remote.putArchive(id: id, path: destinationDir, archiveFile: archive, size: size)
+        default:
+            throw EngineError.daemon("File transfers need gravitond running, here or on a paired Mac.")
+        }
+    }
+
+    /// Download a file or folder from a running container into a local tar file at `archiveFile`.
+    public func downloadArchive(from id: String, path: String, to archiveFile: URL) async throws -> (isDir: Bool, name: String) {
+        guard canTransferFiles else {
+            throw EngineError.daemon("File transfers need gravitond running, here or on a paired Mac.")
+        }
+        switch live {
+        case let local as SocketEngine:
+            return try await local.getArchive(id: id, path: path, to: archiveFile)
+        case let remote as RemoteEngine:
+            return try await remote.getArchive(id: id, path: path, to: archiveFile)
+        default:
+            throw EngineError.daemon("File transfers need gravitond running, here or on a paired Mac.")
+        }
+    }
+
     public func start(_ c: Container) async { await lifecycle { try await $0.start(id: c.id) } }
     public func stop(_ c: Container) async { await lifecycle { try await $0.stop(id: c.id) } }
     public func restart(_ c: Container) async { await lifecycle { try await $0.restart(id: c.id) } }

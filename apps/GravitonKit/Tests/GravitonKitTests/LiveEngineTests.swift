@@ -54,6 +54,26 @@ struct LiveEngineTests {
         #expect(listing.entries.contains { $0.name == "hostname" })
         let hostname = try await engine.readFile(id: container.id, path: "/etc/hostname")
         #expect(hostname.text == name + "\n")
+
+        // Upload + download archive over the Unix socket.
+        let scratch = FileManager.default.temporaryDirectory.appending(path: "graviton-live-cp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let upFile = scratch.appending(path: "upload.txt")
+        try "swift-socket-upload\n".write(to: upFile, atomically: true, encoding: .utf8)
+        let (upTar, upSize) = try BuildUpload.packItems([upFile])
+        defer { try? FileManager.default.removeItem(at: upTar) }
+        #expect(try await engine.putArchive(id: container.id, path: "/tmp", archiveFile: upTar, size: upSize) >= 1)
+        #expect(try await engine.readFile(id: container.id, path: "/tmp/upload.txt").text == "swift-socket-upload\n")
+        let dlTar = scratch.appending(path: "download.tar")
+        let (isDir, archiveName) = try await engine.getArchive(id: container.id, path: "/tmp/upload.txt", to: dlTar)
+        #expect(!isDir && archiveName == "upload.txt")
+        #if os(macOS)
+        let saved = scratch.appending(path: "saved.txt")
+        try BuildUpload.extractArchive(dlTar, isDir: isDir, archiveName: archiveName, to: saved)
+        #expect(try String(contentsOf: saved, encoding: .utf8) == "swift-socket-upload\n")
+        #endif
+
         let details = try await engine.inspect(id: container.id)
         #expect(details.command == ["sleep", "300"])
 
@@ -145,6 +165,25 @@ struct LiveRemoteTests {
             }
             #expect(screen.contains("over-tls"))
             #expect(code == 9)
+
+            // Upload + download archive over TLS.
+            let scratch = FileManager.default.temporaryDirectory.appending(path: "graviton-tls-cp-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: scratch) }
+            let upFile = scratch.appending(path: "tls-upload.txt")
+            try "swift-tls-upload\n".write(to: upFile, atomically: true, encoding: .utf8)
+            let (upTar, upSize) = try BuildUpload.packItems([upFile])
+            defer { try? FileManager.default.removeItem(at: upTar) }
+            #expect(try await remote.putArchive(id: running.id, path: "/tmp", archiveFile: upTar, size: upSize) >= 1)
+            let dlTar = scratch.appending(path: "tls-download.tar")
+            let (isDir, archiveName) = try await remote.getArchive(id: running.id, path: "/tmp/tls-upload.txt", to: dlTar)
+            #expect(!isDir && archiveName == "tls-upload.txt")
+            #if os(macOS)
+            let saved = scratch.appending(path: "tls-saved.txt")
+            try BuildUpload.extractArchive(dlTar, isDir: isDir, archiveName: archiveName, to: saved)
+            #expect(try String(contentsOf: saved, encoding: .utf8) == "swift-tls-upload\n")
+            #endif
+
             // The request connection is unaffected.
             #expect(try await remote.ping() == 2)
         }

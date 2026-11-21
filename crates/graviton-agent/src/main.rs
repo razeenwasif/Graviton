@@ -189,6 +189,17 @@ pub(crate) mod linux {
                     Ok(contents) => send(&writer, &AgentEvent::File(contents)),
                     Err(err) => send(&writer, &AgentEvent::Error { message: err.to_string() }),
                 },
+                Ok(AgentRequest::GetArchive { container, path }) => {
+                    // Dedicated connection: sends ArchiveReady + raw tar bytes until EOF.
+                    drop(writer);
+                    return crate::files::get_archive(&container, &path, reader.into_inner());
+                }
+                Ok(AgentRequest::PutArchive { container, path, size }) => {
+                    match crate::files::put_archive(&container, &path, size, &mut reader) {
+                        Ok(files) => send(&writer, &AgentEvent::Copied { files }),
+                        Err(err) => send(&writer, &AgentEvent::Error { message: err.to_string() }),
+                    }
+                }
                 Ok(AgentRequest::Snapshot { container }) => match crate::build::snapshot(&container) {
                     Ok(()) => send(&writer, &AgentEvent::Done),
                     Err(err) => send(&writer, &AgentEvent::Error { message: format!("snapshot: {err}") }),

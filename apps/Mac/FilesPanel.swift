@@ -1,9 +1,10 @@
 import AppKit
 import GravitonKit
 import SwiftUI
+import UniformTypeIdentifiers
 
-/// The Files tab: browse a running container's filesystem (volumes included)
-/// and preview files. Read-only.
+/// The Files tab: browse a running container's filesystem (volumes included),
+/// preview files, and upload or download files and folders.
 struct FilesPanel: View {
     @Environment(EngineStore.self) private var store
     var container: Container
@@ -14,12 +15,20 @@ struct FilesPanel: View {
     @State private var problem: String?
     @State private var previewProblem: String?
     @State private var loading = false
+    @State private var transferring: String?
+    @State private var transferBanner: (tone: GStatusLine.Tone, text: String)?
+    @State private var dropTargeted = false
     @State private var goTo = ""
     @State private var sort: Column = .name
     @State private var ascending = true
     @FocusState private var listFocused: Bool
 
     enum Column: Hashable { case name, size, modified, mode }
+
+    private var selectedEntry: FileEntry? {
+        guard let selection else { return nil }
+        return entries.first { $0.id == selection }
+    }
 
     private var entries: [FileEntry] {
         let all = listing?.entries ?? []
@@ -45,12 +54,42 @@ struct FilesPanel: View {
         } else {
             VStack(alignment: .leading, spacing: 12) {
                 toolbar
+                if let transferring {
+                    GStatusLine(.working, transferring)
+                } else if let banner = transferBanner {
+                    GStatusLine(banner.tone, banner.text)
+                        .overlay(alignment: .trailing) {
+                            Button { transferBanner = nil } label: { Image(systemName: "xmark") }
+                                .buttonStyle(GIconButtonStyle(size: 22))
+                                .padding(.trailing, 8)
+                                .help("Dismiss")
+                        }
+                }
                 HSplitView {
                     list.frame(minWidth: 380, maxHeight: .infinity)
                     previewPane.frame(minWidth: 280, idealWidth: 420, maxHeight: .infinity)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .gravitonCard()
+                .overlay {
+                    if dropTargeted {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .strokeBorder(G.accent, lineWidth: 2)
+                            .background(G.accent.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .overlay(alignment: .bottom) {
+                                Label("Drop to upload into \(path)", systemImage: "square.and.arrow.up")
+                                    .font(.system(size: 12.5, weight: .medium))
+                                    .foregroundStyle(G.text)
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .background(G.raised, in: Capsule())
+                                    .overlay(Capsule().strokeBorder(G.accent.opacity(0.5)))
+                                    .padding(.bottom, 16)
+                            }
+                            .allowsHitTesting(false)
+                    }
+                }
+                .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { handleDrop($0) }
             }
             .padding(.horizontal, 28)
             .padding(.vertical, 18)
@@ -89,6 +128,12 @@ struct FilesPanel: View {
                 }
                 .gravitonField(mono: true, icon: "arrow.turn.down.right")
                 .frame(width: 220)
+            Button { pickAndUpload() } label: { Image(systemName: "square.and.arrow.up") }
+                .disabled(!store.canTransferFiles || transferring != nil)
+                .help("Upload files or folders into \(path)")
+            Button { downloadSelection() } label: { Image(systemName: "square.and.arrow.down") }
+                .disabled(!store.canTransferFiles || transferring != nil)
+                .help(selectedEntry.map { "Download \($0.name)" } ?? "Download \(path)")
             Button { Task { await load() } } label: { Image(systemName: "arrow.clockwise") }
                 .help("Refresh")
         }
@@ -183,6 +228,11 @@ struct FilesPanel: View {
             listFocused = true
         })
         .contextMenu {
+            Button("Download…") {
+                pickAndDownload(remotePath: join(path, e.name), suggestedName: e.name)
+            }
+            .disabled(!store.canTransferFiles || transferring != nil)
+            Divider()
             Button("Copy Path") { copy(join(path, e.name)) }
         }
     }
@@ -207,6 +257,12 @@ struct FilesPanel: View {
                             .font(.system(size: 11.5)).foregroundStyle(G.faint)
                     }
                     Spacer()
+                    Button("Download", systemImage: "square.and.arrow.down") {
+                        let name = preview.path.split(separator: "/").last.map(String.init) ?? "file"
+                        pickAndDownload(remotePath: preview.path, suggestedName: name)
+                    }
+                    .buttonStyle(.g(.secondary, size: .small))
+                    .disabled(!store.canTransferFiles || transferring != nil)
                     if let text = preview.text {
                         Button("Copy", systemImage: "doc.on.doc") { copy(text) }.buttonStyle(.g(.secondary, size: .small))
                     }
@@ -286,6 +342,125 @@ struct FilesPanel: View {
     private func copy(_ text: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    // MARK: Upload & download
+
+    private func pickAndUpload() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Upload"
+        panel.message = "Copy files or folders into \(container.name):\(path)"
+        panel.begin { response in
+            guard response == .OK, !panel.urls.isEmpty else { return }
+            let urls = panel.urls
+            Task { await upload(urls) }
+        }
+    }
+
+    private func downloadSelection() {
+        if let entry = selectedEntry {
+            pickAndDownload(remotePath: join(path, entry.name), suggestedName: entry.name)
+        } else {
+            let suggested = path == "/" ? "\(container.name)-rootfs" : (path.split(separator: "/").last.map(String.init) ?? container.name)
+            pickAndDownload(remotePath: path, suggestedName: suggested)
+        }
+    }
+
+    private func pickAndDownload(remotePath: String, suggestedName: String) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = suggestedName
+        panel.canCreateDirectories = true
+        panel.prompt = "Download"
+        panel.message = "Save \(container.name):\(remotePath) to this Mac"
+        panel.begin { response in
+            guard response == .OK, let destination = panel.url else { return }
+            Task { await download(remotePath: remotePath, to: destination) }
+        }
+    }
+
+    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard store.canTransferFiles, transferring == nil else { return false }
+        let fileProviders = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
+        guard !fileProviders.isEmpty else { return false }
+
+        let group = DispatchGroup()
+        let collected = DropURLBox()
+        for provider in fileProviders {
+            group.enter()
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                defer { group.leave() }
+                let resolved: URL? = switch item {
+                case let data as Data: URL(dataRepresentation: data, relativeTo: nil)
+                case let url as URL: url
+                case let nsurl as NSURL: nsurl as URL
+                default: nil
+                }
+                if let resolved, resolved.isFileURL {
+                    collected.append(resolved)
+                }
+            }
+        }
+        group.notify(queue: .main) {
+            let dropped = collected.all()
+            guard !dropped.isEmpty else { return }
+            Task { await upload(dropped) }
+        }
+        return true
+    }
+
+    private func upload(_ urls: [URL]) async {
+        let targetDir = path
+        transferBanner = nil
+        transferring = urls.count == 1
+            ? "Uploading \(urls[0].lastPathComponent) to \(targetDir)…"
+            : "Uploading \(urls.count) items to \(targetDir)…"
+        defer { transferring = nil }
+        do {
+            let count = try await store.uploadFiles(to: container.id, destinationDir: targetDir, urls: urls)
+            await load()
+            if let shown = preview?.path {
+                await loadPreview(shown)
+            }
+            let label = count == 1 ? "1 item" : "\(count) items"
+            transferBanner = (.success, "Uploaded \(label) to \(targetDir)")
+        } catch {
+            transferBanner = (.failure, error.localizedDescription)
+        }
+    }
+
+    private func download(remotePath: String, to destination: URL) async {
+        transferBanner = nil
+        transferring = "Downloading \(remotePath)…"
+        defer { transferring = nil }
+        let tempTar = FileManager.default.temporaryDirectory.appending(path: "graviton-dl-\(UUID().uuidString).tar")
+        defer { try? FileManager.default.removeItem(at: tempTar) }
+        do {
+            let (isDir, archiveName) = try await store.downloadArchive(from: container.id, path: remotePath, to: tempTar)
+            try await Task.detached {
+                try BuildUpload.extractArchive(tempTar, isDir: isDir, archiveName: archiveName, to: destination)
+            }.value
+            transferBanner = (.success, "Saved \(destination.lastPathComponent)")
+        } catch {
+            transferBanner = (.failure, error.localizedDescription)
+        }
+    }
+}
+
+private final class DropURLBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var urls: [URL] = []
+    func append(_ url: URL) {
+        lock.lock()
+        urls.append(url)
+        lock.unlock()
+    }
+    func all() -> [URL] {
+        lock.lock()
+        defer { lock.unlock() }
+        return urls
     }
 }
 

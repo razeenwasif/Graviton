@@ -29,6 +29,75 @@ public enum BuildUpload {
         return (out, size)
     }
 
+    /// Pack one or more local files or folders into a temporary tar for `PutArchive`.
+    public static func packItems(_ urls: [URL]) throws -> (URL, UInt64) {
+        let out = FileManager.default.temporaryDirectory.appending(path: "graviton-upload-\(UUID().uuidString).tar")
+        FileManager.default.createFile(atPath: out.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: out)
+        defer { try? handle.close() }
+        var tar = TarWriter(handle: handle)
+        let none = DockerIgnore([])
+
+        for url in urls {
+            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+            let name = url.lastPathComponent
+            try tar.append(url, as: name)
+            if attrs[.type] as? FileAttributeType == .typeDirectory {
+                try walk(url, "", ignore: none) { rel in
+                    try tar.append(url.appending(path: rel), as: "\(name)/\(rel)")
+                }
+            }
+        }
+        try tar.finish()
+        let size = (try FileManager.default.attributesOfItem(atPath: out.path)[.size] as? NSNumber)?.uint64Value ?? 0
+        return (out, size)
+    }
+
+    #if os(macOS)
+    /// Extract a downloaded tar archive from `GetArchive` to `destination`:
+    /// single files land directly at `destination` (honouring the chosen Save name);
+    /// folders unpack their contents directly into `destination/`.
+    public static func extractArchive(_ tarURL: URL, isDir: Bool, archiveName: String, to destination: URL) throws {
+        let fm = FileManager.default
+        let staging = fm.temporaryDirectory.appending(path: "graviton-dl-\(UUID().uuidString)")
+        try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: staging) }
+
+        let tar = Process()
+        tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        tar.arguments = ["-xf", tarURL.path, "-C", staging.path]
+        let stderr = Pipe()
+        tar.standardError = stderr
+        try tar.run()
+        tar.waitUntilExit()
+        guard tar.terminationStatus == 0 else {
+            let msg = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            throw EngineError.io(msg.isEmpty ? "tar exited with status \(tar.terminationStatus)" : msg)
+        }
+
+        let exists = { (url: URL) in (try? fm.attributesOfItem(atPath: url.path)) != nil }
+        if exists(destination) {
+            try fm.removeItem(at: destination)
+        }
+        let extracted = staging.appending(path: archiveName)
+        if !isDir {
+            if exists(extracted) {
+                try fm.moveItem(at: extracted, to: destination)
+            } else if let first = try fm.contentsOfDirectory(at: staging, includingPropertiesForKeys: nil).first {
+                try fm.moveItem(at: first, to: destination)
+            } else {
+                throw EngineError.io("downloaded archive was empty")
+            }
+        } else {
+            if exists(extracted) {
+                try fm.moveItem(at: extracted, to: destination)
+            } else {
+                try fm.moveItem(at: staging, to: destination)
+            }
+        }
+    }
+    #endif
+
     /// Depth-first, not following symlinks, skipping ignored paths (and what's under them).
     static func walk(_ root: URL, _ rel: String, ignore: DockerIgnore, visit: (String) throws -> Void) throws {
         let dir = rel.isEmpty ? root : root.appending(path: rel)

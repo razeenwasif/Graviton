@@ -55,6 +55,7 @@ scripts/dev-gravitond.sh                    # build, sign and run the daemon
 cargo run -p grav -- login ghcr.io          # optional: log in to a private registry (Keychain)
 cargo run -p grav -- pull alpine            # in another terminal (streams per-layer progress)
 cargo run -p grav -- run alpine cat /etc/os-release
+cargo run -p grav -- run -it --rm alpine sh     # interactive PTY shell; stops & removes on exit
 cargo run -p grav -- run -d --name web -p 8080:8000 -v ~/site:/srv python:3.13-slim \
     python3 -m http.server 8000 --directory /srv
 curl localhost:8080
@@ -62,6 +63,8 @@ cargo run -p grav -- ps -a
 cargo run -p grav -- logs web
 cargo run -p grav -- exec web python3 --version
 cargo run -p grav -- exec -it web sh
+cargo run -p grav -- cp ./notes.txt web:/tmp/   # copy files or folders in or out (`-` for stdout tar)
+cargo run -p grav -- cp web:/tmp/notes.txt ./notes-copy.txt
 cargo run -p grav -- stop web && cargo run -p grav -- rm web
 ```
 
@@ -337,28 +340,34 @@ One JSON object per line over the Unix socket:
 `graviton-proto` is the source of truth; `GravitonKit/Wire.swift` mirrors it
 and both sides have tests pinning the JSON shape.
 
-A terminal (`exec` with `"tty": true`) answers `attached`, then the connection
-carries binary frames both ways: a kind byte (0 data, 1 resize, 2 end of input,
-3 exit code), a big-endian u32 length and the payload. gravitond passes them
-between the client and the guest agent untouched, over the Unix socket or TLS.
+A terminal (`run` or `exec` with `"tty": true`) answers `attached`, then the
+connection carries binary frames both ways: a kind byte (0 data, 1 resize, 2
+end of input, 3 exit code), a big-endian u32 length and the payload. File
+transfers (`get_archive` and `put_archive`) stream raw tar archives over the
+same Unix socket or TLS channel (used by `grav cp` and the Mac app's Files tab,
+including Finder drag-and-drop). gravitond passes them between the client and
+the guest agent untouched, over the Unix socket or TLS.
 
 Build images from Dockerfiles:
 
 ```bash
 cargo run -p grav -- build -t myapp .              # ./Dockerfile; the image is myapp:latest
 cargo run -p grav -- build -f docker/Dockerfile --build-arg PY=3.12 --target deps .
+cargo run -p grav -- build --secret id=token,env=API_TOKEN -t myapp .
 cargo run -p grav -- run myapp
 ```
 
-Supported: FROM (multi-stage, `AS name`, ARGs in FROM), RUN, COPY and ADD
-(local files and tarballs, wildcards, `--from` a stage or image, `--chown`),
-CMD, ENTRYPOINT, SHELL, ENV, ARG, WORKDIR, USER, EXPOSE, LABEL, VOLUME,
-STOPSIGNAL and `.dockerignore`. `RUN --mount=type=cache` runs without the
-cache. Not yet: heredocs, ONBUILD, `ADD <url>`, `--chmod` and secret or bind
-mounts. Each step's layer is cached by the step and the files it copies, so a
-rebuild with nothing changed takes no time and gives the same image; steps
-that miss run in a builder VM (4 vCPU, 4 GiB) with the context shared
-read-only, and the agent writes each step's changes as a layer.
+Supported: FROM (multi-stage, `AS name`, ARGs in FROM), RUN (including
+`<<EOF` / `<<-EOF` heredocs, `#!` shebangs, inline shell heredocs, and
+`--mount=type=cache|secret|bind|tmpfs`), COPY and ADD (local files, tarballs,
+`<<EOF` heredocs, `ADD <http(s)://url>` with `--checksum`, wildcards, `--from`
+a stage or image, `--chown`, `--chmod`, hard links preserved as tar link
+entries), CMD, ENTRYPOINT, SHELL, ENV, ARG, WORKDIR, USER, EXPOSE, LABEL,
+VOLUME, STOPSIGNAL and `.dockerignore`. Not yet: ONBUILD and Git build URLs.
+Each step's layer is cached by the step and the files it copies, so a rebuild
+with nothing changed takes no time and gives the same image; steps that miss
+run in a builder VM (4 vCPU, 4 GiB) with the context shared read-only, and the
+agent writes each step's changes as a layer.
 
 Inside a running container:
 
@@ -367,6 +376,8 @@ cargo run -p grav -- stats web        # CPU, memory, network (sampled every 2 s,
 cargo run -p grav -- top web          # its processes
 cargo run -p grav -- ls web /etc      # list a folder (volumes included)
 cargo run -p grav -- cat web /etc/os-release
+cargo run -p grav -- cp ./cfg web:/etc/app      # copy local file or folder in
+cargo run -p grav -- cp web:/etc/app ./cfg-out  # copy container file or folder out (`-` for stdout tar)
 cargo run -p grav -- inspect web      # how it was configured, as JSON
 ```
 

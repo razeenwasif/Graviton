@@ -21,6 +21,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case stats(id: String)
     case listFiles(id: String, path: String)
     case readFile(id: String, path: String)
+    case getArchive(id: String, path: String)
+    case putArchive(id: String, path: String, size: UInt64)
     case inspect(id: String)
     case events(since: UInt64?, limit: Int?)
     case registerPush(token: String, sandbox: Bool)
@@ -40,6 +42,7 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     private struct PairParams: Encodable { let code: String; let device: String }
     private struct AuthParams: Encodable { let token: String }
     private struct PathParams: Encodable { let id: String; let path: String }
+    private struct PutArchiveParams: Encodable { let id: String; let path: String; let size: UInt64 }
     private struct EventsParams: Encodable { let since: UInt64?; let limit: Int? }
     private struct PushParams: Encodable { let token: String; let sandbox: Bool }
 
@@ -64,6 +67,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .stats: "stats"
         case .listFiles: "list_files"
         case .readFile: "read_file"
+        case .getArchive: "get_archive"
+        case .putArchive: "put_archive"
         case .inspect: "inspect"
         case .events: "events"
         case .registerPush: "register_push"
@@ -89,7 +94,10 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case let .prune(spec): try c.encode(spec, forKey: .params)
         case let .start(id), let .stop(id), let .restart(id), let .remove(id), let .stats(id), let .inspect(id):
             try c.encode(IDParams(id: id), forKey: .params)
-        case let .listFiles(id, path), let .readFile(id, path): try c.encode(PathParams(id: id, path: path), forKey: .params)
+        case let .listFiles(id, path), let .readFile(id, path), let .getArchive(id, path):
+            try c.encode(PathParams(id: id, path: path), forKey: .params)
+        case let .putArchive(id, path, size):
+            try c.encode(PutArchiveParams(id: id, path: path, size: size), forKey: .params)
         case let .exec(spec): try c.encode(spec, forKey: .params)
         case let .events(since, limit): try c.encode(EventsParams(since: since, limit: limit), forKey: .params)
         case let .registerPush(token, sandbox): try c.encode(PushParams(token: token, sandbox: sandbox), forKey: .params)
@@ -120,6 +128,8 @@ public enum EngineResponse: Decodable, Sendable {
     case stats(ContainerStats)
     case files(DirectoryListing)
     case file(FileContents)
+    case archive(isDir: Bool, name: String)
+    case copied(files: UInt64)
     case details(ContainerDetails)
     case events([EngineEvent])
     case push(PushInfo)
@@ -138,6 +148,8 @@ public enum EngineResponse: Decodable, Sendable {
     private struct ErrorData: Decodable { let message: String }
     private struct ImageRemovedData: Decodable { let reference: String; let freedBytes: UInt64; let keptBytes: UInt64 }
     private struct BuildLine: Decodable { let line: String }
+    private struct ArchiveData: Decodable { let isDir: Bool; let name: String }
+    private struct CopiedData: Decodable { let files: UInt64 }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
@@ -162,6 +174,10 @@ public enum EngineResponse: Decodable, Sendable {
         case "stats": self = .stats(try c.decode(ContainerStats.self, forKey: .data))
         case "files": self = .files(try c.decode(DirectoryListing.self, forKey: .data))
         case "file": self = .file(try c.decode(FileContents.self, forKey: .data))
+        case "archive":
+            let a = try c.decode(ArchiveData.self, forKey: .data)
+            self = .archive(isDir: a.isDir, name: a.name)
+        case "copied": self = .copied(files: try c.decode(CopiedData.self, forKey: .data).files)
         case "details": self = .details(try c.decode(ContainerDetails.self, forKey: .data))
         case "events": self = .events(try c.decode([EngineEvent].self, forKey: .data))
         case "push": self = .push(try c.decode(PushInfo.self, forKey: .data))

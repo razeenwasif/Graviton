@@ -84,6 +84,24 @@ pub(crate) struct ContainerSpec {
     /// True while a container with a restart policy should stay up (including across daemon restarts).
     #[serde(default)]
     want_running: bool,
+    /// Remove the container automatically after it stops (`grav run --rm -it`).
+    #[serde(default)]
+    auto_remove: bool,
+}
+
+/// Interactive `grav run -it` handle returned to the control connection.
+pub struct AttachedRun {
+    pub guest_fd: OwnedFd,
+    pub exit_tx: std::sync::mpsc::SyncSender<i32>,
+    pub stopped_rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+struct TtyAttach {
+    rows: u16,
+    cols: u16,
+    ready_tx: std::sync::mpsc::SyncSender<Result<OwnedFd>>,
+    exit_rx: std::sync::mpsc::Receiver<i32>,
+    stopped_tx: tokio::sync::oneshot::Sender<()>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -388,7 +406,7 @@ impl Engine {
 
     // -- Containers -------------------------------------------------------
 
-    pub fn run(self: &Arc<Self>, spec: RunSpec) -> Result<ContainerSummary> {
+    fn create_container(&self, spec: RunSpec) -> Result<String> {
         let ports = spec.ports.iter().map(|p| parse_port(p)).collect::<Result<Vec<_>>>()?;
         let volumes = spec.volumes.iter().map(|v| parse_volume(v)).collect::<Result<Vec<_>>>()?;
         if let Some(name) = &spec.name {
@@ -415,7 +433,8 @@ impl Engine {
             ports,
             volumes,
             restart,
-            want_running: restart != RestartPolicy::No,
+            want_running: !spec.tty && restart != RestartPolicy::No,
+            auto_remove: spec.auto_remove && spec.tty,
         };
 
         let id = new_id();
@@ -446,7 +465,41 @@ impl Engine {
         self.specs.lock().unwrap().insert(id.clone(), cs);
         self.save();
         self.refresh_images();
+        Ok(id)
+    }
+
+    pub fn run(self: &Arc<Self>, spec: RunSpec) -> Result<ContainerSummary> {
+        let id = self.create_container(spec)?;
         self.launch(&id)
+    }
+
+    /// Create and boot a container with its main process attached to a PTY (`grav run -it`).
+    /// Returns the terminal vsock fd once the process is running; when the caller sends
+    /// the exit code on `exit_tx`, the VM stops and signals `stopped_rx`.
+    pub fn run_tty(self: &Arc<Self>, spec: RunSpec) -> Result<AttachedRun> {
+        let rows = spec.rows;
+        let cols = spec.cols;
+        let id = self.create_container(spec)?;
+        let bound = self.bind_ports(&id, true)?;
+        self.store.lock().unwrap().update(&id, |c| {
+            c.status = ContainerStatus::Created;
+            c.exit_code = None;
+        });
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel(1);
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        let attach = TtyAttach { rows, cols, ready_tx, exit_rx, stopped_tx };
+        let engine = Arc::clone(self);
+        let owned = id.clone();
+        std::thread::Builder::new()
+            .name(format!("container-{id}"))
+            .spawn(move || engine.supervise(&owned, bound, 0, Some(attach)))?;
+
+        match ready_rx.recv() {
+            Ok(Ok(guest_fd)) => Ok(AttachedRun { guest_fd, exit_tx, stopped_rx }),
+            Ok(Err(err)) => Err(err),
+            Err(_) => bail!("container {id} exited before its terminal attached"),
+        }
     }
 
     pub fn start(self: &Arc<Self>, key: &str) -> Result<ContainerSummary> {
@@ -578,7 +631,7 @@ impl Engine {
         }
     }
 
-    fn launch_inner(self: &Arc<Self>, id: &str, attempt: u32, wait_for_start: bool) -> Result<Option<ContainerSummary>> {
+    fn bind_ports(&self, id: &str, clear_want_on_err: bool) -> Result<Vec<BoundPort>> {
         let ports = self.specs.lock().unwrap().get(id).map(|s| s.ports.clone()).unwrap_or_default();
         // Bind the published ports first, so a port in use or invalid interface fails before a VM boots.
         let mut bound = Vec::new();
@@ -604,7 +657,7 @@ impl Engine {
                         c.status = ContainerStatus::Exited;
                         c.exit_code = Some(125);
                     });
-                    if wait_for_start {
+                    if clear_want_on_err {
                         if let Some(spec) = self.specs.lock().unwrap().get_mut(id) {
                             spec.want_running = false;
                         }
@@ -614,6 +667,11 @@ impl Engine {
                 }
             }
         }
+        Ok(bound)
+    }
+
+    fn launch_inner(self: &Arc<Self>, id: &str, attempt: u32, wait_for_start: bool) -> Result<Option<ContainerSummary>> {
+        let bound = self.bind_ports(id, wait_for_start)?;
 
         self.store.lock().unwrap().update(id, |c| {
             c.status = ContainerStatus::Created;
@@ -621,7 +679,7 @@ impl Engine {
         });
         let engine = Arc::clone(self);
         let owned = id.to_string();
-        std::thread::Builder::new().name(format!("container-{id}")).spawn(move || engine.supervise(&owned, bound, attempt))?;
+        std::thread::Builder::new().name(format!("container-{id}")).spawn(move || engine.supervise(&owned, bound, attempt, None))?;
 
         if !wait_for_start {
             return Ok(None);
@@ -675,9 +733,17 @@ impl Engine {
         );
     }
 
-    fn supervise(self: &Arc<Self>, id: &str, bound: Vec<BoundPort>, attempt: u32) {
+    fn supervise(self: &Arc<Self>, id: &str, bound: Vec<BoundPort>, attempt: u32, tty: Option<TtyAttach>) {
         let mut started_at: Option<Instant> = None;
-        let result = self.run_in_vm(id, bound, &mut started_at);
+        let (tty_ready, tty_exit, stopped_tx) = match tty {
+            Some(t) => (Some((t.rows, t.cols, t.ready_tx)), Some(t.exit_rx), Some(t.stopped_tx)),
+            None => (None, None, None),
+        };
+        let mut ready_tx = tty_ready.as_ref().map(|(_, _, tx)| tx.clone());
+        let result = self.run_in_vm(id, bound, &mut started_at, tty_ready, tty_exit);
+        if let (Err(err), Some(tx)) = (&result, ready_tx.take()) {
+            let _ = tx.send(Err(anyhow!("{err:#}")));
+        }
         if self.shutting_down.load(Ordering::SeqCst) {
             // `Engine::shutdown` is tearing VMs down cleanly; preserve saved state.
             return;
@@ -713,16 +779,16 @@ impl Engine {
                 let _ = r.vm.kill();
             }
         }
-        let restart_policy = {
+        let (restart_policy, auto_remove) = {
             let mut specs = self.specs.lock().unwrap();
             if let Some(spec) = specs.get_mut(id) {
                 let will_restart = spec.want_running && should_restart(spec.restart, requested, code, failure.is_some());
                 if !will_restart {
                     spec.want_running = false;
                 }
-                will_restart.then_some(spec.restart)
+                (will_restart.then_some(spec.restart), spec.auto_remove)
             } else {
-                None
+                (None, false)
             }
         };
         self.store.lock().unwrap().update(id, |c| {
@@ -742,18 +808,38 @@ impl Engine {
             (None, false, code) => (graviton_proto::EventKind::Failed, format!("{name} exited with code {code}")),
         };
         self.events.record(kind, Some((id, &name)), Some(&image), message);
+        if auto_remove && restart_policy.is_none() {
+            let _ = self.remove(id);
+        }
+        if let Some(tx) = stopped_tx {
+            let _ = tx.send(());
+        }
         if let Some(policy) = restart_policy {
             let next_attempt = if started_at.is_some_and(|t| t.elapsed() >= HEALTHY_UPTIME) { 0 } else { attempt };
             self.schedule_restart(id, policy, next_attempt);
         }
     }
 
-    fn run_in_vm(self: &Arc<Self>, id: &str, bound: Vec<BoundPort>, started_at: &mut Option<Instant>) -> Result<i32> {
+    fn run_in_vm(
+        self: &Arc<Self>,
+        id: &str,
+        bound: Vec<BoundPort>,
+        started_at: &mut Option<Instant>,
+        tty_ready: Option<(u16, u16, std::sync::mpsc::SyncSender<Result<OwnedFd>>)>,
+        tty_exit: Option<std::sync::mpsc::Receiver<i32>>,
+    ) -> Result<i32> {
         // The container's disk stays for its next start; `grav rm` deletes it.
-        self.run_in_vm_inner(id, bound, started_at)
+        self.run_in_vm_inner(id, bound, started_at, tty_ready, tty_exit)
     }
 
-    fn run_in_vm_inner(self: &Arc<Self>, id: &str, bound: Vec<BoundPort>, started_at: &mut Option<Instant>) -> Result<i32> {
+    fn run_in_vm_inner(
+        self: &Arc<Self>,
+        id: &str,
+        bound: Vec<BoundPort>,
+        started_at: &mut Option<Instant>,
+        tty_ready: Option<(u16, u16, std::sync::mpsc::SyncSender<Result<OwnedFd>>)>,
+        tty_exit: Option<std::sync::mpsc::Receiver<i32>>,
+    ) -> Result<i32> {
         let spec = self.specs.lock().unwrap().get(id).cloned().ok_or_else(|| anyhow!("unknown container {id}"))?;
         let name = self.store.lock().unwrap().container(id)?.name.clone();
         let t0 = Instant::now();
@@ -857,6 +943,49 @@ impl Engine {
                 }
                 None => self.log(id, LogLevel::Warn, LogStream::System, "the VM got no network address, so its ports aren't published".into()),
             }
+        }
+
+        if let (Some((rows, cols, ready_tx)), Some(exit_rx)) = (tty_ready, tty_exit) {
+            // Interactive `grav run -it`: launch the main process on a dedicated PTY
+            // vsock connection so `agent` stays free for SetHosts, Stats, Signal, and Shutdown.
+            let mut tty_conn = File::from(vm.connect(AGENT_VSOCK_PORT).context("opening terminal connection")?);
+            match read_event_unbuffered(&mut tty_conn)? {
+                AgentEvent::Ready { .. } => {}
+                other => bail!("expected ready from the agent, got {other:?}"),
+            }
+            tty_conn.write_all(&encode_line(&AgentRequest::Exec {
+                argv: spec.argv.clone(),
+                env: spec.env.clone(),
+                cwd: spec.cwd.clone(),
+                tty: true,
+                container: Some(id.into()),
+                user: spec.user.clone(),
+                hostname: Some(name),
+                rows,
+                cols,
+                stdin: None,
+                mounts: vec![],
+            }))?;
+            let pid = match read_event_unbuffered(&mut tty_conn)? {
+                AgentEvent::Started { pid } => pid,
+                AgentEvent::Error { message } => bail!("{message}"),
+                other => bail!("expected started from the agent, got {other:?}"),
+            };
+            *started_at = Some(Instant::now());
+            if let Some(r) = self.running.lock().unwrap().get_mut(id) {
+                r.pid = Some(pid);
+            }
+            self.store.lock().unwrap().update(id, |c| {
+                c.status = ContainerStatus::Running;
+                c.started_at = Some(now_secs());
+                c.ip_address = ip.clone();
+            });
+            self.save();
+            self.start_monitor(id, Arc::clone(&vm));
+            let (cname, image) = self.store.lock().unwrap().container(id).map(|c| (c.name.clone(), c.image.clone())).unwrap_or_default();
+            self.events.record(graviton_proto::EventKind::Started, Some((id, &cname)), Some(&image), format!("{cname} started"));
+            let _ = ready_tx.send(Ok(OwnedFd::from(tty_conn)));
+            return Ok(exit_rx.recv().unwrap_or(129));
         }
 
         send(&agent, &AgentRequest::Exec {
@@ -1065,6 +1194,37 @@ impl Engine {
             AgentEvent::File(contents) => Ok(contents),
             other => bail!("expected a file from the agent, got {other:?}"),
         }
+    }
+
+    /// Open a dedicated agent connection streaming a tar archive of `path` out of a running container.
+    /// Returns `(is_dir, name, fd)` positioned immediately after `ArchiveReady\n`.
+    pub fn get_archive_open(&self, key: &str, path: &str) -> Result<(bool, String, OwnedFd)> {
+        let id = self.store.lock().unwrap().container(key)?.id.clone();
+        let vm = self.running.lock().unwrap().get(&id).map(|r| Arc::clone(&r.vm)).ok_or_else(|| anyhow!("container {key} isn't running"))?;
+        let mut conn = File::from(vm.connect(AGENT_VSOCK_PORT)?);
+        match read_event_unbuffered(&mut conn)? {
+            AgentEvent::Ready { .. } => {}
+            other => bail!("expected ready from the agent, got {other:?}"),
+        }
+        conn.write_all(&encode_line(&AgentRequest::GetArchive { container: id, path: path.to_string() }))?;
+        match read_event_unbuffered(&mut conn)? {
+            AgentEvent::ArchiveReady { is_dir, name } => Ok((is_dir, name, OwnedFd::from(conn))),
+            AgentEvent::Error { message } => bail!("{message}"),
+            other => bail!("expected archive header from the agent, got {other:?}"),
+        }
+    }
+
+    /// Open a dedicated agent connection ready to receive `size` bytes of tar to unpack into `path`.
+    pub fn put_archive_open(&self, key: &str, path: &str, size: u64) -> Result<OwnedFd> {
+        let id = self.store.lock().unwrap().container(key)?.id.clone();
+        let vm = self.running.lock().unwrap().get(&id).map(|r| Arc::clone(&r.vm)).ok_or_else(|| anyhow!("container {key} isn't running"))?;
+        let mut conn = File::from(vm.connect(AGENT_VSOCK_PORT)?);
+        match read_event_unbuffered(&mut conn)? {
+            AgentEvent::Ready { .. } => {}
+            other => bail!("expected ready from the agent, got {other:?}"),
+        }
+        conn.write_all(&encode_line(&AgentRequest::PutArchive { container: id, path: path.to_string(), size }))?;
+        Ok(OwnedFd::from(conn))
     }
 
     pub fn inspect(&self, key: &str) -> Result<ContainerDetails> {

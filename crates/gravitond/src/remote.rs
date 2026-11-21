@@ -352,6 +352,15 @@ impl Remote {
                     }
                     crate::build_stream(Arc::clone(engine), spec.clone(), lines.get_mut(), &mut write).await?;
                 }
+                (Request::Run(spec), crate::Backend::Engine(engine)) if spec.tty => {
+                    return crate::run_tty(Arc::clone(engine), spec.clone(), lines.into_inner(), write).await;
+                }
+                (Request::GetArchive { id, path }, crate::Backend::Engine(engine)) => {
+                    return crate::get_archive_stream(Arc::clone(engine), id.clone(), path.clone(), write).await;
+                }
+                (Request::PutArchive { id, path, size }, crate::Backend::Engine(engine)) => {
+                    crate::put_archive_stream(Arc::clone(engine), id.clone(), path.clone(), *size, lines.get_mut(), &mut write).await?;
+                }
                 (Request::Exec(spec), crate::Backend::Engine(engine)) => {
                     if spec.tty {
                         // The connection becomes a terminal session.

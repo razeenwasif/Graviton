@@ -1,16 +1,19 @@
-//! Browse a container's files for the app's Files tab.
+//! Browse and copy a container's files (Files tab, `grav ls`, `grav cat`, `grav cp`).
 //!
-//! Paths are opened with `openat2(RESOLVE_IN_ROOT)` relative to the
-//! container's root, so `..` and absolute symlinks inside the image resolve
-//! the way they would for a process in the container. Volumes are mounted
-//! under the root, so they show up too.
+//! Paths are resolved relative to the container's root (`openat2(RESOLVE_IN_ROOT)`
+//! for reads/listings, `build::resolve_in_root` for archive streaming), so `..`
+//! and absolute symlinks inside the image resolve the way they would for a
+//! process in the container. Volumes are mounted under the root, so they show up too.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Component, Path, PathBuf};
 
-use graviton_proto::{DirectoryListing, FileContents, FileEntry, FileKind};
+use flate2::read::GzDecoder;
+use graviton_proto::{AgentEvent, DirectoryListing, FileContents, FileEntry, FileKind, encode_line};
 
 const MAX_ENTRIES: usize = 5000;
 
@@ -76,6 +79,172 @@ pub fn read(container: &str, path: &str, limit: u64) -> io::Result<FileContents>
     let mut data = Vec::with_capacity(limit.min(meta.len()) as usize);
     (&mut file).take(limit).read_to_end(&mut data)?;
     Ok(FileContents { path: normalise(path), size: meta.len(), truncated: (data.len() as u64) < meta.len(), data })
+}
+
+/// Stream a file or folder out of `container` as a raw tar archive on `conn`.
+/// Sends one `AgentEvent::ArchiveReady` (or `Error`) line first, then raw tar bytes.
+pub fn get_archive(container: &str, path: &str, mut conn: File) -> io::Result<()> {
+    let root = crate::container::rootfs(container)?;
+    let norm = normalise(path);
+    let resolved = match crate::build::resolve_in_root(&root, &norm, false) {
+        Ok(p) => p,
+        Err(err) => {
+            let _ = conn.write_all(&encode_line(&AgentEvent::Error { message: format!("{norm}: {err}") }));
+            return Ok(());
+        }
+    };
+    let meta = match fs::symlink_metadata(&resolved) {
+        Ok(m) => m,
+        Err(err) => {
+            let _ = conn.write_all(&encode_line(&AgentEvent::Error { message: format!("{norm}: {err}") }));
+            return Ok(());
+        }
+    };
+    let is_dir = meta.is_dir();
+    let name = if norm == "/" {
+        "root".to_string()
+    } else {
+        norm.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("file").to_string()
+    };
+    conn.write_all(&encode_line(&AgentEvent::ArchiveReady { is_dir, name: name.clone() }))?;
+
+    let mut tar = tar::Builder::new(&mut conn);
+    tar.follow_symlinks(false);
+    tar.mode(tar::HeaderMode::Complete);
+    let mut seen_inodes: HashMap<(u64, u64), PathBuf> = HashMap::new();
+
+    if !is_dir {
+        append_entry(&mut tar, &resolved, Path::new(&name), &meta, &mut seen_inodes)?;
+    } else {
+        let is_root = resolved == root;
+        let prefix = if is_root { PathBuf::new() } else { PathBuf::from(&name) };
+        if !prefix.as_os_str().is_empty() {
+            tar.append_path_with_name(&resolved, &prefix)?;
+        }
+        let mut stack = vec![PathBuf::new()];
+        while let Some(rel) = stack.pop() {
+            let dir = if rel.as_os_str().is_empty() { resolved.clone() } else { resolved.join(&rel) };
+            let mut children: Vec<PathBuf> = match fs::read_dir(&dir) {
+                Ok(rd) => rd.flatten().map(|e| rel.join(e.file_name())).collect(),
+                Err(_) => continue,
+            };
+            children.sort();
+            for child in children {
+                if is_root && matches!(child.to_str(), Some("proc" | "sys" | "dev")) {
+                    continue;
+                }
+                let abs = resolved.join(&child);
+                let Ok(m) = fs::symlink_metadata(&abs) else { continue };
+                let ft = m.file_type();
+                if ft.is_char_device() || ft.is_block_device() || ft.is_socket() {
+                    continue;
+                }
+                let archive_path = if prefix.as_os_str().is_empty() { child.clone() } else { prefix.join(&child) };
+                append_entry(&mut tar, &abs, &archive_path, &m, &mut seen_inodes)?;
+                if m.is_dir() {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    tar.finish()?;
+    drop(tar);
+    conn.flush()?;
+    Ok(())
+}
+
+fn append_entry<W: Write>(
+    tar: &mut tar::Builder<W>,
+    abs: &Path,
+    archive_path: &Path,
+    meta: &fs::Metadata,
+    seen_inodes: &mut HashMap<(u64, u64), PathBuf>,
+) -> io::Result<()> {
+    if meta.is_file() && meta.nlink() > 1 {
+        let key = (meta.dev(), meta.ino());
+        if let Some(target) = seen_inodes.get(&key) {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Link);
+            h.set_size(0);
+            h.set_mode(meta.mode() & 0o7777);
+            h.set_uid(u64::from(meta.uid()));
+            h.set_gid(u64::from(meta.gid()));
+            h.set_mtime(meta.mtime().max(0) as u64);
+            return tar.append_link(&mut h, archive_path, target);
+        }
+        seen_inodes.insert(key, archive_path.to_path_buf());
+    }
+    tar.append_path_with_name(abs, archive_path)
+}
+
+/// Read `size` bytes of tar (plain, gzip or zstd) from `reader` and unpack into
+/// directory `path` inside `container`. Always drains `size` bytes so framing stays intact.
+pub fn put_archive(container: &str, path: &str, size: u64, reader: &mut impl BufRead) -> io::Result<u64> {
+    let mut limited = reader.take(size);
+    let result = put_archive_inner(container, path, &mut limited);
+    // Drain any unread tar padding or remaining bytes on early error.
+    let _ = io::copy(&mut limited, &mut io::sink());
+    result
+}
+
+fn put_archive_inner(container: &str, path: &str, limited: &mut impl Read) -> io::Result<u64> {
+    let root = crate::container::rootfs(container)?;
+    let norm = normalise(path);
+    let dest = crate::build::resolve_in_root(&root, &norm, false)?;
+    if !dest.is_dir() {
+        return Err(io::Error::other(format!("{norm} isn't an existing folder")));
+    }
+
+    let mut buf = BufReader::with_capacity(64 * 1024, limited);
+    let peek = buf.fill_buf()?.to_vec();
+    let src: Box<dyn Read> = if peek.len() >= 2 && peek[..2] == [0x1f, 0x8b] {
+        Box::new(GzDecoder::new(buf))
+    } else if crate::zstd_stream::is_zstd_magic(&peek) {
+        Box::new(crate::zstd_stream::ZstdReader::new(buf))
+    } else {
+        Box::new(buf)
+    };
+
+    let mut archive = tar::Archive::new(src);
+    archive.set_preserve_permissions(true);
+    archive.set_preserve_ownerships(false);
+    archive.set_preserve_mtime(true);
+    archive.set_overwrite(true);
+    archive.set_unpack_xattrs(false);
+
+    let mut count = 0u64;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let Some(rel) = clean_path(&entry.path()?) else { continue };
+        let kind = entry.header().entry_type();
+        if kind.is_character_special() || kind.is_block_special() {
+            continue;
+        }
+        let target = dest.join(&rel);
+        if let Ok(meta) = fs::symlink_metadata(&target) {
+            if meta.is_dir() && !kind.is_dir() {
+                fs::remove_dir_all(&target)?;
+            } else if !meta.is_dir() && (kind.is_dir() || kind.is_symlink() || kind.is_hard_link()) {
+                fs::remove_file(&target)?;
+            }
+        }
+        if entry.unpack_in(&dest)? {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn clean_path(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::Normal(p) => out.push(p),
+            Component::CurDir | Component::RootDir => {}
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    (!out.as_os_str().is_empty()).then_some(out)
 }
 
 fn open_in_root(container: &str, path: &str, flags: libc::c_int) -> io::Result<OwnedFd> {

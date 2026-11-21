@@ -109,6 +109,15 @@ enum Command {
         /// Start it and return instead of streaming its output.
         #[arg(short, long)]
         detach: bool,
+        /// Keep stdin open (use with -t for an interactive shell).
+        #[arg(short, long)]
+        interactive: bool,
+        /// Allocate a pseudo-terminal and attach; the container stops when you exit.
+        #[arg(short, long)]
+        tty: bool,
+        /// Automatically remove the container when it exits.
+        #[arg(long)]
+        rm: bool,
         image: String,
         /// Command (replaces the image's default command).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -186,6 +195,14 @@ enum Command {
     },
     /// Print a file from inside a running container (up to 256 KiB).
     Cat { container: String, path: String },
+    /// Copy files or folders between this Mac and a running container
+    /// (`CONTAINER:PATH LOCAL` or `LOCAL CONTAINER:PATH`).
+    Cp {
+        /// Source (`CONTAINER:PATH` or local path).
+        src: String,
+        /// Destination (local path, `-` for tar on stdout, or `CONTAINER:PATH`).
+        dst: String,
+    },
     /// Show how a container is configured, as JSON.
     Inspect { container: String },
     /// What happened recently: containers started, stopped and failed, pulls and builds.
@@ -394,7 +411,13 @@ fn run(cli: Cli) -> Result<()> {
                 other => unexpected(other)?,
             }
         }
-        Command::Run { name, env, cpus, memory, publish, volume, restart, detach, image, command } => {
+        Command::Run { name, env, cpus, memory, publish, volume, restart, detach, interactive, tty, rm, image, command } => {
+            if detach && (tty || interactive) {
+                bail!("can't combine -d/--detach with -i or -t");
+            }
+            if detach && rm {
+                bail!("can't combine -d/--detach with --rm");
+            }
             let spec = RunSpec {
                 image,
                 name,
@@ -405,7 +428,15 @@ fn run(cli: Cli) -> Result<()> {
                 ports: publish,
                 volumes: volume.iter().map(|v| absolute_volume(v)).collect::<Result<_>>()?,
                 restart: restart.filter(|p| *p != RestartPolicy::No),
+                tty,
+                rows: 0,
+                cols: 0,
+                auto_remove: rm,
             };
+            if tty {
+                let code = run_tty(&target, spec, interactive)?;
+                std::process::exit(code);
+            }
             let container = match client.call(&Request::Run(spec))? {
                 Response::Container(c) => c,
                 other => return unexpected(other),
@@ -414,6 +445,9 @@ fn run(cli: Cli) -> Result<()> {
                 println!("{}", container.id);
             } else {
                 let code = follow(&mut client, &container.id)?;
+                if rm {
+                    let _ = client.call(&Request::Remove { id: container.id });
+                }
                 std::process::exit(code);
             }
         }
@@ -477,6 +511,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             other => unexpected(other)?,
         },
+        Command::Cp { src, dst } => copy_files(&mut client, &target, &src, &dst)?,
         Command::Inspect { container } => match client.call(&Request::Inspect { id: container })? {
             Response::Details(d) => println!("{}", serde_json::to_string_pretty(&d)?),
             other => unexpected(other)?,
@@ -875,15 +910,29 @@ fn hosts(action: Option<&HostsAction>) -> Result<()> {
     Ok(())
 }
 
+/// `grav run -it`: boot a container attached to this terminal; stops when you exit.
+fn run_tty(target: &Target, mut spec: RunSpec, interactive: bool) -> Result<i32> {
+    if let Some((rows, cols)) = window_size() {
+        (spec.rows, spec.cols) = (rows, cols);
+    }
+    let mut stream = target.connect()?;
+    stream.write_all(&encode_line(&Request::Run(spec)))?;
+    attach_tty(stream, interactive)
+}
+
 /// `grav exec -t`: put this terminal in raw mode and connect it to the
 /// container's; returns the program's exit code.
 fn exec_tty(target: &Target, mut spec: ExecSpec, interactive: bool) -> Result<i32> {
-    let is_tty = |fd| unsafe { libc::isatty(fd) } == 1;
     if let Some((rows, cols)) = window_size() {
         (spec.rows, spec.cols) = (rows, cols);
     }
     let mut stream = target.connect()?;
     stream.write_all(&encode_line(&Request::Exec(spec)))?;
+    attach_tty(stream, interactive)
+}
+
+fn attach_tty(mut stream: UnixStream, interactive: bool) -> Result<i32> {
+    let is_tty = |fd| unsafe { libc::isatty(fd) } == 1;
     // Read the answer byte by byte: what follows it is terminal frames.
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
@@ -967,6 +1016,245 @@ fn exec_tty(target: &Target, mut spec: ExecSpec, interactive: bool) -> Result<i3
     }
     drop(raw);
     code.ok_or_else(|| anyhow::anyhow!("the terminal session ended without an exit code (did the container stop?)"))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CpEndpoint<'a> {
+    Local(&'a str),
+    Container(&'a str, &'a str),
+}
+
+fn parse_cp_endpoint(arg: &str) -> CpEndpoint<'_> {
+    if let Some((head, tail)) = arg.split_once(':') {
+        // Local paths containing `:` start with `/`, `./`, `../`, or contain `/` before `:`.
+        if !head.is_empty() && !head.contains('/') && !tail.is_empty() {
+            return CpEndpoint::Container(head, tail);
+        }
+    }
+    CpEndpoint::Local(arg)
+}
+
+fn copy_files(client: &mut Client, target: &Target, src: &str, dst: &str) -> Result<()> {
+    match (parse_cp_endpoint(src), parse_cp_endpoint(dst)) {
+        (CpEndpoint::Container(id, remote), CpEndpoint::Local(local)) => cp_from_container(target, id, remote, local),
+        (CpEndpoint::Local(local), CpEndpoint::Container(id, remote)) => cp_to_container(client, local, id, remote),
+        _ => bail!("expected `grav cp CONTAINER:PATH LOCAL` or `grav cp LOCAL CONTAINER:PATH`"),
+    }
+}
+
+fn cp_from_container(target: &Target, container: &str, remote_path: &str, local_dst: &str) -> Result<()> {
+    let mut stream = target.connect()?;
+    stream.write_all(&encode_line(&Request::GetArchive { id: container.into(), path: remote_path.into() }))?;
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while stream.read(&mut byte)? == 1 && byte[0] != b'\n' {
+        line.push(byte[0]);
+    }
+    let (is_dir, name) = match decode_line::<Response>(&line)? {
+        Response::Archive { is_dir, name } => (is_dir, name),
+        Response::Error { message } => bail!(message),
+        other => return unexpected(other),
+    };
+
+    if local_dst == "-" {
+        std::io::copy(&mut stream, &mut std::io::stdout())?;
+        return Ok(());
+    }
+
+    let dst_path = std::path::Path::new(local_dst);
+    let existing = std::fs::symlink_metadata(dst_path).ok();
+    let src_dot = remote_path.ends_with("/.") || remote_path == "/.";
+
+    let mut archive = tar::Archive::new(stream);
+    archive.set_preserve_permissions(true);
+    archive.set_preserve_mtime(true);
+    archive.set_overwrite(true);
+    archive.set_unpack_xattrs(false);
+
+    if !is_dir {
+        let into_dir = existing.as_ref().is_some_and(|m| m.is_dir()) || local_dst.ends_with('/');
+        if into_dir {
+            std::fs::create_dir_all(dst_path)?;
+            for entry in archive.entries()? {
+                let mut entry = entry?;
+                entry.unpack_in(dst_path)?;
+            }
+        } else {
+            if let Some(parent) = dst_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                if !parent.is_dir() {
+                    bail!("destination folder {} doesn't exist", parent.display());
+                }
+            }
+            if let Some(entry) = archive.entries()?.next() {
+                let mut entry = entry?;
+                if existing.is_some() {
+                    let _ = std::fs::remove_file(dst_path);
+                }
+                entry.unpack(dst_path)?;
+            }
+        }
+        return Ok(());
+    }
+
+    if existing.as_ref().is_some_and(|m| !m.is_dir()) {
+        bail!("cannot copy folder {container}:{remote_path} onto existing file {}", dst_path.display());
+    }
+
+    let strip_prefix = existing.is_none() || src_dot;
+    std::fs::create_dir_all(dst_path)?;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let raw_path = entry.path()?.into_owned();
+        let rel = if strip_prefix {
+            match raw_path.strip_prefix(&name) {
+                Ok(stripped) if !stripped.as_os_str().is_empty() => stripped.to_path_buf(),
+                Ok(_) => continue, // top-level dir itself
+                Err(_) => raw_path,
+            }
+        } else {
+            raw_path
+        };
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let Some(safe) = clean_local_rel(&rel) else { continue };
+        let out_path = dst_path.join(&safe);
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let kind = entry.header().entry_type();
+        if let Ok(m) = std::fs::symlink_metadata(&out_path) {
+            if m.is_dir() && !kind.is_dir() {
+                std::fs::remove_dir_all(&out_path)?;
+            } else if !m.is_dir() && (kind.is_dir() || kind.is_symlink() || kind.is_hard_link()) {
+                std::fs::remove_file(&out_path)?;
+            }
+        }
+        if kind.is_hard_link() && strip_prefix {
+            if let Ok(Some(link)) = entry.link_name() {
+                let link_owned = link.into_owned();
+                let target_rel = link_owned.strip_prefix(&name).unwrap_or(&link_owned);
+                if let Some(safe_target) = clean_local_rel(target_rel) {
+                    std::fs::hard_link(dst_path.join(safe_target), &out_path)?;
+                    continue;
+                }
+            }
+        }
+        entry.unpack(&out_path)?;
+    }
+    Ok(())
+}
+
+fn clean_local_rel(path: &std::path::Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::Normal(p) => out.push(p),
+            Component::CurDir | Component::RootDir => {}
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    (!out.as_os_str().is_empty()).then_some(out)
+}
+
+fn cp_to_container(client: &mut Client, local_src: &str, container: &str, remote_dst: &str) -> Result<()> {
+    let src_dot = local_src.ends_with("/.") || local_src == ".";
+    let src_path = std::path::Path::new(local_src);
+    let meta = std::fs::symlink_metadata(src_path).with_context(|| format!("{} doesn't exist", src_path.display()))?;
+
+    let remote_norm = {
+        let parts: Vec<&str> = remote_dst.split('/').filter(|p| !p.is_empty() && *p != ".").collect();
+        format!("/{}", parts.join("/"))
+    };
+    let dst_is_dir = remote_dst.ends_with('/')
+        || remote_norm == "/"
+        || matches!(client.call(&Request::ListFiles { id: container.into(), path: remote_norm.clone() }), Ok(Response::Files(_)));
+
+    let (target_dir, archive_prefix): (String, Option<String>) = if !meta.is_dir() {
+        let src_name = src_path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("bad source path `{local_src}`"))?
+            .to_string_lossy()
+            .into_owned();
+        if dst_is_dir {
+            (remote_norm, Some(src_name))
+        } else {
+            let parent = remote_norm.rsplit_once('/').map(|(p, _)| if p.is_empty() { "/" } else { p }).unwrap_or("/");
+            let name = remote_norm.rsplit('/').next().unwrap_or(&src_name).to_string();
+            (parent.into(), Some(name))
+        }
+    } else if src_dot {
+        (remote_norm, None)
+    } else if dst_is_dir {
+        let src_name = std::fs::canonicalize(src_path)?
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("bad folder `{local_src}`"))?
+            .to_string_lossy()
+            .into_owned();
+        (remote_norm, Some(src_name))
+    } else {
+        let parent = remote_norm.rsplit_once('/').map(|(p, _)| if p.is_empty() { "/" } else { p }).unwrap_or("/");
+        let name = remote_norm.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("dir").to_string();
+        (parent.into(), Some(name))
+    };
+
+    let tmp_path = std::env::temp_dir().join(format!(
+        "graviton-cp-{}-{}.tar",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+    ));
+    let tmp = TempFile(tmp_path);
+    {
+        let file = std::fs::File::create(tmp.path())?;
+        let mut tar = tar::Builder::new(file);
+        tar.follow_symlinks(false);
+        if !meta.is_dir() {
+            let entry_name = archive_prefix.as_deref().unwrap_or("file");
+            tar.append_path_with_name(src_path, entry_name)?;
+        } else {
+            let base = archive_prefix.map(PathBuf::from).unwrap_or_default();
+            if !base.as_os_str().is_empty() {
+                tar.append_dir(&base, src_path)?;
+            }
+            let mut stack = vec![PathBuf::new()];
+            while let Some(rel) = stack.pop() {
+                let dir = if rel.as_os_str().is_empty() { src_path.to_path_buf() } else { src_path.join(&rel) };
+                let mut children: Vec<PathBuf> = std::fs::read_dir(&dir)?
+                    .flatten()
+                    .map(|e| rel.join(e.file_name()))
+                    .collect();
+                children.sort();
+                for child in children {
+                    let abs = src_path.join(&child);
+                    let m = std::fs::symlink_metadata(&abs)?;
+                    let archive_name = if base.as_os_str().is_empty() { child.clone() } else { base.join(&child) };
+                    if m.is_dir() {
+                        tar.append_dir(&archive_name, &abs)?;
+                        stack.push(child);
+                    } else if m.is_file() || m.file_type().is_symlink() {
+                        tar.append_path_with_name(&abs, &archive_name)?;
+                    }
+                }
+            }
+        }
+        tar.finish()?;
+    }
+
+    let size = std::fs::metadata(tmp.path())?.len();
+    client.writer.write_all(&encode_line(&Request::PutArchive { id: container.into(), path: target_dir, size }))?;
+    std::io::copy(&mut std::fs::File::open(tmp.path())?, &mut client.writer)?;
+    client.writer.flush()?;
+
+    let mut line = String::new();
+    if client.reader.read_line(&mut line)? == 0 {
+        bail!("gravitond closed the connection");
+    }
+    match decode_line::<Response>(line.as_bytes())? {
+        Response::Copied { .. } => Ok(()),
+        Response::Error { message } => bail!(message),
+        other => unexpected(other),
+    }
 }
 
 fn window_size() -> Option<(u16, u16)> {
@@ -1314,6 +1602,14 @@ mod tests {
 
         assert!(parse_build_secret("src=/tmp/x").is_err());
         assert!(parse_build_secret("id=a,src=/x,env=Y").is_err());
+    }
+
+    #[test]
+    fn parses_cp_endpoints() {
+        assert_eq!(parse_cp_endpoint("web:/etc/hosts"), CpEndpoint::Container("web", "/etc/hosts"));
+        assert_eq!(parse_cp_endpoint("./foo:bar"), CpEndpoint::Local("./foo:bar"));
+        assert_eq!(parse_cp_endpoint("/tmp/a:b"), CpEndpoint::Local("/tmp/a:b"));
+        assert_eq!(parse_cp_endpoint("-"), CpEndpoint::Local("-"));
     }
 
     #[test]

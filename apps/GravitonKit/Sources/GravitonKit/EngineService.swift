@@ -178,6 +178,95 @@ public final class SocketEngine: EngineService {
         return contents
     }
 
+    /// Download a file or folder from a running container as a tar archive written to `archiveFile`.
+    public func getArchive(id: String, path remotePath: String, to archiveFile: URL) async throws -> (isDir: Bool, name: String) {
+        let socketPath = self.path
+        return try await Task.detached {
+            let fd = try Self.connect(path: socketPath)
+            defer { close(fd) }
+            try Self.writeAll(fd, Array(try Wire.line(.getArchive(id: id, path: remotePath))))
+
+            var buffer = Data()
+            var chunk = [UInt8](repeating: 0, count: 64 * 1024)
+            var headerLine: Data?
+            while headerLine == nil {
+                if let nl = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                    headerLine = Data(buffer[buffer.startIndex..<nl])
+                    buffer.removeSubrange(buffer.startIndex...nl)
+                    break
+                }
+                let n = read(fd, &chunk, chunk.count)
+                guard n >= 0 else { throw EngineError.io(String(cString: strerror(errno))) }
+                guard n > 0 else { throw EngineError.io("gravitond closed the connection") }
+                buffer.append(contentsOf: chunk[0..<n])
+            }
+
+            let response = try Wire.decoder.decode(EngineResponse.self, from: headerLine!)
+            let meta: (Bool, String)
+            switch response {
+            case let .archive(isDir, name): meta = (isDir, name)
+            case let .error(message): throw EngineError.daemon(message)
+            default: throw EngineError.unexpectedResponse
+            }
+
+            FileManager.default.createFile(atPath: archiveFile.path, contents: nil)
+            let out = try FileHandle(forWritingTo: archiveFile)
+            defer { try? out.close() }
+            if !buffer.isEmpty {
+                try out.write(contentsOf: buffer)
+            }
+            while true {
+                let n = read(fd, &chunk, chunk.count)
+                guard n >= 0 else { throw EngineError.io(String(cString: strerror(errno))) }
+                if n == 0 { break }
+                try out.write(contentsOf: chunk[0..<n])
+            }
+            return meta
+        }.value
+    }
+
+    /// Upload a tar archive into directory `remotePath` inside a running container.
+    public func putArchive(id: String, path remotePath: String, archiveFile: URL, size: UInt64) async throws -> UInt64 {
+        let socketPath = self.path
+        return try await Task.detached {
+            let fd = try Self.connect(path: socketPath)
+            defer { close(fd) }
+            try Self.writeAll(fd, Array(try Wire.line(.putArchive(id: id, path: remotePath, size: size))))
+
+            let source = try FileHandle(forReadingFrom: archiveFile)
+            defer { try? source.close() }
+            var sendError: Error?
+            do {
+                while let chunk = try source.read(upToCount: 1 << 20), !chunk.isEmpty {
+                    try Self.writeAll(fd, Array(chunk))
+                }
+            } catch {
+                sendError = error
+            }
+
+            var reply = Data()
+            var buf = [UInt8](repeating: 0, count: 64 * 1024)
+            while reply.last != UInt8(ascii: "\n") {
+                let n = read(fd, &buf, buf.count)
+                if n <= 0 { break }
+                reply.append(contentsOf: buf[0..<n])
+            }
+            if !reply.isEmpty, let response = try? Wire.decoder.decode(EngineResponse.self, from: reply) {
+                switch response {
+                case let .copied(files):
+                    if let sendError { throw sendError }
+                    return files
+                case let .error(message):
+                    throw EngineError.daemon(message)
+                default:
+                    throw EngineError.unexpectedResponse
+                }
+            }
+            if let sendError { throw sendError }
+            throw EngineError.io("gravitond closed the connection")
+        }.value
+    }
+
     public func inspect(id: String) async throws -> ContainerDetails {
         guard case let .details(details) = try await call(.inspect(id: id)) else { throw EngineError.unexpectedResponse }
         return details

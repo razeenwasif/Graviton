@@ -152,6 +152,8 @@ import Testing
     @Test func encodesNewRequests() throws {
         let line = { (r: EngineRequest) in String(decoding: try Wire.line(r), as: UTF8.self) }
         #expect(try line(.listFiles(id: "web", path: "/etc")) == #"{"method":"list_files","params":{"id":"web","path":"/etc"}}"# + "\n")
+        #expect(try line(.getArchive(id: "web", path: "/etc/hosts")) == #"{"method":"get_archive","params":{"id":"web","path":"/etc/hosts"}}"# + "\n")
+        #expect(try line(.putArchive(id: "web", path: "/tmp", size: 2048)) == #"{"method":"put_archive","params":{"id":"web","path":"/tmp","size":2048}}"# + "\n")
         #expect(try line(.stats(id: "web")) == #"{"method":"stats","params":{"id":"web"}}"# + "\n")
         #expect(try line(.exec(ExecSpec(id: "web", command: ["sh"], rows: 30, cols: 100)))
             == #"{"method":"exec","params":{"cols":100,"command":["sh"],"env":[],"id":"web","rows":30,"tty":true}}"# + "\n")
@@ -166,6 +168,14 @@ import Testing
         guard case let .files(l) = try Wire.decoder.decode(EngineResponse.self, from: Data(files.utf8)) else { Issue.record("not files"); return }
         #expect(l.entries.first?.linkTarget == "usr/bin")
         #expect(l.entries.first?.permissions == "lrwxrwxrwx")
+        guard case let .archive(isDir, name) = try Wire.decoder.decode(EngineResponse.self, from: Data(#"{"type":"archive","data":{"is_dir":true,"name":"etc"}}"#.utf8)) else {
+            Issue.record("not archive"); return
+        }
+        #expect(isDir && name == "etc")
+        guard case let .copied(count) = try Wire.decoder.decode(EngineResponse.self, from: Data(#"{"type":"copied","data":{"files":4}}"#.utf8)) else {
+            Issue.record("not copied"); return
+        }
+        #expect(count == 4)
     }
 
     @Test func demoShellEchoesAndExits() async throws {
@@ -248,6 +258,37 @@ import Testing
         #expect(listing.contains("link -> src"))
         #expect(listing.contains("-rwxr-xr-x") && listing.contains("Dockerfile")) // ignored, but always sent
         #expect(!listing.contains("node_modules"))
+    }
+
+    @Test func packsAndExtractsArchiveItems() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appending(path: "graviton-items-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: root) }
+        let nested = root.appending(path: "bundle/sub")
+        try fm.createDirectory(at: nested, withIntermediateDirectories: true)
+        let single = root.appending(path: "hello.txt")
+        try "hello world\n".write(to: single, atomically: true, encoding: .utf8)
+        try "inside\n".write(to: nested.appending(path: "data.txt"), atomically: true, encoding: .utf8)
+        try fm.createSymbolicLink(atPath: root.appending(path: "bundle/ref").path, withDestinationPath: "sub/data.txt")
+
+        // Round-trip single file into a renamed destination.
+        let (fileTar, fileSize) = try BuildUpload.packItems([single])
+        defer { try? fm.removeItem(at: fileTar) }
+        #expect(fileSize > 0 && fileSize % 512 == 0)
+        #if os(macOS)
+        let savedFile = root.appending(path: "saved.txt")
+        try BuildUpload.extractArchive(fileTar, isDir: false, archiveName: "hello.txt", to: savedFile)
+        #expect(try String(contentsOf: savedFile, encoding: .utf8) == "hello world\n")
+
+        // Round-trip folder with nested file + symlink.
+        let (dirTar, dirSize) = try BuildUpload.packItems([root.appending(path: "bundle")])
+        defer { try? fm.removeItem(at: dirTar) }
+        #expect(dirSize > 0 && dirSize % 512 == 0)
+        let savedDir = root.appending(path: "extracted-bundle")
+        try BuildUpload.extractArchive(dirTar, isDir: true, archiveName: "bundle", to: savedDir)
+        #expect(try String(contentsOf: savedDir.appending(path: "sub/data.txt"), encoding: .utf8) == "inside\n")
+        #expect(try fm.destinationOfSymbolicLink(atPath: savedDir.appending(path: "ref").path) == "sub/data.txt")
+        #endif
     }
 
     @MainActor @Test func sharesHostsWithGrav() throws {

@@ -100,6 +100,7 @@ final class LineConnection: @unchecked Sendable {
     private let connection: NWConnection
     private let queue = DispatchQueue(label: "dev.graviton.remote")
     private var buffer = Data()
+    private var eof = false
     /// The certificate fingerprint seen during the handshake.
     private(set) var observedFingerprint: String?
 
@@ -165,34 +166,47 @@ final class LineConnection: @unchecked Sendable {
                 buffer.removeSubrange(buffer.startIndex...newline)
                 return Data(line)
             }
-            let chunk: Data = try await withCheckedThrowingContinuation { continuation in
+            if eof { throw EngineError.io("the Mac closed the connection") }
+            let (data, isComplete): (Data?, Bool) = try await withCheckedThrowingContinuation { continuation in
                 connection.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { data, _, isComplete, error in
                     if let error { continuation.resume(throwing: EngineError.io(error.localizedDescription)) }
-                    else if let data, !data.isEmpty { continuation.resume(returning: data) }
-                    else if isComplete { continuation.resume(throwing: EngineError.io("the Mac closed the connection")) }
-                    else { continuation.resume(returning: Data()) }
+                    else { continuation.resume(returning: (data, isComplete)) }
                 }
             }
-            buffer.append(chunk)
+            if isComplete { eof = true }
+            if let data, !data.isEmpty {
+                buffer.append(data)
+            } else if isComplete {
+                throw EngineError.io("the Mac closed the connection")
+            }
         }
     }
 
     /// The next bytes from the Mac, starting with anything `readLine` read past.
     func receive() async throws -> Data {
+        guard let chunk = try await receiveOrEOF() else {
+            throw EngineError.io("the Mac closed the connection")
+        }
+        return chunk
+    }
+
+    /// The next bytes from the Mac, starting with anything `readLine` read past, or `nil` on clean EOF.
+    func receiveOrEOF() async throws -> Data? {
         if !buffer.isEmpty {
             defer { buffer = Data() }
             return buffer
         }
+        if eof { return nil }
         while true {
-            let chunk: Data = try await withCheckedThrowingContinuation { continuation in
+            let (data, isComplete): (Data?, Bool) = try await withCheckedThrowingContinuation { continuation in
                 connection.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { data, _, isComplete, error in
                     if let error { continuation.resume(throwing: EngineError.io(error.localizedDescription)) }
-                    else if let data, !data.isEmpty { continuation.resume(returning: data) }
-                    else if isComplete { continuation.resume(throwing: EngineError.io("the Mac closed the connection")) }
-                    else { continuation.resume(returning: Data()) }
+                    else { continuation.resume(returning: (data, isComplete)) }
                 }
             }
-            if !chunk.isEmpty { return chunk }
+            if isComplete { eof = true }
+            if let data, !data.isEmpty { return data }
+            if isComplete { return nil }
         }
     }
 
@@ -428,6 +442,64 @@ public actor RemoteEngine: EngineService {
     public func readFile(id: String, path: String) async throws -> FileContents {
         guard case let .file(contents) = try await call(.readFile(id: id, path: path)) else { throw EngineError.unexpectedResponse }
         return contents
+    }
+
+    /// Download a file or folder from a container on the paired Mac as a tar archive.
+    public nonisolated func getArchive(id: String, path: String, to archiveFile: URL) async throws -> (isDir: Bool, name: String) {
+        let c = try await LineConnection.open(host.endpoints, pin: host.fingerprint)
+        defer { c.cancel() }
+        guard case .authenticated = try await c.call(.auth(token: token)) else { throw EngineError.unexpectedResponse }
+        try await c.send(Wire.line(.getArchive(id: id, path: path)))
+        let response = try Wire.decoder.decode(EngineResponse.self, from: try await c.readLine())
+        let meta: (Bool, String)
+        switch response {
+        case let .archive(isDir, name): meta = (isDir, name)
+        case let .error(message): throw EngineError.daemon(message)
+        default: throw EngineError.unexpectedResponse
+        }
+        FileManager.default.createFile(atPath: archiveFile.path, contents: nil)
+        let out = try FileHandle(forWritingTo: archiveFile)
+        defer { try? out.close() }
+        while let chunk = try await c.receiveOrEOF() {
+            try Task.checkCancellation()
+            try out.write(contentsOf: chunk)
+        }
+        return meta
+    }
+
+    /// Upload a tar archive into a container directory on the paired Mac.
+    public nonisolated func putArchive(id: String, path: String, archiveFile: URL, size: UInt64) async throws -> UInt64 {
+        let c = try await LineConnection.open(host.endpoints, pin: host.fingerprint)
+        defer { c.cancel() }
+        guard case .authenticated = try await c.call(.auth(token: token)) else { throw EngineError.unexpectedResponse }
+        try await c.send(Wire.line(.putArchive(id: id, path: path, size: size)))
+
+        let source = try FileHandle(forReadingFrom: archiveFile)
+        defer { try? source.close() }
+        var sendError: Error?
+        do {
+            while let chunk = try source.read(upToCount: 1 << 20), !chunk.isEmpty {
+                try Task.checkCancellation()
+                try await c.send(chunk)
+            }
+        } catch {
+            sendError = error
+        }
+
+        if let line = try? await c.readLine(),
+           let response = try? Wire.decoder.decode(EngineResponse.self, from: line) {
+            switch response {
+            case let .copied(files):
+                if let sendError { throw sendError }
+                return files
+            case let .error(message):
+                throw EngineError.daemon(message)
+            default:
+                throw EngineError.unexpectedResponse
+            }
+        }
+        if let sendError { throw sendError }
+        throw EngineError.io("the Mac closed the connection")
     }
 
     public func inspect(id: String) async throws -> ContainerDetails {
