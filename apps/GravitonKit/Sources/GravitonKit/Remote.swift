@@ -370,6 +370,21 @@ public actor RemoteEngine: EngineService {
         return removed
     }
 
+    public func diskUsage() async throws -> DiskUsage {
+        guard case let .diskUsage(u) = try await call(.diskUsage) else { throw EngineError.unexpectedResponse }
+        return u
+    }
+
+    public func removeImage(reference: String) async throws -> UInt64 {
+        guard case let .imageRemoved(_, freed, _) = try await call(.removeImage(reference: reference)) else { throw EngineError.unexpectedResponse }
+        return freed
+    }
+
+    public func prune(_ spec: PruneSpec) async throws -> PruneReport {
+        guard case let .pruned(r) = try await call(.prune(spec)) else { throw EngineError.unexpectedResponse }
+        return r
+    }
+
     public func stats(id: String) async throws -> ContainerStats {
         guard case let .stats(stats) = try await call(.stats(id: id)) else { throw EngineError.unexpectedResponse }
         return stats

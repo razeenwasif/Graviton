@@ -75,6 +75,18 @@ impl Cache {
     }
 }
 
+/// Layer digests the build cache keeps, and how many steps it remembers.
+pub(crate) fn cache_contents() -> (std::collections::HashSet<String>, u32) {
+    let cache = Cache::load();
+    let layers = cache.steps.values().filter_map(|s| s.layer.as_ref().map(|l| l.digest.clone())).collect();
+    (layers, cache.steps.len() as u32)
+}
+
+/// Forget every cached step (`grav prune`); their layers are then unreferenced.
+pub(crate) fn clear_cache() {
+    Cache { version: 1, ..Cache::default() }.save();
+}
+
 /// Where a stage has got to.
 #[derive(Clone)]
 struct State {

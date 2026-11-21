@@ -105,6 +105,22 @@ powered off. `grav info` counts the disks' real size. Two containers of an image
 here yet share one pull. The agent is PID 1, so it also waits for processes
 orphaned inside the container, which would otherwise stay zombies.
 
+Disk space:
+
+```bash
+grav df                         # images, container disks, build cache, and what each frees
+grav rmi busybox                # remove an image no container uses
+grav prune                      # build cache and layers nothing refers to
+grav prune --images             # ... and images no container uses
+grav prune -a --dry-run         # everything, including stopped containers; show only
+```
+
+Layers are shared: one that another image, a container or the build cache
+still needs stays, and `grav rmi` refuses an image a container uses (it names
+them). Layers written in the last 10 minutes are kept, so a pull or build in
+progress isn't cut short. The Mac app's Images screen has **Clean Up…**, which
+previews the same choices before freeing anything, and **Remove…** on each image.
+
 Boot a bare guest VM and run a command in it (milestone 1's check):
 
 ```bash

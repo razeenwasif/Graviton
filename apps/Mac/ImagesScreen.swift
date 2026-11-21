@@ -5,6 +5,9 @@ struct ImagesScreen: View {
     @Environment(EngineStore.self) private var store
     @State private var showPull = false
     @State private var showBuild = false
+    @State private var showCleanUp = false
+    @State private var removing: ImageInfo?
+    @State private var removeError: String?
     @State private var runImage: ImageInfo?
 
     private var totalSize: UInt64 { store.images.map(\.sizeBytes).reduce(0, +) }
@@ -13,7 +16,7 @@ struct ImagesScreen: View {
         ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 14)], spacing: 14) {
                 ForEach(store.images) { image in
-                    ImageCard(image: image) { runImage = $0 }
+                    ImageCard(image: image, onRun: { runImage = $0 }, onRemove: { removing = $0 })
                 }
             }
             .padding(.horizontal, 28)
@@ -24,6 +27,9 @@ struct ImagesScreen: View {
         .navigationSubtitle("\(store.images.count) images · \(Format.bytes(totalSize)) on disk")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                Button("Clean Up…") { showCleanUp = true }
+                    .help("Free disk space: the build cache, unused layers, images and stopped containers")
+                    .disabled(!store.canManage)
                 Button("Build…") { showBuild = true }
                     .help(store.canBuild ? "Build an image from a folder with a Dockerfile" : "Start gravitond (grav service install) to build images")
                 Button {
@@ -37,6 +43,22 @@ struct ImagesScreen: View {
         }
         .sheet(isPresented: $showPull) { PullImageSheet() }
         .sheet(isPresented: $showBuild) { BuildImageSheet() }
+        .sheet(isPresented: $showCleanUp) { CleanUpSheet() }
+        .confirmationDialog("Remove \(removing.map { "\($0.repository):\($0.tag)" } ?? "")?", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } })) {
+            Button("Remove", role: .destructive) {
+                guard let image = removing else { return }
+                Task {
+                    do { try await store.removeImage(image) } catch { removeError = error.localizedDescription }
+                }
+            }
+        } message: {
+            Text("Its layers go too, unless another image or the build cache uses them. You can pull it again later.")
+        }
+        .alert("Couldn't remove the image", isPresented: Binding(get: { removeError != nil }, set: { if !$0 { removeError = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(removeError ?? "")
+        }
         .sheet(item: $runImage) { image in
             RunContainerSheet(initialImage: "\(image.repository):\(image.tag)")
         }
@@ -46,6 +68,7 @@ struct ImagesScreen: View {
 struct ImageCard: View {
     var image: ImageInfo
     var onRun: (ImageInfo) -> Void = { _ in }
+    var onRemove: (ImageInfo) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -77,6 +100,10 @@ struct ImageCard: View {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(image.reference, forType: .string)
             }
+            Divider()
+            Button("Remove…", role: .destructive) { onRemove(image) }
+                .disabled(image.usedBy > 0)
+                .help(image.usedBy > 0 ? "A container uses it: remove the container first" : "Remove this image")
         }
     }
 }

@@ -246,3 +246,30 @@ import Testing
         #expect(!(try String(contentsOf: url, encoding: .utf8)).contains(#""default" : "mini""#))
     }
 }
+
+@Suite struct CleanupTests {
+    @Test func requestsMatchRust() throws {
+        let line = { (r: EngineRequest) in String(decoding: try Wire.line(r), as: UTF8.self) }
+        #expect(try line(.diskUsage) == #"{"method":"disk_usage"}"# + "\n")
+        #expect(try line(.removeImage(reference: "alpine:3.20")) == #"{"method":"remove_image","params":{"reference":"alpine:3.20"}}"# + "\n")
+        #expect(try line(.prune(PruneSpec(images: true, dryRun: true))) == #"{"method":"prune","params":{"containers":false,"dry_run":true,"images":true}}"# + "\n")
+        let json = #"{"type":"pruned","data":{"containers":["web"],"images":["docker.io/library/busybox:latest"],"build_cache_steps":3,"blobs":7,"freed_bytes":1234,"dry_run":false}}"#
+        guard case let .pruned(r) = try Wire.decoder.decode(EngineResponse.self, from: Data(json.utf8)) else { Issue.record("not pruned"); return }
+        #expect(r.containers == ["web"] && r.blobs == 7 && r.freedBytes == 1234)
+        let removed = #"{"type":"image_removed","data":{"reference":"busybox","freed_bytes":10,"kept_bytes":2}}"#
+        guard case let .imageRemoved(_, freed, kept) = try Wire.decoder.decode(EngineResponse.self, from: Data(removed.utf8)) else { Issue.record("not removed"); return }
+        #expect(freed == 10 && kept == 2)
+    }
+
+    @Test func demoCleansUp() async throws {
+        let demo = DemoEngine()
+        let before = await demo.diskUsage()
+        #expect(before.unusedImages > 0)
+        let dry = await demo.prune(PruneSpec(images: true, dryRun: true))
+        #expect(await demo.diskUsage() == before) // a dry run changes nothing
+        let real = await demo.prune(PruneSpec(images: true))
+        #expect(real.freedBytes == dry.freedBytes)
+        #expect(await demo.diskUsage().unusedImages == 0)
+        await #expect(throws: EngineError.self) { _ = try await demo.removeImage(reference: "docker.io/library/postgres:17-alpine") }
+    }
+}

@@ -419,3 +419,45 @@ public struct EngineEvent: Codable, Identifiable, Hashable, Sendable {
         message = try c.decode(String.self, forKey: .message)
     }
 }
+
+// MARK: - Disk space
+
+/// Where the disk space goes (`grav df`).
+public struct DiskUsage: Codable, Hashable, Sendable {
+    public var images: UInt32
+    public var unusedImages: UInt32
+    public var blobsBytes: UInt64
+    public var unusedImagesBytes: UInt64
+    public var containers: UInt32
+    public var stoppedContainers: UInt32
+    public var containerDisksBytes: UInt64
+    public var stoppedDisksBytes: UInt64
+    public var buildCacheSteps: UInt32
+    public var buildCacheBytes: UInt64
+    public var unreferencedBytes: UInt64
+
+    /// What a plain prune frees: the build cache and unreferenced layers.
+    public var alwaysReclaimable: UInt64 { buildCacheBytes + unreferencedBytes }
+}
+
+/// What a prune removes; the build cache and unreferenced layers always go.
+public struct PruneSpec: Codable, Hashable, Sendable {
+    public var images: Bool
+    public var containers: Bool
+    public var dryRun: Bool
+
+    public init(images: Bool = false, containers: Bool = false, dryRun: Bool = false) {
+        self.images = images
+        self.containers = containers
+        self.dryRun = dryRun
+    }
+}
+
+public struct PruneReport: Codable, Hashable, Sendable {
+    public var containers: [String]
+    public var images: [String]
+    public var buildCacheSteps: UInt32
+    public var blobs: UInt32
+    public var freedBytes: UInt64
+    public var dryRun: Bool
+}

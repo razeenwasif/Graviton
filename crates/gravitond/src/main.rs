@@ -7,6 +7,7 @@
 
 mod boot_check;
 mod build;
+mod cleanup;
 mod events;
 mod push;
 mod remote;
@@ -380,6 +381,12 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                     Request::Stop { id } => Response::Container(engine.stop(&id)?),
                     Request::Restart { id } => Response::Container(engine.restart(&id)?),
                     Request::Remove { id } => Response::Removed { id: engine.remove(&id)? },
+                    Request::DiskUsage => Response::DiskUsage(cleanup::disk_usage(&engine)),
+                    Request::RemoveImage { reference } => {
+                        let (reference, freed_bytes, kept_bytes) = cleanup::remove_image(&engine, &reference)?;
+                        Response::ImageRemoved { reference, freed_bytes, kept_bytes }
+                    }
+                    Request::Prune(spec) => Response::Pruned(cleanup::prune(&engine, &spec)?),
                     Request::Stats { id } => Response::Stats(engine.stats(&id)?),
                     Request::ListFiles { id, path } => Response::Files(engine.list_files(&id, &path)?),
                     Request::ReadFile { id, path } => Response::File(engine.read_file(&id, &path)?),

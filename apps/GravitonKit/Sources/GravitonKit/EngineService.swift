@@ -37,6 +37,12 @@ public protocol EngineService: Sendable {
     func run(_ spec: RunSpec) async throws -> Container
     /// Remove a stopped container; returns its id.
     func remove(id: String) async throws -> String
+    /// Where the disk space goes.
+    func diskUsage() async throws -> DiskUsage
+    /// Remove an image no container uses; returns the bytes freed.
+    func removeImage(reference: String) async throws -> UInt64
+    /// Clear the build cache and unreferenced layers, and more if asked.
+    func prune(_ spec: PruneSpec) async throws -> PruneReport
     /// Recent CPU, memory and network samples and the processes of a running container.
     func stats(id: String) async throws -> ContainerStats
     func listFiles(id: String, path: String) async throws -> DirectoryListing
@@ -102,6 +108,21 @@ public final class SocketEngine: EngineService {
     public func remove(id: String) async throws -> String {
         guard case let .removed(removed) = try await call(.remove(id: id)) else { throw EngineError.unexpectedResponse }
         return removed
+    }
+
+    public func diskUsage() async throws -> DiskUsage {
+        guard case let .diskUsage(u) = try await call(.diskUsage, timeout: 30) else { throw EngineError.unexpectedResponse }
+        return u
+    }
+
+    public func removeImage(reference: String) async throws -> UInt64 {
+        guard case let .imageRemoved(_, freed, _) = try await call(.removeImage(reference: reference), timeout: 60) else { throw EngineError.unexpectedResponse }
+        return freed
+    }
+
+    public func prune(_ spec: PruneSpec) async throws -> PruneReport {
+        guard case let .pruned(r) = try await call(.prune(spec), timeout: 300) else { throw EngineError.unexpectedResponse }
+        return r
     }
 
     public func stats(id: String) async throws -> ContainerStats {

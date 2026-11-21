@@ -190,6 +190,23 @@ public final class EngineStore {
         }
     }
 
+    // Disk space. They throw so a sheet can show the error in place.
+    public func diskUsage() async throws -> DiskUsage { try await service.diskUsage() }
+
+    /// Remove an image no container uses; returns the bytes freed.
+    @discardableResult
+    public func removeImage(_ image: ImageInfo) async throws -> UInt64 {
+        let freed = try await service.removeImage(reference: image.reference)
+        await refresh()
+        return freed
+    }
+
+    public func prune(_ spec: PruneSpec) async throws -> PruneReport {
+        let report = try await service.prune(spec)
+        if !spec.dryRun { await refresh() }
+        return report
+    }
+
     public func remove(_ c: Container) async {
         do {
             _ = try await service.remove(id: c.id)

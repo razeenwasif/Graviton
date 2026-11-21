@@ -112,6 +112,25 @@ enum Command {
     },
     /// Remove a stopped container.
     Rm { container: String },
+    /// Where the disk space goes: images, container disks, the build cache.
+    Df,
+    /// Remove an image no container uses.
+    Rmi { image: String },
+    /// Free space: the build cache and layers nothing refers to, and more if asked.
+    Prune {
+        /// Also remove images no container uses.
+        #[arg(long)]
+        images: bool,
+        /// Also remove stopped containers, with their files.
+        #[arg(long)]
+        containers: bool,
+        /// Images and stopped containers too (--images --containers).
+        #[arg(short, long)]
+        all: bool,
+        /// Show what would go, without removing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Run a command in a running container.
     Exec {
         /// Keep stdin open (use with -t for a shell).
@@ -469,6 +488,45 @@ fn run(cli: Cli) -> Result<()> {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+        Command::Df => match client.call(&Request::DiskUsage)? {
+            Response::DiskUsage(u) => {
+                println!("{:<18} {:>8} {:>11} {:>14}", "", "COUNT", "SIZE", "RECLAIMABLE");
+                println!("{:<18} {:>8} {:>11} {:>14}", "Images", u.images, bytes(u.blobs_bytes), format!("{} ({} unused)", bytes(u.unused_images_bytes), u.unused_images));
+                println!("{:<18} {:>8} {:>11} {:>14}", "Container disks", u.containers, bytes(u.container_disks_bytes), format!("{} ({} stopped)", bytes(u.stopped_disks_bytes), u.stopped_containers));
+                println!("{:<18} {:>8} {:>11} {:>14}", "Build cache", u.build_cache_steps, bytes(u.build_cache_bytes), bytes(u.build_cache_bytes));
+                println!("{:<18} {:>8} {:>11} {:>14}", "Unreferenced", "", bytes(u.unreferenced_bytes), bytes(u.unreferenced_bytes));
+                println!();
+                println!("grav prune frees the build cache and unreferenced layers ({});", bytes(u.build_cache_bytes + u.unreferenced_bytes));
+                println!("--images and --containers add unused images and stopped containers.");
+            }
+            other => unexpected(other)?,
+        },
+        Command::Rmi { image } => match client.call(&Request::RemoveImage { reference: image })? {
+            Response::ImageRemoved { reference, freed_bytes, kept_bytes } => {
+                println!("Removed {} (freed {})", ImageReference::parse(&reference).map(|r| r.display_name()).unwrap_or(reference), bytes(freed_bytes));
+                if kept_bytes > 0 {
+                    println!("{} of its layers stay for the build cache; grav prune frees them.", bytes(kept_bytes));
+                }
+            }
+            other => unexpected(other)?,
+        },
+        Command::Prune { images, containers, all, dry_run } => {
+            let spec = graviton_proto::PruneSpec { images: images || all, containers: containers || all, dry_run };
+            match client.call(&Request::Prune(spec))? {
+                Response::Pruned(r) => {
+                    let verb = if r.dry_run { "Would remove" } else { "Removed" };
+                    if !r.containers.is_empty() {
+                        println!("{verb} {} stopped container{}: {}", r.containers.len(), if r.containers.len() == 1 { "" } else { "s" }, r.containers.join(", "));
+                    }
+                    for i in &r.images {
+                        println!("{verb} image {}", ImageReference::parse(i).map(|x| x.display_name()).unwrap_or(i.clone()));
+                    }
+                    println!("{verb} {} build-cache step{} and {} unreferenced layer file{}", r.build_cache_steps, if r.build_cache_steps == 1 { "" } else { "s" }, r.blobs, if r.blobs == 1 { "" } else { "s" });
+                    println!("{} {}", if r.dry_run { "Would free" } else { "Freed" }, bytes(r.freed_bytes));
+                }
+                other => unexpected(other)?,
             }
         }
         Command::Rm { container } => match client.call(&Request::Remove { id: container })? {

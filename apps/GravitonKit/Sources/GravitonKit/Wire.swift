@@ -14,6 +14,9 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case run(RunSpec)
     case build(BuildSpec)
     case remove(id: String)
+    case diskUsage
+    case removeImage(reference: String)
+    case prune(PruneSpec)
     case exec(ExecSpec)
     case stats(id: String)
     case listFiles(id: String, path: String)
@@ -51,6 +54,9 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .run: "run"
         case .build: "build"
         case .remove: "remove"
+        case .diskUsage: "disk_usage"
+        case .removeImage: "remove_image"
+        case .prune: "prune"
         case .exec: "exec"
         case .stats: "stats"
         case .listFiles: "list_files"
@@ -75,6 +81,9 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case let .pair(code, device): try c.encode(PairParams(code: code, device: device), forKey: .params)
         case let .auth(token): try c.encode(AuthParams(token: token), forKey: .params)
         case let .logs(id, tail): try c.encode(LogParams(id: id, tail: tail), forKey: .params)
+        case .diskUsage: break
+        case let .removeImage(reference): try c.encode(PullParams(reference: reference), forKey: .params)
+        case let .prune(spec): try c.encode(spec, forKey: .params)
         case let .start(id), let .stop(id), let .restart(id), let .remove(id), let .stats(id), let .inspect(id):
             try c.encode(IDParams(id: id), forKey: .params)
         case let .listFiles(id, path), let .readFile(id, path): try c.encode(PathParams(id: id, path: path), forKey: .params)
@@ -98,6 +107,9 @@ public enum EngineResponse: Decodable, Sendable {
     case container(Container)
     case image(ImageInfo)
     case removed(id: String)
+    case diskUsage(DiskUsage)
+    case imageRemoved(reference: String, freedBytes: UInt64, keptBytes: UInt64)
+    case pruned(PruneReport)
     case buildLog(String)
     case attached
     case stats(ContainerStats)
@@ -119,6 +131,7 @@ public enum EngineResponse: Decodable, Sendable {
     private struct Host: Decodable { let host: String }
     private struct Pong: Decodable { let `protocol`: UInt32 }
     private struct ErrorData: Decodable { let message: String }
+    private struct ImageRemovedData: Decodable { let reference: String; let freedBytes: UInt64; let keptBytes: UInt64 }
     private struct BuildLine: Decodable { let line: String }
 
     public init(from decoder: Decoder) throws {
@@ -133,6 +146,11 @@ public enum EngineResponse: Decodable, Sendable {
         case "container": self = .container(try c.decode(Container.self, forKey: .data))
         case "image": self = .image(try c.decode(ImageInfo.self, forKey: .data))
         case "removed": self = .removed(id: try c.decode(Removed.self, forKey: .data).id)
+        case "disk_usage": self = .diskUsage(try c.decode(DiskUsage.self, forKey: .data))
+        case "image_removed":
+            let r = try c.decode(ImageRemovedData.self, forKey: .data)
+            self = .imageRemoved(reference: r.reference, freedBytes: r.freedBytes, keptBytes: r.keptBytes)
+        case "pruned": self = .pruned(try c.decode(PruneReport.self, forKey: .data))
         case "attached": self = .attached
         case "build_log": self = .buildLog(try c.decode(BuildLine.self, forKey: .data).line)
         case "stats": self = .stats(try c.decode(ContainerStats.self, forKey: .data))

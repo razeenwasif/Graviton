@@ -51,8 +51,8 @@ const READ_LIMIT: u64 = 256 * 1024;
 
 /// How to start a container (again).
 #[derive(Clone, Serialize, Deserialize)]
-struct ContainerSpec {
-    image: LocalImage,
+pub(crate) struct ContainerSpec {
+    pub(crate) image: LocalImage,
     argv: Vec<String>,
     env: Vec<String>,
     cwd: String,
@@ -102,7 +102,7 @@ pub struct Engine {
     pub store: Arc<Mutex<Store>>,
     pub(crate) blobs: BlobStore,
     pub(crate) index: Mutex<ImageIndex>,
-    specs: Mutex<HashMap<String, ContainerSpec>>,
+    pub(crate) specs: Mutex<HashMap<String, ContainerSpec>>,
     running: Mutex<HashMap<String, Running>>,
     stats: Mutex<HashMap<String, StatsHistory>>,
     switch: crate::switch::Switch,
@@ -260,7 +260,7 @@ impl Engine {
         self.index.lock().unwrap().get(reference).cloned().ok_or_else(|| anyhow!("pulled {reference} but can't find it"))
     }
 
-    fn used_by(&self, reference: &str) -> u32 {
+    pub(crate) fn used_by(&self, reference: &str) -> u32 {
         let specs = self.specs.lock().unwrap();
         specs.values().filter(|s| s.image.reference == reference).count() as u32
     }

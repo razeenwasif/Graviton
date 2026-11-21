@@ -6,7 +6,10 @@ import Foundation
 public actor DemoEngine: EngineService {
     private var list: [Container]
     private var logLines: [String: [LogLine]]
-    private let imageList: [ImageInfo]
+    private var imageList: [ImageInfo]
+    /// Pretend build cache, for the Clean Up sheet.
+    private var cacheSteps: UInt32 = 23
+    private var cacheBytes: UInt64 = 412 << 20
     private var tick = 0
 
     public init() {
@@ -142,6 +145,54 @@ public actor DemoEngine: EngineService {
         let removed = list.remove(at: i)
         logLines[removed.id] = nil
         return removed.id
+    }
+
+    // MARK: Disk space
+
+    private func inUse(_ image: ImageInfo) -> Bool {
+        list.contains { "\($0.image)" == "\(image.repository):\(image.tag)" || image.reference.hasSuffix($0.image) } || image.usedBy > 0
+    }
+
+    public func diskUsage() -> DiskUsage {
+        let unused = imageList.filter { !inUse($0) }
+        let stopped = list.filter { !$0.isRunning }
+        let disk: (Container) -> UInt64 = { c in (c.memoryBytes ?? 180 << 20) / 2 + (96 << 20) }
+        return DiskUsage(images: UInt32(imageList.count), unusedImages: UInt32(unused.count),
+                         blobsBytes: imageList.map(\.sizeBytes).reduce(0, +) + cacheBytes,
+                         unusedImagesBytes: unused.map(\.sizeBytes).reduce(0, +),
+                         containers: UInt32(list.count), stoppedContainers: UInt32(stopped.count),
+                         containerDisksBytes: list.map(disk).reduce(0, +), stoppedDisksBytes: stopped.map(disk).reduce(0, +),
+                         buildCacheSteps: cacheSteps, buildCacheBytes: cacheBytes, unreferencedBytes: cacheSteps > 0 ? 37 << 20 : 0)
+    }
+
+    public func removeImage(reference: String) throws -> UInt64 {
+        guard let i = imageList.firstIndex(where: { $0.reference == reference || "\($0.repository):\($0.tag)" == reference }) else {
+            throw EngineError.daemon("no image \(reference) here")
+        }
+        guard !inUse(imageList[i]) else { throw EngineError.daemon("\(reference) is used by a container: remove it first") }
+        return imageList.remove(at: i).sizeBytes
+    }
+
+    public func prune(_ spec: PruneSpec) -> PruneReport {
+        let before = diskUsage()
+        var report = PruneReport(containers: [], images: [], buildCacheSteps: cacheSteps, blobs: cacheSteps > 0 ? 31 : 0,
+                                 freedBytes: before.alwaysReclaimable, dryRun: spec.dryRun)
+        if spec.containers {
+            report.containers = list.filter { !$0.isRunning }.map(\.name)
+            report.freedBytes += before.stoppedDisksBytes
+            if !spec.dryRun { list.removeAll { !$0.isRunning } }
+        }
+        if spec.images {
+            let unused = imageList.filter { !inUse($0) }
+            report.images = unused.map(\.reference)
+            report.freedBytes += unused.map(\.sizeBytes).reduce(0, +)
+            if !spec.dryRun { imageList.removeAll { !inUse($0) } }
+        }
+        if !spec.dryRun {
+            cacheSteps = 0
+            cacheBytes = 0
+        }
+        return report
     }
 
     // MARK: Stats, files, details and terminals (made up, but plausible)

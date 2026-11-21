@@ -246,6 +246,55 @@ pub struct BuildSpec {
 /// Where an uploaded build folder's Dockerfile goes when it lives outside the folder.
 pub const UPLOADED_DOCKERFILE: &str = ".graviton-dockerfile";
 
+/// Where the disk space goes (`grav df`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskUsage {
+    pub images: u32,
+    /// Images no container uses.
+    pub unused_images: u32,
+    /// Every stored image layer, config and manifest, counted once.
+    pub blobs_bytes: u64,
+    /// What removing the unused images would free (layers no one else needs).
+    pub unused_images_bytes: u64,
+    pub containers: u32,
+    pub stopped_containers: u32,
+    /// Containers' disks as they really take up space (they're sparse).
+    pub container_disks_bytes: u64,
+    pub stopped_disks_bytes: u64,
+    /// Steps remembered by the build cache, and the layers only it keeps.
+    pub build_cache_steps: u32,
+    pub build_cache_bytes: u64,
+    /// Layers nothing refers to any more.
+    pub unreferenced_bytes: u64,
+}
+
+/// What `grav prune` removes. The build cache and unreferenced layers always go.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneSpec {
+    /// Also images no container uses.
+    #[serde(default)]
+    pub images: bool,
+    /// Also stopped containers, with their disks.
+    #[serde(default)]
+    pub containers: bool,
+    /// Report what would go without removing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneReport {
+    /// Names of the containers removed.
+    pub containers: Vec<String>,
+    /// References of the images removed.
+    pub images: Vec<String>,
+    pub build_cache_steps: u32,
+    /// Blob files deleted.
+    pub blobs: u32,
+    pub freed_bytes: u64,
+    pub dry_run: bool,
+}
+
 /// What `grav exec` asks for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecSpec {
@@ -401,6 +450,12 @@ pub enum Request {
     Run(RunSpec),
     /// Remove a stopped container.
     Remove { id: String },
+    /// Where the disk space goes.
+    DiskUsage,
+    /// Remove an image no container uses, and the layers only it needed.
+    RemoveImage { reference: String },
+    /// Clear the build cache and unreferenced layers, and more if asked.
+    Prune(PruneSpec),
     /// Run a command in a running container. Without a TTY the daemon answers
     /// with `ExecOutput` lines and a final `ExecExited`; with one it answers
     /// `Attached` and the connection then carries terminal [`frame`]s.
@@ -453,6 +508,10 @@ pub enum Response {
     Container(ContainerSummary),
     Image(ImageSummary),
     Removed { id: String },
+    DiskUsage(DiskUsage),
+    /// `kept_bytes`: its layers the build cache still holds (`grav prune` frees them).
+    ImageRemoved { reference: String, freed_bytes: u64, kept_bytes: u64 },
+    Pruned(PruneReport),
     BuildLog { line: String },
     ExecOutput { stream: LogStream, data: Vec<u8> },
     ExecExited { code: i32 },
