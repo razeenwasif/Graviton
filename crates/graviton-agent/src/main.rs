@@ -20,6 +20,8 @@ mod build;
 #[cfg(target_os = "linux")]
 mod container;
 #[cfg(target_os = "linux")]
+mod dns;
+#[cfg(target_os = "linux")]
 mod files;
 #[cfg(target_os = "linux")]
 mod net;
@@ -126,12 +128,12 @@ pub(crate) mod linux {
                     let t0 = std::time::Instant::now();
                     let result = crate::container::prepare(&container, &layers).and_then(|(files, reused)| {
                         let ip = crate::net::wait(std::time::Duration::from_secs(8));
-                        crate::container::finish(&container, &mounts, hostname.as_deref().unwrap_or(&container), ip.as_deref())?;
-                        Ok((files, reused, ip))
+                        let dns = crate::container::finish(&container, &mounts, hostname.as_deref().unwrap_or(&container), ip.as_deref())?;
+                        Ok((files, reused, ip, dns))
                     });
                     match result {
-                        Ok((files, reused, ip)) => {
-                            send(&writer, &AgentEvent::Prepared { container, files, ms: t0.elapsed().as_millis() as u64, ip, reused })
+                        Ok((files, reused, ip, dns)) => {
+                            send(&writer, &AgentEvent::Prepared { container, files, ms: t0.elapsed().as_millis() as u64, ip, reused, dns })
                         }
                         Err(err) => send(&writer, &AgentEvent::Error { message: format!("preparing {container}: {err}") }),
                     }
@@ -198,6 +200,9 @@ pub(crate) mod linux {
                         Ok(files) => send(&writer, &AgentEvent::Copied { files }),
                         Err(err) => send(&writer, &AgentEvent::Error { message: err.to_string() }),
                     }
+                }
+                Ok(AgentRequest::SetHosts { generation, hosts }) => {
+                    crate::dns::set_hosts(generation, &hosts);
                 }
                 Ok(AgentRequest::Shutdown) => power_off(),
                 Err(err) => send(&writer, &AgentEvent::Error { message: format!("bad request: {err}") }),

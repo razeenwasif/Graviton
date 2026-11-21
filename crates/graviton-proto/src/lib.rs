@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub mod build;
+pub mod dns;
 
 /// Bumped whenever a breaking change is made to the control API.
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -543,6 +544,15 @@ pub struct GuestMount {
     pub read_only: bool,
 }
 
+/// A container's name, id, and IPv4 address on the container network, for guest DNS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostEntry {
+    pub name: String,
+    #[serde(default)]
+    pub id: String,
+    pub ip: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum AgentRequest {
@@ -617,6 +627,13 @@ pub enum AgentRequest {
     },
     /// Create a directory (and its parents) in a container (WORKDIR).
     Mkdir { container: String, path: String },
+    /// Update the guest DNS resolver's container name table. Sent on the
+    /// supervisor connection with no reply event so it never interleaves with
+    /// container output.
+    SetHosts {
+        generation: u64,
+        hosts: Vec<HostEntry>,
+    },
     Shutdown,
 }
 
@@ -634,6 +651,9 @@ pub enum AgentEvent {
         /// The container's files were already on its disk from an earlier run.
         #[serde(default)]
         reused: bool,
+        /// The guest runs the container DNS resolver and accepts `SetHosts`.
+        #[serde(default)]
+        dns: bool,
     },
     Started { pid: i32 },
     Stdout { pid: i32, data: Vec<u8> },
@@ -857,6 +877,23 @@ mod tests {
         assert_eq!(
             String::from_utf8(line).unwrap(),
             "{\"event\":\"exited\",\"pid\":7,\"code\":0}\n"
+        );
+    }
+
+    #[test]
+    fn set_hosts_and_prepared_dns_compat() {
+        let req = AgentRequest::SetHosts {
+            generation: 3,
+            hosts: vec![HostEntry { name: "redis".into(), id: "a1b2c3d4e5f6".into(), ip: "192.168.64.5".into() }],
+        };
+        let line = encode_line(&req);
+        assert_eq!(decode_line::<AgentRequest>(&line).unwrap(), req);
+
+        // Older agents omit `dns`; it defaults to false.
+        let old: AgentEvent = decode_line(br#"{"event":"prepared","container":"abc","files":10,"ms":50,"ip":"192.168.64.2"}"#).unwrap();
+        assert_eq!(
+            old,
+            AgentEvent::Prepared { container: "abc".into(), files: 10, ms: 50, ip: Some("192.168.64.2".into()), reused: false, dns: false }
         );
     }
 }

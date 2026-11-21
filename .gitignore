@@ -9,3 +9,7 @@ xcuserdata/
 # Release signing (your team ID) and release output
 apps/Config/Signing.local.xcconfig
 /dist/
+
+# Antigravity local migration & rules
+.antigravity/
+.gemini/

@@ -66,6 +66,10 @@ cargo run -p grav -- stop web && cargo run -p grav -- rm web
 
 - `-p HOST:CONTAINER` publishes a TCP port on 127.0.0.1 (forwarded to the
   container's VM on Virtualization.framework's NAT network).
+- Containers on the same Mac reach each other directly over the container
+  network (TCP, UDP and ICMP) and resolve each other by name, `<name>.graviton`
+  or container ID via the guest's embedded DNS resolver (`127.0.0.11:53`),
+  falling back to the NAT's DNS for external hosts.
 - `-v /mac/dir:/path[:ro]` shares a folder over virtiofs; `-v name:/path` is a
   named volume under `~/Library/Application Support/Graviton/volumes`.
 - Containers, their settings and logs are saved; after gravitond restarts,

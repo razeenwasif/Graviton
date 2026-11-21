@@ -101,6 +101,8 @@ label=dev.graviton.gravitond
 plist="$HOME/Library/LaunchAgents/$label.plist"
 uid=$(id -u)
 grav="$app/Contents/MacOS/grav"
+check_grav="$grav"
+[ -x "$check_grav" ] || check_grav="$stage/grav"
 [ -d "$app" ] || { echo "No $app on $(hostname -s)." >&2; exit 1; }
 [ -f "$plist" ] || { echo "No $plist: install gravitond as a launch agent there first." >&2; exit 1; }
 
@@ -112,7 +114,7 @@ dest() { # staged name -> path in the app
 }
 
 # `grav ps` lists running containers under a header line.
-running=$("$grav" --host local ps 2>/dev/null | tail -n +2 | grep -c . || true)
+running=$("$check_grav" --host local ps 2>/dev/null | tail -n +2 | grep -c . || true)
 if [ "$running" != "0" ] && [ "$force" != "1" ]; then
     echo "$running container(s) running on $(hostname -s); restarting gravitond would stop them. Wait, or pass --force." >&2
     exit 1
@@ -120,13 +122,18 @@ fi
 
 # Keep the current files, then put each new one in as a new file.
 mkdir -p "$stage/backup/guest"
-for f in $files; do cp -p "$(dest "$f")" "$stage/backup/$f"; done
+for f in $files; do
+    d=$(dest "$f")
+    [ -e "$d" ] && cp -p "$d" "$stage/backup/$f"
+done
 launchctl bootout "gui/$uid/$label" 2>/dev/null || true
 for _ in 1 2 3 4 5; do launchctl print "gui/$uid/$label" >/dev/null 2>&1 || break; sleep 1; done
 
 install_files() { # from-dir
     for f in $files; do
+        [ -e "$1/$f" ] || continue
         d=$(dest "$f")
+        mkdir -p "$(dirname "$d")"
         cp -p "$1/$f" "$(dirname "$d")/.$(basename "$d").new"
         mv -f "$(dirname "$d")/.$(basename "$d").new" "$d"
     done

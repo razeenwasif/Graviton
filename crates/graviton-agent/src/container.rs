@@ -160,8 +160,9 @@ pub fn prepare(id: &str, layers: &[String]) -> io::Result<(u64, bool)> {
     Ok((files, false))
 }
 
-/// Mount the container's volumes and write its network files.
-pub fn finish(id: &str, mounts: &[graviton_proto::GuestMount], hostname: &str, ip: Option<&str>) -> io::Result<()> {
+/// Mount the container's volumes and write its network files. Returns whether
+/// the guest's container DNS resolver (`127.0.0.11:53`) is active.
+pub fn finish(id: &str, mounts: &[graviton_proto::GuestMount], hostname: &str, ip: Option<&str>) -> io::Result<bool> {
     let root = rootfs(id)?;
     for m in mounts {
         let rel = clean(Path::new(&m.target)).ok_or_else(|| io::Error::other(format!("bad mount target `{}`", m.target)))?;
@@ -185,10 +186,27 @@ pub fn finish(id: &str, mounts: &[graviton_proto::GuestMount], hostname: &str, i
     write("hostname", &format!("{hostname}\n"))?;
     let named = ip.unwrap_or("127.0.1.1");
     write("hosts", &format!("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n{named}\t{hostname}\n"))?;
-    if let Ok(resolv) = fs::read_to_string("/etc/resolv.conf") {
-        write("resolv.conf", &resolv)?;
+
+    let dns_active = if ip.is_some() && Path::new("/sys/class/net/eth1").exists() {
+        match crate::dns::start() {
+            Ok(()) => {
+                write("resolv.conf", &format!("nameserver {}\n", crate::dns::LISTEN_IP))?;
+                true
+            }
+            Err(err) => {
+                eprintln!("graviton-agent: container dns: {err}");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if !dns_active {
+        if let Ok(resolv) = fs::read_to_string("/etc/resolv.conf") {
+            write("resolv.conf", &resolv)?;
+        }
     }
-    Ok(())
+    Ok(dns_active)
 }
 
 fn mount_blobs() -> io::Result<()> {

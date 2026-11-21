@@ -24,6 +24,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,7 +33,7 @@ use graviton_core::{ImageReference, Store, paths};
 use graviton_image::{BlobStore, ImageIndex, LocalImage, Progress, Registry};
 use graviton_proto::{
     AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ContainerDetails, ContainerStats, ContainerStatus, ContainerSummary,
-    DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats, ImageSummary, LogLevel, LogLine, LogStream,
+    DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats, HostEntry, ImageSummary, LogLevel, LogLine, LogStream,
     Mount, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RunSpec, StatSample, decode_line, encode_line,
 };
 use graviton_vmm::apple::{AppleHypervisor, AppleVm};
@@ -83,9 +84,14 @@ struct SavedState {
 }
 
 struct Running {
+    name: String,
     vm: Arc<AppleVm>,
     agent: Arc<Mutex<File>>,
     pid: Option<i32>,
+    /// IPv4 address on the container network once DHCP has finished.
+    ip: Option<String>,
+    /// Whether the guest runs the embedded DNS resolver (`SetHosts`).
+    dns: bool,
     forwards: Vec<tokio::task::JoinHandle<()>>,
     /// The VM's port on the container network; unplugged when this is dropped (after the VM stops).
     _port: Option<crate::switch::Port>,
@@ -106,6 +112,9 @@ pub struct Engine {
     running: Mutex<HashMap<String, Running>>,
     stats: Mutex<HashMap<String, StatsHistory>>,
     switch: crate::switch::Switch,
+    /// Serialises guest DNS table broadcasts so concurrent starts/stops never reorder.
+    hosts_sync: Mutex<()>,
+    hosts_gen: AtomicU64,
     /// What happened, for the Activity feed and push alerts.
     pub events: Arc<crate::events::EventLog>,
     /// Containers being stopped on request (so their exit isn't a failure).
@@ -130,6 +139,8 @@ impl Engine {
             running: Mutex::new(HashMap::new()),
             stats: Mutex::new(HashMap::new()),
             switch: crate::switch::Switch::new(),
+            hosts_sync: Mutex::new(()),
+            hosts_gen: AtomicU64::new(0),
             events: Arc::new(crate::events::EventLog::open(paths::support_dir().join("events.jsonl"))),
             stopping: Mutex::new(HashSet::new()),
             pulling: Mutex::new(HashMap::new()),
@@ -450,6 +461,19 @@ impl Engine {
             }
         };
         let requested = self.stopping.lock().unwrap().remove(id);
+        let had_ip = {
+            let mut running = self.running.lock().unwrap();
+            if let Some(r) = running.get_mut(id) {
+                let had = r.ip.take().is_some();
+                r.dns = false;
+                had
+            } else {
+                false
+            }
+        };
+        if had_ip {
+            self.sync_hosts();
+        }
         if let Some(r) = self.running.lock().unwrap().remove(id) {
             for f in &r.forwards {
                 f.abort();
@@ -520,10 +544,19 @@ impl Engine {
             AgentEvent::Ready { .. } => {}
             other => bail!("expected ready from the agent, got {other:?}"),
         }
-        self.running
-            .lock()
-            .unwrap()
-            .insert(id.to_string(), Running { vm: Arc::clone(&vm), agent: Arc::clone(&agent), pid: None, forwards: vec![], _port: Some(port) });
+        self.running.lock().unwrap().insert(
+            id.to_string(),
+            Running {
+                name: name.clone(),
+                vm: Arc::clone(&vm),
+                agent: Arc::clone(&agent),
+                pid: None,
+                ip: None,
+                dns: false,
+                forwards: vec![],
+                _port: Some(port),
+            },
+        );
         let booted = t0.elapsed();
 
         send(&agent, &AgentRequest::Prepare {
@@ -532,11 +565,18 @@ impl Engine {
             mounts,
             hostname: Some(name.clone()),
         })?;
-        let (files, unpack_ms, ip, reused) = match events.next()? {
-            AgentEvent::Prepared { files, ms, ip, reused, .. } => (files, ms, ip, reused),
+        let (files, unpack_ms, ip, reused, dns) = match events.next()? {
+            AgentEvent::Prepared { files, ms, ip, reused, dns, .. } => (files, ms, ip, reused, dns),
             AgentEvent::Error { message } => bail!("{message}"),
             other => bail!("expected prepared from the agent, got {other:?}"),
         };
+        if ip.is_some() {
+            if let Some(r) = self.running.lock().unwrap().get_mut(id) {
+                r.ip = ip.clone();
+                r.dns = dns;
+            }
+            self.sync_hosts();
+        }
         let address: Option<IpAddr> = ip.as_deref().and_then(|s| s.parse().ok());
         self.log(
             id,
@@ -621,6 +661,38 @@ impl Engine {
                 AgentEvent::Error { message } => bail!("{message}"),
                 _ => {}
             }
+        }
+    }
+
+    /// Push the current container name → IP table to every running guest with DNS enabled.
+    fn sync_hosts(&self) {
+        let _turn = self.hosts_sync.lock().unwrap();
+        let (hosts, targets): (Vec<HostEntry>, Vec<Arc<Mutex<File>>>) = {
+            let running = self.running.lock().unwrap();
+            let hosts = running
+                .iter()
+                .filter_map(|(id, r)| {
+                    r.ip.as_ref().map(|ip| HostEntry {
+                        name: r.name.clone(),
+                        id: id.clone(),
+                        ip: ip.clone(),
+                    })
+                })
+                .collect();
+            let targets = running
+                .values()
+                .filter(|r| r.dns && r.ip.is_some())
+                .map(|r| Arc::clone(&r.agent))
+                .collect();
+            (hosts, targets)
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let generation = self.hosts_gen.fetch_add(1, Ordering::Relaxed) + 1;
+        let msg = encode_line(&AgentRequest::SetHosts { generation, hosts });
+        for agent in targets {
+            let _ = agent.lock().unwrap().write_all(&msg);
         }
     }
 
