@@ -572,6 +572,9 @@ pub enum AgentEvent {
         /// The guest's address on the NAT network, once DHCP has finished.
         #[serde(default)]
         ip: Option<String>,
+        /// The container's files were already on its disk from an earlier run.
+        #[serde(default)]
+        reused: bool,
     },
     Started { pid: i32 },
     Stdout { pid: i32, data: Vec<u8> },

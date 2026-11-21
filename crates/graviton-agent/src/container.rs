@@ -39,32 +39,53 @@ fn format_disk() -> io::Result<bool> {
     if !Path::new(DISK).exists() {
         return Ok(false);
     }
-    // Scratch, rebuilt each boot: no journal and no checksums to pay for,
-    // nothing to discard (it's a fresh, empty sparse file), and a fixed UUID
-    // and hash seed. Making those up needs randomness the kernel doesn't have
-    // this early in boot, and mke2fs waited seconds for it.
+    if !is_ext4(DISK) {
+        format(DISK)?;
+    }
+    fs::create_dir_all(CONTAINERS)?;
+    crate::linux::mount_with(DISK, CONTAINERS, "ext4", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOATIME, None)
+        .map_err(|e| io::Error::other(format!("mounting {DISK}: {e}")))?;
+    Ok(true)
+}
+
+/// Whether `dev` already holds an ext2/3/4 filesystem (a container's disk from an earlier run).
+fn is_ext4(dev: &str) -> bool {
+    let mut magic = [0u8; 2];
+    File::open(dev).and_then(|mut f| {
+        f.seek(SeekFrom::Start(1024 + 56))?;
+        f.read_exact(&mut magic)
+    })
+    .is_ok()
+        && u16::from_le_bytes(magic) == 0xEF53
+}
+
+/// Format a new disk. A container's disk lasts until it's removed, so it gets a
+/// small journal (a VM powered off mid-write comes back consistent). No
+/// checksums to pay for, nothing to discard (it's a fresh, empty sparse
+/// file), and a fixed UUID and hash seed: making those up needs randomness
+/// the kernel doesn't have this early in boot, and mke2fs waited seconds for it.
+fn format(dev: &str) -> io::Result<()> {
     let out = crate::reap::output(Command::new("/sbin/mke2fs").args([
         "-q",
         "-F",
         "-t",
         "ext4",
+        "-J",
+        "size=16",
         "-O",
-        "^has_journal,^metadata_csum",
+        "^metadata_csum",
         "-E",
         "lazy_itable_init=1,nodiscard,hash_seed=67726176-6974-6f6e-0000-000000000001",
         "-U",
         "67726176-6974-6f6e-0000-000000000002",
         "-m",
         "0",
-        DISK,
+        dev,
     ]))?;
     if !out.status.success() {
-        return Err(io::Error::other(format!("formatting {DISK}: {}", String::from_utf8_lossy(&out.stderr).trim())));
+        return Err(io::Error::other(format!("formatting {dev}: {}", String::from_utf8_lossy(&out.stderr).trim())));
     }
-    fs::create_dir_all(CONTAINERS)?;
-    crate::linux::mount_with(DISK, CONTAINERS, "ext4", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOATIME, None)
-        .map_err(|e| io::Error::other(format!("mounting {DISK}: {e}")))?;
-    Ok(true)
+    Ok(())
 }
 
 pub fn rootfs(id: &str) -> io::Result<PathBuf> {
@@ -75,11 +96,23 @@ pub fn rootfs(id: &str) -> io::Result<PathBuf> {
     Ok(Path::new(CONTAINERS).join(id).join("rootfs"))
 }
 
-/// Unpack `layers` (sha256 digests, lowest first) into a fresh rootfs. Returns the entry count.
-pub fn prepare(id: &str, layers: &[String]) -> io::Result<u64> {
+/// Unpack `layers` (sha256 digests, lowest first) into the container's root.
+/// On its disk, files from an earlier run of the same image are kept as they
+/// are (`(0, true)`); otherwise the root starts fresh. Returns the entry
+/// count unpacked and whether the files were reused.
+pub fn prepare(id: &str, layers: &[String]) -> io::Result<(u64, bool)> {
     mount_blobs()?;
     let disk = on_disk()?;
     let root = rootfs(id)?;
+    // Written once a root is fully unpacked: which image it came from.
+    let marker = root.with_file_name("image");
+    let wanted = layers.join("\n");
+    if disk && root.is_dir() && fs::read_to_string(&marker).is_ok_and(|m| m == wanted) {
+        let path = root.to_string_lossy();
+        crate::linux::mount_with(&path, &path, "none", libc::MS_BIND, None)?;
+        return Ok((0, true));
+    }
+    let _ = fs::remove_file(&marker);
     if root.exists() {
         let _ = umount(&root);
         let _ = fs::remove_dir_all(&root);
@@ -112,7 +145,19 @@ pub fn prepare(id: &str, layers: &[String]) -> io::Result<u64> {
             set_mode(&p, mode)?;
         }
     }
-    Ok(files)
+    if disk {
+        // Get the unpacked files and the marker onto the disk before the
+        // container runs: ext4 holds new data in memory for up to 30 s, and
+        // a VM powered off before then would come back with an empty marker
+        // (and unpack again over the container's changes).
+        fs::write(&marker, &wanted)?;
+        let dir = File::open(CONTAINERS)?;
+        // SAFETY: syncfs(2) on a descriptor we own.
+        if unsafe { libc::syncfs(std::os::fd::AsRawFd::as_raw_fd(&dir)) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok((files, false))
 }
 
 /// Mount the container's volumes and write its network files.

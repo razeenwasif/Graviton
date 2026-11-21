@@ -92,11 +92,16 @@ in the Keychain; gravitond stores only token hashes, in
 streams the output; the exit code is the container's. `gravitond --demo`
 serves the sample containers from the design mockups instead.
 
-The container's files live on a scratch disk, not in the VM's memory: each VM
-gets a sparse disk image (`disk.img` beside its console log, up to
-`$GRAVITON_DISK_GIB`, default 64 GiB, using only what's written), which the
-agent formats ext4 at boot and deletes with the VM. So an image and what runs
-in it can be far bigger than `--memory`. Two containers of an image that isn't
+The container's files live on its own disk, not in the VM's memory: a sparse
+disk image (`disk.img` beside its console log, up to `$GRAVITON_DISK_GIB`,
+default 64 GiB, using only what's written) that the agent formats ext4 on the
+container's first start. So an image and what runs in it can be far bigger
+than `--memory`. The disk stays until `grav rm`: like `docker start`, a
+stopped container starts again with the files it changed, and without
+unpacking its image again (a few hundred ms instead of seconds for big
+images). The image is unpacked once, flushed to disk before the container
+runs, and a small journal keeps the disk consistent if a container has to be
+powered off. `grav info` counts the disks' real size. Two containers of an image that isn't
 here yet share one pull. The agent is PID 1, so it also waits for processes
 orphaned inside the container, which would otherwise stay zombies.
 
@@ -198,7 +203,12 @@ out), so you build local projects on the other Mac. Volume paths (`-v
 ~/code:/app`) are paths on that Mac. Pairings live in `hosts.json` in
 Graviton's support folder (readable only by you) and are shared with the Mac
 app, whose Host menu (⌥⌘0 for this Mac, ⌥⌘1… for the others) and sidebar
-switch which Mac the window shows; it can pair too.
+switch which Mac the window shows; it can pair too. The app and `grav` share
+one default: `grav hosts use mini` makes the app open on the mini, and picking
+a Mac in the Host menu changes grav's default. So with the mini as the
+default, this Mac is just the interface: containers, images and builds from
+the app or `grav` all go to the mini. The iPhone app reopens on whichever Mac
+you last picked in its Hosts tab.
 
 `grav service install|uninstall|status` runs the gravitond inside Graviton.app
 at login on any Mac, without the source.
@@ -211,6 +221,7 @@ say) straight from this checkout, without a release:
 ```bash
 scripts/deploy-remote.sh mini            # gravitond and grav
 scripts/deploy-remote.sh mini --guest    # and the guest kernel and initramfs
+scripts/deploy-remote.sh local --guest   # this Mac's Graviton.app, the same way
 ```
 
 It builds both binaries, signs them with your Apple Development certificate

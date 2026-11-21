@@ -5,6 +5,7 @@
 # server, and it doesn't need the Mac app to build.
 #
 #   scripts/deploy-remote.sh [host]            default host: mini
+#   scripts/deploy-remote.sh local --guest     this Mac, without ssh
 #   scripts/deploy-remote.sh mini --guest      also rebuild and install the guest
 #   scripts/deploy-remote.sh mini --force      even while containers are running
 #   scripts/deploy-remote.sh mini --app /Applications/Graviton.app
@@ -73,17 +74,26 @@ if [ $guest = 1 ]; then
     files="$files guest/vmlinux guest/initrd.img"
 fi
 
-# 2. Copy to a staging folder there.
+# 2. Copy to a staging folder there (or here, for `local`).
 remote_stage=".graviton-deploy"
-# shellcheck disable=SC2029
-ssh "${ssh_opts[@]}" "$host" "rm -rf $remote_stage && mkdir -p $remote_stage/guest"
-for f in $files; do
-    scp -q "${ssh_opts[@]}" "$stage/$f" "$host:$remote_stage/$f"
-done
+if [ "$host" = local ]; then
+    rm -rf "$HOME/$remote_stage" && mkdir -p "$HOME/$remote_stage/guest"
+    for f in $files; do cp "$stage/$f" "$HOME/$remote_stage/$f"; done
+    there() { bash -s -- "$@"; }
+else
+    # shellcheck disable=SC2029
+    ssh "${ssh_opts[@]}" "$host" "rm -rf $remote_stage && mkdir -p $remote_stage/guest"
+    for f in $files; do
+        scp -q "${ssh_opts[@]}" "$stage/$f" "$host:$remote_stage/$f"
+    done
+    # ssh runs one command line through the remote shell: quote the arguments,
+    # or the list of files splits into words and only the first is deployed.
+    there() { ssh "${ssh_opts[@]}" "$host" "bash -s -- $(printf '%q ' "$@")"; }
+fi
 
 # 3. Swap them in there, restart, check, and roll back if it doesn't answer.
 # shellcheck disable=SC2087
-ssh "${ssh_opts[@]}" "$host" bash -s -- "$app" "$force" "$files" <<'REMOTE'
+there "$app" "$force" "$files" <<'REMOTE'
 set -euo pipefail
 app=$1 force=$2 files=$3
 stage="$HOME/.graviton-deploy"

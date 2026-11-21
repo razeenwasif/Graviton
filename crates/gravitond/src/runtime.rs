@@ -119,7 +119,6 @@ pub struct Engine {
 impl Engine {
     /// Open the engine, restoring saved containers. Call from inside the tokio runtime.
     pub fn open() -> Result<Arc<Self>> {
-        remove_stale_disks();
         let blobs = BlobStore::new(paths::blobs_dir());
         fs::create_dir_all(blobs.root().join("sha256")).context("creating the blob store")?;
         let index = ImageIndex::load(paths::support_dir().join("images.json"))?;
@@ -138,6 +137,8 @@ impl Engine {
             state_path: paths::support_dir().join("containers.json"),
         });
         engine.restore()?;
+        let known: HashSet<String> = engine.store.lock().unwrap().containers().iter().map(|c| c.id.clone()).collect();
+        remove_orphan_disks(&known);
         engine.refresh_images();
         Ok(engine)
     }
@@ -146,7 +147,10 @@ impl Engine {
         let running = self.running.lock().unwrap();
         let specs = self.specs.lock().unwrap();
         let used: u64 = running.keys().filter_map(|id| specs.get(id)).map(|s| s.memory_mib << 20).sum();
-        let disk_used: u64 = self.index.lock().unwrap().images().map(LocalImage::size).sum();
+        // Images, plus what containers' disks really take (they're sparse).
+        let images: u64 = self.index.lock().unwrap().images().map(LocalImage::size).sum();
+        let disks: u64 = self.store.lock().unwrap().containers().iter().map(|c| disk_usage(&paths::vms_dir().join(&c.id))).sum();
+        let disk_used = images + disks;
         EngineInfo {
             version: env!("CARGO_PKG_VERSION").into(),
             protocol: PROTOCOL_VERSION,
@@ -355,13 +359,21 @@ impl Engine {
         while self.running.lock().unwrap().contains_key(&id) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
         }
-        if self.running.lock().unwrap().contains_key(&id) {
-            // Didn't exit on SIGTERM: power the VM off; the supervisor records it.
-            let _ = vm.kill();
-            let deadline = Instant::now() + Duration::from_secs(5);
+        // Didn't exit on SIGTERM: the agent flushes the container's disk and
+        // powers the VM off; if it can't, pull the plug. The supervisor records it.
+        let wait = |secs| {
+            let deadline = Instant::now() + Duration::from_secs(secs);
             while self.running.lock().unwrap().contains_key(&id) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(25));
             }
+        };
+        if self.running.lock().unwrap().contains_key(&id) {
+            let _ = agent.lock().unwrap().write_all(&encode_line(&AgentRequest::Shutdown));
+            wait(5);
+        }
+        if self.running.lock().unwrap().contains_key(&id) {
+            let _ = vm.kill();
+            wait(5);
         }
         Ok(self.store.lock().unwrap().container(&id)?.clone())
     }
@@ -467,10 +479,8 @@ impl Engine {
     }
 
     fn run_in_vm(self: &Arc<Self>, id: &str, listeners: Vec<(TcpListener, u16)>) -> Result<i32> {
-        let result = self.run_in_vm_inner(id, listeners);
-        // The container's files went with the VM; give the space back.
-        let _ = fs::remove_file(paths::vms_dir().join(id).join(SCRATCH_DISK));
-        result
+        // The container's disk stays for its next start; `grav rm` deletes it.
+        self.run_in_vm_inner(id, listeners)
     }
 
     fn run_in_vm_inner(self: &Arc<Self>, id: &str, listeners: Vec<(TcpListener, u16)>) -> Result<i32> {
@@ -481,7 +491,7 @@ impl Engine {
         let guest = paths::guest_dir();
         let vm_dir = paths::vms_dir().join(id);
         fs::create_dir_all(&vm_dir)?;
-        let mut config = VmConfig::new(guest.join("vmlinux"), guest.join("initrd.img"), scratch_disk(&vm_dir)?);
+        let mut config = VmConfig::new(guest.join("vmlinux"), guest.join("initrd.img"), container_disk(&vm_dir)?);
         config.cpus = spec.cpus;
         config.memory_mib = spec.memory_mib;
         config.network = NetworkMode::Nat;
@@ -522,8 +532,8 @@ impl Engine {
             mounts,
             hostname: Some(name.clone()),
         })?;
-        let (files, unpack_ms, ip) = match events.next()? {
-            AgentEvent::Prepared { files, ms, ip, .. } => (files, ms, ip),
+        let (files, unpack_ms, ip, reused) = match events.next()? {
+            AgentEvent::Prepared { files, ms, ip, reused, .. } => (files, ms, ip, reused),
             AgentEvent::Error { message } => bail!("{message}"),
             other => bail!("expected prepared from the agent, got {other:?}"),
         };
@@ -533,8 +543,9 @@ impl Engine {
             LogLevel::Info,
             LogStream::System,
             format!(
-                "VM booted in {} ms; unpacked {files} files in {unpack_ms} ms; {}",
+                "VM booted in {} ms; {}; {}",
                 booted.as_millis(),
+                if reused { format!("kept its files from the last run ({unpack_ms} ms)") } else { format!("unpacked {files} files in {unpack_ms} ms") },
                 match &ip {
                     Some(ip) => format!("network {ip}"),
                     None => "no network".into(),
@@ -1021,11 +1032,31 @@ pub(crate) fn scratch_disk(dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Scratch disks left by VMs that were running when gravitond stopped.
-pub(crate) fn remove_stale_disks() {
+/// A container's disk: kept across its runs (it holds the files the container
+/// changed), created on its first start. `grav rm` deletes it with the
+/// container's folder.
+pub(crate) fn container_disk(dir: &Path) -> Result<PathBuf> {
+    let path = dir.join(SCRATCH_DISK);
+    if path.is_file() {
+        return Ok(path);
+    }
+    scratch_disk(dir)
+}
+
+/// What a container's disk takes on the Mac's disk (allocated blocks, not its size).
+fn disk_usage(dir: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(dir.join(SCRATCH_DISK)).map_or(0, |m| m.blocks() * 512)
+}
+
+/// Disks of containers that no longer exist (removed while gravitond wasn't running, say).
+fn remove_orphan_disks(known: &HashSet<String>) {
     let Ok(entries) = fs::read_dir(paths::vms_dir()) else { return };
     for e in entries.flatten() {
-        let _ = fs::remove_file(e.path().join(SCRATCH_DISK));
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !known.contains(&name) {
+            let _ = fs::remove_file(e.path().join(SCRATCH_DISK));
+        }
     }
 }
 

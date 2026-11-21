@@ -124,14 +124,14 @@ pub(crate) mod linux {
             match decode_line::<AgentRequest>(line.as_bytes()) {
                 Ok(AgentRequest::Prepare { container, layers, mounts, hostname }) => {
                     let t0 = std::time::Instant::now();
-                    let result = crate::container::prepare(&container, &layers).and_then(|files| {
+                    let result = crate::container::prepare(&container, &layers).and_then(|(files, reused)| {
                         let ip = crate::net::wait(std::time::Duration::from_secs(8));
                         crate::container::finish(&container, &mounts, hostname.as_deref().unwrap_or(&container), ip.as_deref())?;
-                        Ok((files, ip))
+                        Ok((files, reused, ip))
                     });
                     match result {
-                        Ok((files, ip)) => {
-                            send(&writer, &AgentEvent::Prepared { container, files, ms: t0.elapsed().as_millis() as u64, ip })
+                        Ok((files, reused, ip)) => {
+                            send(&writer, &AgentEvent::Prepared { container, files, ms: t0.elapsed().as_millis() as u64, ip, reused })
                         }
                         Err(err) => send(&writer, &AgentEvent::Error { message: format!("preparing {container}: {err}") }),
                     }
