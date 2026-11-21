@@ -27,6 +27,10 @@ public protocol EngineService: Sendable {
     func engineInfo() async throws -> EngineInfo
     func containers() async throws -> [Container]
     func images() async throws -> [ImageInfo]
+    func volumes() async throws -> [VolumeInfo]
+    func createVolume(name: String) async throws -> VolumeInfo
+    func removeVolume(name: String) async throws -> UInt64
+    func networkInfo() async throws -> NetworkInfo
     func logs(id: String, tail: Int?) async throws -> [LogLine]
     func start(id: String) async throws -> Container
     func stop(id: String) async throws -> Container
@@ -83,6 +87,26 @@ public final class SocketEngine: EngineService {
     public func images() async throws -> [ImageInfo] {
         guard case let .images(list) = try await call(.listImages) else { throw EngineError.unexpectedResponse }
         return list
+    }
+
+    public func volumes() async throws -> [VolumeInfo] {
+        guard case let .volumes(list) = try await call(.listVolumes, timeout: 30) else { throw EngineError.unexpectedResponse }
+        return list
+    }
+
+    public func createVolume(name: String) async throws -> VolumeInfo {
+        guard case let .volume(vol) = try await call(.createVolume(name: name)) else { throw EngineError.unexpectedResponse }
+        return vol
+    }
+
+    public func removeVolume(name: String) async throws -> UInt64 {
+        guard case let .volumeRemoved(_, freed) = try await call(.removeVolume(name: name), timeout: 60) else { throw EngineError.unexpectedResponse }
+        return freed
+    }
+
+    public func networkInfo() async throws -> NetworkInfo {
+        guard case let .network(info) = try await call(.networkInfo) else { throw EngineError.unexpectedResponse }
+        return info
     }
 
     public func logs(id: String, tail: Int?) async throws -> [LogLine] {

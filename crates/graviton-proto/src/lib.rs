@@ -111,6 +111,57 @@ pub struct Mount {
     pub read_only: bool,
 }
 
+/// One container's mount of a named volume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeMountRef {
+    pub container_id: String,
+    pub container_name: String,
+    pub target: String,
+    pub read_only: bool,
+    pub running: bool,
+}
+
+/// One named volume (`-v name:/path`) stored under Graviton's `volumes/` folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeSummary {
+    pub name: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub file_count: u64,
+    /// Unix seconds.
+    pub created_at: u64,
+    pub used_by: Vec<VolumeMountRef>,
+}
+
+/// One container connected to (or known on) the container network.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkEndpoint {
+    pub container_id: String,
+    pub container_name: String,
+    pub image: String,
+    pub status: ContainerStatus,
+    pub ip_address: Option<String>,
+    pub dns_names: Vec<String>,
+    pub dns_enabled: bool,
+    pub ports: Vec<PortMapping>,
+}
+
+/// Live view of Graviton's shared container network, switch, and embedded DNS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkInfo {
+    pub name: String,
+    pub driver: String,
+    pub subnet: String,
+    pub gateway: String,
+    pub dns_server: String,
+    pub dns_domain: String,
+    pub connected_ports: u32,
+    pub learned_macs: u32,
+    pub frames_forwarded: u64,
+    pub bytes_forwarded: u64,
+    pub endpoints: Vec<NetworkEndpoint>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContainerSummary {
     pub id: String,
@@ -557,6 +608,14 @@ pub enum Request {
     EngineInfo,
     ListContainers,
     ListImages,
+    /// Named volumes on this Mac, with disk size and which containers use each.
+    ListVolumes,
+    /// Create an empty named volume.
+    CreateVolume { name: String },
+    /// Remove a named volume no container uses.
+    RemoveVolume { name: String },
+    /// Live state of the shared container network, switch and DNS.
+    NetworkInfo,
     /// `id` may be a container id, id prefix or name.
     Logs { id: String, tail: Option<usize> },
     Start { id: String },
@@ -646,6 +705,10 @@ pub enum Response {
     Engine(EngineInfo),
     Containers(Vec<ContainerSummary>),
     Images(Vec<ImageSummary>),
+    Volumes(Vec<VolumeSummary>),
+    Volume(VolumeSummary),
+    VolumeRemoved { name: String, freed_bytes: u64 },
+    Network(NetworkInfo),
     Logs(Vec<LogLine>),
     Container(ContainerSummary),
     Image(ImageSummary),
@@ -1209,5 +1272,76 @@ mod tests {
             old,
             AgentEvent::Prepared { container: "abc".into(), files: 10, ms: 50, ip: Some("192.168.64.2".into()), reused: false, dns: false }
         );
+    }
+
+    #[test]
+    fn volumes_and_network_round_trip() {
+        assert_eq!(String::from_utf8(encode_line(&Request::ListVolumes)).unwrap(), "{\"method\":\"list_volumes\"}\n");
+        assert_eq!(
+            String::from_utf8(encode_line(&Request::CreateVolume { name: "pgdata".into() })).unwrap(),
+            "{\"method\":\"create_volume\",\"params\":{\"name\":\"pgdata\"}}\n"
+        );
+        assert_eq!(
+            String::from_utf8(encode_line(&Request::RemoveVolume { name: "pgdata".into() })).unwrap(),
+            "{\"method\":\"remove_volume\",\"params\":{\"name\":\"pgdata\"}}\n"
+        );
+        assert_eq!(String::from_utf8(encode_line(&Request::NetworkInfo)).unwrap(), "{\"method\":\"network_info\"}\n");
+
+        let vol = VolumeSummary {
+            name: "pgdata".into(),
+            path: "/Users/me/Library/Application Support/Graviton/volumes/pgdata".into(),
+            size_bytes: 4096,
+            file_count: 12,
+            created_at: 1_700_000_000,
+            used_by: vec![VolumeMountRef {
+                container_id: "abc123def456".into(),
+                container_name: "postgres".into(),
+                target: "/var/lib/postgresql/data".into(),
+                read_only: false,
+                running: true,
+            }],
+        };
+        assert_eq!(decode_line::<Response>(&encode_line(&Response::Volumes(vec![vol.clone()]))).unwrap(), Response::Volumes(vec![vol.clone()]));
+        assert_eq!(decode_line::<Response>(&encode_line(&Response::Volume(vol))).unwrap(), decode_line::<Response>(&encode_line(&Response::Volume(VolumeSummary {
+            name: "pgdata".into(),
+            path: "/Users/me/Library/Application Support/Graviton/volumes/pgdata".into(),
+            size_bytes: 4096,
+            file_count: 12,
+            created_at: 1_700_000_000,
+            used_by: vec![VolumeMountRef {
+                container_id: "abc123def456".into(),
+                container_name: "postgres".into(),
+                target: "/var/lib/postgresql/data".into(),
+                read_only: false,
+                running: true,
+            }],
+        }))).unwrap());
+        assert_eq!(
+            decode_line::<Response>(&encode_line(&Response::VolumeRemoved { name: "pgdata".into(), freed_bytes: 4096 })).unwrap(),
+            Response::VolumeRemoved { name: "pgdata".into(), freed_bytes: 4096 }
+        );
+        let net = NetworkInfo {
+            name: "graviton".into(),
+            driver: "L2 switch + NAT".into(),
+            subnet: "192.168.64.0/24".into(),
+            gateway: "192.168.64.1".into(),
+            dns_server: "127.0.0.11:53".into(),
+            dns_domain: "graviton".into(),
+            connected_ports: 2,
+            learned_macs: 2,
+            frames_forwarded: 128,
+            bytes_forwarded: 65536,
+            endpoints: vec![NetworkEndpoint {
+                container_id: "abc123def456".into(),
+                container_name: "postgres".into(),
+                image: "postgres:17-alpine".into(),
+                status: ContainerStatus::Running,
+                ip_address: Some("192.168.64.2".into()),
+                dns_names: vec!["postgres".into(), "postgres.graviton".into(), "abc123def456".into()],
+                dns_enabled: true,
+                ports: vec![PortMapping { host_ip: None, host_port: 5432, container_port: 5432, protocol: PortProtocol::Tcp }],
+            }],
+        };
+        assert_eq!(decode_line::<Response>(&encode_line(&Response::Network(net.clone()))).unwrap(), Response::Network(net));
     }
 }

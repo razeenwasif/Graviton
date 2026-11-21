@@ -349,3 +349,51 @@ import Testing
         await #expect(throws: EngineError.self) { _ = try await demo.removeImage(reference: "docker.io/library/postgres:17-alpine") }
     }
 }
+
+@Suite struct VolumesAndNetworkTests {
+    @Test func wireMatchesRust() throws {
+        let line = { (r: EngineRequest) in String(decoding: try Wire.line(r), as: UTF8.self) }
+        #expect(try line(.listVolumes) == #"{"method":"list_volumes"}"# + "\n")
+        #expect(try line(.createVolume(name: "pgdata")) == #"{"method":"create_volume","params":{"name":"pgdata"}}"# + "\n")
+        #expect(try line(.removeVolume(name: "pgdata")) == #"{"method":"remove_volume","params":{"name":"pgdata"}}"# + "\n")
+        #expect(try line(.networkInfo) == #"{"method":"network_info"}"# + "\n")
+
+        let volsJSON = #"{"type":"volumes","data":[{"name":"pgdata","path":"/tmp/volumes/pgdata","size_bytes":4096,"file_count":12,"created_at":1700000000,"used_by":[{"container_id":"abc123def456","container_name":"postgres","target":"/var/lib/postgresql/data","read_only":false,"running":true}]}]}"#
+        guard case let .volumes(vols) = try Wire.decoder.decode(EngineResponse.self, from: Data(volsJSON.utf8)) else {
+            Issue.record("expected volumes"); return
+        }
+        #expect(vols.count == 1 && vols[0].name == "pgdata" && vols[0].isInUse && vols[0].usedBy[0].containerName == "postgres")
+
+        let removedJSON = #"{"type":"volume_removed","data":{"name":"pgdata","freed_bytes":4096}}"#
+        guard case let .volumeRemoved(name, freed) = try Wire.decoder.decode(EngineResponse.self, from: Data(removedJSON.utf8)) else {
+            Issue.record("expected volume_removed"); return
+        }
+        #expect(name == "pgdata" && freed == 4096)
+
+        let netJSON = #"{"type":"network","data":{"name":"graviton","driver":"L2 switch + NAT","subnet":"192.168.64.0/24","gateway":"192.168.64.1","dns_server":"127.0.0.11:53","dns_domain":"graviton","connected_ports":2,"learned_macs":2,"frames_forwarded":128,"bytes_forwarded":65536,"endpoints":[{"container_id":"abc123def456","container_name":"postgres","image":"postgres:17-alpine","status":"running","ip_address":"192.168.64.2","dns_names":["postgres","postgres.graviton","abc123def456"],"dns_enabled":true,"ports":[{"host_port":5432,"container_port":5432,"protocol":"tcp"}]}]}}"#
+        guard case let .network(net) = try Wire.decoder.decode(EngineResponse.self, from: Data(netJSON.utf8)) else {
+            Issue.record("expected network"); return
+        }
+        #expect(net.subnet == "192.168.64.0/24" && net.connectedPorts == 2 && net.endpoints.first?.dnsNames.contains("postgres.graviton") == true)
+    }
+
+    @Test func demoVolumesAndNetwork() async throws {
+        let demo = DemoEngine()
+        let initial = await demo.volumes()
+        #expect(initial.contains { $0.name == "pgdata" && $0.isInUse })
+        #expect(initial.contains { $0.name == "redis-snapshots" && !$0.isInUse })
+
+        // Can't remove an in-use volume or create a bad/duplicate name.
+        await #expect(throws: EngineError.self) { _ = try await demo.removeVolume(name: "pgdata") }
+        await #expect(throws: EngineError.self) { _ = try await demo.createVolume(name: "../escape") }
+        await #expect(throws: EngineError.self) { _ = try await demo.createVolume(name: "pgdata") }
+
+        let created = try await demo.createVolume(name: "scratch-vol")
+        #expect(created.name == "scratch-vol" && !created.isInUse)
+        #expect(try await demo.removeVolume(name: "scratch-vol") == 0)
+
+        let net = await demo.networkInfo()
+        #expect(net.subnet == "192.168.64.0/24" && net.connectedPorts == 4)
+        #expect(net.endpoints.first?.isRunning == true)
+    }
+}

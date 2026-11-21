@@ -65,6 +65,11 @@ pub fn vms_dir() -> PathBuf {
     support_dir().join("vms")
 }
 
+/// Named volumes shared into containers (`-v name:/path`).
+pub fn volumes_dir() -> PathBuf {
+    support_dir().join("volumes")
+}
+
 #[cfg(test)]
 mod bundle_tests {
     use super::*;

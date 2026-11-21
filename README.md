@@ -34,7 +34,7 @@ apps/
   project.yml      XcodeGen spec → Graviton.xcodeproj (generated, not committed)
   GravitonKit/     Shared Swift package: models, socket client, demo engine, theme, components
   Shared/          Swift shared by both apps: shell sessions drawn by SwiftTerm
-  Mac/             macOS app (Containers, Run sheet, Logs, Terminal, Stats, Files, Inspect, Images + Pull sheet, menu bar item)
+  Mac/             macOS app (Containers, Run sheet, Logs, Terminal, Stats, Files, Inspect, Images + Pull/Build/Clean Up sheets, Volumes, Networks, menu bar item)
   iOS/             iOS companion (Containers, Detail, Logs, Shell, Stats, Files, Inspect, Run + Pull sheets, Activity, Hosts)
 scripts/
   build-guest.sh   Guest kernel (Alpine linux-virt) + initramfs with the agent as /init
@@ -83,9 +83,14 @@ cargo run -p grav -- stop web && cargo run -p grav -- rm web
 - Containers on the same Mac reach each other directly over the container
   network (TCP, UDP and ICMP) and resolve each other by name, `<name>.graviton`
   or container ID via the guest's embedded DNS resolver (`127.0.0.11:53`),
-  falling back to the NAT's DNS for external hosts.
+  falling back to the NAT's DNS for external hosts. `grav network` (and the Mac
+  app's **Networks** screen) shows the live switch, DNS resolver, container IPs,
+  and published TCP/UDP ports.
 - `-v /mac/dir:/path[:ro]` shares a folder over virtiofs; `-v name:/path` is a
-  named volume under `~/Library/Application Support/Graviton/volumes`.
+  named volume under `~/Library/Application Support/Graviton/volumes`. Manage
+  named volumes with `grav volumes` (`grav volume create NAME`, `grav volume rm NAME`)
+  or the Mac app's **Volumes** screen (size, file count, attached containers,
+  bind mounts, and removal of unused volumes).
 - Containers, their settings and logs are saved. Pass `--restart no|on-failure|always`
   (or pick **Restart** in the Mac/iPhone Run sheet) to automatically restart a
   container on exit with exponential backoff (1 s to 60 s) and bring it back

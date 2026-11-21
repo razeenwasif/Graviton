@@ -34,7 +34,8 @@ use graviton_image::{BlobStore, ImageIndex, LocalImage, Progress, Registry};
 use graviton_proto::{
     AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ContainerDetails, ContainerStats, ContainerStatus, ContainerSummary,
     DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats, HostEntry, ImageSummary, LogLevel, LogLine, LogStream,
-    Mount, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy, RunSpec, StatSample, decode_line, encode_line,
+    Mount, NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy, RunSpec,
+    StatSample, VolumeMountRef, VolumeSummary, decode_line, encode_line,
 };
 use graviton_vmm::apple::{AppleHypervisor, AppleVm};
 use graviton_vmm::{NetworkMode, SharedDirectory, VmConfig, VmHandle};
@@ -1247,6 +1248,162 @@ impl Engine {
         })
     }
 
+    // -- volumes & network ------------------------------------------------
+
+    pub fn list_volumes(&self) -> Vec<VolumeSummary> {
+        let mut users: HashMap<String, Vec<VolumeMountRef>> = HashMap::new();
+        {
+            let specs = self.specs.lock().unwrap();
+            let store = self.store.lock().unwrap();
+            for (id, spec) in specs.iter() {
+                let Ok(container) = store.container(id) else { continue };
+                let running = container.status == ContainerStatus::Running;
+                for v in &spec.volumes {
+                    let Some(name) = &v.name else { continue };
+                    users.entry(name.clone()).or_default().push(VolumeMountRef {
+                        container_id: container.id.clone(),
+                        container_name: container.name.clone(),
+                        target: v.target.clone(),
+                        read_only: v.read_only,
+                        running,
+                    });
+                }
+            }
+        }
+        let root = paths::volumes_dir();
+        let mut names: HashSet<String> = users.keys().cloned().collect();
+        if let Ok(entries) = fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if is_valid_volume_name(&name) && entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    names.insert(name);
+                }
+            }
+        }
+        let mut sorted: Vec<String> = names.into_iter().collect();
+        sorted.sort();
+        sorted
+            .into_iter()
+            .map(|name| {
+                let dir = root.join(&name);
+                let (size_bytes, file_count, created_at) = volume_usage(&dir);
+                let mut used_by = users.remove(&name).unwrap_or_default();
+                used_by.sort_by(|a, b| b.running.cmp(&a.running).then_with(|| a.container_name.cmp(&b.container_name)));
+                VolumeSummary { name, path: dir.display().to_string(), size_bytes, file_count, created_at, used_by }
+            })
+            .collect()
+    }
+
+    pub fn create_volume(&self, raw_name: &str) -> Result<VolumeSummary> {
+        let name = raw_name.trim();
+        if !is_valid_volume_name(name) {
+            bail!("`{name}` isn't a valid volume name (start with a letter or digit, then letters, digits, _ . -)");
+        }
+        let root = paths::volumes_dir();
+        fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
+        let dir = root.join(name);
+        match fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => bail!("volume {name} already exists"),
+            Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+        }
+        let (size_bytes, file_count, created_at) = volume_usage(&dir);
+        Ok(VolumeSummary { name: name.to_string(), path: dir.display().to_string(), size_bytes, file_count, created_at, used_by: vec![] })
+    }
+
+    pub fn remove_volume(&self, raw_name: &str) -> Result<(String, u64)> {
+        let name = raw_name.trim();
+        if !is_valid_volume_name(name) {
+            bail!("`{name}` isn't a valid volume name");
+        }
+        let users: Vec<String> = {
+            let specs = self.specs.lock().unwrap();
+            let store = self.store.lock().unwrap();
+            let mut list: Vec<String> = specs
+                .iter()
+                .filter(|(_, s)| s.volumes.iter().any(|v| v.name.as_deref() == Some(name)))
+                .filter_map(|(id, _)| store.container(id).ok().map(|c| c.name.clone()))
+                .collect();
+            list.sort();
+            list.dedup();
+            list
+        };
+        if !users.is_empty() {
+            bail!(
+                "volume {name} is used by {}: remove {} first (grav rm)",
+                users.join(", "),
+                if users.len() == 1 { "it" } else { "them" }
+            );
+        }
+        let dir = paths::volumes_dir().join(name);
+        if !dir.is_dir() {
+            bail!("no volume {name} here");
+        }
+        let (freed_bytes, _, _) = volume_usage(&dir);
+        fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+        self.events.record(graviton_proto::EventKind::Removed, None, None, format!("volume {name} removed"));
+        Ok((name.to_string(), freed_bytes))
+    }
+
+    pub fn network_info(&self) -> NetworkInfo {
+        let sw = self.switch.stats();
+        let running: HashMap<String, (Option<String>, bool)> = self
+            .running
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, r)| (id.clone(), (r.ip.clone(), r.dns)))
+            .collect();
+        let containers = self.store.lock().unwrap().containers().to_vec();
+        let (subnet, gateway) = containers
+            .iter()
+            .filter(|c| c.status == ContainerStatus::Running)
+            .filter_map(|c| c.ip_address.as_deref())
+            .find_map(ipv4_subnet_and_gateway)
+            .unwrap_or_else(|| ("192.168.64.0/24".into(), "192.168.64.1".into()));
+        let mut endpoints: Vec<NetworkEndpoint> = containers
+            .into_iter()
+            .map(|c| {
+                let is_running = c.status == ContainerStatus::Running;
+                let (live_ip, dns_enabled) = running.get(&c.id).cloned().unwrap_or((None, false));
+                let ip = if is_running { live_ip.or(c.ip_address) } else { None };
+                let dns_names = if is_running && ip.is_some() {
+                    vec![c.name.clone(), format!("{}.graviton", c.name), c.id.clone()]
+                } else {
+                    vec![]
+                };
+                NetworkEndpoint {
+                    container_id: c.id,
+                    container_name: c.name,
+                    image: c.image,
+                    status: c.status,
+                    ip_address: ip,
+                    dns_names,
+                    dns_enabled,
+                    ports: c.ports,
+                }
+            })
+            .collect();
+        endpoints.sort_by(|a, b| {
+            (b.status == ContainerStatus::Running)
+                .cmp(&(a.status == ContainerStatus::Running))
+                .then_with(|| a.container_name.cmp(&b.container_name))
+        });
+        NetworkInfo {
+            name: "graviton".into(),
+            driver: "L2 switch + NAT".into(),
+            subnet,
+            gateway,
+            dns_server: "127.0.0.11:53".into(),
+            dns_domain: "graviton".into(),
+            connected_ports: sw.ports,
+            learned_macs: sw.learned_macs,
+            frames_forwarded: sw.frames_forwarded,
+            bytes_forwarded: sw.bytes_forwarded,
+            endpoints,
+        }
+    }
+
     // -- exec -------------------------------------------------------------
 
     /// Open a fresh agent connection and start `spec` in the container.
@@ -1508,13 +1665,53 @@ fn parse_volume(spec: &str) -> Result<Volume> {
     if source.starts_with('/') {
         return Ok(Volume { source: PathBuf::from(source), target, read_only, name: None });
     }
-    let valid = !source.is_empty()
-        && source.as_bytes()[0].is_ascii_alphanumeric()
-        && source.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b));
-    if !valid {
+    if !is_valid_volume_name(source) {
         bail!("`{source}` isn't an absolute path or a volume name (letters, digits, _ . -)");
     }
-    Ok(Volume { source: paths::support_dir().join("volumes").join(source), target, read_only, name: Some(source.to_string()) })
+    Ok(Volume { source: paths::volumes_dir().join(source), target, read_only, name: Some(source.to_string()) })
+}
+
+pub(crate) fn is_valid_volume_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+}
+
+/// Walk `dir` without following symlinks, returning `(size_bytes, file_count, created_at_secs)`.
+fn volume_usage(dir: &Path) -> (u64, u64, u64) {
+    let Ok(root_meta) = fs::symlink_metadata(dir) else { return (0, 0, 0) };
+    let created_at = root_meta
+        .created()
+        .or_else(|_| root_meta.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    let mut size = 0u64;
+    let mut files = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(cur) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&cur) else { continue };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else { continue };
+            let ft = meta.file_type();
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() {
+                size = size.saturating_add(meta.len());
+                files = files.saturating_add(1);
+            } else if ft.is_symlink() {
+                files = files.saturating_add(1);
+            }
+        }
+    }
+    (size, files, created_at)
+}
+
+fn ipv4_subnet_and_gateway(ip: &str) -> Option<(String, String)> {
+    let addr: Ipv4Addr = ip.parse().ok()?;
+    let [a, b, c, _] = addr.octets();
+    Some((format!("{a}.{b}.{c}.0/24"), format!("{a}.{b}.{c}.1")))
 }
 
 fn log_path(id: &str) -> PathBuf {
@@ -1838,5 +2035,28 @@ mod tests {
 
         let delays: Vec<u64> = (0..8).map(|n| restart_delay(n).as_secs()).collect();
         assert_eq!(delays, vec![1, 2, 4, 8, 16, 32, 60, 60]);
+    }
+
+    #[test]
+    fn volume_helpers_validate_and_measure() {
+        assert!(is_valid_volume_name("pgdata"));
+        assert!(is_valid_volume_name("app_cache-1.2"));
+        assert!(!is_valid_volume_name(""));
+        assert!(!is_valid_volume_name(".hidden"));
+        assert!(!is_valid_volume_name("../escape"));
+        assert!(!is_valid_volume_name("a/b"));
+
+        let tmp = std::env::temp_dir().join(format!("graviton-vol-test-{}", new_id()));
+        fs::create_dir_all(tmp.join("sub")).unwrap();
+        fs::write(tmp.join("a.txt"), b"hello").unwrap();
+        fs::write(tmp.join("sub/b.bin"), b"0123456789").unwrap();
+        let (size, files, created) = volume_usage(&tmp);
+        assert_eq!(size, 15);
+        assert_eq!(files, 2);
+        assert!(created > 0);
+        let _ = fs::remove_dir_all(&tmp);
+
+        assert_eq!(ipv4_subnet_and_gateway("192.168.64.9"), Some(("192.168.64.0/24".into(), "192.168.64.1".into())));
+        assert_eq!(ipv4_subnet_and_gateway("not-an-ip"), None);
     }
 }

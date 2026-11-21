@@ -186,7 +186,17 @@ struct LiveRemoteTests {
 
             // The request connection is unaffected.
             #expect(try await remote.ping() == 2)
+            let remoteNet = try await remote.networkInfo()
+            #expect(remoteNet.endpoints.contains { $0.containerId == running.id && $0.isRunning })
         }
+
+        // Volumes over TLS: create, list, remove.
+        let volName = "swift-tls-vol-\(Int.random(in: 1000...9999))"
+        let created = try await remote.createVolume(name: volName)
+        #expect(created.name == volName)
+        #expect(try await remote.volumes().contains { $0.name == volName })
+        _ = try await remote.removeVolume(name: volName)
+        #expect(try await remote.volumes().contains { $0.name == volName } == false)
 
         try await local.revokeDevice(id: paired.host.deviceID)
         let revoked = RemoteEngine(host: paired.host, token: paired.token)

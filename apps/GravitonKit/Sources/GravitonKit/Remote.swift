@@ -352,6 +352,26 @@ public actor RemoteEngine: EngineService {
         return list
     }
 
+    public func volumes() async throws -> [VolumeInfo] {
+        guard case let .volumes(list) = try await call(.listVolumes) else { throw EngineError.unexpectedResponse }
+        return list
+    }
+
+    public func createVolume(name: String) async throws -> VolumeInfo {
+        guard case let .volume(vol) = try await call(.createVolume(name: name)) else { throw EngineError.unexpectedResponse }
+        return vol
+    }
+
+    public func removeVolume(name: String) async throws -> UInt64 {
+        guard case let .volumeRemoved(_, freed) = try await call(.removeVolume(name: name)) else { throw EngineError.unexpectedResponse }
+        return freed
+    }
+
+    public func networkInfo() async throws -> NetworkInfo {
+        guard case let .network(info) = try await call(.networkInfo) else { throw EngineError.unexpectedResponse }
+        return info
+    }
+
     public func logs(id: String, tail: Int?) async throws -> [LogLine] {
         guard case let .logs(lines) = try await call(.logs(id: id, tail: tail)) else { throw EngineError.unexpectedResponse }
         return lines

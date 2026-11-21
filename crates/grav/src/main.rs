@@ -205,6 +205,15 @@ enum Command {
     },
     /// Show how a container is configured, as JSON.
     Inspect { container: String },
+    /// Named volumes on this Mac (`ls`, `create`, `rm`).
+    #[command(visible_alias = "volume")]
+    Volumes {
+        #[command(subcommand)]
+        action: Option<VolumeAction>,
+    },
+    /// The shared container network: addresses, DNS names and published ports.
+    #[command(visible_alias = "networks")]
+    Network,
     /// What happened recently: containers started, stopped and failed, pulls and builds.
     Events {
         /// How many (default 30).
@@ -238,6 +247,16 @@ enum Command {
     },
     /// Parse and normalise an image reference (no daemon needed).
     Resolve { reference: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum VolumeAction {
+    /// List named volumes.
+    Ls,
+    /// Create an empty named volume.
+    Create { name: String },
+    /// Remove a named volume no container uses.
+    Rm { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -514,6 +533,81 @@ fn run(cli: Cli) -> Result<()> {
         Command::Cp { src, dst } => copy_files(&mut client, &target, &src, &dst)?,
         Command::Inspect { container } => match client.call(&Request::Inspect { id: container })? {
             Response::Details(d) => println!("{}", serde_json::to_string_pretty(&d)?),
+            other => unexpected(other)?,
+        },
+        Command::Volumes { action } => match action.unwrap_or(VolumeAction::Ls) {
+            VolumeAction::Ls => match client.call(&Request::ListVolumes)? {
+                Response::Volumes(vols) => {
+                    println!("{:<24} {:>10} {:>8}  USED BY", "NAME", "SIZE", "FILES");
+                    for v in vols {
+                        let used = if v.used_by.is_empty() {
+                            "—".into()
+                        } else {
+                            v.used_by
+                                .iter()
+                                .map(|u| format!("{}:{}", u.container_name, u.target))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        println!("{:<24} {:>10} {:>8}  {used}", v.name, bytes(v.size_bytes), v.file_count);
+                    }
+                }
+                other => unexpected(other)?,
+            },
+            VolumeAction::Create { name } => match client.call(&Request::CreateVolume { name })? {
+                Response::Volume(v) => println!("{}", v.name),
+                other => unexpected(other)?,
+            },
+            VolumeAction::Rm { name } => match client.call(&Request::RemoveVolume { name })? {
+                Response::VolumeRemoved { name, freed_bytes } => {
+                    println!("Removed volume {name} ({} freed).", bytes(freed_bytes));
+                }
+                other => unexpected(other)?,
+            },
+        },
+        Command::Network => match client.call(&Request::NetworkInfo)? {
+            Response::Network(net) => {
+                println!("Network   {} ({})", net.name, net.driver);
+                println!("Subnet    {}  gateway {}", net.subnet, net.gateway);
+                println!("DNS       {}  (*.{})", net.dns_server, net.dns_domain);
+                println!(
+                    "Switch    {} connected  {} MACs  {} frames ({})",
+                    net.connected_ports,
+                    net.learned_macs,
+                    net.frames_forwarded,
+                    bytes(net.bytes_forwarded)
+                );
+                if !net.endpoints.is_empty() {
+                    println!();
+                    println!("{:<18} {:<10} {:<16} {:<24} PORTS", "CONTAINER", "STATUS", "IP", "DNS");
+                    for ep in net.endpoints {
+                        let st = match ep.status {
+                            ContainerStatus::Running => "running",
+                            ContainerStatus::Exited => "exited",
+                            ContainerStatus::Created => "created",
+                            ContainerStatus::Paused => "paused",
+                        };
+                        let ip = ep.ip_address.as_deref().unwrap_or("—");
+                        let dns = ep.dns_names.get(1).or_else(|| ep.dns_names.first()).map(String::as_str).unwrap_or("—");
+                        let ports = ep
+                            .ports
+                            .iter()
+                            .map(|p| {
+                                let proto = match p.protocol {
+                                    graviton_proto::PortProtocol::Tcp => "tcp",
+                                    graviton_proto::PortProtocol::Udp => "udp",
+                                };
+                                match &p.host_ip {
+                                    Some(host_ip) => format!("{host_ip}:{}->{}/{proto}", p.host_port, p.container_port),
+                                    None => format!("{}->{}/{proto}", p.host_port, p.container_port),
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        println!("{:<18} {:<10} {:<16} {:<24} {ports}", ep.container_name, st, ip, dns);
+                    }
+                }
+            }
             other => unexpected(other)?,
         },
         Command::Build { tag, file, build_arg, secret, target: build_target, no_cache, path } => {

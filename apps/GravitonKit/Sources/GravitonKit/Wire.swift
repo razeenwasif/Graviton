@@ -6,6 +6,10 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case engineInfo
     case listContainers
     case listImages
+    case listVolumes
+    case createVolume(name: String)
+    case removeVolume(name: String)
+    case networkInfo
     case logs(id: String, tail: Int?)
     case start(id: String)
     case stop(id: String)
@@ -34,6 +38,7 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
 
     private enum Keys: String, CodingKey { case method, params }
     private struct IDParams: Encodable { let id: String }
+    private struct NameParams: Encodable { let name: String }
     private struct LogParams: Encodable { let id: String; let tail: Int? }
     private struct PullParams: Encodable {
         let reference: String
@@ -52,6 +57,10 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .engineInfo: "engine_info"
         case .listContainers: "list_containers"
         case .listImages: "list_images"
+        case .listVolumes: "list_volumes"
+        case .createVolume: "create_volume"
+        case .removeVolume: "remove_volume"
+        case .networkInfo: "network_info"
         case .logs: "logs"
         case .start: "start"
         case .stop: "stop"
@@ -84,7 +93,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         var c = encoder.container(keyedBy: Keys.self)
         try c.encode(method, forKey: .method)
         switch self {
-        case .ping, .engineInfo, .listContainers, .listImages, .pairBegin, .listDevices: break
+        case .ping, .engineInfo, .listContainers, .listImages, .listVolumes, .networkInfo, .pairBegin, .listDevices: break
+        case let .createVolume(name), let .removeVolume(name): try c.encode(NameParams(name: name), forKey: .params)
         case let .revokeDevice(id): try c.encode(IDParams(id: id), forKey: .params)
         case let .pair(code, device): try c.encode(PairParams(code: code, device: device), forKey: .params)
         case let .auth(token): try c.encode(AuthParams(token: token), forKey: .params)
@@ -115,6 +125,10 @@ public enum EngineResponse: Decodable, Sendable {
     case engine(EngineInfo)
     case containers([Container])
     case images([ImageInfo])
+    case volumes([VolumeInfo])
+    case volume(VolumeInfo)
+    case volumeRemoved(name: String, freedBytes: UInt64)
+    case network(NetworkInfo)
     case logs([LogLine])
     case container(Container)
     case image(ImageInfo)
@@ -150,6 +164,7 @@ public enum EngineResponse: Decodable, Sendable {
     private struct BuildLine: Decodable { let line: String }
     private struct ArchiveData: Decodable { let isDir: Bool; let name: String }
     private struct CopiedData: Decodable { let files: UInt64 }
+    private struct VolumeRemovedData: Decodable { let name: String; let freedBytes: UInt64 }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
@@ -159,6 +174,12 @@ public enum EngineResponse: Decodable, Sendable {
         case "engine": self = .engine(try c.decode(EngineInfo.self, forKey: .data))
         case "containers": self = .containers(try c.decode([Container].self, forKey: .data))
         case "images": self = .images(try c.decode([ImageInfo].self, forKey: .data))
+        case "volumes": self = .volumes(try c.decode([VolumeInfo].self, forKey: .data))
+        case "volume": self = .volume(try c.decode(VolumeInfo.self, forKey: .data))
+        case "volume_removed":
+            let r = try c.decode(VolumeRemovedData.self, forKey: .data)
+            self = .volumeRemoved(name: r.name, freedBytes: r.freedBytes)
+        case "network": self = .network(try c.decode(NetworkInfo.self, forKey: .data))
         case "logs": self = .logs(try c.decode([LogLine].self, forKey: .data))
         case "container": self = .container(try c.decode(Container.self, forKey: .data))
         case "image": self = .image(try c.decode(ImageInfo.self, forKey: .data))

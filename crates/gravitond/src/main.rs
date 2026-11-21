@@ -569,6 +569,8 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                 Request::Start { id } => result(store.start(&id).map(Response::Container)),
                 Request::Stop { id } => result(store.stop(&id).map(Response::Container)),
                 Request::Restart { id } => result(store.restart(&id).map(Response::Container)),
+                Request::ListVolumes => Response::Volumes(demo_volumes(&store)),
+                Request::NetworkInfo => Response::Network(demo_network(&store)),
                 _ => Response::Error { message: "gravitond is serving demo data; restart it without --demo to pull, run, exec and browse files".into() },
             }
         }
@@ -578,6 +580,13 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
             let outcome = tokio::task::spawn_blocking(move || -> Result<Response> {
                 Ok(match request {
                     Request::EngineInfo => Response::Engine(engine.engine_info()),
+                    Request::ListVolumes => Response::Volumes(engine.list_volumes()),
+                    Request::CreateVolume { name } => Response::Volume(engine.create_volume(&name)?),
+                    Request::RemoveVolume { name } => {
+                        let (name, freed_bytes) = engine.remove_volume(&name)?;
+                        Response::VolumeRemoved { name, freed_bytes }
+                    }
+                    Request::NetworkInfo => Response::Network(engine.network_info()),
                     Request::Pull { reference, .. } => Response::Image(engine.pull(&reference)?),
                     Request::RegistryLogin { registry, username, password } => {
                         let (registry, username) = engine.auth.login(&registry, &username, &password)?;
@@ -627,6 +636,69 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
 
 fn result<E: std::fmt::Display>(r: Result<Response, E>) -> Response {
     r.unwrap_or_else(|err| Response::Error { message: err.to_string() })
+}
+
+fn demo_volumes(store: &Store) -> Vec<graviton_proto::VolumeSummary> {
+    let mut out = Vec::new();
+    for c in store.containers() {
+        for m in &c.mounts {
+            if !m.source.starts_with('/') && !m.source.starts_with('~') {
+                out.push(graviton_proto::VolumeSummary {
+                    name: m.source.clone(),
+                    path: paths::volumes_dir().join(&m.source).display().to_string(),
+                    size_bytes: 184 << 20,
+                    file_count: 412,
+                    created_at: c.created_at,
+                    used_by: vec![graviton_proto::VolumeMountRef {
+                        container_id: c.id.clone(),
+                        container_name: c.name.clone(),
+                        target: m.target.clone(),
+                        read_only: m.read_only,
+                        running: c.status == graviton_proto::ContainerStatus::Running,
+                    }],
+                });
+            }
+        }
+    }
+    out
+}
+
+fn demo_network(store: &Store) -> graviton_proto::NetworkInfo {
+    let endpoints: Vec<graviton_proto::NetworkEndpoint> = store
+        .containers()
+        .iter()
+        .map(|c| {
+            let running = c.status == graviton_proto::ContainerStatus::Running;
+            graviton_proto::NetworkEndpoint {
+                container_id: c.id.clone(),
+                container_name: c.name.clone(),
+                image: c.image.clone(),
+                status: c.status,
+                ip_address: c.ip_address.clone(),
+                dns_names: if running && c.ip_address.is_some() {
+                    vec![c.name.clone(), format!("{}.graviton", c.name), c.id.clone()]
+                } else {
+                    vec![]
+                },
+                dns_enabled: running,
+                ports: c.ports.clone(),
+            }
+        })
+        .collect();
+    let connected = endpoints.iter().filter(|e| e.status == graviton_proto::ContainerStatus::Running).count() as u32;
+    graviton_proto::NetworkInfo {
+        name: "graviton".into(),
+        driver: "L2 switch + NAT".into(),
+        subnet: "192.168.64.0/24".into(),
+        gateway: "192.168.64.1".into(),
+        dns_server: "127.0.0.11:53".into(),
+        dns_domain: "graviton".into(),
+        connected_ports: connected,
+        learned_macs: connected,
+        frames_forwarded: 1842,
+        bytes_forwarded: 4_812_900,
+        endpoints,
+    }
 }
 
 #[cfg(test)]

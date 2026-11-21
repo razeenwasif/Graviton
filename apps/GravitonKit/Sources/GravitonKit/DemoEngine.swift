@@ -7,6 +7,7 @@ public actor DemoEngine: EngineService {
     private var list: [Container]
     private var logLines: [String: [LogLine]]
     private var imageList: [ImageInfo]
+    private var volumeList: [VolumeInfo]
     /// Pretend build cache, for the Clean Up sheet.
     private var cacheSteps: UInt32 = 23
     private var cacheBytes: UInt64 = 412 << 20
@@ -45,6 +46,12 @@ public actor DemoEngine: EngineService {
             img("node", "22-slim", 221, "arm64", 1), img("minio/minio", "latest", 162, "arm64", 1),
             img("python", "3.13-slim", 146, "arm64", 0), img("ubuntu", "24.04", 101, "amd64", 0),
             img("ghcr.io/astral-sh/uv", "0.9", 38, "arm64", 0),
+        ]
+
+        volumeList = [
+            VolumeInfo(name: "pgdata", path: "~/Library/Application Support/Graviton/volumes/pgdata", sizeBytes: 184 * mib, fileCount: 412, createdAt: now - 4 * 3600),
+            VolumeInfo(name: "redis-snapshots", path: "~/Library/Application Support/Graviton/volumes/redis-snapshots", sizeBytes: 18 * mib, fileCount: 14, createdAt: now - 26 * 3600),
+            VolumeInfo(name: "model-cache", path: "~/Library/Application Support/Graviton/volumes/model-cache", sizeBytes: 642 * mib, fileCount: 83, createdAt: now - 72 * 3600),
         ]
 
         let t0 = (now - 30) * 1000
@@ -96,6 +103,51 @@ public actor DemoEngine: EngineService {
     }
 
     public func images() -> [ImageInfo] { imageList }
+
+    public func volumes() -> [VolumeInfo] {
+        volumeList.map { v in
+            var copy = v
+            copy.usedBy = list.flatMap { c in
+                c.mounts.filter { $0.source == v.name }.map { m in
+                    VolumeMountRef(containerId: c.id, containerName: c.name, target: m.target, readOnly: m.readOnly, running: c.isRunning)
+                }
+            }
+            return copy
+        }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    public func createVolume(name: String) throws -> VolumeInfo {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard let first = trimmed.first, first.isASCII && (first.isLetter || first.isNumber),
+              trimmed.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || "_.-".contains($0)) }) else {
+            throw EngineError.daemon("`\(trimmed)` isn't a valid volume name (start with a letter or digit, then letters, digits, _ . -)")
+        }
+        guard !volumeList.contains(where: { $0.name == trimmed }) else {
+            throw EngineError.daemon("volume \(trimmed) already exists")
+        }
+        let vol = VolumeInfo(name: trimmed, path: "~/Library/Application Support/Graviton/volumes/\(trimmed)",
+                             sizeBytes: 0, fileCount: 0, createdAt: UInt64(Date.now.timeIntervalSince1970))
+        volumeList.append(vol)
+        return vol
+    }
+
+    public func removeVolume(name: String) throws -> UInt64 {
+        guard let i = volumeList.firstIndex(where: { $0.name == name }) else {
+            throw EngineError.daemon("no volume \(name) here")
+        }
+        let users = list.filter { $0.mounts.contains { $0.source == name } }.map(\.name)
+        guard users.isEmpty else {
+            throw EngineError.daemon("volume \(name) is used by \(users.joined(separator: ", ")): remove \(users.count == 1 ? "it" : "them") first")
+        }
+        return volumeList.remove(at: i).sizeBytes
+    }
+
+    public func networkInfo() -> NetworkInfo {
+        var info = NetworkInfo.synthesized(from: list)
+        info.framesForwarded = UInt64(1840 + tick * 14)
+        info.bytesForwarded = UInt64(4_810_000 + tick * 6120)
+        return info
+    }
 
     public func logs(id: String, tail: Int?) throws -> [LogLine] {
         let c = try resolve(id)

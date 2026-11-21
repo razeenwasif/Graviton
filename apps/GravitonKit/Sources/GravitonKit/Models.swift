@@ -615,3 +615,143 @@ public struct PruneReport: Codable, Hashable, Sendable {
     public var freedBytes: UInt64
     public var dryRun: Bool
 }
+
+// MARK: - Volumes & network
+
+/// One container's mount of a named volume (mirrors `VolumeMountRef` in `graviton-proto`).
+public struct VolumeMountRef: Codable, Hashable, Sendable, Identifiable {
+    public var containerId: String
+    public var containerName: String
+    public var target: String
+    public var readOnly: Bool
+    public var running: Bool
+
+    public var id: String { "\(containerId):\(target)" }
+
+    public init(containerId: String, containerName: String, target: String, readOnly: Bool, running: Bool) {
+        self.containerId = containerId
+        self.containerName = containerName
+        self.target = target
+        self.readOnly = readOnly
+        self.running = running
+    }
+}
+
+/// One named volume (`-v name:/path`) stored under Graviton's `volumes/` folder.
+public struct VolumeInfo: Codable, Hashable, Sendable, Identifiable {
+    public var name: String
+    public var path: String
+    public var sizeBytes: UInt64
+    public var fileCount: UInt64
+    public var createdAt: UInt64
+    public var usedBy: [VolumeMountRef]
+
+    public var id: String { name }
+    public var isInUse: Bool { !usedBy.isEmpty }
+    public var createdDate: Date { Date(timeIntervalSince1970: Double(createdAt)) }
+
+    public init(name: String, path: String, sizeBytes: UInt64, fileCount: UInt64, createdAt: UInt64, usedBy: [VolumeMountRef] = []) {
+        self.name = name
+        self.path = path
+        self.sizeBytes = sizeBytes
+        self.fileCount = fileCount
+        self.createdAt = createdAt
+        self.usedBy = usedBy
+    }
+}
+
+/// One container on Graviton's shared container network (`NetworkEndpoint` in `graviton-proto`).
+public struct NetworkEndpoint: Codable, Hashable, Sendable, Identifiable {
+    public var containerId: String
+    public var containerName: String
+    public var image: String
+    public var status: ContainerStatus
+    public var ipAddress: String?
+    public var dnsNames: [String]
+    public var dnsEnabled: Bool
+    public var ports: [PortMapping]
+
+    public var id: String { containerId }
+    public var isRunning: Bool { status == .running }
+
+    public init(containerId: String, containerName: String, image: String, status: ContainerStatus,
+                ipAddress: String? = nil, dnsNames: [String] = [], dnsEnabled: Bool = false, ports: [PortMapping] = []) {
+        self.containerId = containerId
+        self.containerName = containerName
+        self.image = image
+        self.status = status
+        self.ipAddress = ipAddress
+        self.dnsNames = dnsNames
+        self.dnsEnabled = dnsEnabled
+        self.ports = ports
+    }
+}
+
+/// Live view of Graviton's shared container network, switch, and embedded DNS.
+public struct NetworkInfo: Codable, Hashable, Sendable {
+    public var name: String
+    public var driver: String
+    public var subnet: String
+    public var gateway: String
+    public var dnsServer: String
+    public var dnsDomain: String
+    public var connectedPorts: UInt32
+    public var learnedMacs: UInt32
+    public var framesForwarded: UInt64
+    public var bytesForwarded: UInt64
+    public var endpoints: [NetworkEndpoint]
+
+    public init(name: String, driver: String, subnet: String, gateway: String, dnsServer: String, dnsDomain: String,
+                connectedPorts: UInt32, learnedMacs: UInt32, framesForwarded: UInt64, bytesForwarded: UInt64, endpoints: [NetworkEndpoint]) {
+        self.name = name
+        self.driver = driver
+        self.subnet = subnet
+        self.gateway = gateway
+        self.dnsServer = dnsServer
+        self.dnsDomain = dnsDomain
+        self.connectedPorts = connectedPorts
+        self.learnedMacs = learnedMacs
+        self.framesForwarded = framesForwarded
+        self.bytesForwarded = bytesForwarded
+        self.endpoints = endpoints
+    }
+
+    /// Synthesise a network view from `containers` when talking to an older gravitond.
+    public static func synthesized(from containers: [Container]) -> NetworkInfo {
+        let running = containers.filter(\.isRunning)
+        let subnetAndGateway: (String, String) = running.compactMap(\.ipAddress).compactMap { ip -> (String, String)? in
+            let parts = ip.split(separator: ".")
+            guard parts.count == 4 else { return nil }
+            let prefix = "\(parts[0]).\(parts[1]).\(parts[2])"
+            return ("\(prefix).0/24", "\(prefix).1")
+        }.first ?? ("192.168.64.0/24", "192.168.64.1")
+        let endpoints = containers.map { c in
+            NetworkEndpoint(
+                containerId: c.id,
+                containerName: c.name,
+                image: c.image,
+                status: c.status,
+                ipAddress: c.isRunning ? c.ipAddress : nil,
+                dnsNames: (c.isRunning && c.ipAddress != nil) ? [c.name, "\(c.name).graviton", c.id] : [],
+                dnsEnabled: c.isRunning && c.ipAddress != nil,
+                ports: c.ports
+            )
+        }.sorted { a, b in
+            if a.isRunning != b.isRunning { return a.isRunning }
+            return a.containerName.localizedStandardCompare(b.containerName) == .orderedAscending
+        }
+        return NetworkInfo(
+            name: "graviton",
+            driver: "L2 switch + NAT",
+            subnet: subnetAndGateway.0,
+            gateway: subnetAndGateway.1,
+            dnsServer: "127.0.0.11:53",
+            dnsDomain: "graviton",
+            connectedPorts: UInt32(running.count),
+            learnedMacs: UInt32(running.count),
+            framesForwarded: 0,
+            bytesForwarded: 0,
+            endpoints: endpoints
+        )
+    }
+}

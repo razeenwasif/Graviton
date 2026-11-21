@@ -20,6 +20,8 @@ public final class EngineStore {
     public private(set) var connection: Connection = .connecting
     public private(set) var containers: [Container] = []
     public private(set) var images: [ImageInfo] = []
+    public private(set) var volumes: [VolumeInfo] = []
+    public private(set) var network: NetworkInfo?
     public private(set) var engine: EngineInfo?
     public private(set) var logs: [String: [LogLine]] = [:]
     /// Recent events, newest last.
@@ -29,6 +31,8 @@ public final class EngineStore {
     public var lastError: String?
     /// Why the live engine isn't answering (shown on iOS's host chip).
     public private(set) var liveError: String?
+
+    private var volumesLoaded = false
 
     public static let historyLength = 40
 
@@ -65,6 +69,9 @@ public final class EngineStore {
         connection = .connecting
         containers = []
         images = []
+        volumes = []
+        volumesLoaded = false
+        network = nil
         self.engine = nil
         logs = [:]
         events = []
@@ -96,6 +103,7 @@ public final class EngineStore {
     }
 
     public func refresh() async {
+        let previousConnection = connection
         if let live {
             do {
                 _ = try await live.ping()
@@ -113,6 +121,9 @@ public final class EngineStore {
             connection = .demo
             liveError = nil
         }
+        if connection != previousConnection {
+            volumesLoaded = false
+        }
         do {
             let service = self.service
             async let list = service.containers()
@@ -121,6 +132,16 @@ public final class EngineStore {
             containers = try await list
             images = try await imgs
             engine = try await info
+            // Gracefully fall back if talking to an older gravitond without network_info / list_volumes.
+            if let net = try? await service.networkInfo() {
+                network = net
+            } else {
+                network = NetworkInfo.synthesized(from: containers)
+            }
+            if !volumesLoaded, let vols = try? await service.volumes() {
+                volumes = vols
+                volumesLoaded = true
+            }
             recordHistory()
             await refreshEvents(from: service)
         } catch {
@@ -184,6 +205,7 @@ public final class EngineStore {
     public func run(_ spec: RunSpec) async throws -> Container {
         let container = try await service.run(spec)
         await refresh()
+        if volumesLoaded { await loadVolumes() }
         return container
     }
 
@@ -235,9 +257,35 @@ public final class EngineStore {
             _ = try await service.remove(id: c.id)
             logs[c.id] = nil
             await refresh()
+            if volumesLoaded { await loadVolumes() }
         } catch {
             lastError = error.localizedDescription
         }
+    }
+
+    // Volumes.
+    public func loadVolumes() async {
+        do {
+            volumes = try await service.volumes()
+            volumesLoaded = true
+        } catch {
+            // Older daemons don't have list_volumes; keep empty without popping an alert.
+            if case EngineError.daemon = error { volumesLoaded = true }
+        }
+    }
+
+    @discardableResult
+    public func createVolume(name: String) async throws -> VolumeInfo {
+        let vol = try await service.createVolume(name: name)
+        await loadVolumes()
+        return vol
+    }
+
+    @discardableResult
+    public func removeVolume(_ volume: VolumeInfo) async throws -> UInt64 {
+        let freed = try await service.removeVolume(name: volume.name)
+        await loadVolumes()
+        return freed
     }
 
     // Panels call these directly and show errors in place.

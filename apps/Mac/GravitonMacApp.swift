@@ -93,12 +93,8 @@ struct RootView: View {
                 switch section {
                 case .containers: ContainersScreen()
                 case .images: ImagesScreen()
-                case .volumes:
-                    ComingSoon(title: "Volumes", symbol: Section.volumes.symbol,
-                               detail: "Named volumes work from grav and the Run sheet (-v name:/path). A screen to browse them is on the plan.")
-                case .networks:
-                    ComingSoon(title: "Networks", symbol: Section.networks.symbol,
-                               detail: "Every container gets NAT, DNS and the shared container network. A screen to manage them is on the plan.")
+                case .volumes: VolumesScreen()
+                case .networks: NetworksScreen()
                 }
             }
             .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
@@ -175,7 +171,8 @@ struct Sidebar: View {
         switch item {
         case .containers: store.containers.count
         case .images: store.images.count
-        case .volumes, .networks: nil
+        case .volumes: store.volumes.count
+        case .networks: store.runningCount
         }
     }
 }
@@ -269,18 +266,5 @@ struct EngineCard: View {
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .gravitonCard(Color(hex: 0x15161A))
-    }
-}
-
-struct ComingSoon: View {
-    var title: String
-    var symbol: String
-    var detail: String
-
-    var body: some View {
-        VStack(spacing: 0) {
-            ScreenHeader(title, subtitle: "Coming later")
-            GEmptyState("\(title) aren't here yet", symbol: symbol, detail: detail)
-        }
     }
 }

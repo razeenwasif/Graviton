@@ -13,8 +13,18 @@
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Live counters for the container switch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SwitchStats {
+    pub ports: u32,
+    pub learned_macs: u32,
+    pub frames_forwarded: u64,
+    pub bytes_forwarded: u64,
+}
 
 /// How long a learned MAC address is trusted without hearing from it.
 const MAC_TTL: Duration = Duration::from_secs(300);
@@ -33,6 +43,8 @@ struct Inner {
 #[derive(Default, Clone)]
 pub struct Switch {
     inner: Arc<Mutex<Inner>>,
+    frames_forwarded: Arc<AtomicU64>,
+    bytes_forwarded: Arc<AtomicU64>,
 }
 
 /// A port on the switch: give `vm_fd()` to the VM; dropping it unplugs the port.
@@ -65,6 +77,18 @@ impl Drop for Port {
 impl Switch {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn stats(&self) -> SwitchStats {
+        let now = Instant::now();
+        let inner = self.inner.lock().unwrap();
+        let learned = inner.macs.values().filter(|(_, seen)| now.duration_since(*seen) < MAC_TTL).count();
+        SwitchStats {
+            ports: inner.ports.len() as u32,
+            learned_macs: learned as u32,
+            frames_forwarded: self.frames_forwarded.load(Ordering::Relaxed),
+            bytes_forwarded: self.bytes_forwarded.load(Ordering::Relaxed),
+        }
     }
 
     /// Plug in a new port.
@@ -116,7 +140,11 @@ impl Switch {
             for target in self.route(id, frame) {
                 // A full receiver drops the frame, as a real switch would.
                 // SAFETY: send(2) of a buffer we own on a descriptor the switch holds.
-                unsafe { libc::send(target.as_raw_fd(), frame.as_ptr().cast(), frame.len(), libc::MSG_DONTWAIT) };
+                let sent = unsafe { libc::send(target.as_raw_fd(), frame.as_ptr().cast(), frame.len(), libc::MSG_DONTWAIT) };
+                if sent > 0 {
+                    self.frames_forwarded.fetch_add(1, Ordering::Relaxed);
+                    self.bytes_forwarded.fetch_add(sent as u64, Ordering::Relaxed);
+                }
             }
         }
     }
