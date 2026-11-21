@@ -59,6 +59,7 @@ struct InspectPanel: View {
                         InspectRow("Created", Date(timeIntervalSince1970: Double(d.container.createdAt)).formatted(date: .abbreviated, time: .standard))
                         InspectRow("Started", d.container.startedAt.map { Date(timeIntervalSince1970: Double($0)).formatted(date: .abbreviated, time: .standard) } ?? "—")
                         InspectRow("Status", d.container.statusText())
+                        InspectRow("Restart policy", (d.restart ?? .no).rawValue)
                     }
                 } else {
                     GSpinner(size: 20).frame(maxWidth: .infinity, minHeight: 200)

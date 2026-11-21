@@ -385,6 +385,7 @@ struct MobileInspectView: View {
                     section("Lifecycle") {
                         row("ID", d.container.id)
                         row("Status", d.container.statusText())
+                        row("Restart policy", (d.restart ?? .no).rawValue)
                     }
                 } else if problem == nil {
                     GSpinner(size: 22).frame(maxWidth: .infinity, minHeight: 300)

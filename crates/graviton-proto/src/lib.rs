@@ -44,6 +44,48 @@ pub enum PortProtocol {
     Udp,
 }
 
+/// When `gravitond` should restart a container automatically.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    /// Never restart automatically.
+    #[default]
+    No,
+    /// Restart on non-zero exit (with backoff), and on daemon startup if it was running.
+    OnFailure,
+    /// Restart on any self-exit (with backoff), and on daemon startup unless stopped.
+    Always,
+}
+
+impl RestartPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RestartPolicy::No => "no",
+            RestartPolicy::OnFailure => "on-failure",
+            RestartPolicy::Always => "always",
+        }
+    }
+}
+
+impl std::fmt::Display for RestartPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for RestartPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "no" | "never" => Ok(RestartPolicy::No),
+            "on-failure" | "on_failure" => Ok(RestartPolicy::OnFailure),
+            "always" => Ok(RestartPolicy::Always),
+            other => Err(format!("unknown restart policy `{other}` (use: no, on-failure, always)")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortMapping {
     pub host_port: u16,
@@ -140,6 +182,9 @@ pub struct RunSpec {
     /// `/host/dir:/container/path[:ro]` or `name:/container/path[:ro]` (a named volume).
     #[serde(default)]
     pub volumes: Vec<String>,
+    /// Automatic restart policy (`no`, `on-failure`, `always`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<RestartPolicy>,
 }
 
 /// Push alert set-up on this Mac.
@@ -410,6 +455,9 @@ pub struct ContainerDetails {
     pub kernel: String,
     /// Where the container's VM keeps its console and logs on the Mac.
     pub vm_dir: String,
+    /// Automatic restart policy saved with the container.
+    #[serde(default)]
+    pub restart: RestartPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -836,6 +884,14 @@ mod tests {
         assert_eq!(spec.command.as_deref(), Some(&["python3".to_string(), "-m".into(), "http.server".into()][..]));
         assert_eq!((spec.cpus, spec.memory_mib), (None, Some(2048)));
         assert_eq!((spec.ports, spec.volumes), (vec!["8080:8000".to_string()], vec!["~/code:/app:ro".to_string()]));
+        assert_eq!(spec.restart, None);
+        let with_restart = br#"{"method":"run","params":{"env":[],"image":"redis","ports":[],"restart":"on-failure","volumes":[]}}"#;
+        let Request::Run(spec) = decode_line::<Request>(with_restart).unwrap() else { panic!("not a run") };
+        assert_eq!(spec.restart, Some(RestartPolicy::OnFailure));
+        assert_eq!("always".parse::<RestartPolicy>().unwrap(), RestartPolicy::Always);
+        assert_eq!("on-failure".parse::<RestartPolicy>().unwrap(), RestartPolicy::OnFailure);
+        assert_eq!("no".parse::<RestartPolicy>().unwrap(), RestartPolicy::No);
+        assert!("bogus".parse::<RestartPolicy>().is_err());
         let pull: Request = decode_line(br#"{"method":"pull","params":{"reference":"alpine"}}"#).unwrap();
         assert_eq!(pull, Request::Pull { reference: "alpine".into() });
     }

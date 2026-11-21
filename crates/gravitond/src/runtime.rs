@@ -24,7 +24,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -34,7 +34,7 @@ use graviton_image::{BlobStore, ImageIndex, LocalImage, Progress, Registry};
 use graviton_proto::{
     AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ContainerDetails, ContainerStats, ContainerStatus, ContainerSummary,
     DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats, HostEntry, ImageSummary, LogLevel, LogLine, LogStream,
-    Mount, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RunSpec, StatSample, decode_line, encode_line,
+    Mount, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy, RunSpec, StatSample, decode_line, encode_line,
 };
 use graviton_vmm::apple::{AppleHypervisor, AppleVm};
 use graviton_vmm::{NetworkMode, SharedDirectory, VmConfig, VmHandle};
@@ -43,6 +43,11 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_CPUS: u32 = 2;
 const DEFAULT_MEMORY_MIB: u64 = 1024;
 const STOP_GRACE: Duration = Duration::from_secs(10);
+/// Exponential backoff for automatic restarts: 1s, 2s, 4s, ..., capped at 60s.
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Staying up at least this long resets the restart backoff back to 1s.
+const HEALTHY_UPTIME: Duration = Duration::from_secs(10);
 const KERNEL: &str = "Linux 6.12 (Alpine linux-virt)";
 /// How often running containers are sampled, and how many samples are kept (5 minutes).
 const STATS_INTERVAL: Duration = Duration::from_secs(2);
@@ -64,6 +69,11 @@ pub(crate) struct ContainerSpec {
     ports: Vec<PortMapping>,
     #[serde(default)]
     volumes: Vec<Volume>,
+    #[serde(default)]
+    restart: RestartPolicy,
+    /// True while a container with a restart policy should stay up (including across daemon restarts).
+    #[serde(default)]
+    want_running: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -119,6 +129,10 @@ pub struct Engine {
     pub events: Arc<crate::events::EventLog>,
     /// Containers being stopped on request (so their exit isn't a failure).
     stopping: Mutex<HashSet<String>>,
+    /// Scheduled backoff restart tasks, keyed by container id (aborted on stop/start/remove/shutdown).
+    pending_restarts: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Set during daemon shutdown so running containers keep `want_running` and don't emit false failure alerts.
+    shutting_down: AtomicBool,
     /// One pull per image at a time: a second waits for the first, then finds it.
     pulling: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     rt: tokio::runtime::Handle,
@@ -143,15 +157,46 @@ impl Engine {
             hosts_gen: AtomicU64::new(0),
             events: Arc::new(crate::events::EventLog::open(paths::support_dir().join("events.jsonl"))),
             stopping: Mutex::new(HashSet::new()),
+            pending_restarts: Mutex::new(HashMap::new()),
+            shutting_down: AtomicBool::new(false),
             pulling: Mutex::new(HashMap::new()),
             rt: tokio::runtime::Handle::current(),
             state_path: paths::support_dir().join("containers.json"),
         });
-        engine.restore()?;
+        let autostart = engine.restore()?;
         let known: HashSet<String> = engine.store.lock().unwrap().containers().iter().map(|c| c.id.clone()).collect();
         remove_orphan_disks(&known);
         engine.refresh_images();
+        for id in autostart {
+            let e = Arc::clone(&engine);
+            engine.rt.spawn(async move {
+                let _ = tokio::task::spawn_blocking(move || e.launch_auto(&id, 0)).await;
+            });
+        }
         Ok(engine)
+    }
+
+    /// Cleanly flush and power off running VMs when `gravitond` stops, without
+    /// altering saved `want_running` state so restart policies bring them back.
+    pub fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        for (_, handle) in self.pending_restarts.lock().unwrap().drain() {
+            handle.abort();
+        }
+        let running: Vec<Running> = self.running.lock().unwrap().drain().map(|(_, r)| r).collect();
+        for r in &running {
+            for f in &r.forwards {
+                f.abort();
+            }
+            let _ = r.agent.lock().unwrap().write_all(&encode_line(&AgentRequest::Shutdown));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for r in &running {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || r.vm.wait_stopped(remaining).is_err() {
+                let _ = r.vm.kill();
+            }
+        }
     }
 
     pub fn engine_info(&self) -> EngineInfo {
@@ -177,13 +222,13 @@ impl Engine {
 
     // -- Saved state --------------------------------------------------------
 
-    fn restore(&self) -> Result<()> {
+    fn restore(&self) -> Result<Vec<String>> {
         let saved: SavedState = match fs::read(&self.state_path) {
             Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("reading {}", self.state_path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
-        let mut interrupted = Vec::new();
+        let mut interrupted = HashSet::new();
         {
             let mut store = self.store.lock().unwrap();
             for mut c in saved.containers {
@@ -191,7 +236,7 @@ impl Engine {
                     // Its VM ended with the previous gravitond.
                     c.status = ContainerStatus::Exited;
                     c.started_at = None;
-                    interrupted.push(c.id.clone());
+                    interrupted.insert(c.id.clone());
                 }
                 c.ip_address = None;
                 c.cpu_percent = None;
@@ -202,11 +247,26 @@ impl Engine {
                 }
             }
         }
-        *self.specs.lock().unwrap() = saved.specs;
-        for id in interrupted {
+        let mut specs = saved.specs;
+        let mut autostart = Vec::new();
+        let mut stopped_logs = Vec::new();
+        for (id, spec) in &mut specs {
+            let was_running = interrupted.contains(id);
+            if spec.restart != RestartPolicy::No && (spec.want_running || was_running) {
+                spec.want_running = true;
+                autostart.push((id.clone(), spec.restart));
+            } else if was_running {
+                stopped_logs.push(id.clone());
+            }
+        }
+        *self.specs.lock().unwrap() = specs;
+        for id in stopped_logs {
             self.log(&id, LogLevel::Warn, LogStream::System, "gravitond restarted while this container was running; its VM stopped".into());
         }
-        Ok(())
+        for (id, policy) in &autostart {
+            self.log(id, LogLevel::Info, LogStream::System, format!("gravitond started; restarting container automatically (policy: {policy})"));
+        }
+        Ok(autostart.into_iter().map(|(id, _)| id).collect())
     }
 
     fn save(&self) {
@@ -306,6 +366,7 @@ impl Engine {
             bail!("{} has no entrypoint or command; pass one after the image name", spec.image);
         }
         let display = ImageReference::parse(&image.reference).map(|r| r.display_name()).unwrap_or(image.reference.clone());
+        let restart = spec.restart.unwrap_or_default();
         let cs = ContainerSpec {
             argv,
             env: config.env(&spec.env),
@@ -316,6 +377,8 @@ impl Engine {
             image,
             ports,
             volumes,
+            restart,
+            want_running: restart != RestartPolicy::No,
         };
 
         let id = new_id();
@@ -354,18 +417,40 @@ impl Engine {
         if self.running.lock().unwrap().contains_key(&id) {
             bail!("container {key} is already running");
         }
-        if !self.specs.lock().unwrap().contains_key(&id) {
-            bail!("container {key} has no saved settings, so it can't be started again");
+        {
+            let mut specs = self.specs.lock().unwrap();
+            let Some(spec) = specs.get_mut(&id) else {
+                bail!("container {key} has no saved settings, so it can't be started again");
+            };
+            spec.want_running = spec.restart != RestartPolicy::No;
         }
+        self.cancel_restart(&id);
+        self.save();
         self.launch(&id)
     }
 
     pub fn stop(&self, key: &str) -> Result<ContainerSummary> {
         let id = self.store.lock().unwrap().container(key)?.id.clone();
-        let (agent, pid, vm) = {
+        // Clear `want_running` before cancelling any pending backoff timer
+        // (same lock order as `schedule_restart`, preventing any race).
+        let cancelled = {
+            let mut specs = self.specs.lock().unwrap();
+            if let Some(spec) = specs.get_mut(&id) {
+                spec.want_running = false;
+            }
+            self.cancel_restart(&id)
+        };
+        let running_entry = {
             let running = self.running.lock().unwrap();
-            let r = running.get(&id).ok_or_else(|| anyhow!("container {key} isn't running"))?;
-            (Arc::clone(&r.agent), r.pid, Arc::clone(&r.vm))
+            running.get(&id).map(|r| (Arc::clone(&r.agent), r.pid, Arc::clone(&r.vm)))
+        };
+        let Some((agent, pid, vm)) = running_entry else {
+            if cancelled {
+                self.save();
+                self.log(&id, LogLevel::Info, LogStream::System, "auto-restart cancelled".into());
+                return Ok(self.store.lock().unwrap().container(&id)?.clone());
+            }
+            bail!("container {key} isn't running");
         };
         self.stopping.lock().unwrap().insert(id.clone());
         if let Some(pid) = pid {
@@ -391,21 +476,30 @@ impl Engine {
             let _ = vm.kill();
             wait(5);
         }
+        self.save();
         Ok(self.store.lock().unwrap().container(&id)?.clone())
     }
 
     pub fn restart(self: &Arc<Self>, key: &str) -> Result<ContainerSummary> {
         let id = self.store.lock().unwrap().container(key)?.id.clone();
+        self.cancel_restart(&id);
         if self.running.lock().unwrap().contains_key(&id) {
             self.stop(&id)?;
         }
+        if let Some(spec) = self.specs.lock().unwrap().get_mut(&id) {
+            spec.want_running = spec.restart != RestartPolicy::No;
+        }
+        self.save();
         self.launch(&id)
     }
 
     pub fn remove(&self, key: &str) -> Result<String> {
         let removed = self.store.lock().unwrap().remove(key)?;
         self.events.record(graviton_proto::EventKind::Removed, Some((&removed.id, &removed.name)), Some(&removed.image), format!("{} removed", removed.name));
-        self.specs.lock().unwrap().remove(&removed.id);
+        {
+            self.specs.lock().unwrap().remove(&removed.id);
+            self.cancel_restart(&removed.id);
+        }
         self.stats.lock().unwrap().remove(&removed.id);
         let _ = fs::remove_dir_all(paths::vms_dir().join(&removed.id));
         self.save();
@@ -413,8 +507,41 @@ impl Engine {
         Ok(removed.id)
     }
 
+    /// Abort any queued backoff restart for `id`; returns whether one was waiting.
+    fn cancel_restart(&self, id: &str) -> bool {
+        if let Some(handle) = self.pending_restarts.lock().unwrap().remove(id) {
+            handle.abort();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Start the supervisor and wait until the process is running (or failed).
     fn launch(self: &Arc<Self>, id: &str) -> Result<ContainerSummary> {
+        self.launch_inner(id, 0, true)?.ok_or_else(|| anyhow!("container {id} disappeared"))
+    }
+
+    /// Automatic start (daemon boot or restart-policy retry): doesn't block
+    /// waiting for startup, and reschedules with backoff if port binding fails.
+    fn launch_auto(self: &Arc<Self>, id: &str, attempt: u32) {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.running.lock().unwrap().contains_key(id) {
+            return;
+        }
+        let policy = match self.specs.lock().unwrap().get(id) {
+            Some(s) if s.want_running && s.restart != RestartPolicy::No => s.restart,
+            _ => return,
+        };
+        if let Err(err) = self.launch_inner(id, attempt, false) {
+            eprintln!("auto-start {id} failed: {err:#}");
+            self.schedule_restart(id, policy, attempt);
+        }
+    }
+
+    fn launch_inner(self: &Arc<Self>, id: &str, attempt: u32, wait_for_start: bool) -> Result<Option<ContainerSummary>> {
         let ports = self.specs.lock().unwrap().get(id).map(|s| s.ports.clone()).unwrap_or_default();
         // Bind the published ports first, so a port in use fails before a VM boots.
         let mut listeners = Vec::new();
@@ -428,6 +555,11 @@ impl Engine {
                         c.status = ContainerStatus::Exited;
                         c.exit_code = Some(125);
                     });
+                    if wait_for_start {
+                        if let Some(spec) = self.specs.lock().unwrap().get_mut(id) {
+                            spec.want_running = false;
+                        }
+                    }
                     self.save();
                     bail!(message);
                 }
@@ -440,13 +572,17 @@ impl Engine {
         });
         let engine = Arc::clone(self);
         let owned = id.to_string();
-        std::thread::Builder::new().name(format!("container-{id}")).spawn(move || engine.supervise(&owned, listeners))?;
+        std::thread::Builder::new().name(format!("container-{id}")).spawn(move || engine.supervise(&owned, listeners, attempt))?;
+
+        if !wait_for_start {
+            return Ok(None);
+        }
 
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             let c = self.store.lock().unwrap().container(id)?.clone();
             if c.status != ContainerStatus::Created {
-                return Ok(c);
+                return Ok(Some(c));
             }
             if Instant::now() > deadline {
                 bail!("container {} took too long to start", c.name);
@@ -455,8 +591,48 @@ impl Engine {
         }
     }
 
-    fn supervise(self: &Arc<Self>, id: &str, listeners: Vec<(TcpListener, u16)>) {
-        let result = self.run_in_vm(id, listeners);
+    /// Queue a backoff restart if `want_running` is still set and the daemon isn't stopping.
+    fn schedule_restart(self: &Arc<Self>, id: &str, policy: RestartPolicy, attempt: u32) {
+        let delay = restart_delay(attempt);
+        let next_attempt = attempt.saturating_add(1);
+        let engine = Arc::clone(self);
+        let owned = id.to_string();
+        // Hold `specs` before `pending_restarts` (same lock order as `stop`/`remove`).
+        let specs = self.specs.lock().unwrap();
+        if self.shutting_down.load(Ordering::SeqCst) || !specs.get(id).is_some_and(|s| s.want_running && s.restart != RestartPolicy::No) {
+            return;
+        }
+        let mut pending = self.pending_restarts.lock().unwrap();
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        let handle = self.rt.spawn(async move {
+            tokio::time::sleep(delay).await;
+            engine.pending_restarts.lock().unwrap().remove(&owned);
+            let e = Arc::clone(&engine);
+            let cid = owned.clone();
+            let _ = tokio::task::spawn_blocking(move || e.launch_auto(&cid, next_attempt)).await;
+        });
+        if let Some(prev) = pending.insert(id.to_string(), handle) {
+            prev.abort();
+        }
+        drop(pending);
+        drop(specs);
+        self.log(
+            id,
+            LogLevel::Info,
+            LogStream::System,
+            format!("restarting in {}s (policy: {policy}, attempt {next_attempt})", delay.as_secs()),
+        );
+    }
+
+    fn supervise(self: &Arc<Self>, id: &str, listeners: Vec<(TcpListener, u16)>, attempt: u32) {
+        let mut started_at: Option<Instant> = None;
+        let result = self.run_in_vm(id, listeners, &mut started_at);
+        if self.shutting_down.load(Ordering::SeqCst) {
+            // `Engine::shutdown` is tearing VMs down cleanly; preserve saved state.
+            return;
+        }
         let failure = result.as_ref().err().map(|e| format!("{e:#}"));
         let code = match result {
             Ok(code) => code,
@@ -488,6 +664,18 @@ impl Engine {
                 let _ = r.vm.kill();
             }
         }
+        let restart_policy = {
+            let mut specs = self.specs.lock().unwrap();
+            if let Some(spec) = specs.get_mut(id) {
+                let will_restart = spec.want_running && should_restart(spec.restart, requested, code, failure.is_some());
+                if !will_restart {
+                    spec.want_running = false;
+                }
+                will_restart.then_some(spec.restart)
+            } else {
+                None
+            }
+        };
         self.store.lock().unwrap().update(id, |c| {
             c.status = ContainerStatus::Exited;
             c.exit_code = Some(code);
@@ -505,14 +693,18 @@ impl Engine {
             (None, false, code) => (graviton_proto::EventKind::Failed, format!("{name} exited with code {code}")),
         };
         self.events.record(kind, Some((id, &name)), Some(&image), message);
+        if let Some(policy) = restart_policy {
+            let next_attempt = if started_at.is_some_and(|t| t.elapsed() >= HEALTHY_UPTIME) { 0 } else { attempt };
+            self.schedule_restart(id, policy, next_attempt);
+        }
     }
 
-    fn run_in_vm(self: &Arc<Self>, id: &str, listeners: Vec<(TcpListener, u16)>) -> Result<i32> {
+    fn run_in_vm(self: &Arc<Self>, id: &str, listeners: Vec<(TcpListener, u16)>, started_at: &mut Option<Instant>) -> Result<i32> {
         // The container's disk stays for its next start; `grav rm` deletes it.
-        self.run_in_vm_inner(id, listeners)
+        self.run_in_vm_inner(id, listeners, started_at)
     }
 
-    fn run_in_vm_inner(self: &Arc<Self>, id: &str, listeners: Vec<(TcpListener, u16)>) -> Result<i32> {
+    fn run_in_vm_inner(self: &Arc<Self>, id: &str, listeners: Vec<(TcpListener, u16)>, started_at: &mut Option<Instant>) -> Result<i32> {
         let spec = self.specs.lock().unwrap().get(id).cloned().ok_or_else(|| anyhow!("unknown container {id}"))?;
         let name = self.store.lock().unwrap().container(id)?.name.clone();
         let t0 = Instant::now();
@@ -631,6 +823,7 @@ impl Engine {
         loop {
             match events.next()? {
                 AgentEvent::Started { pid } => {
+                    *started_at = Some(Instant::now());
                     if let Some(r) = self.running.lock().unwrap().get_mut(id) {
                         r.pid = Some(pid);
                     }
@@ -827,6 +1020,7 @@ impl Engine {
             memory_mib: spec.memory_mib,
             kernel: KERNEL.into(),
             vm_dir: paths::vms_dir().join(&container.id).display().to_string(),
+            restart: spec.restart,
             container,
         })
     }
@@ -922,6 +1116,23 @@ impl Engine {
                 return candidate;
             }
         }
+    }
+}
+
+/// Exponential backoff for automatic restarts: 1s, 2s, 4s, ..., capped at 60s.
+fn restart_delay(attempt: u32) -> Duration {
+    let secs = INITIAL_BACKOFF.as_secs().saturating_mul(1u64 << attempt.min(6));
+    Duration::from_secs(secs.min(MAX_BACKOFF.as_secs()))
+}
+
+fn should_restart(policy: RestartPolicy, requested: bool, exit_code: i32, failed_to_start: bool) -> bool {
+    if requested {
+        return false;
+    }
+    match policy {
+        RestartPolicy::No => false,
+        RestartPolicy::OnFailure => failed_to_start || exit_code != 0,
+        RestartPolicy::Always => true,
     }
 }
 
@@ -1200,5 +1411,21 @@ mod tests {
         assert!(parse_volume("/tmp:/").is_err());
         assert!(parse_volume("../x:/app").is_err());
         assert!(parse_volume("nocolon").is_err());
+    }
+
+    #[test]
+    fn restart_policy_decisions_and_backoff() {
+        assert!(!should_restart(RestartPolicy::No, false, 1, false));
+        assert!(!should_restart(RestartPolicy::No, false, 0, false));
+        assert!(!should_restart(RestartPolicy::OnFailure, false, 0, false));
+        assert!(should_restart(RestartPolicy::OnFailure, false, 1, false));
+        assert!(should_restart(RestartPolicy::OnFailure, false, 0, true));
+        assert!(!should_restart(RestartPolicy::OnFailure, true, 143, false));
+        assert!(should_restart(RestartPolicy::Always, false, 0, false));
+        assert!(should_restart(RestartPolicy::Always, false, 1, false));
+        assert!(!should_restart(RestartPolicy::Always, true, 0, false));
+
+        let delays: Vec<u64> = (0..8).map(|n| restart_delay(n).as_secs()).collect();
+        assert_eq!(delays, vec![1, 2, 4, 8, 16, 32, 60, 60]);
     }
 }

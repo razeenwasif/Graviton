@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use graviton_proto::frame::{Decoder, Frame};
 use remote::Target;
-use graviton_proto::{BuildSpec, ContainerStatus, ContainerSummary, ExecSpec, FileKind, LogStream, Request, Response, RunSpec, decode_line, encode_line};
+use graviton_proto::{BuildSpec, ContainerStatus, ContainerSummary, ExecSpec, FileKind, LogStream, Request, Response, RestartPolicy, RunSpec, decode_line, encode_line};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Native containers for macOS")]
@@ -81,6 +81,9 @@ enum Command {
         /// Mount a folder or named volume: /host/dir:/path[:ro] or name:/path; repeatable.
         #[arg(short, long = "volume")]
         volume: Vec<String>,
+        /// Restart policy: no, on-failure, or always.
+        #[arg(long, value_name = "POLICY")]
+        restart: Option<RestartPolicy>,
         /// Start it and return instead of streaming its output.
         #[arg(short, long)]
         detach: bool,
@@ -340,7 +343,7 @@ fn run(cli: Cli) -> Result<()> {
                 other => unexpected(other)?,
             }
         }
-        Command::Run { name, env, cpus, memory, publish, volume, detach, image, command } => {
+        Command::Run { name, env, cpus, memory, publish, volume, restart, detach, image, command } => {
             let spec = RunSpec {
                 image,
                 name,
@@ -350,6 +353,7 @@ fn run(cli: Cli) -> Result<()> {
                 memory_mib: memory,
                 ports: publish,
                 volumes: volume.iter().map(|v| absolute_volume(v)).collect::<Result<_>>()?,
+                restart: restart.filter(|p| *p != RestartPolicy::No),
             };
             let container = match client.call(&Request::Run(spec))? {
                 Response::Container(c) => c,

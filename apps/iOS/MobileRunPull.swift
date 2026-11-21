@@ -11,6 +11,7 @@ struct MobileRunSheet: View {
     @State private var ports = ""
     @State private var env = ""
     @State private var memory: Double = 1024
+    @State private var restartPolicy: RestartPolicy = .no
     @State private var phase: Phase = .idle
     var onRun: (Container) -> Void = { _ in }
 
@@ -53,6 +54,9 @@ struct MobileRunSheet: View {
             GFormRow("Memory") {
                 GSegmented(selection: $memory, options: Self.memoryChoices.map { ($0, $0 < 1024 ? "\(Int($0)) MB" : "\(Int($0) / 1024) GB") }, stretch: true)
             }
+            GFormRow("Restart") {
+                GSegmented(selection: $restartPolicy, options: RestartPolicy.allCases.map { ($0, $0.label) }, stretch: true)
+            }
 
             switch phase {
             case .idle:
@@ -70,7 +74,8 @@ struct MobileRunSheet: View {
     private func run() {
         let words = RunSpec.words(command)
         let spec = RunSpec(image: trimmedImage, name: name.trimmingCharacters(in: .whitespaces).isEmpty ? nil : name.trimmingCharacters(in: .whitespaces),
-                           command: words.isEmpty ? nil : words, env: RunSpec.list(env), memoryMib: UInt64(memory), ports: RunSpec.list(ports))
+                           command: words.isEmpty ? nil : words, env: RunSpec.list(env), memoryMib: UInt64(memory), ports: RunSpec.list(ports),
+                           restart: restartPolicy == .no ? nil : restartPolicy)
         phase = .running
         Task {
             do {

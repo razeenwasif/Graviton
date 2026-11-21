@@ -11,6 +11,21 @@ public enum PortProtocol: String, Codable, Sendable, Hashable {
     case tcp, udp
 }
 
+/// When gravitond should restart a container automatically (`RestartPolicy` in `graviton-proto`).
+public enum RestartPolicy: String, Codable, CaseIterable, Hashable, Sendable {
+    case no
+    case onFailure = "on-failure"
+    case always
+
+    public var label: String {
+        switch self {
+        case .no: "Never"
+        case .onFailure: "On failure"
+        case .always: "Always"
+        }
+    }
+}
+
 public struct PortMapping: Codable, Hashable, Sendable {
     public var hostPort: UInt16
     public var containerPort: UInt16
@@ -121,9 +136,11 @@ public struct RunSpec: Codable, Hashable, Sendable {
     public var ports: [String]
     /// `/host/dir:/path[:ro]`, `~/dir:/path` or `name:/path`.
     public var volumes: [String]
+    /// Automatic restart policy (`no`, `on-failure`, `always`); nil defaults to `no`.
+    public var restart: RestartPolicy?
 
     public init(image: String, name: String? = nil, command: [String]? = nil, env: [String] = [], cpus: UInt32? = nil,
-                memoryMib: UInt64? = nil, ports: [String] = [], volumes: [String] = []) {
+                memoryMib: UInt64? = nil, ports: [String] = [], volumes: [String] = [], restart: RestartPolicy? = nil) {
         self.image = image
         self.name = name
         self.command = command
@@ -132,6 +149,7 @@ public struct RunSpec: Codable, Hashable, Sendable {
         self.memoryMib = memoryMib
         self.ports = ports
         self.volumes = volumes
+        self.restart = restart
     }
 
     /// Split a list typed as "8080:80, 5432" or one per line.
@@ -298,6 +316,7 @@ public struct ContainerDetails: Codable, Hashable, Sendable {
     public var memoryMib: UInt64
     public var kernel: String
     public var vmDir: String
+    public var restart: RestartPolicy?
 }
 
 /// What `grav exec` asks for.

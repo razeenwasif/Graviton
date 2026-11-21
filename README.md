@@ -72,8 +72,11 @@ cargo run -p grav -- stop web && cargo run -p grav -- rm web
   falling back to the NAT's DNS for external hosts.
 - `-v /mac/dir:/path[:ro]` shares a folder over virtiofs; `-v name:/path` is a
   named volume under `~/Library/Application Support/Graviton/volumes`.
-- Containers, their settings and logs are saved; after gravitond restarts,
-  running ones show as stopped and `grav start` brings them back.
+- Containers, their settings and logs are saved. Pass `--restart no|on-failure|always`
+  (or pick **Restart** in the Mac/iPhone Run sheet) to automatically restart a
+  container on exit with exponential backoff (1 s to 60 s) and bring it back
+  when `gravitond` starts (after a deploy or reboot); containers with the
+  default `no` stay stopped until `grav start`.
 - `scripts/install-launch-agent.sh` installs gravitond as a launch agent so it
   starts at login (`--remote` to accept phones, `--uninstall` to remove it).
 

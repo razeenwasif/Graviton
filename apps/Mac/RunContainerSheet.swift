@@ -18,6 +18,7 @@ struct RunContainerSheet: View {
     @State private var volumesText = ""
     @State private var cpus = 2
     @State private var memoryMib: UInt64 = 1024
+    @State private var restartPolicy: RestartPolicy = .no
     @State private var running: Date?
     @State private var failure: String?
     @FocusState private var imageFocused: Bool
@@ -88,6 +89,9 @@ struct RunContainerSheet: View {
                     Text("memory").font(.system(size: 12)).foregroundStyle(G.faint)
                 }
             }
+            GFormRow("Restart", hint: "Bring it back on failure or when gravitond starts.") {
+                GSegmented(selection: $restartPolicy, options: RestartPolicy.allCases.map { ($0, $0.label) })
+            }
 
             if let since = running {
                 TimelineView(.periodic(from: since, by: 1)) { context in
@@ -131,7 +135,8 @@ struct RunContainerSheet: View {
             cpus: UInt32(cpus),
             memoryMib: memoryMib,
             ports: RunSpec.list(portsText),
-            volumes: RunSpec.list(volumesText)
+            volumes: RunSpec.list(volumesText),
+            restart: restartPolicy == .no ? nil : restartPolicy
         )
         failure = nil
         running = .now

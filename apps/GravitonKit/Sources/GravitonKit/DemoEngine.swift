@@ -288,11 +288,16 @@ public actor DemoEngine: EngineService {
         default: ["/app/bin/api", "--config", "/app/config.toml"]
         }
         let image = imageList.first { $0.reference.hasSuffix(c.image) || "\($0.repository):\($0.tag)" == c.image }
+        let restart: RestartPolicy = switch c.name {
+        case "postgres", "redis-cache", "api-gateway": .always
+        case "web": .onFailure
+        default: .no
+        }
         return ContainerDetails(container: c, imageReference: image?.reference ?? c.image, imageDigest: image?.digest ?? "sha256:…",
                                 command: command, env: ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "APP_ENV=development", "LOG_LEVEL=info"],
                                 workingDir: c.name == "web" ? "/srv" : "/app", user: c.name == "postgres" ? "postgres" : nil,
                                 hostname: c.name, cpus: 2, memoryMib: (c.memoryLimitBytes ?? 1 << 30) >> 20,
-                                kernel: "Linux 6.12 (demo)", vmDir: "~/Library/Application Support/Graviton/vms/\(c.id)")
+                                kernel: "Linux 6.12 (demo)", vmDir: "~/Library/Application Support/Graviton/vms/\(c.id)", restart: restart)
     }
 
     public func openTerminal(_ spec: ExecSpec) throws -> any TerminalSession {

@@ -77,6 +77,9 @@ import Testing
         // Must parse as graviton_proto::Request::Run (see the Rust test `run_from_swift`).
         #expect(run == "{\"method\":\"run\",\"params\":{\"command\":[\"python3\",\"-m\",\"http.server\"],\"env\":[\"A=1\"],\"image\":\"python:3.13-slim\",\"memory_mib\":2048,\"name\":\"web\",\"ports\":[\"8080:8000\"],\"volumes\":[\"~/code:/app:ro\"]}}\n")
 
+        let withRestart = String(decoding: try Wire.line(.run(RunSpec(image: "redis", restart: .onFailure))), as: UTF8.self)
+        #expect(withRestart == "{\"method\":\"run\",\"params\":{\"env\":[],\"image\":\"redis\",\"ports\":[],\"restart\":\"on-failure\",\"volumes\":[]}}\n")
+
         let removed = try Wire.decoder.decode(EngineResponse.self, from: Data(#"{"type":"removed","data":{"id":"abc"}}"#.utf8))
         guard case .removed("abc") = removed else { Issue.record("expected removed"); return }
     }

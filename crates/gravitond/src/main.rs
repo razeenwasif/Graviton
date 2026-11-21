@@ -149,6 +149,10 @@ async fn serve_forever(args: Args) -> Result<()> {
         }
     }
 
+    if let Backend::Engine(engine) = &backend {
+        let engine = Arc::clone(engine);
+        let _ = tokio::task::spawn_blocking(move || engine.shutdown()).await;
+    }
     tokio::fs::remove_file(&socket).await.ok();
     eprintln!("gravitond stopped");
     Ok(())
