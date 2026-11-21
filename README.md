@@ -52,7 +52,8 @@ periwinkle accent `#7C8CFF`; green, amber and red only for status).
 ```bash
 scripts/build-guest.sh                      # once: guest kernel + initramfs
 scripts/dev-gravitond.sh                    # build, sign and run the daemon
-cargo run -p grav -- pull alpine            # in another terminal
+cargo run -p grav -- login ghcr.io          # optional: log in to a private registry (Keychain)
+cargo run -p grav -- pull alpine            # in another terminal (streams per-layer progress)
 cargo run -p grav -- run alpine cat /etc/os-release
 cargo run -p grav -- run -d --name web -p 8080:8000 -v ~/site:/srv python:3.13-slim \
     python3 -m http.server 8000 --directory /srv
@@ -64,6 +65,14 @@ cargo run -p grav -- exec -it web sh
 cargo run -p grav -- stop web && cargo run -p grav -- rm web
 ```
 
+- `grav login [REGISTRY]` / `grav logout [REGISTRY]` authenticate with Docker
+  Hub, GHCR or any OCI registry (Bearer or Basic auth). Usernames live in
+  `~/Library/Application Support/Graviton/registries.json` (`0600`) and
+  passwords/tokens stay in the Mac's login Keychain (`grav login --list` shows
+  saved logins; `--password-stdin` reads from stdin). Both `gzip` and `zstd`
+  image layers (including multi-frame and skippable-frame `zstd:chunked`) are
+  supported, and `grav pull` plus the Mac and iPhone Pull sheets stream
+  per-layer progress.
 - `-p [IP:]HOST:CONTAINER[/tcp|udp]` (or `-p PORT[/udp]`) publishes a TCP or
   UDP port forwarded to the container's VM. Without `IP:`, it binds `127.0.0.1`;
   pass `0.0.0.0:8080:80` (or `[::]:8080:80` / a specific interface IP) to accept

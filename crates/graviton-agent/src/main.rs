@@ -15,6 +15,8 @@
 //!
 //! Build it for the guest with `scripts/build-guest.sh`.
 
+mod zstd_stream;
+
 #[cfg(target_os = "linux")]
 mod build;
 #[cfg(target_os = "linux")]

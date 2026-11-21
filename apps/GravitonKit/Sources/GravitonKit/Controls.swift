@@ -899,3 +899,95 @@ public struct GRowBackground: ViewModifier {
 public extension View {
     func gravitonRow(selected: Bool) -> some View { modifier(GRowBackground(selected: selected)) }
 }
+
+// MARK: - Pull progress
+
+/// Live per-layer progress card used by both the Mac and iOS Pull sheets.
+public struct GPullProgressView: View {
+    public var reference: String
+    public var since: Date
+    public var state: PullState
+
+    public init(reference: String, since: Date, state: PullState) {
+        self.reference = reference
+        self.since = since
+        self.state = state
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            TimelineView(.periodic(from: since, by: 1)) { ctx in
+                let elapsed = max(0, Int(ctx.date.timeIntervalSince(since)))
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    if state.resolved {
+                        Text("Layer \(min(state.completedLayers + (state.completedLayers < state.totalLayers ? 1 : 0), max(state.totalLayers, 1)))/\(max(state.totalLayers, 1))")
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(G.text)
+                    } else {
+                        Text("Resolving \(reference)…")
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(G.text)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer(minLength: 4)
+                    if state.resolved && state.totalBytes > 0 {
+                        Text("\(Format.bytes(state.downloadedBytes)) / \(Format.bytes(state.totalBytes))")
+                            .font(G.mono(11))
+                            .foregroundStyle(G.muted)
+                    }
+                    Text("\(elapsed)s")
+                        .font(G.mono(11))
+                        .foregroundStyle(G.faint)
+                }
+            }
+
+            if let fraction = state.fraction {
+                progressBar(fraction: fraction, color: G.accent, height: 5)
+            }
+
+            if !state.layers.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 7) {
+                        ForEach(state.layers) { layer in
+                            HStack(spacing: 10) {
+                                Text(layer.shortDigest)
+                                    .font(G.mono(11))
+                                    .foregroundStyle(G.textSecondary)
+                                    .frame(width: 86, alignment: .leading)
+                                progressBar(fraction: layer.fraction, color: layer.isComplete ? G.running : G.accent, height: 4)
+                                Text(layerStatus(layer))
+                                    .font(G.mono(11))
+                                    .foregroundStyle(layer.cached ? G.muted : (layer.isComplete ? G.running : G.textSecondary))
+                                    .frame(width: 78, alignment: .trailing)
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 150)
+            }
+        }
+        .padding(12)
+        .background(G.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(G.border))
+    }
+
+    private func progressBar(fraction: Double, color: Color, height: CGFloat) -> some View {
+        GeometryReader { geo in
+            let w = max(0, min(geo.size.width, geo.size.width * fraction))
+            ZStack(alignment: .leading) {
+                Capsule().fill(G.control)
+                Capsule().fill(color).frame(width: w)
+                    .animation(.easeOut(duration: 0.14), value: fraction)
+            }
+        }
+        .frame(height: height)
+    }
+
+    private func layerStatus(_ layer: LayerPullProgress) -> String {
+        if layer.cached { return "cached" }
+        if layer.isComplete { return Format.bytes(layer.total) }
+        return "\(Int((layer.fraction * 100).rounded()))%"
+    }
+}

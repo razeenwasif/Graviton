@@ -150,13 +150,13 @@ struct ImageCard: View {
     }
 }
 
-/// Pulls an image through gravitond. The daemon logs per-layer progress;
-/// the sheet shows that a pull is running and how it ended.
+/// Pulls an image through gravitond with streamed per-layer progress.
 struct PullImageSheet: View {
     @Environment(EngineStore.self) private var store
     @Environment(\.dismiss) private var dismiss
     @State private var reference = ""
     @State private var phase: Phase = .idle
+    @State private var progress = PullState()
     @FocusState private var focused: Bool
 
     enum Phase: Equatable {
@@ -185,9 +185,7 @@ struct PullImageSheet: View {
                     GStatusLine(.warning, "Start gravitond to pull images: scripts/dev-gravitond.sh")
                 }
             case let .pulling(since):
-                TimelineView(.periodic(from: since, by: 1)) { context in
-                    GStatusLine(.working, "Pulling \(trimmed)… \(Int(context.date.timeIntervalSince(since))) s")
-                }
+                GPullProgressView(reference: trimmed, since: since, state: progress)
             case let .done(image):
                 GStatusLine(.success, "Pulled \(image.repository):\(image.tag) · \(Format.bytes(image.sizeBytes)) · \(image.architecture)")
             case let .failed(message):
@@ -212,10 +210,24 @@ struct PullImageSheet: View {
     private func startPull() {
         guard !pulling, !trimmed.isEmpty, store.canManage else { return }
         let reference = trimmed
+        progress = PullState()
         phase = .pulling(since: .now)
         Task {
             do {
-                phase = .done(try await store.pull(reference))
+                var finished: ImageInfo?
+                for try await event in store.pullStream(reference) {
+                    switch event {
+                    case let .progress(update):
+                        progress.apply(update)
+                    case let .pulled(image):
+                        finished = image
+                    }
+                }
+                if let image = finished {
+                    phase = .done(image)
+                } else {
+                    phase = .failed("Pull finished without an image response.")
+                }
             } catch {
                 phase = .failed(error.localizedDescription)
             }

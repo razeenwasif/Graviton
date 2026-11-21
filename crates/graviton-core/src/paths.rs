@@ -8,8 +8,14 @@ use std::path::PathBuf;
 /// Environment variable that overrides the control socket location.
 pub const SOCKET_ENV: &str = "GRAVITON_SOCKET";
 
-/// `~/Library/Application Support/Graviton`
+/// Environment variable that overrides the Graviton support directory.
+pub const DATA_DIR_ENV: &str = "GRAVITON_DATA_DIR";
+
+/// `$GRAVITON_DATA_DIR`, else `~/Library/Application Support/Graviton`.
 pub fn support_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os(DATA_DIR_ENV) {
+        return PathBuf::from(dir);
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
     home.join("Library/Application Support/Graviton")
 }

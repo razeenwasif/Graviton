@@ -5,6 +5,7 @@
 //! Containers run in their own guest VMs (see `runtime.rs`); `--demo` serves
 //! the sample containers from the design mockups instead.
 
+mod auth;
 mod boot_check;
 mod build;
 mod cleanup;
@@ -226,6 +227,10 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
             write.write_all(&encode_line(&response)).await?;
             continue;
         }
+        if let (Request::Pull { reference, progress: true }, Backend::Engine(engine)) = (&request, &backend) {
+            pull_stream(Arc::clone(engine), reference.clone(), &mut write).await?;
+            continue;
+        }
         if let (Request::Build(spec), Backend::Engine(engine)) = (&request, &backend) {
             build_stream(Arc::clone(engine), spec.clone(), lines.get_mut(), &mut write).await?;
             continue;
@@ -242,6 +247,37 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
         let response = handle(request, &backend).await;
         write.write_all(&encode_line(&response)).await?;
     }
+}
+
+/// `grav pull` (and app Pull sheets): stream per-layer progress, then the image.
+pub(crate) async fn pull_stream(
+    engine: Arc<Engine>,
+    reference: String,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> Result<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::task::spawn_blocking(move || {
+        let updates = tx.clone();
+        let result = engine.pull_with_progress(&reference, |progress| {
+            let _ = updates.send(Response::PullProgress(progress));
+        });
+        let _ = tx.send(match result {
+            Ok(image) => Response::Image(image),
+            Err(err) => Response::Error { message: format!("{err:#}") },
+        });
+    });
+    let mut disconnected = false;
+    while let Some(response) = rx.recv().await {
+        if write.write_all(&encode_line(&response)).await.is_err() || write.flush().await.is_err() {
+            disconnected = true;
+            break; // client closed the sheet/terminal; pull carries on in the background
+        }
+    }
+    drop(rx);
+    if !disconnected {
+        let _ = task.await;
+    }
+    Ok(())
 }
 
 /// `grav build`: stream the build's log lines, then the image. With an
@@ -379,7 +415,16 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
             let outcome = tokio::task::spawn_blocking(move || -> Result<Response> {
                 Ok(match request {
                     Request::EngineInfo => Response::Engine(engine.engine_info()),
-                    Request::Pull { reference } => Response::Image(engine.pull(&reference)?),
+                    Request::Pull { reference, .. } => Response::Image(engine.pull(&reference)?),
+                    Request::RegistryLogin { registry, username, password } => {
+                        let (registry, username) = engine.auth.login(&registry, &username, &password)?;
+                        Response::LoggedIn { registry, username }
+                    }
+                    Request::RegistryLogout { registry } => {
+                        let registry = engine.auth.logout(&registry)?;
+                        Response::LoggedOut { registry }
+                    }
+                    Request::ListLogins => Response::Logins(engine.auth.list()),
                     Request::Run(spec) => Response::Container(engine.run(spec)?),
                     Request::Start { id } => Response::Container(engine.start(&id)?),
                     Request::Stop { id } => Response::Container(engine.stop(&id)?),
@@ -435,7 +480,7 @@ mod tests {
             Response::Error { message } => assert!(message.contains("no such container")),
             other => panic!("unexpected {other:?}"),
         }
-        match handle(Request::Pull { reference: "alpine".into() }, &backend).await {
+        match handle(Request::Pull { reference: "alpine".into(), progress: false }, &backend).await {
             Response::Error { message } => assert!(message.contains("demo")),
             other => panic!("unexpected {other:?}"),
         }

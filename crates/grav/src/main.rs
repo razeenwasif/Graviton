@@ -15,7 +15,10 @@ use std::sync::{Arc, Mutex};
 
 use graviton_proto::frame::{Decoder, Frame};
 use remote::Target;
-use graviton_proto::{BuildSpec, ContainerStatus, ContainerSummary, ExecSpec, FileKind, LogStream, Request, Response, RestartPolicy, RunSpec, decode_line, encode_line};
+use graviton_proto::{
+    BuildSpec, ContainerStatus, ContainerSummary, ExecSpec, FileKind, LogStream, PullProgress, Request, Response, RestartPolicy, RunSpec, decode_line,
+    encode_line,
+};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Native containers for macOS")]
@@ -61,6 +64,25 @@ enum Command {
     Restart { container: String },
     /// Pull an image from its registry.
     Pull { reference: String },
+    /// Log in to an OCI registry (Docker Hub, GHCR, etc.); credentials stay in the Mac's Keychain.
+    Login {
+        /// Registry hostname (default: docker.io).
+        registry: Option<String>,
+        /// Username (prompted if omitted).
+        #[arg(short, long)]
+        username: Option<String>,
+        /// Read the password or token from stdin (for scripts and CI).
+        #[arg(long)]
+        password_stdin: bool,
+        /// List registries you are currently logged in to.
+        #[arg(long)]
+        list: bool,
+    },
+    /// Log out of an OCI registry and remove its saved credentials.
+    Logout {
+        /// Registry hostname (default: docker.io).
+        registry: Option<String>,
+    },
     /// Run a command in a new container (each container gets its own VM).
     Run {
         /// Name the container (default: image name plus a short suffix).
@@ -329,17 +351,43 @@ fn run(cli: Cli) -> Result<()> {
         Command::Start { container } => lifecycle(&mut client, Request::Start { id: container }, "started")?,
         Command::Stop { container } => lifecycle(&mut client, Request::Stop { id: container }, "stopped")?,
         Command::Restart { container } => lifecycle(&mut client, Request::Restart { id: container }, "restarted")?,
-        Command::Pull { reference } => {
-            eprintln!("Pulling {reference}…");
-            match client.call(&Request::Pull { reference })? {
-                Response::Image(i) => println!(
-                    "Pulled {}:{} ({}, {}, {})",
-                    i.repository,
-                    i.tag,
-                    bytes(i.size_bytes),
-                    i.architecture,
-                    &i.digest[..i.digest.len().min(19)]
-                ),
+        Command::Pull { reference } => pull_image(&mut client, &reference)?,
+        Command::Login { registry, username, password_stdin, list } => {
+            if list {
+                match client.call(&Request::ListLogins)? {
+                    Response::Logins(entries) if entries.is_empty() => println!("Not logged in to any registries."),
+                    Response::Logins(entries) => {
+                        println!("{:<28} USERNAME", "REGISTRY");
+                        for entry in entries {
+                            println!("{:<28} {}", entry.registry, entry.username);
+                        }
+                    }
+                    other => unexpected(other)?,
+                }
+            } else {
+                let registry = registry.unwrap_or_else(|| "docker.io".into());
+                let username = match username {
+                    Some(u) => u,
+                    None if password_stdin => bail!("pass --username when using --password-stdin"),
+                    None => prompt_line(&format!("Username ({registry}): "))?,
+                };
+                let password = if password_stdin {
+                    let mut buf = String::new();
+                    std::io::stdin().read_to_string(&mut buf)?;
+                    buf.trim_end_matches(['\r', '\n']).to_string()
+                } else {
+                    prompt_password("Password (or token): ")?
+                };
+                match client.call(&Request::RegistryLogin { registry, username, password })? {
+                    Response::LoggedIn { registry, username } => println!("Logged in to {registry} as {username}."),
+                    other => unexpected(other)?,
+                }
+            }
+        }
+        Command::Logout { registry } => {
+            let registry = registry.unwrap_or_else(|| "docker.io".into());
+            match client.call(&Request::RegistryLogout { registry })? {
+                Response::LoggedOut { registry } => println!("Logged out of {registry}."),
                 other => unexpected(other)?,
             }
         }
@@ -937,6 +985,159 @@ impl Drop for RawMode {
     fn drop(&mut self) {
         // SAFETY: restores the attributes saved in `enable`.
         unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0) };
+    }
+}
+
+/// Temporarily disables terminal echo while reading a password.
+struct NoEcho(libc::termios);
+
+impl NoEcho {
+    fn enable() -> Option<Self> {
+        // SAFETY: tcgetattr/tcsetattr on stdin with a termios we own.
+        unsafe {
+            let mut original: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut original) != 0 {
+                return None;
+            }
+            let mut hidden = original;
+            hidden.c_lflag &= !libc::ECHO;
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &hidden);
+            Some(Self(original))
+        }
+    }
+}
+
+impl Drop for NoEcho {
+    fn drop(&mut self) {
+        // SAFETY: restores the attributes saved in `enable`.
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0) };
+    }
+}
+
+fn prompt_line(prompt: &str) -> Result<String> {
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
+fn prompt_password(prompt: &str) -> Result<String> {
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let guard = NoEcho::enable();
+    let mut line = String::new();
+    let res = std::io::stdin().read_line(&mut line);
+    drop(guard);
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+        eprintln!();
+    }
+    res?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn pull_image(client: &mut Client, reference: &str) -> Result<()> {
+    let is_tty = unsafe { libc::isatty(libc::STDERR_FILENO) } == 1;
+    eprintln!("Pulling {reference}…");
+    client.writer.write_all(&encode_line(&Request::Pull { reference: reference.to_string(), progress: true }))?;
+    client.writer.flush()?;
+
+    #[derive(Clone)]
+    struct Row {
+        digest: String,
+        done: u64,
+        total: u64,
+        cached: bool,
+        started: bool,
+    }
+
+    let mut rows: Vec<Row> = Vec::new();
+    let mut drawn = 0usize;
+    let mut logged_done: Vec<bool> = Vec::new();
+    let mut line = String::new();
+
+    let render_tty = |rows: &[Row], drawn: &mut usize| {
+        let mut err = std::io::stderr().lock();
+        if *drawn > 0 {
+            let _ = write!(err, "\x1b[{}A", *drawn);
+        }
+        for (i, r) in rows.iter().enumerate() {
+            let short = r.digest.strip_prefix("sha256:").map(|h| &h[..h.len().min(12)]).unwrap_or(&r.digest);
+            let status = if !r.started {
+                "waiting".to_string()
+            } else if r.cached {
+                format!("cached ({})", bytes(r.total))
+            } else if r.total > 0 && r.done >= r.total {
+                format!("done   ({})", bytes(r.total))
+            } else {
+                let pct = (r.done * 100).checked_div(r.total).unwrap_or(0).min(100);
+                let filled = (pct as usize * 20) / 100;
+                let bar: String = "█".repeat(filled) + &"░".repeat(20 - filled);
+                format!("[{bar}] {pct:>3}%  {} / {}", bytes(r.done), bytes(r.total))
+            };
+            let label = if short.is_empty() { format!("layer {}", i + 1) } else { short.to_string() };
+            let _ = writeln!(err, "\r\x1b[K  {label:<12}  {status}");
+        }
+        let _ = err.flush();
+        *drawn = rows.len();
+    };
+
+    loop {
+        line.clear();
+        if client.reader.read_line(&mut line)? == 0 {
+            bail!("gravitond closed the connection");
+        }
+        match decode_line::<Response>(line.as_bytes())? {
+            Response::PullProgress(PullProgress::Resolved { layers, total_bytes }) => {
+                rows = vec![
+                    Row { digest: String::new(), done: 0, total: 0, cached: false, started: false };
+                    layers
+                ];
+                logged_done = vec![false; layers];
+                if !is_tty || layers > 24 {
+                    eprintln!("  {layers} layer{}, {} total", if layers == 1 { "" } else { "s" }, bytes(total_bytes));
+                } else if !rows.is_empty() {
+                    render_tty(&rows, &mut drawn);
+                }
+            }
+            Response::PullProgress(PullProgress::Layer { index, total_layers, digest, done, total, cached }) => {
+                if rows.len() < total_layers.max(index + 1) {
+                    rows.resize(
+                        total_layers.max(index + 1),
+                        Row { digest: String::new(), done: 0, total: 0, cached: false, started: false },
+                    );
+                    logged_done.resize(rows.len(), false);
+                }
+                rows[index] = Row { digest: digest.clone(), done, total, cached, started: true };
+                if is_tty && rows.len() <= 24 {
+                    render_tty(&rows, &mut drawn);
+                } else {
+                    let is_done = cached || (total > 0 && done >= total);
+                    if is_done && !logged_done[index] {
+                        logged_done[index] = true;
+                        let short = digest.strip_prefix("sha256:").map(|h| &h[..h.len().min(12)]).unwrap_or(&digest);
+                        if cached {
+                            eprintln!("  layer {}/{} {short}  cached ({})", index + 1, rows.len(), bytes(total));
+                        } else {
+                            eprintln!("  layer {}/{} {short}  done ({})", index + 1, rows.len(), bytes(total));
+                        }
+                    }
+                }
+            }
+            Response::Image(i) => {
+                println!(
+                    "Pulled {}:{} ({}, {}, {})",
+                    i.repository,
+                    i.tag,
+                    bytes(i.size_bytes),
+                    i.architecture,
+                    &i.digest[..i.digest.len().min(19)]
+                );
+                return Ok(());
+            }
+            Response::Error { message } => bail!(message),
+            other => return unexpected(other),
+        }
     }
 }
 

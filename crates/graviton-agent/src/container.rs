@@ -230,8 +230,8 @@ fn unpack_layer(blob: &Path, root: &Path) -> io::Result<u64> {
     file.seek(SeekFrom::Start(0))?;
     let reader: Box<dyn Read> = if n >= 2 && magic[..2] == [0x1f, 0x8b] {
         Box::new(GzDecoder::new(BufReader::with_capacity(1 << 20, file)))
-    } else if n == 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
-        return Err(io::Error::other("zstd-compressed layers aren't supported yet"));
+    } else if crate::zstd_stream::is_zstd_magic(&magic[..n]) {
+        Box::new(crate::zstd_stream::ZstdReader::new(BufReader::with_capacity(1 << 20, file)))
     } else {
         Box::new(BufReader::with_capacity(1 << 20, file))
     };

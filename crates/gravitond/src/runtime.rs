@@ -137,6 +137,8 @@ pub struct Engine {
     hosts_gen: AtomicU64,
     /// What happened, for the Activity feed and push alerts.
     pub events: Arc<crate::events::EventLog>,
+    /// Saved OCI registry credentials (usernames on disk, passwords in login Keychain).
+    pub auth: crate::auth::RegistryAuth,
     /// Containers being stopped on request (so their exit isn't a failure).
     stopping: Mutex<HashSet<String>>,
     /// Scheduled backoff restart tasks, keyed by container id (aborted on stop/start/remove/shutdown).
@@ -166,6 +168,7 @@ impl Engine {
             hosts_sync: Mutex::new(()),
             hosts_gen: AtomicU64::new(0),
             events: Arc::new(crate::events::EventLog::open(paths::support_dir().join("events.jsonl"))),
+            auth: crate::auth::RegistryAuth::open(),
             stopping: Mutex::new(HashSet::new()),
             pending_restarts: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
@@ -301,25 +304,49 @@ impl Engine {
     // -- Images -----------------------------------------------------------
 
     pub fn pull(&self, reference: &str) -> Result<ImageSummary> {
+        self.pull_with_progress(reference, |_| {})
+    }
+
+    pub fn pull_with_progress(&self, reference: &str, mut on_progress: impl FnMut(graviton_proto::PullProgress)) -> Result<ImageSummary> {
         let parsed = ImageReference::parse(reference)?;
+        let creds = self.auth.credentials_for(&parsed.registry)?;
         eprintln!("pull {}", parsed.display_name());
         let t0 = Instant::now();
-        let mut last_report = Instant::now();
-        let image = Registry::new().pull(&parsed, &self.blobs, |p| match p {
+        let mut last_log = Instant::now();
+        let mut last_emit = Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now);
+        let mut last_layer_idx: Option<usize> = None;
+        let mut total_layers = 0usize;
+        let image = Registry::new().pull_with_auth(&parsed, &self.blobs, creds.as_ref(), |p| match p {
             Progress::Resolved { layers, total_bytes, .. } => {
-                eprintln!("  {layers} layers, {:.1} MiB", total_bytes as f64 / 1048576.0)
+                total_layers = layers;
+                eprintln!("  {layers} layers, {:.1} MiB", total_bytes as f64 / 1048576.0);
+                on_progress(graviton_proto::PullProgress::Resolved { layers, total_bytes });
             }
             Progress::Layer { index, digest, done, total, cached } => {
+                let short = digest.strip_prefix("sha256:").map(|h| &h[..h.len().min(12)]).unwrap_or(&digest);
                 if cached {
-                    eprintln!("  layer {} {} (cached)", index + 1, &digest[7..19]);
-                } else if done == total || last_report.elapsed() > Duration::from_secs(1) {
-                    last_report = Instant::now();
+                    eprintln!("  layer {} {short} (cached)", index + 1);
+                } else if done == total || last_log.elapsed() > Duration::from_secs(1) {
+                    last_log = Instant::now();
                     eprintln!(
-                        "  layer {} {} {:>3}%",
+                        "  layer {} {short} {:>3}%",
                         index + 1,
-                        &digest[7..19],
                         (done * 100).checked_div(total).unwrap_or(100)
                     );
+                }
+                let is_new_layer = last_layer_idx != Some(index);
+                let is_terminal = cached || (total > 0 && done >= total);
+                if is_new_layer || is_terminal || last_emit.elapsed() >= Duration::from_millis(100) {
+                    last_layer_idx = Some(index);
+                    last_emit = Instant::now();
+                    on_progress(graviton_proto::PullProgress::Layer {
+                        index,
+                        total_layers,
+                        digest,
+                        done,
+                        total,
+                        cached,
+                    });
                 }
             }
         })?;

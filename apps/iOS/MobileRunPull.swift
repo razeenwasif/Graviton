@@ -89,12 +89,13 @@ struct MobileRunSheet: View {
     }
 }
 
-/// Pull an image onto the Mac this phone shows.
+/// Pull an image onto the Mac this phone shows, with streamed per-layer progress.
 struct MobilePullSheet: View {
     @Environment(EngineStore.self) private var store
     @Environment(\.dismiss) private var dismiss
     @State private var reference = ""
     @State private var phase: Phase = .idle
+    @State private var progress = PullState()
     @FocusState private var focused: Bool
 
     enum Phase {
@@ -113,6 +114,7 @@ struct MobilePullSheet: View {
             GFormRow("Reference") {
                 MobileField(placeholder: "e.g. redis:7-alpine", text: $reference)
                     .focused($focused)
+                    .disabled(busy)
                     .submitLabel(.go)
                     .onSubmit(pull)
             }
@@ -120,8 +122,11 @@ struct MobilePullSheet: View {
             case .idle:
                 EmptyView()
             case let .pulling(since):
-                TimelineView(.periodic(from: since, by: 1)) { ctx in
-                    GStatusLine(.working, "Pulling… \(Int(ctx.date.timeIntervalSince(since))) s. You can close this; the pull carries on.")
+                VStack(alignment: .leading, spacing: 8) {
+                    GPullProgressView(reference: reference.trimmingCharacters(in: .whitespaces), since: since, state: progress)
+                    Text("You can close this; the pull carries on.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(G.faint)
                 }
             case let .done(image):
                 GStatusLine(.success, "Pulled \(image.repository):\(image.tag) · \(Format.bytes(image.sizeBytes))")
@@ -138,10 +143,24 @@ struct MobilePullSheet: View {
     private func pull() {
         let ref = reference.trimmingCharacters(in: .whitespaces)
         guard !busy, !ref.isEmpty, store.canManage else { return }
+        progress = PullState()
         phase = .pulling(.now)
         Task {
             do {
-                phase = .done(try await store.pull(ref))
+                var finished: ImageInfo?
+                for try await event in store.pullStream(ref) {
+                    switch event {
+                    case let .progress(update):
+                        progress.apply(update)
+                    case let .pulled(image):
+                        finished = image
+                    }
+                }
+                if let image = finished {
+                    phase = .done(image)
+                } else {
+                    phase = .failed("Pull finished without an image response.")
+                }
             } catch {
                 phase = .failed(error.localizedDescription)
             }

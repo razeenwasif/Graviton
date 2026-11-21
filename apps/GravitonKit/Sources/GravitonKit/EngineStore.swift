@@ -156,6 +156,29 @@ public final class EngineStore {
         return image
     }
 
+    /// Pull an image with streamed per-layer progress. Refreshes the image list when done.
+    public func pullStream(_ reference: String) -> AsyncThrowingStream<PullEvent, Error> {
+        let upstream: AsyncThrowingStream<PullEvent, Error>
+        switch live {
+        case let local as SocketEngine where canManage: upstream = local.pullStream(reference: reference)
+        case let remote as RemoteEngine where canManage: upstream = remote.pullStream(reference: reference)
+        default:
+            return AsyncThrowingStream { $0.finish(throwing: EngineError.daemon("Pulls need gravitond running, here or on a paired Mac.")) }
+        }
+        return AsyncThrowingStream { continuation in
+            let task = Task { @MainActor [weak self] in
+                do {
+                    for try await event in upstream { continuation.yield(event) }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+                await self?.refresh()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     /// Run a container (pulling its image first if needed). Throws so a sheet can show the error.
     @discardableResult
     public func run(_ spec: RunSpec) async throws -> Container {

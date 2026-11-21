@@ -99,6 +99,44 @@ public final class SocketEngine: EngineService {
         return image
     }
 
+    /// Pull an image, streaming per-layer progress before the final image.
+    public func pullStream(reference: String) -> AsyncThrowingStream<PullEvent, Error> {
+        let path = self.path
+        return AsyncThrowingStream { continuation in
+            let thread = Thread {
+                do {
+                    let fd = try Self.connect(path: path)
+                    defer { close(fd) }
+                    try Self.writeAll(fd, Array(try Wire.line(.pull(reference: reference, progress: true))))
+                    var buffer = Data()
+                    var chunk = [UInt8](repeating: 0, count: 64 * 1024)
+                    while true {
+                        while let nl = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                            let line = buffer[buffer.startIndex..<nl]
+                            buffer.removeSubrange(buffer.startIndex...nl)
+                            switch try Wire.decoder.decode(EngineResponse.self, from: Data(line)) {
+                            case let .pullProgress(progress): continuation.yield(.progress(progress))
+                            case let .image(image):
+                                continuation.yield(.pulled(image))
+                                continuation.finish()
+                                return
+                            case let .error(message): throw EngineError.daemon(message)
+                            default: throw EngineError.unexpectedResponse
+                            }
+                        }
+                        let n = read(fd, &chunk, chunk.count)
+                        guard n > 0 else { throw EngineError.io("gravitond closed the connection") }
+                        buffer.append(contentsOf: chunk[0..<n])
+                    }
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            thread.name = "graviton-pull"
+            thread.start()
+        }
+    }
+
     public func run(_ spec: RunSpec) async throws -> Container {
         // Pulls the image first if it isn't local, then boots a VM.
         guard case let .container(c) = try await call(.run(spec), timeout: 1800) else { throw EngineError.unexpectedResponse }

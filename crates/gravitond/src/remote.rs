@@ -341,6 +341,9 @@ impl Remote {
                 | Request::PushSetup { .. } | Request::PushStatus | Request::PushTest, _) => {
                     write.write_all(&encode_line(&Response::Error { message: "only available on the Mac itself".into() })).await?;
                 }
+                (Request::Pull { reference, progress: true }, crate::Backend::Engine(engine)) => {
+                    crate::pull_stream(Arc::clone(engine), reference.clone(), &mut write).await?;
+                }
                 (Request::Build(spec), crate::Backend::Engine(engine)) => {
                     if spec.upload.is_none() {
                         let message = "from another Mac, send the build folder with the request (grav build --host uploads it)";

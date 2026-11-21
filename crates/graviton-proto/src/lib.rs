@@ -141,6 +141,31 @@ pub struct ImageSummary {
     pub used_by: u32,
 }
 
+/// Per-layer pull progress, streamed before the final `Response::Image` when
+/// `Request::Pull { progress: true, .. }` is set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub enum PullProgress {
+    /// Manifest resolved; `layers` layers totalling `total_bytes` compressed.
+    Resolved { layers: usize, total_bytes: u64 },
+    /// Progress on layer `index` (0-based of `total_layers`).
+    Layer {
+        index: usize,
+        total_layers: usize,
+        digest: String,
+        done: u64,
+        total: u64,
+        cached: bool,
+    },
+}
+
+/// One saved registry login (username only; passwords stay in the Mac's Keychain).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryLoginInfo {
+    pub registry: String,
+    pub username: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogLevel {
@@ -502,7 +527,22 @@ pub enum Request {
     Stop { id: String },
     Restart { id: String },
     /// Pull an image from its registry; answers `Image` when done.
-    Pull { reference: String },
+    /// With `progress: true`, streams `PullProgress` lines before the final `Image`.
+    Pull {
+        reference: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        progress: bool,
+    },
+    /// Verify and save credentials for an OCI registry (password goes in the Mac's Keychain).
+    RegistryLogin {
+        registry: String,
+        username: String,
+        password: String,
+    },
+    /// Remove saved credentials for an OCI registry.
+    RegistryLogout { registry: String },
+    /// List registries with saved credentials.
+    ListLogins,
     /// Build an image from a Dockerfile. The daemon answers with `BuildLog`
     /// lines as it goes, then `Image` (or `Error`).
     Build(BuildSpec),
@@ -567,6 +607,10 @@ pub enum Response {
     Logs(Vec<LogLine>),
     Container(ContainerSummary),
     Image(ImageSummary),
+    PullProgress(PullProgress),
+    LoggedIn { registry: String, username: String },
+    LoggedOut { registry: String },
+    Logins(Vec<RegistryLoginInfo>),
     Removed { id: String },
     DiskUsage(DiskUsage),
     /// `kept_bytes`: its layers the build cache still holds (`grav prune` frees them).
@@ -904,7 +948,44 @@ mod tests {
         assert_eq!("no".parse::<RestartPolicy>().unwrap(), RestartPolicy::No);
         assert!("bogus".parse::<RestartPolicy>().is_err());
         let pull: Request = decode_line(br#"{"method":"pull","params":{"reference":"alpine"}}"#).unwrap();
-        assert_eq!(pull, Request::Pull { reference: "alpine".into() });
+        assert_eq!(pull, Request::Pull { reference: "alpine".into(), progress: false });
+        let pull_stream: Request = decode_line(br#"{"method":"pull","params":{"progress":true,"reference":"alpine"}}"#).unwrap();
+        assert_eq!(pull_stream, Request::Pull { reference: "alpine".into(), progress: true });
+    }
+
+    #[test]
+    fn pull_progress_and_registry_logins() {
+        let resolved = Response::PullProgress(PullProgress::Resolved { layers: 3, total_bytes: 12_345 });
+        let line = String::from_utf8(encode_line(&resolved)).unwrap();
+        assert_eq!(line, "{\"type\":\"pull_progress\",\"data\":{\"stage\":\"resolved\",\"layers\":3,\"total_bytes\":12345}}\n");
+        assert_eq!(decode_line::<Response>(line.as_bytes()).unwrap(), resolved);
+
+        let layer = Response::PullProgress(PullProgress::Layer {
+            index: 1,
+            total_layers: 3,
+            digest: "sha256:abcdef0123456789".into(),
+            done: 500,
+            total: 1000,
+            cached: false,
+        });
+        let line = String::from_utf8(encode_line(&layer)).unwrap();
+        assert_eq!(
+            line,
+            "{\"type\":\"pull_progress\",\"data\":{\"stage\":\"layer\",\"index\":1,\"total_layers\":3,\"digest\":\"sha256:abcdef0123456789\",\"done\":500,\"total\":1000,\"cached\":false}}\n"
+        );
+        assert_eq!(decode_line::<Response>(line.as_bytes()).unwrap(), layer);
+
+        let login = Request::RegistryLogin {
+            registry: "ghcr.io".into(),
+            username: "octocat".into(),
+            password: "secret".into(),
+        };
+        let encoded = encode_line(&login);
+        assert_eq!(decode_line::<Request>(&encoded).unwrap(), login);
+
+        let logins = Response::Logins(vec![RegistryLoginInfo { registry: "ghcr.io".into(), username: "octocat".into() }]);
+        let encoded = encode_line(&logins);
+        assert_eq!(decode_line::<Response>(&encoded).unwrap(), logins);
     }
 
     #[test]

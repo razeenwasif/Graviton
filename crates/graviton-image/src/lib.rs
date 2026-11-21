@@ -15,7 +15,7 @@ pub use blobs::{BlobStore, Digest};
 pub use dockerfile::Dockerfile;
 pub use config::{ImageConfig, RuntimeConfig};
 pub use index::{ImageIndex, LocalImage, Layer};
-pub use registry::{Progress, Registry};
+pub use registry::{Credentials, Progress, Registry, normalize_registry};
 
 use thiserror::Error;
 

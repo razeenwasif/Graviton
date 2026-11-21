@@ -76,6 +76,28 @@ import Testing
         let pull = String(decoding: try Wire.line(.pull(reference: "alpine")), as: UTF8.self)
         #expect(pull == "{\"method\":\"pull\",\"params\":{\"reference\":\"alpine\"}}\n")
 
+        let pullStream = String(decoding: try Wire.line(.pull(reference: "alpine", progress: true)), as: UTF8.self)
+        #expect(pullStream == "{\"method\":\"pull\",\"params\":{\"progress\":true,\"reference\":\"alpine\"}}\n")
+
+        let resolvedJSON = #"{"type":"pull_progress","data":{"stage":"resolved","layers":2,"total_bytes":1000}}"#
+        guard case let .pullProgress(.resolved(layers, totalBytes)) = try Wire.decoder.decode(EngineResponse.self, from: Data(resolvedJSON.utf8)) else {
+            Issue.record("expected resolved pull_progress"); return
+        }
+        #expect(layers == 2 && totalBytes == 1000)
+
+        let layerJSON = #"{"type":"pull_progress","data":{"stage":"layer","index":0,"total_layers":2,"digest":"sha256:abcdef0123456789","done":400,"total":800,"cached":false}}"#
+        guard case let .pullProgress(.layer(layer)) = try Wire.decoder.decode(EngineResponse.self, from: Data(layerJSON.utf8)) else {
+            Issue.record("expected layer pull_progress"); return
+        }
+        #expect(layer.shortDigest == "abcdef012345" && !layer.isComplete && layer.fraction == 0.5)
+
+        var state = PullState()
+        state.apply(.resolved(layers: 2, totalBytes: 1000))
+        state.apply(.layer(layer))
+        #expect(state.downloadedBytes == 400 && state.fraction == 0.4)
+        state.apply(.layer(LayerPullProgress(index: 1, totalLayers: 2, digest: "sha256:1111222233334444", done: 200, total: 200, cached: true)))
+        #expect(state.downloadedBytes == 600 && state.completedLayers == 1 && state.fraction == 0.6)
+
         let spec = RunSpec(image: "python:3.13-slim", name: "web", command: ["python3", "-m", "http.server"], env: ["A=1"], memoryMib: 2048,
                            ports: ["8080:8000"], volumes: ["~/code:/app:ro"])
         let run = String(decoding: try Wire.line(.run(spec)), as: UTF8.self)

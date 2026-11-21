@@ -10,7 +10,7 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case start(id: String)
     case stop(id: String)
     case restart(id: String)
-    case pull(reference: String)
+    case pull(reference: String, progress: Bool = false)
     case run(RunSpec)
     case build(BuildSpec)
     case remove(id: String)
@@ -33,7 +33,10 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     private enum Keys: String, CodingKey { case method, params }
     private struct IDParams: Encodable { let id: String }
     private struct LogParams: Encodable { let id: String; let tail: Int? }
-    private struct PullParams: Encodable { let reference: String }
+    private struct PullParams: Encodable {
+        let reference: String
+        let progress: Bool?
+    }
     private struct PairParams: Encodable { let code: String; let device: String }
     private struct AuthParams: Encodable { let token: String }
     private struct PathParams: Encodable { let id: String; let path: String }
@@ -82,7 +85,7 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case let .auth(token): try c.encode(AuthParams(token: token), forKey: .params)
         case let .logs(id, tail): try c.encode(LogParams(id: id, tail: tail), forKey: .params)
         case .diskUsage: break
-        case let .removeImage(reference): try c.encode(PullParams(reference: reference), forKey: .params)
+        case let .removeImage(reference): try c.encode(PullParams(reference: reference, progress: nil), forKey: .params)
         case let .prune(spec): try c.encode(spec, forKey: .params)
         case let .start(id), let .stop(id), let .restart(id), let .remove(id), let .stats(id), let .inspect(id):
             try c.encode(IDParams(id: id), forKey: .params)
@@ -90,7 +93,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case let .exec(spec): try c.encode(spec, forKey: .params)
         case let .events(since, limit): try c.encode(EventsParams(since: since, limit: limit), forKey: .params)
         case let .registerPush(token, sandbox): try c.encode(PushParams(token: token, sandbox: sandbox), forKey: .params)
-        case let .pull(reference): try c.encode(PullParams(reference: reference), forKey: .params)
+        case let .pull(reference, progress):
+            try c.encode(PullParams(reference: reference, progress: progress ? true : nil), forKey: .params)
         case let .run(spec): try c.encode(spec, forKey: .params)
         case let .build(spec): try c.encode(spec, forKey: .params)
         }
@@ -106,6 +110,7 @@ public enum EngineResponse: Decodable, Sendable {
     case logs([LogLine])
     case container(Container)
     case image(ImageInfo)
+    case pullProgress(PullProgress)
     case removed(id: String)
     case diskUsage(DiskUsage)
     case imageRemoved(reference: String, freedBytes: UInt64, keptBytes: UInt64)
@@ -145,6 +150,7 @@ public enum EngineResponse: Decodable, Sendable {
         case "logs": self = .logs(try c.decode([LogLine].self, forKey: .data))
         case "container": self = .container(try c.decode(Container.self, forKey: .data))
         case "image": self = .image(try c.decode(ImageInfo.self, forKey: .data))
+        case "pull_progress": self = .pullProgress(try c.decode(PullProgress.self, forKey: .data))
         case "removed": self = .removed(id: try c.decode(Removed.self, forKey: .data).id)
         case "disk_usage": self = .diskUsage(try c.decode(DiskUsage.self, forKey: .data))
         case "image_removed":

@@ -394,6 +394,124 @@ public enum BuildEvent: Sendable, Equatable {
     case built(ImageInfo)
 }
 
+/// Progress on one layer during a pull (mirrors `PullProgress::Layer` in `graviton-proto`).
+public struct LayerPullProgress: Hashable, Sendable, Identifiable {
+    public var index: Int
+    public var totalLayers: Int
+    public var digest: String
+    public var done: UInt64
+    public var total: UInt64
+    public var cached: Bool
+
+    public init(index: Int, totalLayers: Int, digest: String, done: UInt64, total: UInt64, cached: Bool) {
+        self.index = index
+        self.totalLayers = totalLayers
+        self.digest = digest
+        self.done = done
+        self.total = total
+        self.cached = cached
+    }
+
+    public var id: Int { index }
+
+    public var shortDigest: String {
+        let stripped = digest.hasPrefix("sha256:") ? String(digest.dropFirst(7)) : digest
+        return String(stripped.prefix(12))
+    }
+
+    public var isComplete: Bool { cached || (total > 0 && done >= total) }
+
+    public var fraction: Double {
+        if cached { return 1 }
+        guard total > 0 else { return 0 }
+        return min(1, max(0, Double(done) / Double(total)))
+    }
+}
+
+/// Per-layer pull progress streamed by `gravitond` before the final image.
+public enum PullProgress: Decodable, Hashable, Sendable {
+    case resolved(layers: Int, totalBytes: UInt64)
+    case layer(LayerPullProgress)
+
+    private enum Keys: String, CodingKey {
+        case stage, layers, totalBytes, index, totalLayers, digest, done, total, cached
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        let stage = try c.decode(String.self, forKey: .stage)
+        switch stage {
+        case "resolved":
+            self = .resolved(
+                layers: try c.decode(Int.self, forKey: .layers),
+                totalBytes: try c.decode(UInt64.self, forKey: .totalBytes)
+            )
+        case "layer":
+            self = .layer(LayerPullProgress(
+                index: try c.decode(Int.self, forKey: .index),
+                totalLayers: try c.decode(Int.self, forKey: .totalLayers),
+                digest: try c.decode(String.self, forKey: .digest),
+                done: try c.decode(UInt64.self, forKey: .done),
+                total: try c.decode(UInt64.self, forKey: .total),
+                cached: try c.decode(Bool.self, forKey: .cached)
+            ))
+        default:
+            throw DecodingError.dataCorruptedError(forKey: .stage, in: c, debugDescription: "unknown pull stage \(stage)")
+        }
+    }
+}
+
+/// Progress from a streaming image pull.
+public enum PullEvent: Sendable, Equatable {
+    case progress(PullProgress)
+    case pulled(ImageInfo)
+}
+
+/// Accumulates streamed `PullProgress` events for Mac and iOS Pull sheets.
+public struct PullState: Hashable, Sendable {
+    public var totalLayers: Int = 0
+    public var totalBytes: UInt64 = 0
+    public var layers: [LayerPullProgress] = []
+    public var resolved: Bool = false
+
+    public init() {}
+
+    public mutating func apply(_ progress: PullProgress) {
+        switch progress {
+        case let .resolved(count, bytes):
+            resolved = true
+            totalLayers = count
+            totalBytes = bytes
+        case let .layer(layer):
+            resolved = true
+            totalLayers = max(totalLayers, layer.totalLayers, layer.index + 1)
+            if let existing = layers.firstIndex(where: { $0.index == layer.index }) {
+                layers[existing] = layer
+            } else {
+                layers.append(layer)
+                layers.sort { $0.index < $1.index }
+            }
+        }
+    }
+
+    public var completedLayers: Int { layers.filter(\.isComplete).count }
+
+    public var downloadedBytes: UInt64 {
+        layers.reduce(0) { sum, l in sum + (l.cached ? l.total : min(l.done, l.total)) }
+    }
+
+    public var fraction: Double? {
+        guard resolved else { return nil }
+        if totalBytes > 0 {
+            return min(1, Double(downloadedBytes) / Double(totalBytes))
+        }
+        if totalLayers > 0 {
+            return min(1, Double(completedLayers) / Double(totalLayers))
+        }
+        return 1
+    }
+}
+
 /// Bytes per second between consecutive stat samples.
 public struct NetworkRate: Identifiable, Sendable {
     public var date: Date
