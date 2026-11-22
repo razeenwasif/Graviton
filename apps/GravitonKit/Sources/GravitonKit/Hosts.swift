@@ -52,6 +52,37 @@ public final class HostStore {
         save()
     }
 
+    /// Update ordered addresses, port, or Bonjour service name on an existing paired Mac.
+    public func updateAddresses(for id: String, addresses: [String], port: UInt16? = nil, serviceName: String? = nil) {
+        guard let i = hosts.firstIndex(where: { $0.id == id }) else { return }
+        let ordered = RemoteHost.normalize(addresses)
+        let cleanSvc = serviceName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        hosts[i] = RemoteHost(
+            deviceID: hosts[i].deviceID,
+            name: hosts[i].name,
+            serviceName: cleanSvc.flatMap { $0.isEmpty ? nil : $0 } ?? (serviceName == nil ? hosts[i].serviceName : nil),
+            address: ordered.first,
+            addresses: ordered,
+            port: port ?? hosts[i].port,
+            fingerprint: hosts[i].fingerprint
+        )
+        save()
+    }
+
+    /// Match discovered Bonjour TXT `fp=` records against paired Macs so renames or IP shifts still resolve.
+    public func syncBonjour(_ found: [HostBrowser.Found]) {
+        guard !found.isEmpty else { return }
+        var changed = false
+        for i in hosts.indices {
+            if let hit = found.first(where: { $0.fingerprint?.caseInsensitiveCompare(hosts[i].fingerprint) == .orderedSame }),
+               hosts[i].serviceName != hit.name {
+                hosts[i].serviceName = hit.name
+                changed = true
+            }
+        }
+        if changed { save() }
+    }
+
     /// Forget a Mac on this device. (Its gravitond still lists the device until `grav devices revoke`.)
     public func forget(_ id: String) {
         Self.deleteToken(for: id)
@@ -100,7 +131,13 @@ public final class HostStore {
 public final class HostBrowser {
     public struct Found: Hashable, Identifiable, Sendable {
         public var name: String
+        public var fingerprint: String?
         public var id: String { name }
+
+        public init(name: String, fingerprint: String? = nil) {
+            self.name = name
+            self.fingerprint = fingerprint
+        }
     }
 
     public private(set) var found: [Found] = []
@@ -109,16 +146,31 @@ public final class HostBrowser {
 
     public init() {}
 
+    public func match(fingerprint: String) -> Found? {
+        found.first { $0.fingerprint?.caseInsensitiveCompare(fingerprint) == .orderedSame }
+    }
+
     public func start() {
         guard browser == nil else { return }
-        let browser = NWBrowser(for: .bonjour(type: RemoteHost.bonjourType, domain: nil), using: .tcp)
+        let descriptor = NWBrowser.Descriptor.bonjourWithTXTRecord(type: RemoteHost.bonjourType, domain: nil)
+        let browser = NWBrowser(for: descriptor, using: .tcp)
         browser.browseResultsChangedHandler = { [weak self] results, _ in
-            let names = results.compactMap { result -> String? in
-                if case let .service(name, _, _, _) = result.endpoint { return name }
-                return nil
+            var byName: [String: String?] = [:]
+            for result in results {
+                guard case let .service(name, _, _, _) = result.endpoint else { continue }
+                var fp: String?
+                if case let .bonjour(txt) = result.metadata,
+                   let raw = txt.dictionary["fp"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                   raw.count == 64, raw.allSatisfy(\.isHexDigit) {
+                    fp = raw
+                }
+                if byName[name] == nil || fp != nil {
+                    byName[name] = fp
+                }
             }
+            let items = byName.keys.sorted().map { Found(name: $0, fingerprint: byName[$0] ?? nil) }
             Task { @MainActor in
-                self?.found = Array(Set(names)).sorted().map(Found.init)
+                self?.found = items
             }
         }
         browser.stateUpdateHandler = { [weak self] state in

@@ -101,6 +101,7 @@ impl Remote {
             Err(e) => return Err(e.into()),
         };
         let host = computer_name();
+        let bonjour = Bonjour::register(&host, port, &fingerprint);
         Ok(Arc::new(Self {
             push: std::sync::OnceLock::new(),
             state: Mutex::new(State { devices, ..Default::default() }),
@@ -108,7 +109,7 @@ impl Remote {
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
             fingerprint,
             port,
-            _bonjour: Bonjour::register(&host, port),
+            _bonjour: bonjour,
             host,
             rng: SystemRandom::new(),
         }))
@@ -426,33 +427,67 @@ fn computer_name() -> String {
         .unwrap_or_else(|| "Mac".into())
 }
 
-/// IPv4 addresses on this Mac's real interfaces (not loopback or the VMs' bridge).
+/// IPv4 addresses on this Mac: local LAN interfaces first, followed by Tailscale CGNAT (`100.64.0.0/10`).
 fn lan_addresses() -> Vec<String> {
-    let mut out = Vec::new();
+    let mut lan = Vec::new();
+    let mut tailscale = Vec::new();
     // SAFETY: getifaddrs allocates a list we walk and then free.
     unsafe {
         let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut list) != 0 {
-            return out;
+            return lan;
         }
         let mut cur = list;
         while !cur.is_null() {
             let ifa = &*cur;
-            let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy();
-            if !ifa.ifa_addr.is_null()
-                && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET
-                && !name.starts_with("lo")
-                && !name.starts_with("bridge")
-                && !name.starts_with("utun")
-            {
+            if !ifa.ifa_addr.is_null() && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET && !ifa.ifa_name.is_null() {
+                let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy();
                 let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
                 let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                out.push(ip.to_string());
+                if !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified() {
+                    if is_tailscale_ipv4(ip) {
+                        tailscale.push(ip.to_string());
+                    } else if !name.starts_with("lo")
+                        && !name.starts_with("bridge")
+                        && !name.starts_with("utun")
+                        && !name.starts_with("awdl")
+                        && !name.starts_with("llw")
+                    {
+                        lan.push(ip.to_string());
+                    }
+                }
             }
             cur = ifa.ifa_next;
         }
         libc::freeifaddrs(list);
     }
+    order_host_addresses(lan, tailscale)
+}
+
+fn is_tailscale_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 100 && (o[1] & 0xc0) == 64
+}
+
+fn order_host_addresses(lan: Vec<String>, tailscale: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for addr in lan.into_iter().chain(tailscale) {
+        if !addr.is_empty() && !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    out
+}
+
+/// Encode an RFC 6763 length-prefixed TXT record containing `fp=<sha256>`.
+fn encode_txt_record(fingerprint: &str) -> Vec<u8> {
+    let entry = format!("fp={fingerprint}");
+    if entry.is_empty() || entry.len() > u8::MAX as usize {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(1 + entry.len());
+    out.push(entry.len() as u8);
+    out.extend_from_slice(entry.as_bytes());
     out
 }
 
@@ -482,13 +517,19 @@ unsafe extern "C" {
 }
 
 impl Bonjour {
-    fn register(name: &str, port: u16) -> Option<Self> {
+    fn register(name: &str, port: u16, fingerprint: &str) -> Option<Self> {
         let name = std::ffi::CString::new(name).ok()?;
         let regtype = std::ffi::CString::new(graviton_proto::BONJOUR_SERVICE).ok()?;
+        let txt = encode_txt_record(fingerprint);
+        let (txt_len, txt_ptr) = if txt.len() <= u16::MAX as usize && !txt.is_empty() {
+            (txt.len() as u16, txt.as_ptr().cast())
+        } else {
+            (0, std::ptr::null())
+        };
         let mut sd_ref = std::ptr::null_mut();
-        // SAFETY: valid C strings; a null callback is allowed (we don't need the result).
+        // SAFETY: valid C strings and length-prefixed TXT bytes copied synchronously by mDNSResponder; a null callback is allowed.
         let err = unsafe {
-            DNSServiceRegister(&mut sd_ref, 0, 0, name.as_ptr(), regtype.as_ptr(), std::ptr::null(), std::ptr::null(), port.to_be(), 0, std::ptr::null(), std::ptr::null(), std::ptr::null_mut())
+            DNSServiceRegister(&mut sd_ref, 0, 0, name.as_ptr(), regtype.as_ptr(), std::ptr::null(), std::ptr::null(), port.to_be(), txt_len, txt_ptr, std::ptr::null(), std::ptr::null_mut())
         };
         if err != 0 {
             eprintln!("Bonjour registration failed ({err}); phones can still connect by address");
@@ -577,5 +618,27 @@ mod tests {
         let bad_tls = anyhow::Error::new(std::io::Error::new(ErrorKind::InvalidData, "corrupt TLS frame"));
         assert!(!is_benign_disconnect(&bad_tls));
         assert!(!is_benign_disconnect(&anyhow::anyhow!("TLS handshake timed out")));
+    }
+
+    #[test]
+    fn encodes_txt_fp_and_orders_lan_before_tailscale() {
+        use std::net::Ipv4Addr;
+
+        assert!(is_tailscale_ipv4(Ipv4Addr::new(100, 97, 247, 34)));
+        assert!(is_tailscale_ipv4(Ipv4Addr::new(100, 64, 0, 1)));
+        assert!(is_tailscale_ipv4(Ipv4Addr::new(100, 127, 255, 254)));
+        assert!(!is_tailscale_ipv4(Ipv4Addr::new(100, 128, 0, 1)));
+        assert!(!is_tailscale_ipv4(Ipv4Addr::new(192, 168, 68, 61)));
+
+        let ordered = order_host_addresses(
+            vec!["192.0.2.61".into(), "192.0.2.61".into()],
+            vec!["100.64.0.10".into(), "192.0.2.61".into()],
+        );
+        assert_eq!(ordered, vec!["192.0.2.61", "100.64.0.10"]);
+
+        let fp = "ab".repeat(32);
+        let txt = encode_txt_record(&fp);
+        assert_eq!(txt[0] as usize, 3 + 64);
+        assert_eq!(&txt[1..], format!("fp={fp}").as_bytes());
     }
 }

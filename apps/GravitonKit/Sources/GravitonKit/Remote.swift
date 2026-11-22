@@ -12,21 +12,56 @@ public struct RemoteHost: Codable, Hashable, Sendable, Identifiable {
     public var name: String
     /// Bonjour service name, when it was found on the network. Preferred: survives address changes.
     public var serviceName: String?
-    /// Address and port, from a pairing link or typed in.
+    /// Primary address, from a pairing link or typed in.
     public var address: String?
+    /// Ordered list of addresses (primary + fallbacks such as LAN + Tailscale).
+    public var addresses: [String]
     public var port: UInt16
     /// SHA-256 of the endpoint's certificate (lowercase hex). Every connection checks it.
     public var fingerprint: String
 
     public var id: String { deviceID }
 
-    public init(deviceID: String, name: String, serviceName: String?, address: String?, port: UInt16, fingerprint: String) {
+    public init(deviceID: String, name: String, serviceName: String?, address: String?, addresses: [String] = [], port: UInt16, fingerprint: String) {
         self.deviceID = deviceID
         self.name = name
         self.serviceName = serviceName
-        self.address = address
+        let ordered = Self.normalize([address].compactMap { $0 } + addresses)
+        self.address = ordered.first ?? address
+        self.addresses = ordered
         self.port = port
         self.fingerprint = fingerprint
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case deviceID, name, serviceName, address, addresses, port, fingerprint
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        deviceID = try c.decode(String.self, forKey: .deviceID)
+        name = try c.decode(String.self, forKey: .name)
+        serviceName = try c.decodeIfPresent(String.self, forKey: .serviceName)
+        address = try c.decodeIfPresent(String.self, forKey: .address)
+        addresses = try c.decodeIfPresent([String].self, forKey: .addresses) ?? []
+        port = try c.decode(UInt16.self, forKey: .port)
+        fingerprint = try c.decode(String.self, forKey: .fingerprint)
+    }
+
+    /// Deduplicated, ordered addresses starting with `address` followed by any fallback `addresses`.
+    public var allAddresses: [String] {
+        Self.normalize([address].compactMap { $0 } + addresses)
+    }
+
+    public static func normalize(_ raw: [String]) -> [String] {
+        var out: [String] = []
+        for item in raw {
+            let trimmed = item.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty, !out.contains(trimmed) {
+                out.append(trimmed)
+            }
+        }
+        return out
     }
 
     /// "F004 18F9 00F8 BA56", as `grav pair` prints it.
@@ -41,11 +76,13 @@ public struct RemoteHost: Codable, Hashable, Sendable, Identifiable {
 
     var endpoints: [NWEndpoint] {
         var list: [NWEndpoint] = []
-        if let serviceName {
+        if let serviceName = serviceName?.trimmingCharacters(in: .whitespacesAndNewlines), !serviceName.isEmpty {
             list.append(.service(name: serviceName, type: RemoteHost.bonjourType, domain: "local.", interface: nil))
         }
-        if let address, let port = NWEndpoint.Port(rawValue: port) {
-            list.append(.hostPort(host: NWEndpoint.Host(address), port: port))
+        if let port = NWEndpoint.Port(rawValue: port) {
+            for addr in allAddresses {
+                list.append(.hostPort(host: NWEndpoint.Host(addr), port: port))
+            }
         }
         return list
     }
@@ -59,37 +96,58 @@ public struct PairingTarget: Hashable, Sendable {
     public var name: String
     public var serviceName: String?
     public var address: String?
+    public var addresses: [String]
     public var port: UInt16
     /// From a link: the fingerprint to insist on. Otherwise the phone shows what it saw.
     public var fingerprint: String?
     /// From a link.
     public var code: String?
 
-    public init(name: String, serviceName: String? = nil, address: String? = nil, port: UInt16 = RemoteHost.defaultPort,
-                fingerprint: String? = nil, code: String? = nil) {
+    public init(name: String, serviceName: String? = nil, address: String? = nil, addresses: [String] = [],
+                port: UInt16 = RemoteHost.defaultPort, fingerprint: String? = nil, code: String? = nil) {
         self.name = name
         self.serviceName = serviceName
-        self.address = address
+        let ordered = RemoteHost.normalize([address].compactMap { $0 } + addresses)
+        self.address = ordered.first ?? address
+        self.addresses = ordered
         self.port = port
         self.fingerprint = fingerprint
         self.code = code
     }
 
-    /// Parse `graviton://pair?host=…&port=…&fp=…&code=…&name=…` (what `grav pair` prints and its QR code holds).
+    public var allAddresses: [String] {
+        RemoteHost.normalize([address].compactMap { $0 } + addresses)
+    }
+
+    /// Parse `graviton://pair?host=…&addrs=…&service=…&port=…&fp=…&code=…&name=…` (what `grav pair` prints and its QR code holds).
     public init?(link: String) {
         guard let url = URL(string: link.trimmingCharacters(in: .whitespacesAndNewlines)),
               url.scheme == "graviton", url.host == "pair",
               let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems else { return nil }
         let value = { (key: String) in items.first { $0.name == key }?.value }
-        guard let host = value("host"), !host.isEmpty else { return nil }
+        let host = value("host")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let addrs = (value("addrs") ?? "")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let combined = RemoteHost.normalize((host.isEmpty ? [] : [host]) + addrs)
+        guard let primary = combined.first else { return nil }
         let fp = value("fp")?.lowercased()
         if let fp, fp.count != 64 || !fp.allSatisfy(\.isHexDigit) { return nil }
-        self.init(name: value("name") ?? host, address: host, port: value("port").flatMap(UInt16.init) ?? RemoteHost.defaultPort,
-                  fingerprint: fp, code: value("code"))
+        let svc = value("service")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.init(
+            name: value("name") ?? primary,
+            serviceName: svc?.isEmpty == false ? svc : nil,
+            address: primary,
+            addresses: combined,
+            port: value("port").flatMap(UInt16.init) ?? RemoteHost.defaultPort,
+            fingerprint: fp,
+            code: value("code")
+        )
     }
 
     var endpoints: [NWEndpoint] {
-        RemoteHost(deviceID: "", name: name, serviceName: serviceName, address: address, port: port, fingerprint: "").endpoints
+        RemoteHost(deviceID: "", name: name, serviceName: serviceName, address: address, addresses: addresses, port: port, fingerprint: "").endpoints
     }
 }
 
@@ -221,20 +279,59 @@ final class LineConnection: @unchecked Sendable {
         connection.cancel()
     }
 
-    /// Connect to the first endpoint that answers.
+    /// Connect concurrently across all endpoints and return whichever answers first.
     static func open(_ endpoints: [NWEndpoint], pin: String?) async throws -> LineConnection {
-        var lastError: Error = EngineError.unreachable("no address for this Mac")
-        for endpoint in endpoints {
-            let c = LineConnection(endpoint: endpoint, pin: pin)
+        guard !endpoints.isEmpty else {
+            throw EngineError.unreachable("no address for this Mac")
+        }
+        if endpoints.count == 1, let single = endpoints.first {
+            let c = LineConnection(endpoint: single, pin: pin)
             do {
-                try await c.start()
+                try await withTaskCancellationHandler {
+                    try await c.start()
+                } onCancel: {
+                    c.cancel()
+                }
                 return c
             } catch {
                 c.cancel()
-                lastError = error
+                throw error
             }
         }
-        throw lastError
+        return try await withThrowingTaskGroup(of: LineConnection.self) { group in
+            for endpoint in endpoints {
+                group.addTask {
+                    let c = LineConnection(endpoint: endpoint, pin: pin)
+                    do {
+                        try await withTaskCancellationHandler {
+                            try await c.start()
+                        } onCancel: {
+                            c.cancel()
+                        }
+                        return c
+                    } catch {
+                        c.cancel()
+                        throw error
+                    }
+                }
+            }
+            var certError: Error?
+            var lastError: Error = EngineError.unreachable("no address for this Mac")
+            while !group.isEmpty {
+                do {
+                    if let winner = try await group.next() {
+                        group.cancelAll()
+                        return winner
+                    }
+                } catch {
+                    if case let EngineError.unreachable(msg) = error, msg.contains("certificate") {
+                        certError = error
+                    }
+                    lastError = error
+                }
+            }
+            throw certError ?? lastError
+        }
     }
 }
 
@@ -267,7 +364,8 @@ public enum Pairing {
             throw EngineError.unexpectedResponse
         }
         guard let fingerprint = connection.observedFingerprint else { throw EngineError.unexpectedResponse }
-        let host = RemoteHost(deviceID: deviceID, name: hostName, serviceName: target.serviceName, address: target.address,
+        let host = RemoteHost(deviceID: deviceID, name: hostName, serviceName: target.serviceName ?? hostName,
+                              address: target.address ?? target.addresses.first, addresses: target.allAddresses,
                               port: target.port, fingerprint: fingerprint)
         return PairingResult(host: host, token: token)
     }

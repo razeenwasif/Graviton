@@ -6,7 +6,9 @@ public struct PairedMac: Identifiable, Hashable, Sendable {
     /// What `grav --host` calls it.
     public var name: String
     public var address: String
+    public var addresses: [String]
     public var port: UInt16
+    public var serviceName: String?
     public var fingerprint: String
     public var token: String
     public var deviceID: String
@@ -15,8 +17,43 @@ public struct PairedMac: Identifiable, Hashable, Sendable {
 
     public var id: String { name }
 
+    public init(
+        name: String,
+        address: String,
+        addresses: [String] = [],
+        port: UInt16,
+        serviceName: String? = nil,
+        fingerprint: String,
+        token: String,
+        deviceID: String,
+        hostName: String
+    ) {
+        let ordered = RemoteHost.normalize([address] + addresses)
+        self.name = name
+        self.address = ordered.first ?? address
+        self.addresses = ordered
+        self.port = port
+        self.serviceName = serviceName
+        self.fingerprint = fingerprint
+        self.token = token
+        self.deviceID = deviceID
+        self.hostName = hostName
+    }
+
+    public var allAddresses: [String] {
+        RemoteHost.normalize([address] + addresses)
+    }
+
     public var remoteHost: RemoteHost {
-        RemoteHost(deviceID: deviceID, name: hostName, serviceName: nil, address: address, port: port, fingerprint: fingerprint)
+        RemoteHost(
+            deviceID: deviceID,
+            name: hostName,
+            serviceName: serviceName ?? hostName,
+            address: allAddresses.first,
+            addresses: allAddresses,
+            port: port,
+            fingerprint: fingerprint
+        )
     }
 
     public var shortFingerprint: String { RemoteHost.short(fingerprint) }
@@ -76,13 +113,78 @@ public final class SharedHosts {
     @discardableResult
     public func add(_ result: PairingResult, name: String? = nil) throws -> PairedMac {
         var file = (try? File.read(url)) ?? File(default: nil, hosts: [])
-        let mac = PairedMac(name: name ?? PairedMac.shortName(result.host.name), address: result.host.address ?? "", port: result.host.port,
-                            fingerprint: result.host.fingerprint, token: result.token, deviceID: result.host.deviceID, hostName: result.host.name)
+        let all = result.host.allAddresses
+        let mac = PairedMac(
+            name: name ?? PairedMac.shortName(result.host.name),
+            address: all.first ?? "",
+            addresses: all,
+            port: result.host.port,
+            serviceName: result.host.serviceName ?? result.host.name,
+            fingerprint: result.host.fingerprint,
+            token: result.token,
+            deviceID: result.host.deviceID,
+            hostName: result.host.name
+        )
         file.hosts.removeAll { $0.name.caseInsensitiveCompare(mac.name) == .orderedSame || $0.fingerprint == mac.fingerprint }
         file.hosts.append(File.Entry(mac))
         try file.write(url)
         reload()
         return mac
+    }
+
+    /// Update ordered addresses, port, or Bonjour service name on an already paired Mac.
+    @discardableResult
+    public func update(_ name: String, addresses: [String], port: UInt16? = nil, serviceName: String? = nil) throws -> PairedMac {
+        var file = try File.read(url)
+        guard let idx = file.hosts.firstIndex(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) else {
+            throw EngineError.daemon("No paired Mac named \(name).")
+        }
+        var current = file.hosts[idx].paired
+        let cleanAddrs = RemoteHost.normalize(addresses)
+        let cleanService = serviceName.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let effectiveService = cleanService.flatMap { $0.isEmpty ? nil : $0 } ?? (serviceName == nil ? current.serviceName : nil)
+        guard !cleanAddrs.isEmpty || effectiveService != nil else {
+            throw EngineError.daemon("Enter at least one address or Bonjour service name.")
+        }
+        current = PairedMac(
+            name: current.name,
+            address: cleanAddrs.first ?? "",
+            addresses: cleanAddrs,
+            port: port ?? current.port,
+            serviceName: effectiveService,
+            fingerprint: current.fingerprint,
+            token: current.token,
+            deviceID: current.deviceID,
+            hostName: current.hostName
+        )
+        file.hosts[idx] = File.Entry(current)
+        try file.write(url)
+        reload()
+        return hosts.first { $0.name == current.name } ?? current
+    }
+
+    /// Update Bonjour service names for any paired Mac whose pinned certificate fingerprint appears in Bonjour TXT records.
+    public func syncBonjour(_ found: [HostBrowser.Found]) {
+        guard !found.isEmpty else { return }
+        var changed = false
+        var updated = hosts
+        for i in updated.indices {
+            if let hit = found.first(where: { $0.fingerprint?.caseInsensitiveCompare(updated[i].fingerprint) == .orderedSame }),
+               updated[i].serviceName != hit.name {
+                updated[i].serviceName = hit.name
+                changed = true
+            }
+        }
+        guard changed else { return }
+        hosts = updated
+        if var file = try? File.read(url) {
+            for mac in updated {
+                if let idx = file.hosts.firstIndex(where: { $0.name == mac.name }) {
+                    file.hosts[idx] = File.Entry(mac)
+                }
+            }
+            try? file.write(url)
+        }
     }
 
     /// Forget a Mac here and for grav (its gravitond keeps the device until `grav devices revoke` there).
@@ -103,18 +205,40 @@ public final class SharedHosts {
         struct Entry: Codable {
             var name: String
             var address: String
+            var addresses: [String]?
             var port: UInt16
+            var serviceName: String?
             var fingerprint: String
             var token: String
             var deviceId: String
             var hostName: String
 
             init(_ m: PairedMac) {
-                (name, address, port, fingerprint, token, deviceId, hostName) = (m.name, m.address, m.port, m.fingerprint, m.token, m.deviceID, m.hostName)
+                let all = m.allAddresses
+                self.name = m.name
+                self.address = all.first ?? m.address
+                self.addresses = all.count > 1 ? all : nil
+                self.port = m.port
+                let svc = m.serviceName?.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.serviceName = (svc?.isEmpty == false) ? svc : nil
+                self.fingerprint = m.fingerprint
+                self.token = m.token
+                self.deviceId = m.deviceID
+                self.hostName = m.hostName
             }
 
             var paired: PairedMac {
-                PairedMac(name: name, address: address, port: port, fingerprint: fingerprint, token: token, deviceID: deviceId, hostName: hostName)
+                PairedMac(
+                    name: name,
+                    address: address,
+                    addresses: addresses ?? [],
+                    port: port,
+                    serviceName: serviceName,
+                    fingerprint: fingerprint,
+                    token: token,
+                    deviceID: deviceId,
+                    hostName: hostName
+                )
             }
         }
 

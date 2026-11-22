@@ -48,6 +48,7 @@ struct HostMenu: View {
     @Environment(ShellSessions.self) private var shells
     @Environment(AppRouter.self) private var router
     @Environment(Dialogs.self) private var dialogs
+    @State private var editingHost: PairedMac?
 
     var body: some View {
         Menu {
@@ -59,16 +60,19 @@ struct HostMenu: View {
             if !hosts.hosts.isEmpty {
                 Divider()
                 ForEach(hosts.hosts) { mac in
+                    let addrs = mac.allAddresses
+                    let extra = addrs.count > 1 ? " (+\(addrs.count - 1))" : ""
                     Button {
                         switchTo(mac)
                     } label: {
-                        Label("\(mac.name)  ·  \(mac.address)", systemImage: hosts.selected == mac.name ? "checkmark" : "desktopcomputer")
+                        Label("\(mac.name)  ·  \(mac.address)\(extra)", systemImage: hosts.selected == mac.name ? "checkmark" : "desktopcomputer")
                     }
                 }
             }
             Divider()
             Button("Pair a Mac…", systemImage: "plus") { router.pending = .pairMac }
             if let current = hosts.current {
+                Button("Edit Addresses…", systemImage: "network") { editingHost = current }
                 Button("Forget \(current.name)…", systemImage: "trash") { confirmForget(current) }
             }
         } label: {
@@ -80,6 +84,13 @@ struct HostMenu: View {
         .menuIndicator(.hidden)
         .help("Choose the Mac this window shows")
         .onAppear(perform: hosts.reload)
+        .sheet(item: $editingHost) { mac in
+            EditHostAddressesSheet(mac: mac) { updated in
+                if hosts.selected == updated.name {
+                    store.use(RemoteEngine(host: updated.remoteHost, token: updated.token), named: updated.name)
+                }
+            }
+        }
     }
 
     private func confirmForget(_ mac: PairedMac) {
@@ -105,6 +116,8 @@ struct PairMacSheet: View {
     @State private var code = ""
     @State private var name = ""
     @State private var phase: Phase = .idle
+    @State private var browser = HostBrowser()
+    @State private var pickedBonjour: HostBrowser.Found?
 
     enum Phase {
         case idle, pairing
@@ -115,11 +128,42 @@ struct PairMacSheet: View {
     private var busy: Bool { if case .pairing = phase { true } else { false } }
     private var link: PairingTarget? { PairingTarget(link: address) }
     private var normalizedCode: String { (link?.code ?? code).uppercased().filter { $0.isLetter || $0.isNumber } }
+    private var discoveredUnpaired: [HostBrowser.Found] {
+        browser.found.filter { found in
+            !hosts.hosts.contains { mac in
+                mac.serviceName == found.name
+                    || mac.name == found.name
+                    || (found.fingerprint != nil && found.fingerprint?.caseInsensitiveCompare(mac.fingerprint) == .orderedSame)
+            }
+        }
+    }
 
     var body: some View {
         GSheet("Pair a Mac", subtitle: "On the other Mac, run grav service install --remote once, then grav pair for a code.", symbol: "desktopcomputer.and.arrow.down") {
-            GFormRow("Address", hint: link != nil ? "A pairing link: its code and certificate fingerprint are filled in." : nil) {
+            if !discoveredUnpaired.isEmpty {
+                GFormRow("Nearby on this network") {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(discoveredUnpaired) { found in
+                                Button {
+                                    pickedBonjour = found
+                                    address = found.name
+                                    if name.isEmpty { name = PairedMac.shortName(found.name) }
+                                } label: {
+                                    Label(found.name, systemImage: "bonjour")
+                                }
+                                .buttonStyle(.g(pickedBonjour?.name == found.name ? .primary : .secondary, size: .small))
+                                .disabled(busy)
+                            }
+                        }
+                    }
+                }
+            }
+            GFormRow("Address", hint: link != nil ? "A pairing link: its addresses, code, and certificate fingerprint are filled in." : nil) {
                 field("mini.local, 192.168.1.20, or the graviton://pair link", text: $address)
+                    .onChange(of: address) { _, next in
+                        if next != pickedBonjour?.name { pickedBonjour = nil }
+                    }
             }
             HStack(alignment: .top, spacing: 12) {
                 if link == nil {
@@ -164,6 +208,8 @@ struct PairMacSheet: View {
                     .disabled(busy || address.trimmingCharacters(in: .whitespaces).isEmpty || normalizedCode.count != 8)
             }
         }
+        .onAppear { browser.start() }
+        .onDisappear { browser.stop() }
     }
 
     private func field(_ placeholder: String, text: Binding<String>) -> some View {
@@ -174,10 +220,12 @@ struct PairMacSheet: View {
 
     private func pair() {
         let target: PairingTarget
+        let typed = address.trimmingCharacters(in: .whitespaces)
         if let link {
             target = link
+        } else if let picked = pickedBonjour, typed == picked.name {
+            target = PairingTarget(name: picked.name, serviceName: picked.name, fingerprint: picked.fingerprint)
         } else {
-            let typed = address.trimmingCharacters(in: .whitespaces)
             let parts = typed.split(separator: ":")
             let port = parts.count == 2 ? UInt16(parts[1]) ?? RemoteHost.defaultPort : RemoteHost.defaultPort
             target = PairingTarget(name: String(parts.first ?? ""), address: String(parts.first ?? ""), port: port)
@@ -204,6 +252,83 @@ struct PairMacSheet: View {
             dismiss()
         } catch {
             phase = .failed("Couldn't save the pairing: \(error.localizedDescription)")
+        }
+    }
+}
+
+/// Edit fallback addresses (e.g. LAN + Tailscale), port, and Bonjour service name for a paired Mac.
+struct EditHostAddressesSheet: View {
+    @Environment(SharedHosts.self) private var hosts
+    @Environment(\.dismiss) private var dismiss
+    var mac: PairedMac
+    var onSaved: (PairedMac) -> Void
+
+    @State private var addressesText: String
+    @State private var portText: String
+    @State private var serviceName: String
+    @State private var problem: String?
+
+    init(mac: PairedMac, onSaved: @escaping (PairedMac) -> Void) {
+        self.mac = mac
+        self.onSaved = onSaved
+        _addressesText = State(initialValue: mac.allAddresses.joined(separator: "\n"))
+        _portText = State(initialValue: String(mac.port))
+        _serviceName = State(initialValue: mac.serviceName ?? mac.hostName)
+    }
+
+    private var parsedAddresses: [String] {
+        RemoteHost.normalize(addressesText.split(whereSeparator: { $0.isNewline || $0 == "," }).map(String.init))
+    }
+
+    private var validPort: UInt16? {
+        UInt16(portText.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    var body: some View {
+        GSheet("Host routing for \(mac.name)",
+               subtitle: "Graviton races all addresses alongside Bonjour (_graviton._tcp) and connects over whichever verifies your pinned certificate first.",
+               symbol: "network") {
+            GFormRow("Addresses", hint: "One IP or hostname per line (e.g. LAN IP + Tailscale IP).") {
+                TextEditor(text: $addressesText)
+                    .scrollContentBackground(.hidden)
+                    .frame(height: 82)
+                    .gravitonField(mono: true, height: nil)
+            }
+            HStack(alignment: .top, spacing: 12) {
+                GFormRow("Bonjour service", hint: "Matched automatically via certificate fingerprint.") {
+                    GTextField(mac.hostName, text: $serviceName)
+                        .gravitonField(mono: true)
+                }
+                GFormRow("Port") {
+                    GTextField("7843", text: $portText)
+                        .gravitonField(mono: true)
+                }
+                .frame(width: 110)
+            }
+            if let problem {
+                GStatusLine(.failure, problem)
+            }
+        } footer: {
+            Spacer()
+            Button("Cancel") { dismiss() }.buttonStyle(.gSecondary).keyboardShortcut(.cancelAction)
+            Button("Save", action: save)
+                .buttonStyle(.gPrimary)
+                .keyboardShortcut(.defaultAction)
+                .disabled(validPort == nil || (parsedAddresses.isEmpty && serviceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+        }
+    }
+
+    private func save() {
+        guard let port = validPort else {
+            problem = "Enter a valid TCP port (1–65535)."
+            return
+        }
+        do {
+            let updated = try hosts.update(mac.name, addresses: parsedAddresses, port: port, serviceName: serviceName)
+            onSaved(updated)
+            dismiss()
+        } catch {
+            problem = error.localizedDescription
         }
     }
 }

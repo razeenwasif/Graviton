@@ -367,6 +367,57 @@ import Testing
         #expect(hosts.hosts.map(\.name) == ["razeens-macbook"])
         #expect(!(try String(contentsOf: url, encoding: .utf8)).contains(#""default" : "mini""#))
     }
+
+    @MainActor @Test func multiAddressHostsBonjourSyncAndUpdate() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "graviton-multi-hosts-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appending(path: "hosts.json")
+        let fp = String(repeating: "ab", count: 32)
+        try #"{"default":"mini","hosts":[{"name":"mini","address":"100.64.0.10","port":7843,"fingerprint":"\#(fp)","token":"t","device_id":"d1","host_name":"BuildHost"}]}"#
+            .write(to: url, atomically: true, encoding: .utf8)
+
+        let hosts = SharedHosts(url: url)
+        #expect(hosts.hosts.first?.allAddresses == ["100.64.0.10"])
+
+        // Multi-address update writes primary `address` + ordered `addresses` + `service_name`.
+        let updated = try hosts.update("mini", addresses: ["192.0.2.61", "100.64.0.10", "192.0.2.61"], port: 7843, serviceName: "BuildHost")
+        #expect(updated.address == "192.0.2.61")
+        #expect(updated.allAddresses == ["192.0.2.61", "100.64.0.10"])
+        #expect(updated.remoteHost.endpoints.count == 3) // 1 Bonjour + 2 hostPort
+
+        // Re-read verifies persistence + compatibility.
+        let reloaded = SharedHosts(url: url)
+        #expect(reloaded.hosts.first?.allAddresses == ["192.0.2.61", "100.64.0.10"])
+        #expect(reloaded.hosts.first?.serviceName == "BuildHost")
+
+        // Bonjour TXT fingerprint sync updates serviceName if renamed on the LAN.
+        reloaded.syncBonjour([HostBrowser.Found(name: "BuildHost-2", fingerprint: fp.uppercased())])
+        #expect(reloaded.hosts.first?.serviceName == "BuildHost-2")
+
+        // Legacy RemoteHost JSON without `addresses` still decodes cleanly.
+        let legacyJSON = #"{"deviceID":"d9","name":"Mini","address":"10.0.0.5","port":7843,"fingerprint":"\#(fp)"}"#
+        let decodedLegacy = try JSONDecoder().decode(RemoteHost.self, from: Data(legacyJSON.utf8))
+        #expect(decodedLegacy.allAddresses == ["10.0.0.5"])
+
+        // Multi-address PairingTarget parsing.
+        let link = "graviton://pair?host=192.0.2.61&addrs=192.0.2.61,100.64.0.10&service=BuildHost&port=7843&fp=\(fp)&code=Z5VRBPZ3&name=mini"
+        let target = PairingTarget(link: link)
+        #expect(target?.address == "192.0.2.61")
+        #expect(target?.addresses == ["192.0.2.61", "100.64.0.10"])
+        #expect(target?.serviceName == "BuildHost")
+
+        // HostStore.updateAddresses and syncBonjour on isolated UserDefaults.
+        let suiteName = "graviton-hoststore-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(try JSONEncoder().encode([decodedLegacy]), forKey: "graviton.hosts")
+        let hostStore = HostStore(defaults: defaults)
+        hostStore.updateAddresses(for: "d9", addresses: ["192.0.2.61", "100.64.0.10"], port: 7843, serviceName: "BuildHost")
+        #expect(hostStore.hosts.first?.allAddresses == ["192.0.2.61", "100.64.0.10"])
+        hostStore.syncBonjour([HostBrowser.Found(name: "BuildHost-Lab", fingerprint: fp)])
+        #expect(hostStore.hosts.first?.serviceName == "BuildHost-Lab")
+    }
 }
 
 @Suite struct CleanupTests {

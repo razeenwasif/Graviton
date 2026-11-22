@@ -13,9 +13,16 @@ struct HostsView: View {
     @Environment(Dialogs.self) private var dialogs
     @Binding var pairTarget: PairingTarget?
     @State private var askAddress = false
+    @State private var editingHost: RemoteHost?
 
     private var unpaired: [HostBrowser.Found] {
-        browser.found.filter { found in !hosts.hosts.contains { $0.serviceName == found.name || $0.name == found.name } }
+        browser.found.filter { found in
+            !hosts.hosts.contains {
+                $0.serviceName == found.name
+                    || $0.name == found.name
+                    || (found.fingerprint != nil && found.fingerprint?.caseInsensitiveCompare($0.fingerprint) == .orderedSame)
+            }
+        }
     }
 
     var body: some View {
@@ -32,6 +39,7 @@ struct HostsView: View {
                                 HostRow(title: host.name, detail: detail(for: host), symbol: "desktopcomputer",
                                         selected: hosts.selectedID == host.id) { choose(host) }
                                     .contextMenu {
+                                        Button("Edit Addresses…", systemImage: "network") { editingHost = host }
                                         Button("Forget \(host.name)", systemImage: "trash", role: .destructive) { confirmForget(host) }
                                     }
                             }
@@ -100,6 +108,16 @@ struct HostsView: View {
             }
             .mobileScreen(pushed: false)
             .onAppear { browser.start() }
+            .onChange(of: browser.found) { _, found in
+                hosts.syncBonjour(found)
+            }
+            .sheet(item: $editingHost) { host in
+                MobileEditHostSheet(host: host) {
+                    if hosts.selectedID == host.id {
+                        store.use(hosts.engineForSelection(), named: host.name)
+                    }
+                }
+            }
             .sheet(isPresented: $askAddress) {
                 AddressSheet { target in
                     askAddress = false
@@ -121,7 +139,15 @@ struct HostsView: View {
     }
 
     private func detail(for host: RemoteHost) -> String {
-        let place = host.serviceName != nil ? "on this network" : "\(host.address ?? "?"):\(host.port)"
+        let addrs = host.allAddresses
+        let place: String
+        if host.serviceName != nil {
+            place = addrs.isEmpty ? "on this network" : "Bonjour + \(addrs.count) \(addrs.count == 1 ? "address" : "addresses")"
+        } else if addrs.count > 1 {
+            place = "\(addrs[0]):\(host.port) (+\(addrs.count - 1))"
+        } else {
+            place = "\(addrs.first ?? "?"):\(host.port)"
+        }
         return "\(place) · \(host.shortFingerprint)"
     }
 
@@ -313,5 +339,63 @@ struct PairSheet: View {
                 phase = .failed(error.localizedDescription)
             }
         }
+    }
+}
+
+/// Edit fallback addresses (e.g. LAN + Tailscale), port, and Bonjour service name on iOS.
+private struct MobileEditHostSheet: View {
+    @Environment(HostStore.self) private var hosts
+    @Environment(\.dismiss) private var dismiss
+    let host: RemoteHost
+    var onSaved: () -> Void
+
+    @State private var addressesText: String
+    @State private var portText: String
+    @State private var serviceName: String
+
+    init(host: RemoteHost, onSaved: @escaping () -> Void) {
+        self.host = host
+        self.onSaved = onSaved
+        _addressesText = State(initialValue: host.allAddresses.joined(separator: "\n"))
+        _portText = State(initialValue: String(host.port))
+        _serviceName = State(initialValue: host.serviceName ?? "")
+    }
+
+    private var parsedAddresses: [String] {
+        RemoteHost.normalize(addressesText.split(whereSeparator: { $0.isNewline || $0 == "," }).map(String.init))
+    }
+
+    private var validPort: UInt16? {
+        UInt16(portText.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    var body: some View {
+        MobileSheet("Edit \(host.name)",
+                    subtitle: "Add LAN and Tailscale addresses; Graviton tries whichever connects fastest alongside Bonjour.",
+                    actionTitle: "Save",
+                    actionEnabled: validPort != nil && (!parsedAddresses.isEmpty || !serviceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty),
+                    action: save) {
+            GFormRow("Addresses", hint: "One IP or hostname per line.") {
+                TextEditor(text: $addressesText)
+                    .scrollContentBackground(.hidden)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .frame(height: 92)
+                    .gravitonField(mono: true, height: nil, size: 15)
+            }
+            GFormRow("Bonjour service") {
+                MobileField(placeholder: host.name, text: $serviceName, mono: false)
+            }
+            GFormRow("Port") {
+                MobileField(placeholder: "7843", text: $portText, keyboard: .numberPad)
+            }
+        }
+    }
+
+    private func save() {
+        guard let port = validPort else { return }
+        hosts.updateAddresses(for: host.id, addresses: parsedAddresses, port: port, serviceName: serviceName)
+        onSaved()
+        dismiss()
     }
 }

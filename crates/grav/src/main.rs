@@ -454,6 +454,31 @@ enum HostsAction {
         /// What to call it in --host (default: from its name).
         #[arg(long)]
         name: Option<String>,
+        /// Extra fallback address(es) to try if the primary address isn't reachable.
+        #[arg(long = "fallback")]
+        fallback: Vec<String>,
+    },
+    /// Update saved address(es), port, or Bonjour service name for a paired host.
+    Update {
+        /// Paired host name (see `grav hosts`).
+        name: String,
+        /// New address(es), highest priority first (optionally `HOST:PORT`).
+        addresses: Vec<String>,
+        /// Override TLS port.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Append address(es) to existing fallbacks instead of replacing them.
+        #[arg(long)]
+        add: bool,
+        /// Remove a stale address from the host's address list.
+        #[arg(long)]
+        remove: Vec<String>,
+        /// Set or update the Bonjour `_graviton._tcp` service name.
+        #[arg(long)]
+        service: Option<String>,
+        /// Immediately connect and authenticate over TLS to verify reachability.
+        #[arg(long)]
+        verify: bool,
     },
     /// Forget a host (on that Mac, `grav devices revoke` stops its token too).
     Rm { name: String },
@@ -1284,12 +1309,17 @@ fn lifecycle(client: &mut Client, request: Request, verb: &str) -> Result<()> {
 
 fn print_pairing(p: &graviton_proto::PairingInfo) -> Result<()> {
     let address = p.addresses.first().cloned().unwrap_or_else(|| "this-mac.local".into());
+    let encoded_name = p.host.replace(' ', "%20");
+    let extra = if p.addresses.len() > 1 {
+        format!("&addrs={}", p.addresses.join(","))
+    } else {
+        String::new()
+    };
     let link = format!(
-        "graviton://pair?host={address}&port={}&fp={}&code={}&name={}",
+        "graviton://pair?host={address}{extra}&service={encoded_name}&port={}&fp={}&code={}&name={encoded_name}",
         p.port,
         p.fingerprint,
         p.code,
-        p.host.replace(' ', "%20")
     );
     let qr = qrcode::QrCode::new(link.as_bytes())?;
     println!("{}", qr.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(true).build());
@@ -1416,15 +1446,26 @@ fn hosts(action: Option<&HostsAction>) -> Result<()> {
                 return Ok(());
             }
             let default = hosts.default.clone();
-            println!("{:<3}{:<18} {:<26} {:<20} MAC", "", "NAME", "ADDRESS", "FINGERPRINT");
-            println!("{:<3}{:<18} {:<26} {:<20}", if default.is_none() { "*" } else { "" }, "local", "this Mac", "");
+            println!("{:<3}{:<18} {:<30} {:<20} MAC", "", "NAME", "ADDRESSES", "FINGERPRINT");
+            println!("{:<3}{:<18} {:<30} {:<20}", if default.is_none() { "*" } else { "" }, "local", "this Mac", "");
             for h in &hosts.hosts {
                 let star = if default.as_deref().is_some_and(|d| d.eq_ignore_ascii_case(&h.name)) { "*" } else { "" };
-                println!("{star:<3}{:<18} {:<26} {:<20} {}", h.name, format!("{}:{}", h.address, h.port), remote::fingerprint_short(&h.fingerprint), h.host_name);
+                let addrs = h.candidate_addresses();
+                let addr_col = if addrs.is_empty() {
+                    h.service_name
+                        .as_deref()
+                        .map(|s| format!("bonjour:{s}:{}", h.port))
+                        .unwrap_or_else(|| format!(":{}", h.port))
+                } else if addrs.len() == 1 {
+                    format!("{}:{}", addrs[0], h.port)
+                } else {
+                    format!("{}:{} (+{} {})", addrs[0], h.port, addrs.len() - 1, addrs[1..].join(", "))
+                };
+                println!("{star:<3}{:<18} {:<30} {:<20} {}", h.name, addr_col, remote::fingerprint_short(&h.fingerprint), h.host_name);
             }
             println!("\n* = where commands go without --host (change with `grav hosts use NAME`)");
         }
-        Some(HostsAction::Add { target, code, name }) => {
+        Some(HostsAction::Add { target, code, name, fallback }) => {
             let t = remote::PairTarget::parse(target)?;
             let code = match code.clone().or(t.code.clone()) {
                 Some(c) => c,
@@ -1436,7 +1477,14 @@ fn hosts(action: Option<&HostsAction>) -> Result<()> {
                     line.trim().to_string()
                 }
             };
-            let host = remote::pair(&t.address, t.port, &code, t.fingerprint.as_deref(), name.as_deref())?;
+            let mut extra = t.addresses.clone();
+            for item in fallback {
+                let (addr, _) = remote::parse_host_port_opt(item)?;
+                if !extra.contains(&addr) {
+                    extra.push(addr);
+                }
+            }
+            let host = remote::pair(&t.address, &extra, t.service_name.as_deref(), t.port, &code, t.fingerprint.as_deref(), name.as_deref())?;
             if t.fingerprint.is_none() {
                 // Paired by address: check it's really that Mac.
                 eprintln!("{} says its fingerprint is {}.", host.host_name, remote::fingerprint_short(&host.fingerprint));
@@ -1445,10 +1493,73 @@ fn hosts(action: Option<&HostsAction>) -> Result<()> {
                 }
             }
             hosts.hosts.retain(|h| !h.name.eq_ignore_ascii_case(&host.name) && h.fingerprint != host.fingerprint);
-            println!("Paired with {} as `{}` ({}:{}, {}).", host.host_name, host.name, host.address, host.port, remote::fingerprint_short(&host.fingerprint));
+            let saved_addrs = host.candidate_addresses();
+            let extra_desc = if saved_addrs.len() > 1 {
+                format!(" + fallbacks [{}]", saved_addrs[1..].join(", "))
+            } else {
+                String::new()
+            };
+            println!("Paired with {} as `{}` ({}:{}{}, {}).", host.host_name, host.name, host.address, host.port, extra_desc, remote::fingerprint_short(&host.fingerprint));
             println!("Use it with `grav --host {} ps`, or make it the default: `grav hosts use {}`.", host.name, host.name);
             hosts.hosts.push(host);
             hosts.save()?;
+        }
+        Some(HostsAction::Update { name, addresses, port, add, remove, service, verify }) => {
+            let idx = hosts
+                .hosts
+                .iter()
+                .position(|h| h.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| anyhow::anyhow!("no host called {name}: see `grav hosts`"))?;
+            let has_addr_args = !addresses.is_empty();
+            if !has_addr_args && port.is_none() && remove.is_empty() && service.is_none() && !verify {
+                bail!("nothing to update; pass new address(es), --port, --remove, --service, or --verify");
+            }
+            let mut h = hosts.hosts[idx].clone();
+            let mut updated_port = *port;
+            let mut list = if *add || !has_addr_args { h.candidate_addresses() } else { Vec::new() };
+
+            for raw in addresses {
+                let (addr, parsed_port) = remote::parse_host_port_opt(raw)?;
+                if let Some(p) = parsed_port {
+                    if updated_port.is_none() {
+                        updated_port = Some(p);
+                    }
+                }
+                if !list.contains(&addr) {
+                    list.push(addr);
+                }
+            }
+            if !remove.is_empty() {
+                let mut to_remove = Vec::with_capacity(remove.len());
+                for raw in remove {
+                    let (addr, _) = remote::parse_host_port_opt(raw)?;
+                    to_remove.push(addr);
+                }
+                list.retain(|a| !to_remove.iter().any(|r| r == a));
+            }
+            if let Some(p) = updated_port {
+                h.port = p;
+            }
+            if let Some(svc) = service {
+                let trimmed = svc.trim();
+                h.service_name = (!trimmed.is_empty()).then(|| trimmed.to_string());
+            }
+            if list.is_empty() && h.service_name.is_none() {
+                bail!("cannot remove the last address unless `--service` is set for Bonjour routing");
+            }
+            h.set_addresses(list);
+            if *verify {
+                remote::verify_host(&h)?;
+            }
+            let summary_addrs = h.candidate_addresses();
+            let summary = if summary_addrs.is_empty() {
+                format!("bonjour:{}", h.service_name.as_deref().unwrap_or("_graviton._tcp"))
+            } else {
+                summary_addrs.join(", ")
+            };
+            hosts.hosts[idx] = h;
+            hosts.save()?;
+            println!("Updated `{name}` -> [{summary}] (port {}{}).", hosts.hosts[idx].port, if *verify { ", verified TLS" } else { "" });
         }
         Some(HostsAction::Rm { name }) => {
             let before = hosts.hosts.len();
