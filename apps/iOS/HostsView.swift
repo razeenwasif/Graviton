@@ -42,6 +42,13 @@ struct HostsView: View {
                         }
                     }
 
+                    if store.connection == .live, let engine = store.engine, engine.memoryBytes > 0 {
+                        VStack(alignment: .leading, spacing: 8) {
+                            GCaption(store.liveName ?? "Connected Mac").padding(.horizontal, 4)
+                            MobileEngineMemoryCard(engine: engine)
+                        }
+                    }
+
                     VStack(alignment: .leading, spacing: 8) {
                         GCaption("On this network").padding(.horizontal, 4)
                         VStack(spacing: 0) {

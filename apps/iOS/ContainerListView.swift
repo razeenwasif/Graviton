@@ -29,9 +29,13 @@ struct ContainerListView: View {
                             MetricValue(String(format: "%.0f", store.totalCPU), unit: "%", size: 22)
                         }
                         SummaryTile(title: "Memory", symbol: "memorychip") {
-                            let parts = Format.bytes(store.totalMemory).split(separator: " ")
+                            let parts = Format.bytes(store.engine?.totalMemoryUsedBytes ?? store.totalMemory).split(separator: " ")
                             MetricValue(String(parts.first ?? ""), unit: " " + String(parts.last ?? ""), size: 22)
                         }
+                    }
+
+                    if let engine = store.engine, engine.memoryBytes > 0 {
+                        MobileEngineMemoryCard(engine: engine)
                     }
 
                     MobileSearchField(prompt: "Search containers", text: $search)
@@ -300,5 +304,61 @@ struct LifecycleMenu: View {
         } else {
             Button("Start", systemImage: "play.fill") { Task { await store.start(container) } }
         }
+    }
+}
+
+/// Host + VM color-coded memory card shown on iPhone Containers and Hosts screens.
+struct MobileEngineMemoryCard: View {
+    var engine: EngineInfo
+
+    private var hostColor: Color {
+        engine.hostMemoryFraction >= 0.93 ? G.danger
+            : engine.hostMemoryFraction >= 0.85 ? G.warning
+            : Color(hex: 0x646E82)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text(engine.hasHostMemory ? "Memory" : "VM memory")
+                Spacer()
+                Text("\(Format.bytes(engine.totalMemoryUsedBytes)) / \(Format.bytes(engine.memoryBytes))")
+                    .font(G.mono(11.5))
+                    .monospacedDigit()
+            }
+            .font(.system(size: 12.5, weight: .medium))
+            .foregroundStyle(G.muted)
+
+            StackedMeterBar([
+                .init(engine.vmMemoryFraction, color: G.accent),
+                .init(engine.otherHostMemoryFraction, color: hostColor),
+            ], height: 5)
+
+            if engine.hasHostMemory {
+                HStack(spacing: 10) {
+                    HStack(spacing: 5) {
+                        Circle().fill(G.accent).frame(width: 6, height: 6)
+                        Text("VMs \(Format.bytes(engine.vmMemoryUsedBytes))")
+                            .foregroundStyle(engine.vmMemoryUsedBytes > 0 ? G.textSecondary : G.faint)
+                    }
+                    Spacer()
+                    HStack(spacing: 5) {
+                        Circle().fill(hostColor).frame(width: 6, height: 6)
+                        Text("macOS \(Format.bytes(engine.otherHostMemoryUsedBytes))")
+                            .foregroundStyle(G.faint)
+                    }
+                }
+                .font(G.mono(10.5))
+            }
+
+            let rosetta = engine.rosetta == true ? " · Rosetta" : ""
+            Text("\(engine.kernel) · \(engine.arch) · \(engine.cpus) vCPU\(rosetta)")
+                .font(.system(size: 11))
+                .foregroundStyle(G.faint)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .mobileCard(radius: 14)
     }
 }

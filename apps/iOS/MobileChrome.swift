@@ -8,13 +8,14 @@ import UIKit
 // MARK: - Tab bar
 
 enum AppTab: Int, CaseIterable, Identifiable {
-    case containers, images, activity, hosts
+    case containers, images, resources, activity, hosts
     var id: Int { rawValue }
 
     var title: String {
         switch self {
         case .containers: "Containers"
         case .images: "Images"
+        case .resources: "Resources"
         case .activity: "Activity"
         case .hosts: "Hosts"
         }
@@ -24,6 +25,7 @@ enum AppTab: Int, CaseIterable, Identifiable {
         switch self {
         case .containers: "shippingbox"
         case .images: "square.stack.3d.up"
+        case .resources: "internaldrive"
         case .activity: "waveform.path.ecg"
         case .hosts: "desktopcomputer"
         }
@@ -34,6 +36,7 @@ enum AppTab: Int, CaseIterable, Identifiable {
         switch self {
         case .containers: "shippingbox.fill"
         case .images: "square.stack.3d.up.fill"
+        case .resources: "internaldrive.fill"
         case .activity, .hosts: symbol
         }
     }

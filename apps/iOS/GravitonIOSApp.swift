@@ -68,6 +68,7 @@ struct GravitonIOSApp: App {
         switch tab {
         case .containers: ContainerListView(openHosts: { self.tab = .hosts })
         case .images: ImageListView()
+        case .resources: MobileResourcesView()
         case .activity: ActivityView()
         case .hosts: HostsView(pairTarget: $pairTarget)
         }
@@ -76,6 +77,7 @@ struct GravitonIOSApp: App {
 
 struct ImageListView: View {
     @Environment(EngineStore.self) private var store
+    @Environment(Dialogs.self) private var dialogs
     @State private var pulling = false
     @State private var runImage: ImageInfo?
     @State private var search = ""
@@ -106,7 +108,7 @@ struct ImageListView: View {
                         VStack(spacing: 0) {
                             ForEach(Array(shown.enumerated()), id: \.element.id) { i, image in
                                 if i > 0 { RowDivider(inset: 64) }
-                                ImageRow(image: image, canRun: store.canManage) { runImage = image }
+                                ImageRow(image: image, canRun: store.canManage, run: { runImage = image }, remove: { confirmRemove(image) })
                             }
                         }
                         .mobileCard()
@@ -129,12 +131,27 @@ struct ImageListView: View {
             .sheet(item: $runImage) { image in MobileRunSheet(image: "\(image.repository):\(image.tag)") }
         }
     }
+
+    private func confirmRemove(_ image: ImageInfo) {
+        dialogs.confirm("Remove \(image.repository):\(image.tag)?",
+                        message: "Deletes the manifest and layers no other image or container uses.",
+                        confirm: "Remove") {
+            Task {
+                do {
+                    _ = try await store.removeImage(image)
+                } catch {
+                    dialogs.alert("Couldn't remove image", message: error.localizedDescription)
+                }
+            }
+        }
+    }
 }
 
 private struct ImageRow: View {
     var image: ImageInfo
     var canRun: Bool
     var run: () -> Void
+    var remove: () -> Void
 
     var body: some View {
         Button(action: run) {
@@ -150,9 +167,14 @@ private struct ImageRow: View {
                         Text(image.tag).font(G.mono(11.5)).foregroundStyle(G.muted)
                         Text("·").foregroundStyle(G.faint)
                         Text(Format.bytes(image.sizeBytes)).font(.system(size: 12)).foregroundStyle(G.faint)
+                        Text("·").foregroundStyle(G.faint)
+                        Text(image.architecture).font(G.mono(11)).foregroundStyle(G.faint)
                     }
                 }
                 Spacer()
+                if image.architecture == "amd64" {
+                    GBadge("Rosetta", color: G.accent)
+                }
                 if image.usedBy > 0 {
                     GBadge("\(image.usedBy) in use", color: G.running)
                 }
@@ -171,6 +193,8 @@ private struct ImageRow: View {
         .contextMenu {
             Button("Run…", systemImage: "play.fill", action: run).disabled(!canRun)
             Button("Copy Reference", systemImage: "doc.on.doc") { UIPasteboard.general.string = image.reference }
+            Button("Remove Image", systemImage: "trash", role: .destructive, action: remove)
+                .disabled(!canRun || image.usedBy > 0)
         }
     }
 }
