@@ -21,6 +21,9 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case diskUsage
     case removeImage(reference: String)
     case prune(PruneSpec)
+    case snapshotStatus
+    case snapshotWarm(cpus: UInt32? = nil, memoryMib: UInt64? = nil, rosetta: Bool = false, slots: UInt32? = nil)
+    case snapshotClear
     case exec(ExecSpec)
     case stats(id: String)
     case listFiles(id: String, path: String)
@@ -51,6 +54,12 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     private struct PutArchiveParams: Encodable { let id: String; let path: String; let size: UInt64 }
     private struct EventsParams: Encodable { let since: UInt64?; let limit: Int? }
     private struct PushParams: Encodable { let token: String; let sandbox: Bool }
+    private struct SnapshotWarmParams: Encodable {
+        let cpus: UInt32?
+        let memoryMib: UInt64?
+        let rosetta: Bool?
+        let slots: UInt32?
+    }
 
     public var method: String {
         switch self {
@@ -73,6 +82,9 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .diskUsage: "disk_usage"
         case .removeImage: "remove_image"
         case .prune: "prune"
+        case .snapshotStatus: "snapshot_status"
+        case .snapshotWarm: "snapshot_warm"
+        case .snapshotClear: "snapshot_clear"
         case .exec: "exec"
         case .stats: "stats"
         case .listFiles: "list_files"
@@ -94,7 +106,7 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         var c = encoder.container(keyedBy: Keys.self)
         try c.encode(method, forKey: .method)
         switch self {
-        case .ping, .engineInfo, .listContainers, .listImages, .listVolumes, .networkInfo, .pairBegin, .listDevices: break
+        case .ping, .engineInfo, .listContainers, .listImages, .listVolumes, .networkInfo, .pairBegin, .listDevices, .snapshotStatus, .snapshotClear: break
         case let .createVolume(name), let .removeVolume(name): try c.encode(NameParams(name: name), forKey: .params)
         case let .revokeDevice(id): try c.encode(IDParams(id: id), forKey: .params)
         case let .pair(code, device): try c.encode(PairParams(code: code, device: device), forKey: .params)
@@ -103,6 +115,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .diskUsage: break
         case let .removeImage(reference): try c.encode(PullParams(reference: reference, progress: nil, platform: nil), forKey: .params)
         case let .prune(spec): try c.encode(spec, forKey: .params)
+        case let .snapshotWarm(cpus, memoryMib, rosetta, slots):
+            try c.encode(SnapshotWarmParams(cpus: cpus, memoryMib: memoryMib, rosetta: rosetta ? true : nil, slots: slots), forKey: .params)
         case let .start(id), let .stop(id), let .restart(id), let .remove(id), let .stats(id), let .inspect(id):
             try c.encode(IDParams(id: id), forKey: .params)
         case let .listFiles(id, path), let .readFile(id, path), let .getArchive(id, path):
@@ -138,7 +152,10 @@ public enum EngineResponse: Decodable, Sendable {
     case diskUsage(DiskUsage)
     case imageRemoved(reference: String, freedBytes: UInt64, keptBytes: UInt64)
     case pruned(PruneReport)
+    case snapshots(SnapshotInfo)
     case buildLog(String)
+    case execOutput(stream: String, data: [UInt8])
+    case execExited(code: Int32)
     case attached
     case stats(ContainerStats)
     case files(DirectoryListing)
@@ -166,6 +183,8 @@ public enum EngineResponse: Decodable, Sendable {
     private struct ArchiveData: Decodable { let isDir: Bool; let name: String }
     private struct CopiedData: Decodable { let files: UInt64 }
     private struct VolumeRemovedData: Decodable { let name: String; let freedBytes: UInt64 }
+    private struct ExecOutputData: Decodable { let stream: String?; let data: [UInt8] }
+    private struct ExecExitedData: Decodable { let code: Int32 }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
@@ -191,7 +210,13 @@ public enum EngineResponse: Decodable, Sendable {
             let r = try c.decode(ImageRemovedData.self, forKey: .data)
             self = .imageRemoved(reference: r.reference, freedBytes: r.freedBytes, keptBytes: r.keptBytes)
         case "pruned": self = .pruned(try c.decode(PruneReport.self, forKey: .data))
+        case "snapshots": self = .snapshots(try c.decode(SnapshotInfo.self, forKey: .data))
         case "attached": self = .attached
+        case "exec_output":
+            let o = try c.decode(ExecOutputData.self, forKey: .data)
+            self = .execOutput(stream: o.stream ?? "stdout", data: o.data)
+        case "exec_exited":
+            self = .execExited(code: try c.decode(ExecExitedData.self, forKey: .data).code)
         case "build_log": self = .buildLog(try c.decode(BuildLine.self, forKey: .data).line)
         case "stats": self = .stats(try c.decode(ContainerStats.self, forKey: .data))
         case "files": self = .files(try c.decode(DirectoryListing.self, forKey: .data))

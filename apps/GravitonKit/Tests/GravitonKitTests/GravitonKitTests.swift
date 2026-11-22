@@ -488,3 +488,407 @@ import Testing
         #expect(store.stacks.first?.runningCount == 5)
     }
 }
+
+@Suite struct FairyBridgeTests {
+    @Test func wireEncodesSnapshotsAndDecodesExec() throws {
+        let line = { (r: EngineRequest) in String(decoding: try Wire.line(r), as: UTF8.self) }
+        #expect(try line(.snapshotStatus) == #"{"method":"snapshot_status"}"# + "\n")
+        #expect(try line(.snapshotClear) == #"{"method":"snapshot_clear"}"# + "\n")
+        #expect(try line(.snapshotWarm(cpus: 4, memoryMib: 2048, rosetta: true, slots: 2))
+            == #"{"method":"snapshot_warm","params":{"cpus":4,"memory_mib":2048,"rosetta":true,"slots":2}}"# + "\n")
+        #expect(try line(.snapshotWarm()) == #"{"method":"snapshot_warm","params":{}}"# + "\n")
+
+        let snapJSON = #"{"type":"snapshots","data":{"enabled":true,"total_slots":2,"in_use":1,"total_bytes":27000000,"max_slots_per_shape":8,"groups":[{"cpus":2,"memory_mib":1024,"rosetta":false,"slots":2,"in_use":1,"size_bytes":27000000}]}}"#
+        guard case let .snapshots(info) = try Wire.decoder.decode(EngineResponse.self, from: Data(snapJSON.utf8)) else {
+            Issue.record("expected snapshots"); return
+        }
+        #expect(info.enabled && info.totalSlots == 2 && info.inUse == 1 && info.groups.count == 1)
+
+        let outJSON = #"{"type":"exec_output","data":{"stream":"stdout","data":[104,105,10]}}"#
+        guard case let .execOutput(stream, bytes) = try Wire.decoder.decode(EngineResponse.self, from: Data(outJSON.utf8)) else {
+            Issue.record("expected exec_output"); return
+        }
+        #expect(stream == "stdout" && String(decoding: bytes, as: UTF8.self) == "hi\n")
+
+        let exitJSON = #"{"type":"exec_exited","data":{"code":7}}"#
+        guard case let .execExited(code) = try Wire.decoder.decode(EngineResponse.self, from: Data(exitJSON.utf8)) else {
+            Issue.record("expected exec_exited"); return
+        }
+        #expect(code == 7)
+    }
+
+    @Test func approvalPolicyMatchesTieredRules() {
+        #expect(FairyApprovalPolicy.supportedTools.count == 25)
+
+        // Auto-run reads & reversible operations
+        for readTool in ["status", "events", "containers", "inspect", "logs", "stats",
+                         "list_files", "read_file", "images", "volumes", "network",
+                         "navigate", "switch_host", "pull"] {
+            #expect(!FairyApprovalPolicy.requiresTouchID(tool: readTool, args: [:]), "\(readTool) should not need Touch ID")
+        }
+        #expect(!FairyApprovalPolicy.requiresTouchID(tool: "container_action", args: ["action": .string("start")]))
+        #expect(!FairyApprovalPolicy.requiresTouchID(tool: "container_action", args: ["action": .string("restart")]))
+        #expect(!FairyApprovalPolicy.requiresTouchID(tool: "stack_action", args: ["action": .string("start")]))
+        #expect(!FairyApprovalPolicy.requiresTouchID(tool: "volume_action", args: ["action": .string("create")]))
+        #expect(!FairyApprovalPolicy.requiresTouchID(tool: "disk_and_prune", args: ["action": .string("usage")]))
+        #expect(!FairyApprovalPolicy.requiresTouchID(tool: "disk_and_prune", args: ["action": .string("prune_dry_run")]))
+        #expect(!FairyApprovalPolicy.requiresTouchID(tool: "snapshots", args: ["action": .string("status")]))
+        for safeCompose in ["config", "ps", "logs", "start", "restart"] {
+            #expect(!FairyApprovalPolicy.requiresTouchID(tool: "compose", args: ["action": .string(safeCompose)]))
+        }
+
+        // Touch ID required operations
+        #expect(FairyApprovalPolicy.requiresTouchID(tool: "container_action", args: ["action": .string("stop")]))
+        #expect(FairyApprovalPolicy.requiresTouchID(tool: "container_action", args: ["action": .string("remove")]))
+        #expect(FairyApprovalPolicy.requiresTouchID(tool: "stack_action", args: ["action": .string("stop")]))
+        #expect(FairyApprovalPolicy.requiresTouchID(tool: "volume_action", args: ["action": .string("remove")]))
+        #expect(FairyApprovalPolicy.requiresTouchID(tool: "disk_and_prune", args: ["action": .string("prune")]))
+        #expect(FairyApprovalPolicy.requiresTouchID(tool: "snapshots", args: ["action": .string("warm")]))
+        #expect(FairyApprovalPolicy.requiresTouchID(tool: "snapshots", args: ["action": .string("clear")]))
+        for gatedCompose in ["up", "down", "stop", "build"] {
+            #expect(FairyApprovalPolicy.requiresTouchID(tool: "compose", args: ["action": .string(gatedCompose)]))
+        }
+        for gatedTool in ["run", "exec", "build", "remove_image", "copy_files", "unknown_future_tool"] {
+            #expect(FairyApprovalPolicy.requiresTouchID(tool: gatedTool, args: [:]), "\(gatedTool) must require Touch ID")
+        }
+    }
+
+    @Test func redactsSecretsByDefaultAndPreservesWhenAsked() {
+        let env = ["APP_ENV=dev", "API_TOKEN=supersecret123", "DB_PASSWORD=pw"]
+        let masked = FairyApprovalPolicy.redactEnv(env, includeValues: false)
+        #expect(masked.allSatisfy { $0.contains("[redacted") })
+        let revealed = FairyApprovalPolicy.redactEnv(env, includeValues: true)
+        #expect(revealed[0] == "APP_ENV=dev")
+        #expect(revealed[1].contains("[redacted"))
+        #expect(revealed[2].contains("[redacted"))
+    }
+
+    #if os(macOS)
+    @Test func toolServerAndLinkClientRoundTripOverUnixSocket() async throws {
+        let dir = "/tmp/graviton-fairy-test-\(UUID().uuidString.prefix(8))"
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+
+        let toolsSock = "\(dir)/tools.sock"
+        let server = FairyToolServer(socketPath: toolsSock)
+        try server.start { tool, args in
+            return .object(["echo": .string(tool), "filter": args["filter"] ?? .null])
+        }
+        defer { server.stop() }
+
+        let grant = try #require(server.grant())
+        #expect(grant.token.count == 64)
+
+        // Helper speaking single-line JSON over Unix domain socket (matches Node GravitonBridge)
+        func callRaw(_ payload: String) throws -> [String: Any] {
+            let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+            defer { Darwin.close(fd) }
+            var addr = sockaddr_un()
+            addr.sun_family = sa_family_t(AF_UNIX)
+            withUnsafeMutablePointer(to: &addr.sun_path) { raw in
+                raw.withMemoryRebound(to: CChar.self, capacity: 104) { _ = strncpy($0, toolsSock, 103) }
+            }
+            addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+            let rc = withUnsafePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                }
+            }
+            #expect(rc == 0)
+            let bytes = Array((payload + "\n").utf8)
+            _ = bytes.withUnsafeBytes { Darwin.write(fd, $0.baseAddress!, $0.count) }
+            var buf = [UInt8](repeating: 0, count: 4096)
+            let n = Darwin.read(fd, &buf, buf.count)
+            let data = Data(buf[0..<max(0, n)])
+            return try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+
+        // Valid call
+        let ok = try callRaw(#"{"id":1,"token":"\#(grant.token)","tool":"containers","args":{"filter":"running"}}"#)
+        #expect(ok["id"] as? Int == 1)
+        let res = ok["result"] as? [String: Any]
+        #expect(res?["echo"] as? String == "containers" && res?["filter"] as? String == "running")
+
+        // Unknown tool rejected
+        let badTool = try callRaw(#"{"id":2,"token":"\#(grant.token)","tool":"shell_exec","args":{}}"#)
+        #expect((badTool["error"] as? String)?.contains("no tool") == true)
+
+        // Revoked token rejected
+        server.revoke(grant.token)
+        let badToken = try callRaw(#"{"id":3,"token":"\#(grant.token)","tool":"status","args":{}}"#)
+        #expect((badToken["error"] as? String)?.contains("key isn't current") == true)
+
+        // Mock Fairy link server on graviton.sock
+        let fairySock = "\(dir)/graviton.sock"
+        let listenFD = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        var sAddr = sockaddr_un()
+        sAddr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutablePointer(to: &sAddr.sun_path) { raw in
+            raw.withMemoryRebound(to: CChar.self, capacity: 104) { _ = strncpy($0, fairySock, 103) }
+        }
+        sAddr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        let brc = withUnsafePointer(to: &sAddr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(listenFD, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        #expect(brc == 0 && Darwin.listen(listenFD, 4) == 0)
+        let mockThread = Thread {
+            defer { Darwin.close(listenFD) }
+            let conn = Darwin.accept(listenFD, nil, nil)
+            guard conn >= 0 else { return }
+            defer { Darwin.close(conn) }
+            var data = Data()
+            var buf = [UInt8](repeating: 0, count: 4096)
+            while !String(decoding: data, as: UTF8.self).contains("\"type\":\"ask\"") {
+                let n = Darwin.read(conn, &buf, buf.count)
+                if n <= 0 { break }
+                data.append(contentsOf: buf[0..<n])
+            }
+            let replies = [
+                #"{"type":"hello","name":"Fairy"}"#,
+                #"{"type":"text","text":"Working"}"#,
+                #"{"type":"done","text":"All good."}"#,
+            ].joined(separator: "\n") + "\n"
+            let out = Array(replies.utf8)
+            _ = out.withUnsafeBytes { Darwin.write(conn, $0.baseAddress!, $0.count) }
+        }
+        mockThread.start()
+
+        let client = FairyLinkClient(socketPath: fairySock)
+        var events: [FairyLinkEvent] = []
+        for try await ev in client.ask(
+            text: "status?",
+            context: FairyAskContext(host: "This Mac", connection: "live", section: "Containers"),
+            fresh: true,
+            tools: grant,
+            wakeIfNeeded: false
+        ) {
+            events.append(ev)
+        }
+        #expect(events == [.hello(name: "Fairy"), .text("Working"), .done("All good.")])
+    }
+
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["GRAVITON_FAIRY_E2E_SOCKET"] != nil))
+    func crossProcessNodeSwiftE2E() async throws {
+        let fairySock = try #require(ProcessInfo.processInfo.environment["GRAVITON_FAIRY_E2E_SOCKET"])
+        let dir = "/tmp/graviton-fairy-e2e-\(UUID().uuidString.prefix(8))"
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+
+        final class GateState: @unchecked Sendable {
+            private let lock = NSLock()
+            var allowTouchID = false
+            var called: [(tool: String, needsAuth: Bool)] = []
+
+            func record(tool: String, needsAuth: Bool) -> Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                called.append((tool, needsAuth))
+                return allowTouchID
+            }
+
+            func setAllow(_ allowed: Bool) {
+                lock.lock()
+                allowTouchID = allowed
+                lock.unlock()
+            }
+
+            func snapshot() -> [(tool: String, needsAuth: Bool)] {
+                lock.lock()
+                defer { lock.unlock() }
+                return called
+            }
+        }
+
+        let gate = GateState()
+        let toolsSock = "\(dir)/tools.sock"
+        let server = FairyToolServer(socketPath: toolsSock)
+        try server.start { tool, args in
+            let needsAuth = FairyApprovalPolicy.requiresTouchID(tool: tool, args: args)
+            let allowed = gate.record(tool: tool, needsAuth: needsAuth)
+            if needsAuth && !allowed {
+                throw EngineError.daemon("Touch ID approval denied by user.")
+            }
+            switch tool {
+            case "status":
+                return .object(["host": .string("e2e-mac"), "running": .int(4)])
+            case "container_action":
+                return .object(["removed": args["container"] ?? .null])
+            default:
+                throw EngineError.daemon("Unexpected E2E tool: \(tool)")
+            }
+        }
+        defer { server.stop() }
+
+        let client = FairyLinkClient(socketPath: fairySock)
+
+        // Turn 1: read auto-runs while Touch ID gated mutation denies cleanly
+        gate.setAllow(false)
+        let grant1 = try #require(server.grant())
+        var events1: [FairyLinkEvent] = []
+        for try await ev in client.ask(
+            text: "check status and remove api-gateway",
+            context: FairyAskContext(host: "e2e-mac", connection: "live", section: "Containers"),
+            fresh: true,
+            tools: grant1,
+            wakeIfNeeded: false
+        ) {
+            events1.append(ev)
+        }
+        server.revoke(grant1.token)
+        #expect(events1.contains(.hello(name: "Fairy")))
+        let done1 = try #require(events1.compactMap { if case let .done(t) = $0 { return t }; return nil }.first)
+        #expect(done1.contains("e2e-mac"))
+        #expect(done1.contains("Touch ID approval denied by user."))
+
+        // Turn 2: fresh token + approved Touch ID allows remove to execute
+        gate.setAllow(true)
+        let grant2 = try #require(server.grant())
+        var events2: [FairyLinkEvent] = []
+        for try await ev in client.ask(
+            text: "now remove api-gateway",
+            context: FairyAskContext(host: "e2e-mac", connection: "live", section: "Containers"),
+            fresh: false,
+            tools: grant2,
+            wakeIfNeeded: false
+        ) {
+            events2.append(ev)
+        }
+        server.revoke(grant2.token)
+        let done2 = try #require(events2.compactMap { if case let .done(t) = $0 { return t }; return nil }.first)
+        #expect(done2.contains("e2e-mac"))
+        #expect(done2.contains("api-gateway"))
+
+        let calls = gate.snapshot()
+        #expect(calls.count == 4)
+        #expect(calls[0].tool == "status" && !calls[0].needsAuth)
+        #expect(calls[1].tool == "container_action" && calls[1].needsAuth)
+        #expect(calls[2].tool == "status" && !calls[2].needsAuth)
+        #expect(calls[3].tool == "container_action" && calls[3].needsAuth)
+
+        // Revoked token is immediately rejected by FairyToolServer
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        defer { Darwin.close(fd) }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutablePointer(to: &addr.sun_path) { raw in
+            raw.withMemoryRebound(to: CChar.self, capacity: 104) { _ = strncpy($0, toolsSock, 103) }
+        }
+        addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        let rc = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        #expect(rc == 0)
+        let payload = Array((#"{"id":99,"token":"\#(grant2.token)","tool":"status","args":{}}"# + "\n").utf8)
+        _ = payload.withUnsafeBytes { Darwin.write(fd, $0.baseAddress!, $0.count) }
+        var buf = [UInt8](repeating: 0, count: 4096)
+        let n = Darwin.read(fd, &buf, buf.count)
+        let revokedResp = try #require(try JSONSerialization.jsonObject(with: Data(buf[0..<max(0, n)])) as? [String: Any])
+        #expect((revokedResp["error"] as? String)?.contains("key isn't current") == true)
+    }
+    #endif
+}
+
+@Suite struct FairyHistoryTests {
+    @Test func saveLoadSanitizesInterruptedAndEnforcesPermissions() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "graviton-fairy-hist-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appending(path: "fairy-history.json")
+        let store = FairyHistoryStore(url: fileURL)
+
+        let t1 = Date(timeIntervalSince1970: 1_700_000_100)
+        let t2 = Date(timeIntervalSince1970: 1_700_000_200)
+        let stepDone = FairyToolStep(tool: "container_action", title: "Remove old-api", status: .done, touchIDVerified: true)
+        let stepRunning = FairyToolStep(tool: "logs", title: "Read logs", status: .running)
+        let stepWaiting = FairyToolStep(tool: "prune", title: "Prune storage", status: .waitingTouchID)
+
+        let oldConv = FairyConversation(
+            title: "Older thread",
+            hostName: "This Mac",
+            createdAt: t1,
+            updatedAt: t1,
+            messages: [
+                FairyChatMessage(role: .user, text: "Check logs"),
+                FairyChatMessage(role: .assistant, text: "Working on it", steps: [stepRunning, stepWaiting]),
+            ]
+        )
+        let newConv = FairyConversation(
+            title: "Clean up old-api on mini",
+            hostName: "mini",
+            createdAt: t2,
+            updatedAt: t2,
+            messages: [
+                FairyChatMessage(role: .user, text: "Remove old-api"),
+                FairyChatMessage(role: .assistant, text: "Removed cleanly.", steps: [stepDone]),
+            ]
+        )
+
+        try store.save(FairyHistorySnapshot(activeConversationID: oldConv.id, conversations: [oldConv, newConv]))
+        let attrs = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+        let perms = attrs[.posixPermissions] as? NSNumber
+        #expect(perms?.intValue == 0o600)
+
+        let loaded = store.load()
+        #expect(loaded.activeConversationID == oldConv.id)
+        #expect(loaded.conversations.map(\.id) == [newConv.id, oldConv.id])
+        #expect(loaded.conversations[0].messages[1].steps[0].touchIDVerified == true)
+        #expect(loaded.conversations[0].messages[1].steps[0].status == .done)
+
+        let restoredSteps = loaded.conversations[1].messages[1].steps
+        #expect(restoredSteps[0].status == .failed && restoredSteps[0].note == "Interrupted")
+        #expect(restoredSteps[1].status == .failed && restoredSteps[1].note == "Interrupted")
+
+        // Corrupt JSON recovers cleanly without crashing
+        let corruptURL = dir.appending(path: "corrupt.json")
+        try Data("{not json".utf8).write(to: corruptURL)
+        let empty = FairyHistoryStore(url: corruptURL).load()
+        #expect(empty.conversations.isEmpty)
+        #expect(empty.activeConversationID == nil)
+    }
+
+    @Test func helpersDeriveTitleFilterAndBuildContinuationSummary() {
+        #expect(FairyHistoryStore.deriveTitle(from: "   \n  ") == "New conversation")
+        #expect(FairyHistoryStore.deriveTitle(from: "  Check   running\n containers  ") == "Check running containers")
+        let longTitle = FairyHistoryStore.deriveTitle(from: String(repeating: "a", count: 90))
+        #expect(longTitle.count == 64 && longTitle.hasSuffix("…"))
+
+        let convA = FairyConversation(
+            title: "Restart redis on mini",
+            hostName: "mini",
+            messages: [
+                FairyChatMessage(role: .user, text: "Please restart redis"),
+                FairyChatMessage(role: .assistant, text: "Done.", steps: [
+                    FairyToolStep(tool: "container_action", title: "Restart redis", status: .done),
+                ]),
+            ]
+        )
+        let convB = FairyConversation(
+            title: "Disk usage check",
+            hostName: "This Mac",
+            messages: [
+                FairyChatMessage(role: .user, text: "How much space is reclaimable?"),
+                FairyChatMessage(role: .assistant, text: "420 MB build cache."),
+            ]
+        )
+
+        #expect(FairyHistoryStore.filter([convA, convB], query: "").count == 2)
+        #expect(FairyHistoryStore.filter([convA, convB], query: "mini").map(\.id) == [convA.id])
+        #expect(FairyHistoryStore.filter([convA, convB], query: "420 MB").map(\.id) == [convB.id])
+        #expect(FairyHistoryStore.filter([convA, convB], query: "container_action").map(\.id) == [convA.id])
+
+        #expect(FairyHistoryStore.continuationSummary(for: []) == nil)
+        let recap = FairyHistoryStore.continuationSummary(for: [
+            FairyChatMessage(role: .user, text: "First prompt"),
+            FairyChatMessage(role: .error, text: "Transient error should be excluded"),
+            FairyChatMessage(role: .assistant, text: "First reply", steps: [
+                FairyToolStep(tool: "status", title: "Check status", status: .done),
+            ]),
+        ], maxChars: 500)
+        #expect(recap?.contains("User: First prompt") == true)
+        #expect(recap?.contains("Fairy [1 tool steps]: First reply") == true)
+        #expect(recap?.contains("Transient error") == false)
+    }
+}

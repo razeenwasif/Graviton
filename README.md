@@ -34,7 +34,7 @@ apps/
   project.yml      XcodeGen spec → Graviton.xcodeproj (generated, not committed)
   GravitonKit/     Shared Swift package: models, socket client, demo engine, theme, components
   Shared/          Swift shared by both apps: shell sessions drawn by SwiftTerm
-  Mac/             macOS app (Containers, Run sheet, Logs, Terminal, Stats, Files, Inspect, Images + Pull/Build/Clean Up sheets, Volumes, Networks, menu bar item)
+  Mac/             macOS app (Containers, Run sheet, Logs, Terminal, Stats, Files, Inspect, Images + Pull/Build/Clean Up sheets, Volumes, Networks, Fairy AI panel, menu bar item)
   iOS/             iOS companion (Containers, Detail, Logs, Shell, Stats, Files, Inspect, Run + Pull sheets, Activity, Hosts)
 scripts/
   build-kernel.sh  Build custom Linux 6.12-graviton arm64 kernel (zero modules, ~8.2 MiB) inside Graviton
@@ -144,6 +144,29 @@ cargo run -p grav -- compose down -v            # tear down stack and project-ow
   iPhone apps group Compose containers into collapsible **Stacks** with
   one-click stack Start/Stop/Restart controls and show Stack/Service/Labels in
   Inspect.
+- **Fairy AI agent (`⌥⌘I`)**: open **Ask Fairy** from the Mac app's sidebar
+  or press `⌥⌘I` to inspect and drive Graviton through your local `Fairy.app`
+  (works with both full Fairy and Fairy Face) across both this Mac and paired
+  remote Macs (such as `mini`). Graviton connects to Fairy over
+  `~/Library/Application Support/lyra-companion/lyra/graviton.sock`, issues a
+  64-hex-char per-turn token on its private `0600` socket
+  (`~/Library/Application Support/Graviton/fairy-tools.sock`), saves
+  conversations locally in `~/Library/Application Support/Graviton/fairy-history.json`
+  (`0600`) with past-conversation search, resume, transcript copy, and delete
+  controls, speaks replies aloud by default (via `gemini-4-neon-high`), exposes
+  25 tools (status, events, host switching, UI navigation, containers, inspect
+  with secret redaction, logs, stats, container/stack actions, `run`, `exec`,
+  files/copy, images, pull, build, volumes, networks, Compose, `df`/`prune`,
+  and VM snapshots), and enforces a **tiered Touch ID policy** inside Graviton
+  (`LocalAuthentication` + inline Approval Card; fail-closed for unknown actions):
+  - **Auto-run (no Touch ID):** all read queries plus safe reversible ops
+    (`start`/`restart` container or stack, `compose start`/`restart`/`config`/`ps`/`logs`,
+    `pull`, `volume_action create`, `disk_and_prune usage`/`prune_dry_run`,
+    `snapshots status`, `switch_host`, and `navigate`).
+  - **Touch ID required:** `stop`/`remove` container, `stop` stack, `run`,
+    `exec`, `build`, `remove_image`, `remove` volume, `copy_files`,
+    `disk_and_prune prune`, `snapshots warm`/`clear`, and
+    `compose up`/`down`/`stop`/`build`.
 - `scripts/install-launch-agent.sh` installs gravitond as a launch agent so it
   starts at login (`--remote` to accept phones, `--uninstall` to remove it).
 

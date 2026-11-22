@@ -844,3 +844,55 @@ public struct NetworkInfo: Codable, Hashable, Sendable {
         )
     }
 }
+
+/// Cached VM memory snapshot pool for one VM shape (`grav snapshot status`).
+public struct SnapshotGroup: Codable, Hashable, Sendable {
+    public var cpus: UInt32
+    public var memoryMib: UInt64
+    public var rosetta: Bool
+    public var slots: UInt32
+    public var inUse: UInt32
+    public var sizeBytes: UInt64
+
+    public init(cpus: UInt32, memoryMib: UInt64, rosetta: Bool, slots: UInt32, inUse: UInt32, sizeBytes: UInt64) {
+        self.cpus = cpus
+        self.memoryMib = memoryMib
+        self.rosetta = rosetta
+        self.slots = slots
+        self.inUse = inUse
+        self.sizeBytes = sizeBytes
+    }
+}
+
+/// Summary of the daemon's VM snapshot pool (`grav snapshot status|warm|clear`).
+public struct SnapshotInfo: Codable, Hashable, Sendable {
+    public var enabled: Bool
+    public var totalSlots: UInt32
+    public var inUse: UInt32
+    public var totalBytes: UInt64
+    public var maxSlotsPerShape: UInt32
+    public var groups: [SnapshotGroup]
+
+    public init(enabled: Bool = true, totalSlots: UInt32 = 0, inUse: UInt32 = 0, totalBytes: UInt64 = 0,
+                maxSlotsPerShape: UInt32 = 8, groups: [SnapshotGroup] = []) {
+        self.enabled = enabled
+        self.totalSlots = totalSlots
+        self.inUse = inUse
+        self.totalBytes = totalBytes
+        self.maxSlotsPerShape = maxSlotsPerShape
+        self.groups = groups
+    }
+}
+
+/// Result of running a non-interactive command inside a running container (`grav exec`).
+public struct ExecResult: Hashable, Sendable {
+    public var exitCode: Int32
+    public var output: String
+    public var truncated: Bool
+
+    public init(exitCode: Int32, output: String, truncated: Bool = false) {
+        self.exitCode = exitCode
+        self.output = output
+        self.truncated = truncated
+    }
+}

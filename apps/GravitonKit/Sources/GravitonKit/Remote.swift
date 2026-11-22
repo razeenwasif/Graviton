@@ -588,6 +588,56 @@ public actor RemoteEngine: EngineService {
         try await RemoteTerminal.open(host: host, token: token, spec: spec)
     }
 
+    public nonisolated func execCommand(id: String, command: [String], env: [String] = [], timeout: Int = 120) async throws -> ExecResult {
+        let spec = ExecSpec(id: id, command: command, tty: false, rows: 0, cols: 0, env: env)
+        let host = self.host, token = self.token
+        return try await Task.detached {
+            let c = try await LineConnection.open(host.endpoints, pin: host.fingerprint)
+            defer { c.cancel() }
+            guard case .authenticated = try await c.call(.auth(token: token)) else { throw EngineError.unexpectedResponse }
+            try await c.send(Wire.line(.exec(spec)))
+            var out = Data()
+            let maxBytes = 128 * 1024
+            var truncated = false
+            while true {
+                try Task.checkCancellation()
+                switch try Wire.decoder.decode(EngineResponse.self, from: try await c.readLine()) {
+                case let .execOutput(_, bytes):
+                    if out.count < maxBytes {
+                        let take = min(bytes.count, maxBytes - out.count)
+                        out.append(contentsOf: bytes[..<take])
+                        if take < bytes.count { truncated = true }
+                    } else {
+                        truncated = true
+                    }
+                case let .execExited(code):
+                    return ExecResult(exitCode: code, output: String(decoding: out, as: UTF8.self), truncated: truncated)
+                case let .error(message):
+                    throw EngineError.daemon(message)
+                default:
+                    throw EngineError.unexpectedResponse
+                }
+            }
+        }.value
+    }
+
+    public func snapshotStatus() async throws -> SnapshotInfo {
+        guard case let .snapshots(info) = try await call(.snapshotStatus) else { throw EngineError.unexpectedResponse }
+        return info
+    }
+
+    public func snapshotWarm(cpus: UInt32? = nil, memoryMib: UInt64? = nil, rosetta: Bool = false, slots: UInt32? = nil) async throws -> SnapshotInfo {
+        guard case let .snapshots(info) = try await separately(.snapshotWarm(cpus: cpus, memoryMib: memoryMib, rosetta: rosetta, slots: slots)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return info
+    }
+
+    public func snapshotClear() async throws -> SnapshotInfo {
+        guard case let .snapshots(info) = try await call(.snapshotClear) else { throw EngineError.unexpectedResponse }
+        return info
+    }
+
     private func container(_ request: EngineRequest) async throws -> Container {
         guard case let .container(c) = try await call(request) else { throw EngineError.unexpectedResponse }
         return c

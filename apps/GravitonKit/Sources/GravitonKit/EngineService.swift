@@ -55,6 +55,14 @@ public protocol EngineService: Sendable {
     func inspect(id: String) async throws -> ContainerDetails
     /// Start a program on a terminal in a running container.
     func openTerminal(_ spec: ExecSpec) async throws -> any TerminalSession
+    /// Run a non-interactive command inside a running container and capture its combined output.
+    func execCommand(id: String, command: [String], env: [String], timeout: Int) async throws -> ExecResult
+    /// Inspect cached VM snapshot slots.
+    func snapshotStatus() async throws -> SnapshotInfo
+    /// Pre-warm one or more VM snapshot slots.
+    func snapshotWarm(cpus: UInt32?, memoryMib: UInt64?, rosetta: Bool, slots: UInt32?) async throws -> SnapshotInfo
+    /// Remove idle cached VM snapshots from disk.
+    func snapshotClear() async throws -> SnapshotInfo
     /// Recent events after `since` (oldest first), at most `limit`.
     func events(since: UInt64?, limit: Int?) async throws -> [EngineEvent]
 }
@@ -304,6 +312,69 @@ public final class SocketEngine: EngineService {
     public func openTerminal(_ spec: ExecSpec) async throws -> any TerminalSession {
         let path = self.path
         return try await Task.detached { try SocketTerminal(path: path, spec: spec) }.value
+    }
+
+    public func execCommand(id: String, command: [String], env: [String] = [], timeout: Int = 120) async throws -> ExecResult {
+        let path = self.path
+        let spec = ExecSpec(id: id, command: command, tty: false, rows: 0, cols: 0, env: env)
+        return try await Task.detached {
+            let fd = try Self.connect(path: path)
+            defer { close(fd) }
+            var limit = timeval(tv_sec: timeout, tv_usec: 0)
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &limit, socklen_t(MemoryLayout<timeval>.size))
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &limit, socklen_t(MemoryLayout<timeval>.size))
+            try Self.writeAll(fd, Array(try Wire.line(.exec(spec))))
+
+            var buffer = Data()
+            var chunk = [UInt8](repeating: 0, count: 64 * 1024)
+            var out = Data()
+            let maxBytes = 128 * 1024
+            var truncated = false
+            while true {
+                while let nl = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                    let line = Data(buffer[buffer.startIndex..<nl])
+                    buffer.removeSubrange(buffer.startIndex...nl)
+                    switch try Wire.decoder.decode(EngineResponse.self, from: line) {
+                    case let .execOutput(_, bytes):
+                        if out.count < maxBytes {
+                            let take = min(bytes.count, maxBytes - out.count)
+                            out.append(contentsOf: bytes[..<take])
+                            if take < bytes.count { truncated = true }
+                        } else {
+                            truncated = true
+                        }
+                    case let .execExited(code):
+                        let text = String(decoding: out, as: UTF8.self)
+                        return ExecResult(exitCode: code, output: text, truncated: truncated)
+                    case let .error(message):
+                        throw EngineError.daemon(message)
+                    default:
+                        throw EngineError.unexpectedResponse
+                    }
+                }
+                let n = read(fd, &chunk, chunk.count)
+                if n < 0 { throw EngineError.io(String(cString: strerror(errno))) }
+                if n == 0 { throw EngineError.io("gravitond closed the connection") }
+                buffer.append(contentsOf: chunk[0..<n])
+            }
+        }.value
+    }
+
+    public func snapshotStatus() async throws -> SnapshotInfo {
+        guard case let .snapshots(info) = try await call(.snapshotStatus, timeout: 15) else { throw EngineError.unexpectedResponse }
+        return info
+    }
+
+    public func snapshotWarm(cpus: UInt32? = nil, memoryMib: UInt64? = nil, rosetta: Bool = false, slots: UInt32? = nil) async throws -> SnapshotInfo {
+        guard case let .snapshots(info) = try await call(.snapshotWarm(cpus: cpus, memoryMib: memoryMib, rosetta: rosetta, slots: slots), timeout: 120) else {
+            throw EngineError.unexpectedResponse
+        }
+        return info
+    }
+
+    public func snapshotClear() async throws -> SnapshotInfo {
+        guard case let .snapshots(info) = try await call(.snapshotClear, timeout: 30) else { throw EngineError.unexpectedResponse }
+        return info
     }
 
     /// Build an image from a Dockerfile; the stream carries the log, then the image.

@@ -172,7 +172,15 @@ public final class EngineStore {
 
     /// Pull an image. Throws so a sheet can show the error in place.
     @discardableResult
-    public func pull(_ reference: String) async throws -> ImageInfo {
+    public func pull(_ reference: String, platform: String? = nil) async throws -> ImageInfo {
+        if let platform, !platform.isEmpty {
+            var pulled: ImageInfo?
+            for try await event in pullStream(reference, platform: platform) {
+                if case let .pulled(image) = event { pulled = image }
+            }
+            guard let pulled else { throw EngineError.unexpectedResponse }
+            return pulled
+        }
         let image = try await service.pull(reference: reference)
         await refresh()
         return image
@@ -242,7 +250,13 @@ public final class EngineStore {
     /// Remove an image no container uses; returns the bytes freed.
     @discardableResult
     public func removeImage(_ image: ImageInfo) async throws -> UInt64 {
-        let freed = try await service.removeImage(reference: image.reference)
+        try await removeImage(reference: image.reference)
+    }
+
+    /// Remove an image by reference string; returns the bytes freed.
+    @discardableResult
+    public func removeImage(reference: String) async throws -> UInt64 {
+        let freed = try await service.removeImage(reference: reference)
         await refresh()
         return freed
     }
@@ -295,6 +309,14 @@ public final class EngineStore {
     public func readFile(in id: String, path: String) async throws -> FileContents { try await service.readFile(id: id, path: path) }
     public func inspect(_ id: String) async throws -> ContainerDetails { try await service.inspect(id: id) }
     public func openTerminal(_ spec: ExecSpec) async throws -> any TerminalSession { try await service.openTerminal(spec) }
+    public func execCommand(id: String, command: [String], env: [String] = [], timeout: Int = 120) async throws -> ExecResult {
+        try await service.execCommand(id: id, command: command, env: env, timeout: timeout)
+    }
+    public func snapshotStatus() async throws -> SnapshotInfo { try await service.snapshotStatus() }
+    public func snapshotWarm(cpus: UInt32? = nil, memoryMib: UInt64? = nil, rosetta: Bool = false, slots: UInt32? = nil) async throws -> SnapshotInfo {
+        try await service.snapshotWarm(cpus: cpus, memoryMib: memoryMib, rosetta: rosetta, slots: slots)
+    }
+    public func snapshotClear() async throws -> SnapshotInfo { try await service.snapshotClear() }
 
     /// File uploads and downloads need a real gravitond (local or remote).
     public var canTransferFiles: Bool { connection == .live && (live is SocketEngine || live is RemoteEngine) }
@@ -335,6 +357,29 @@ public final class EngineStore {
     public func start(_ c: Container) async { await lifecycle { try await $0.start(id: c.id) } }
     public func stop(_ c: Container) async { await lifecycle { try await $0.stop(id: c.id) } }
     public func restart(_ c: Container) async { await lifecycle { try await $0.restart(id: c.id) } }
+
+    /// Throwing lifecycle variants for programmatic callers (e.g. Fairy) that surface errors inline.
+    @discardableResult
+    public func performStart(_ c: Container) async throws -> Container { try await throwingLifecycle { try await $0.start(id: c.id) } }
+    @discardableResult
+    public func performStop(_ c: Container) async throws -> Container { try await throwingLifecycle { try await $0.stop(id: c.id) } }
+    @discardableResult
+    public func performRestart(_ c: Container) async throws -> Container { try await throwingLifecycle { try await $0.restart(id: c.id) } }
+    @discardableResult
+    public func performRemove(_ c: Container) async throws -> String {
+        let removed = try await service.remove(id: c.id)
+        logs[c.id] = nil
+        await refresh()
+        if volumesLoaded { await loadVolumes() }
+        return removed
+    }
+
+    private func throwingLifecycle(_ action: (any EngineService) async throws -> Container) async throws -> Container {
+        let updated = try await action(service)
+        if let i = containers.firstIndex(where: { $0.id == updated.id }) { containers[i] = updated }
+        await refresh()
+        return updated
+    }
 
     /// Start all stopped containers belonging to Compose project `project`.
     public func startStack(_ project: String) async {

@@ -369,6 +369,27 @@ public actor DemoEngine: EngineService {
         return DemoTerminal(container: c.name)
     }
 
+    public func execCommand(id: String, command: [String], env: [String] = [], timeout: Int = 120) throws -> ExecResult {
+        let c = list[try resolve(id)]
+        guard c.isRunning else { throw EngineError.daemon("container \(c.name) isn't running") }
+        return ExecResult(exitCode: 0, output: "(demo) executed \(command.joined(separator: " ")) inside \(c.name)\n", truncated: false)
+    }
+
+    public func snapshotStatus() -> SnapshotInfo {
+        SnapshotInfo(enabled: true, totalSlots: 2, inUse: 0, totalBytes: 27 * 1024 * 1024, maxSlotsPerShape: 8,
+                     groups: [SnapshotGroup(cpus: 2, memoryMib: 1024, rosetta: false, slots: 2, inUse: 0, sizeBytes: 27 * 1024 * 1024)])
+    }
+
+    public func snapshotWarm(cpus: UInt32? = nil, memoryMib: UInt64? = nil, rosetta: Bool = false, slots: UInt32? = nil) -> SnapshotInfo {
+        let count = max(1, min(8, slots ?? 1))
+        return SnapshotInfo(enabled: true, totalSlots: count, inUse: 0, totalBytes: UInt64(count) * 14 * 1024 * 1024, maxSlotsPerShape: 8,
+                            groups: [SnapshotGroup(cpus: cpus ?? 2, memoryMib: memoryMib ?? 1024, rosetta: rosetta, slots: count, inUse: 0, sizeBytes: UInt64(count) * 14 * 1024 * 1024)])
+    }
+
+    public func snapshotClear() -> SnapshotInfo {
+        SnapshotInfo(enabled: true, totalSlots: 0, inUse: 0, totalBytes: 0, maxSlotsPerShape: 8, groups: [])
+    }
+
     public func events(since: UInt64?, limit: Int?) -> [EngineEvent] {
         let now = UInt64(Date.now.timeIntervalSince1970 * 1000)
         let min: UInt64 = 60_000

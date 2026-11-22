@@ -44,13 +44,17 @@ struct ContainersScreen: View {
                 filter = .all
                 selection = id
                 route = ContainerRoute(id: id, tab: tab)
-            case .images, .pairMac, nil:
+            case .containers, .images, .volumes, .networks, .pairMac, nil:
                 return
             }
             router.pending = nil
         }
         .onAppear {
             if selection == nil { selection = store.containers.first(where: \.isRunning)?.id }
+            router.selectedContainerID = selection
+        }
+        .onChange(of: selection) { _, newValue in
+            router.selectedContainerID = newValue
         }
         .onChange(of: store.containers.map(\.id)) {
             if selection == nil { selection = store.containers.first(where: \.isRunning)?.id }

@@ -9,13 +9,19 @@ final class AppRouter {
     enum Request: Equatable {
         case runContainer
         case container(String, DetailTab)
+        case containers
         case images
+        case volumes
+        case networks
         /// Open the Pair a Mac sheet.
         case pairMac
     }
 
-    /// Set by the menu bar panel; the screen that handles it sets it back to `nil`.
+    /// Set by the menu bar panel or Fairy; the screen that handles it sets it back to `nil`.
     var pending: Request?
+    /// Updated by the main window so Fairy knows the active screen and selected container.
+    var activeSection: String = "Containers"
+    var selectedContainerID: String?
 }
 
 /// The menu bar item: the Graviton glyph, plus the running count if that's turned on.

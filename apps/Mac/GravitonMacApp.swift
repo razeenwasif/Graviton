@@ -8,6 +8,7 @@ struct GravitonMacApp: App {
     @State private var hosts: SharedHosts
     @State private var router = AppRouter()
     @State private var dialogs = Dialogs()
+    @State private var fairy: FairyController
     @AppStorage("showsMenuBarExtra") private var showsMenuBarExtra = true
 
     init() {
@@ -15,12 +16,17 @@ struct GravitonMacApp: App {
         let demo = ProcessInfo.processInfo.environment["GRAVITON_DEMO"] == "1"
         let store = EngineStore(useDaemon: !demo)
         let hosts = SharedHosts()
+        let shells = ShellSessions()
+        let router = AppRouter()
         // Show the Mac picked last time.
         if !demo, let mac = hosts.current {
             store.use(RemoteEngine(host: mac.remoteHost, token: mac.token), named: mac.name)
         }
         _store = State(initialValue: store)
         _hosts = State(initialValue: hosts)
+        _shells = State(initialValue: shells)
+        _router = State(initialValue: router)
+        _fairy = State(initialValue: FairyController(store: store, hosts: hosts, shells: shells, router: router))
         // Poll for the app's whole life, not just while a window is open: the menu bar item shows it too.
         Task { await store.run() }
     }
@@ -33,6 +39,7 @@ struct GravitonMacApp: App {
                 .environment(router)
                 .environment(hosts)
                 .environment(dialogs)
+                .environment(fairy)
                 .preferredColorScheme(.dark)
                 .tint(G.accent)
                 .frame(minWidth: 980, minHeight: 620)
@@ -43,6 +50,10 @@ struct GravitonMacApp: App {
             CommandGroup(after: .toolbar) {
                 Button("Refresh") { Task { await store.refresh() } }
                     .keyboardShortcut("r")
+                Button(fairy.isOpen ? "Hide Fairy" : "Ask Fairy") {
+                    withAnimation(.snappy(duration: 0.22)) { fairy.toggle() }
+                }
+                .keyboardShortcut("i", modifiers: [.command, .option])
                 Toggle("Show in Menu Bar", isOn: $showsMenuBarExtra)
             }
             HostCommands(store: store, hosts: hosts, shells: shells, router: router)
@@ -78,6 +89,7 @@ struct RootView: View {
     @Environment(EngineStore.self) private var store
     @Environment(AppRouter.self) private var router
     @Environment(Dialogs.self) private var dialogs
+    @Environment(FairyController.self) private var fairy
     @State private var section: Section = .containers
     @State private var pairing = false
     @Environment(SharedHosts.self) private var hosts
@@ -100,14 +112,34 @@ struct RootView: View {
             .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
             .clipped()
             .background(G.background)
+
+            if fairy.isOpen {
+                Rectangle().fill(G.border).frame(width: 1)
+                FairyPanel()
+                    .frame(width: 390)
+                    .transition(.move(edge: .trailing))
+            }
         }
+        .animation(.snappy(duration: 0.22), value: fairy.isOpen)
         .background(G.background)
         .ignoresSafeArea()
         .gravitonDialogs(dialogs)
+        .onChange(of: section, initial: true) { _, newValue in
+            router.activeSection = newValue.rawValue
+        }
         .onChange(of: router.pending, initial: true) { _, request in
             switch request {
+            case .containers:
+                section = .containers
+                router.pending = nil
             case .images:
                 section = .images
+                router.pending = nil
+            case .volumes:
+                section = .volumes
+                router.pending = nil
+            case .networks:
+                section = .networks
                 router.pending = nil
             case .runContainer, .container:
                 section = .containers // ContainersScreen handles the rest.
@@ -131,6 +163,7 @@ struct RootView: View {
 
 struct Sidebar: View {
     @Environment(EngineStore.self) private var store
+    @Environment(FairyController.self) private var fairy
     @Binding var selection: Section
 
     var body: some View {
@@ -161,6 +194,7 @@ struct Sidebar: View {
             .padding(.horizontal, 10)
 
             Spacer(minLength: 12)
+            FairySidebarButton().padding(.horizontal, 12).padding(.bottom, 8)
             EngineCard().padding(12)
         }
         .frame(maxHeight: .infinity, alignment: .top)
@@ -266,5 +300,43 @@ struct EngineCard: View {
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .gravitonCard(Color(hex: 0x15161A))
+    }
+}
+
+private struct FairySidebarButton: View {
+    @Environment(FairyController.self) private var fairy
+    @State private var hovering = false
+
+    var body: some View {
+        Button {
+            withAnimation(.snappy(duration: 0.22)) { fairy.toggle() }
+        } label: {
+            HStack(spacing: 9) {
+                FairyEyeMark(size: 16, color: fairy.isOpen || fairy.pendingApproval != nil ? G.accent : G.muted)
+                Text("Ask \(fairy.fairyName)")
+                    .font(.system(size: 12.5, weight: fairy.isOpen ? .semibold : .medium))
+                    .foregroundStyle(fairy.isOpen ? G.text : G.textSecondary)
+                Spacer()
+                if fairy.pendingApproval != nil {
+                    Circle().fill(G.warning).frame(width: 7, height: 7)
+                } else {
+                    Text("⌥⌘I").font(G.mono(10.5)).foregroundStyle(G.faint)
+                }
+            }
+            .padding(.horizontal, 11)
+            .frame(height: 34)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(fairy.isOpen ? G.accent.opacity(0.14) : (hovering ? Color.white.opacity(0.04) : Color(hex: 0x15161A)))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(fairy.isOpen ? G.accent.opacity(0.35) : G.border)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help("Open or close the Fairy agent panel (⌥⌘I)")
     }
 }
