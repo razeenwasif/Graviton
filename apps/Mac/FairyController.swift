@@ -493,8 +493,10 @@ final class FairyController {
 
     private func buildContext(continuation: String? = nil) -> FairyAskContext {
         let selected = store.container(router.selectedContainerID)
+        let pausedCount = store.containers.filter(\.isPaused).count
+        let pausedSuffix = pausedCount > 0 ? ", \(pausedCount) paused" : ""
         var summaryItems = [
-            "Containers: \(store.runningCount) running / \(store.containers.count) total",
+            "Containers: \(store.runningCount) running\(pausedSuffix) / \(store.containers.count) total",
             "Stacks: \(store.stacks.map { "\($0.name) (\($0.runningCount)/\($0.containers.count))" }.joined(separator: ", "))",
             "Images: \(store.images.count) · Volumes: \(store.volumes.count)",
         ]
@@ -685,12 +687,17 @@ final class FairyController {
             await store.refresh()
             let filterStr = args["filter"]?.stringValue?.lowercased() ?? "all"
             let project = args["project"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let filter: ContainerFilter = switch filterStr {
-            case "running": .running
-            case "stopped": .stopped
-            default: .all
+            var items: [Container]
+            if filterStr == "paused" {
+                items = store.containers.filter(\.isPaused)
+            } else {
+                let filter: ContainerFilter = switch filterStr {
+                case "running": .running
+                case "stopped": .stopped
+                default: .all
+                }
+                items = filter.apply(store.containers)
             }
-            var items = filter.apply(store.containers)
             if let project, !project.isEmpty {
                 items = items.filter { $0.project == project }
             }
@@ -741,6 +748,12 @@ final class FairyController {
             case "restart":
                 let updated = try await store.performRestart(c)
                 return try FairyJSON.fromEncodable(updated)
+            case "pause":
+                let updated = try await store.performPause(c)
+                return try FairyJSON.fromEncodable(updated)
+            case "unpause":
+                let updated = try await store.performUnpause(c)
+                return try FairyJSON.fromEncodable(updated)
             case "remove":
                 let removed = try await store.performRemove(c)
                 return .object(["removed_id": .string(removed), "name": .string(c.name)])
@@ -777,6 +790,7 @@ final class FairyController {
 
         case "exec":
             let c = try resolveContainer(try requireString(args, "container"))
+            if c.isPaused { throw EngineError.daemon("Container \(c.name) is paused; unpause it first.") }
             guard c.isRunning else { throw EngineError.daemon("Container \(c.name) isn't running.") }
             guard let command = args["command"]?.stringArrayValue, !command.isEmpty else {
                 throw EngineError.daemon("`command` must be a non-empty array of strings.")
@@ -1023,6 +1037,13 @@ final class FairyController {
             argv.append(contentsOf: ["ps", "-a"])
         case "logs":
             argv.append("logs")
+            if args["timestamps"]?.boolValue == true { argv.append("-t") }
+            if let since = args["since"]?.stringValue, !since.isEmpty {
+                argv.append(contentsOf: ["--since", since])
+            }
+            if let until = args["until"]?.stringValue, !until.isEmpty {
+                argv.append(contentsOf: ["--until", until])
+            }
             let tail = args["tail"]?.intValue ?? 50
             argv.append(contentsOf: ["-n", "\(max(1, min(500, tail)))"])
             argv.append(contentsOf: args["services"]?.stringArrayValue ?? [])

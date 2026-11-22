@@ -117,8 +117,8 @@ public enum FairyApprovalPolicy {
     ]
 
     /// Tiered Touch ID gate:
-    /// - Reads & reversible low-risk actions (`start`, `restart`, `pull`, `tag_image`, `create` volume, `navigate`, `switch_host`, dry-runs) run automatically.
-    /// - High-impact execution & destructive mutations (or registry uploads using credentials) require Touch ID approval.
+    /// - Reads & reversible low-risk actions (`start`, `restart`, `unpause`, `pull`, `tag_image`, `create` volume, `navigate`, `switch_host`, dry-runs) run automatically.
+    /// - High-impact execution & destructive mutations (or registry uploads using credentials, plus `pause`) require Touch ID approval.
     /// - Unknown tools/actions fail closed (`true`).
     public static func requiresTouchID(tool: String, args: [String: FairyJSON]) -> Bool {
         let action = args["action"]?.stringValue ?? ""
@@ -127,7 +127,9 @@ public enum FairyApprovalPolicy {
              "list_files", "read_file", "images", "volumes", "network",
              "navigate", "switch_host", "pull", "tag_image":
             return false
-        case "container_action", "stack_action":
+        case "container_action":
+            return !["start", "restart", "unpause"].contains(action)
+        case "stack_action":
             return action != "start" && action != "restart"
         case "volume_action":
             return action != "create"
@@ -207,10 +209,15 @@ public enum FairyApprovalPolicy {
         case "build":
             let ctx = str("context")
             let tag = str("tag")
+            let platform = str("platform")
             destructive = false
             title = "Build \(tag.isEmpty ? ctx : tag)"
-            detail = "Context: \(ctx)" + (reasonArg.isEmpty ? "" : "\n\(reasonArg)")
-            macReason = "let Fairy build an image from \(ctx)\(suffix)"
+            var detailParts = ["Context: \(ctx)"]
+            if !platform.isEmpty { detailParts.append("Platform: \(platform)") }
+            if !reasonArg.isEmpty { detailParts.append(reasonArg) }
+            detail = detailParts.joined(separator: "\n")
+            let platSuffix = platform.isEmpty ? "" : " (\(platform))"
+            macReason = "let Fairy build an image from \(ctx)\(platSuffix)\(suffix)"
         case "compose":
             let act = str("action")
             let dir = str("directory")

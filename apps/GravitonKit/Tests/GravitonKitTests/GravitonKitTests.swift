@@ -572,6 +572,7 @@ import Testing
         }
         #expect(!FairyApprovalPolicy.requiresTouchID(tool: "container_action", args: ["action": .string("start")]))
         #expect(!FairyApprovalPolicy.requiresTouchID(tool: "container_action", args: ["action": .string("restart")]))
+        #expect(!FairyApprovalPolicy.requiresTouchID(tool: "container_action", args: ["action": .string("unpause")]))
         #expect(!FairyApprovalPolicy.requiresTouchID(tool: "stack_action", args: ["action": .string("start")]))
         #expect(!FairyApprovalPolicy.requiresTouchID(tool: "volume_action", args: ["action": .string("create")]))
         #expect(!FairyApprovalPolicy.requiresTouchID(tool: "disk_and_prune", args: ["action": .string("usage")]))
@@ -582,6 +583,7 @@ import Testing
         }
 
         // Touch ID required operations
+        #expect(FairyApprovalPolicy.requiresTouchID(tool: "container_action", args: ["action": .string("pause")]))
         #expect(FairyApprovalPolicy.requiresTouchID(tool: "container_action", args: ["action": .string("stop")]))
         #expect(FairyApprovalPolicy.requiresTouchID(tool: "container_action", args: ["action": .string("remove")]))
         #expect(FairyApprovalPolicy.requiresTouchID(tool: "stack_action", args: ["action": .string("stop")]))
@@ -614,6 +616,29 @@ import Testing
         #expect(!pushSummary.isDestructive)
         #expect(pushSummary.touchIDReason.contains("ghcr.io/me/app:1"))
         #expect(pushSummary.touchIDReason.contains("mini"))
+
+        let pauseSummary = FairyApprovalPolicy.summarize(
+            tool: "container_action",
+            args: ["action": .string("pause"), "container": .string("api"), "reason": .string("freeze load")],
+            host: "mini"
+        )
+        #expect(pauseSummary.title == "Pause container api")
+        #expect(!pauseSummary.isDestructive)
+        #expect(pauseSummary.touchIDReason.contains("pause"))
+        #expect(pauseSummary.touchIDReason.contains("mini"))
+
+        let multiArchBuild = FairyApprovalPolicy.summarize(
+            tool: "build",
+            args: [
+                "context": .string("/tmp/app"),
+                "tag": .string("app:1"),
+                "platform": .string("linux/arm64,linux/amd64"),
+                "reason": .string("multi-arch"),
+            ],
+            host: "local"
+        )
+        #expect(multiArchBuild.detail.contains("Platform: linux/arm64,linux/amd64"))
+        #expect(multiArchBuild.touchIDReason.contains("linux/arm64,linux/amd64"))
     }
 
     @Test func redactsSecretsByDefaultAndPreservesWhenAsked() {

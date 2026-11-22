@@ -273,7 +273,9 @@ impl Remote {
             let backend = backend.clone();
             tokio::spawn(async move {
                 if let Err(err) = remote.session(tcp, backend).await {
-                    eprintln!("remote {peer}: {err:#}");
+                    if !is_benign_disconnect(&err) {
+                        eprintln!("remote {peer}: {err:#}");
+                    }
                 }
             });
         }
@@ -343,6 +345,9 @@ impl Remote {
                 }
                 (Request::Pull { reference, progress: true, platform }, crate::Backend::Engine(engine)) => {
                     crate::pull_stream(Arc::clone(engine), reference.clone(), platform.clone(), &mut write).await?;
+                }
+                (Request::PushImage { reference, progress: true }, crate::Backend::Engine(engine)) => {
+                    crate::push_stream(Arc::clone(engine), reference.clone(), &mut write).await?;
                 }
                 (Request::Build(spec), crate::Backend::Engine(engine)) => {
                     if spec.upload.is_none() {
@@ -520,6 +525,18 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn is_benign_disconnect(err: &anyhow::Error) -> bool {
+    use std::io::ErrorKind;
+    err.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
+            matches!(
+                io_err.kind(),
+                ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::ConnectionAborted
+            )
+        })
+    })
+}
+
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
@@ -536,5 +553,29 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert_eq!(short_fingerprint("3fa2c91b00d4e5f6aa"), "3FA2 C91B 00D4 E5F6");
         assert_eq!(sha256_hex(b"hello").len(), 64);
+    }
+
+    #[test]
+    fn classifies_benign_tls_disconnects() {
+        use std::io::ErrorKind;
+
+        let eof = anyhow::Error::new(std::io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify",
+        ));
+        assert!(is_benign_disconnect(&eof));
+
+        let handshake_eof = anyhow::Error::new(std::io::Error::new(ErrorKind::UnexpectedEof, "tls handshake eof"))
+            .context("reading client hello");
+        assert!(is_benign_disconnect(&handshake_eof));
+
+        for kind in [ErrorKind::ConnectionReset, ErrorKind::BrokenPipe, ErrorKind::ConnectionAborted] {
+            let err = anyhow::Error::new(std::io::Error::new(kind, "peer gone"));
+            assert!(is_benign_disconnect(&err), "expected {kind:?} to be benign");
+        }
+
+        let bad_tls = anyhow::Error::new(std::io::Error::new(ErrorKind::InvalidData, "corrupt TLS frame"));
+        assert!(!is_benign_disconnect(&bad_tls));
+        assert!(!is_benign_disconnect(&anyhow::anyhow!("TLS handshake timed out")));
     }
 }
