@@ -91,10 +91,52 @@ impl Store {
     }
 
     pub fn logs(&self, key: &str, tail: Option<usize>) -> Result<Vec<LogLine>, StoreError> {
+        self.logs_filtered(key, tail, None, None)
+    }
+
+    pub fn logs_filtered(
+        &self,
+        key: &str,
+        tail: Option<usize>,
+        since_ms: Option<u64>,
+        until_ms: Option<u64>,
+    ) -> Result<Vec<LogLine>, StoreError> {
         let c = self.container(key)?;
-        let lines = self.logs.get(&c.id).map(Vec::as_slice).unwrap_or_default();
-        let start = tail.map_or(0, |n| lines.len().saturating_sub(n));
-        Ok(lines[start..].to_vec())
+        if tail == Some(0) {
+            return Ok(Vec::new());
+        }
+        let filtered: Vec<LogLine> = self
+            .logs
+            .get(&c.id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter(|l| matches_log_window(l, since_ms, until_ms))
+            .cloned()
+            .collect();
+        let start = tail.map_or(0, |n| filtered.len().saturating_sub(n));
+        Ok(filtered[start..].to_vec())
+    }
+
+    pub fn last_log_seq(&self, id: &str) -> u64 {
+        self.logs.get(id).and_then(|v| v.last()).map_or(0, |l| l.seq)
+    }
+
+    pub fn logs_after(
+        &self,
+        id: &str,
+        after_seq: u64,
+        since_ms: Option<u64>,
+        until_ms: Option<u64>,
+    ) -> Vec<LogLine> {
+        self.logs
+            .get(id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter(|l| l.seq > after_seq && matches_log_window(l, since_ms, until_ms))
+            .cloned()
+            .collect()
     }
 
     pub fn start(&mut self, key: &str) -> Result<ContainerSummary, StoreError> {
@@ -335,6 +377,10 @@ impl Store {
     }
 }
 
+fn matches_log_window(line: &LogLine, since_ms: Option<u64>, until_ms: Option<u64>) -> bool {
+    since_ms.is_none_or(|s| line.timestamp_ms >= s) && until_ms.is_none_or(|u| line.timestamp_ms <= u)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +442,31 @@ mod tests {
         assert_eq!(tail.len(), 3);
         assert_eq!(tail.last(), all.last());
         assert!(s.logs("redis-cache", Some(5)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn log_filter_since_until_and_tail() {
+        let mut s = Store::new();
+        let c = Store::demo().containers()[4].clone();
+        s.insert(c.clone()).unwrap();
+        s.set_logs(
+            &c.id,
+            vec![
+                LogLine { seq: 1, timestamp_ms: 1000, level: LogLevel::Info, message: "a".into(), stream: LogStream::Stdout },
+                LogLine { seq: 2, timestamp_ms: 2000, level: LogLevel::Info, message: "b".into(), stream: LogStream::Stdout },
+                LogLine { seq: 3, timestamp_ms: 3000, level: LogLevel::Info, message: "c".into(), stream: LogStream::Stderr },
+                LogLine { seq: 4, timestamp_ms: 4000, level: LogLevel::Info, message: "d".into(), stream: LogStream::Stdout },
+            ],
+        );
+
+        let w = s.logs_filtered(&c.id, Some(1), Some(2000), Some(3000)).unwrap();
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].message, "c");
+
+        assert!(s.logs_filtered(&c.id, Some(0), None, None).unwrap().is_empty());
+        assert_eq!(s.last_log_seq(&c.id), 4);
+
+        let after = s.logs_after(&c.id, 1, Some(2000), Some(3000));
+        assert_eq!(after.iter().map(|l| l.seq).collect::<Vec<_>>(), vec![2, 3]);
     }
 }

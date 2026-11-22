@@ -374,6 +374,11 @@ impl Remote {
                     }
                     crate::exec_stream(Arc::clone(engine), spec.clone(), &mut write).await?;
                 }
+                (Request::Logs { id, tail, follow: true, since_ms, until_ms }, _) => {
+                    if !crate::logs_stream(&backend, id.clone(), *tail, *since_ms, *until_ms, lines.get_mut(), &mut write).await? {
+                        return Ok(());
+                    }
+                }
                 _ => {
                     let response = crate::handle(request, &backend).await;
                     write.write_all(&encode_line(&response)).await?;

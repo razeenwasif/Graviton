@@ -19,7 +19,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::cleanup;
-use crate::runtime::{ContainerSpec, Engine, new_id, now_secs};
+use crate::runtime::{ContainerSpec, Engine, LogEvent, new_id, now_ms, now_secs};
 use crate::{Backend, upload};
 
 use super::http::{
@@ -1417,6 +1417,19 @@ pub async fn wait_container(
 // GET /containers/{id}/logs
 // ---------------------------------------------------------------------------
 
+fn parse_query_timestamp_ms(head: &RequestHead, name: &str, now: u64) -> Option<u64> {
+    let raw = head.query_param(name)?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return None;
+    }
+    graviton_core::time::parse_timestamp_ms(trimmed, now).ok().filter(|&ms| ms > 0)
+}
+
+fn is_docker_log_active(status: ContainerStatus) -> bool {
+    matches!(status, ContainerStatus::Created | ContainerStatus::Running | ContainerStatus::Paused)
+}
+
 pub async fn container_logs(
     state: &Arc<DockerState>,
     raw_id: &str,
@@ -1424,6 +1437,8 @@ pub async fn container_logs(
     reader: &mut BufReader<OwnedReadHalf>,
     write: &mut OwnedWriteHalf,
 ) -> Result<RouteOutcome> {
+    use tokio::sync::broadcast::error::RecvError;
+
     drain_body(reader, write, head).await?;
     let key = raw_id.trim_start_matches('/');
     let want_stdout = head.query_bool("stdout", false);
@@ -1434,17 +1449,23 @@ pub async fn container_logs(
         Some("all") | None => None,
         Some(n) => n.parse::<usize>().ok(),
     };
-    let since_secs = head.query_param("since").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let now = now_ms();
+    let since_ms = parse_query_timestamp_ms(head, "since", now);
+    let until_ms = parse_query_timestamp_ms(head, "until", now);
+
+    // Subscribe before reading initial logs so lines/exit transitions aren't missed in between.
+    let rx = state.engine().map(|e| e.subscribe_logs());
 
     let resolved = {
         let store = state.backend.store().lock().unwrap();
         store.container(key).map(|c| {
-            let lines = store.logs(&c.id, tail).unwrap_or_default();
-            (c.id.clone(), lines, c.status)
+            let lines = store.logs_filtered(&c.id, tail, since_ms, until_ms).unwrap_or_default();
+            let last_seq = store.last_log_seq(&c.id);
+            (c.id.clone(), lines, last_seq, c.status)
         }).map_err(|e| e.to_string())
     };
-    let (id, initial_lines, initial_status) = match resolved {
-        Ok(triple) => triple,
+    let (id, initial_lines, mut last_seq, initial_status) = match resolved {
+        Ok(quad) => quad,
         Err(msg) => {
             write_error(write, 404, &msg, head.close_after).await?;
             return Ok(RouteOutcome::Continue);
@@ -1459,11 +1480,14 @@ pub async fn container_logs(
         .is_some_and(|m| m.tty);
 
     let format_line = |l: &graviton_proto::LogLine| -> Option<Vec<u8>> {
-        if (since_secs > 0 && (l.timestamp_ms / 1000) < since_secs) || !want_stream(l.stream, want_stdout, want_stderr) {
+        if since_ms.is_some_and(|s| l.timestamp_ms < s)
+            || until_ms.is_some_and(|u| l.timestamp_ms > u)
+            || !want_stream(l.stream, want_stdout, want_stderr)
+        {
             return None;
         }
         let text = if timestamps {
-            format!("{} {}\n", crate::build::rfc3339(l.timestamp_ms / 1000), l.message)
+            format!("{} {}\n", graviton_core::time::format_rfc3339_ms(l.timestamp_ms), l.message)
         } else {
             format!("{}\n", l.message)
         };
@@ -1484,7 +1508,7 @@ pub async fn container_logs(
         "application/vnd.docker.multiplexed-stream"
     };
 
-    if !follow || initial_status == ContainerStatus::Exited {
+    if !follow || !is_docker_log_active(initial_status) || rx.is_none() || until_ms.is_some_and(|u| now_ms() >= u) {
         let mut payload = Vec::new();
         for l in &initial_lines {
             if let Some(chunk) = format_line(l) {
@@ -1496,7 +1520,6 @@ pub async fn container_logs(
     }
 
     write_chunked_head(write, 200, ctype, &[]).await?;
-    let mut last_seq = 0u64;
     for l in &initial_lines {
         last_seq = last_seq.max(l.seq);
         if let Some(chunk) = format_line(l) {
@@ -1506,32 +1529,104 @@ pub async fn container_logs(
         }
     }
 
+    let mut rx = rx.expect("checked Some above");
     loop {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        let (lines, still_running) = {
-            let store = state.backend.store().lock().unwrap();
-            let lines = store.logs(&id, None).unwrap_or_default();
-            let running = store
-                .container(&id)
-                .is_ok_and(|c| c.status == ContainerStatus::Running || c.status == ContainerStatus::Created);
-            (lines, running)
-        };
-        for l in lines {
-            if l.seq > last_seq {
-                last_seq = l.seq;
+        let until_rem = until_ms.map(|u| u.saturating_sub(now_ms()));
+        if until_rem == Some(0) {
+            let trailing = state.backend.store().lock().unwrap().logs_after(&id, last_seq, since_ms, until_ms);
+            for l in trailing {
+                last_seq = last_seq.max(l.seq);
                 if let Some(chunk) = format_line(&l) {
                     if write_chunk(write, &chunk).await.is_err() {
                         return Ok(RouteOutcome::Done);
                     }
                 }
             }
-        }
-        if !still_running {
             break;
+        }
+
+        let check_eof = reader.buffer().is_empty();
+        tokio::select! {
+            ev = rx.recv() => match ev {
+                Ok(LogEvent::Line { container_id, line }) if container_id == id => {
+                    if line.seq <= last_seq {
+                        continue;
+                    }
+                    last_seq = line.seq;
+                    if until_ms.is_some_and(|u| line.timestamp_ms > u) {
+                        break;
+                    }
+                    if let Some(chunk) = format_line(&line) {
+                        if write_chunk(write, &chunk).await.is_err() {
+                            return Ok(RouteOutcome::Done);
+                        }
+                    }
+                }
+                Ok(LogEvent::Ended { container_id, .. }) if container_id == id => {
+                    let (trailing, still_active) = drain_docker_logs_after(state, &id, last_seq, since_ms, until_ms);
+                    for l in trailing {
+                        last_seq = last_seq.max(l.seq);
+                        if let Some(chunk) = format_line(&l) {
+                            if write_chunk(write, &chunk).await.is_err() {
+                                return Ok(RouteOutcome::Done);
+                            }
+                        }
+                    }
+                    if !still_active {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(RecvError::Lagged(_)) => {
+                    let (trailing, still_active) = drain_docker_logs_after(state, &id, last_seq, since_ms, until_ms);
+                    for l in trailing {
+                        last_seq = last_seq.max(l.seq);
+                        if let Some(chunk) = format_line(&l) {
+                            if write_chunk(write, &chunk).await.is_err() {
+                                return Ok(RouteOutcome::Done);
+                            }
+                        }
+                    }
+                    if !still_active {
+                        break;
+                    }
+                }
+                Err(RecvError::Closed) => break,
+            },
+            _ = tokio::time::sleep(Duration::from_millis(until_rem.unwrap_or(0))), if until_rem.is_some() => {
+                let trailing = state.backend.store().lock().unwrap().logs_after(&id, last_seq, since_ms, until_ms);
+                for l in trailing {
+                    last_seq = last_seq.max(l.seq);
+                    if let Some(chunk) = format_line(&l) {
+                        if write_chunk(write, &chunk).await.is_err() {
+                            return Ok(RouteOutcome::Done);
+                        }
+                    }
+                }
+                break;
+            }
+            res = reader.fill_buf(), if check_eof => match res {
+                Ok([]) => return Ok(RouteOutcome::Done),
+                Err(_) => return Ok(RouteOutcome::Done),
+                Ok(_) => {}
+            }
         }
     }
     let _ = finish_chunked(write).await;
     Ok(RouteOutcome::Continue)
+}
+
+fn drain_docker_logs_after(
+    state: &Arc<DockerState>,
+    id: &str,
+    last_seq: u64,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
+) -> (Vec<graviton_proto::LogLine>, bool) {
+    let store = state.backend.store().lock().unwrap();
+    let trailing = store.logs_after(id, last_seq, since_ms, until_ms);
+    let still_active = store.container(id).is_ok_and(|c| is_docker_log_active(c.status));
+    (trailing, still_active)
 }
 
 fn want_stream(stream: LogStream, stdout: bool, stderr: bool) -> bool {

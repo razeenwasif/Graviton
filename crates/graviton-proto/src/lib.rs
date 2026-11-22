@@ -994,7 +994,17 @@ pub enum Request {
     /// Live state of the shared container network, switch and DNS.
     NetworkInfo,
     /// `id` may be a container id, id prefix or name.
-    Logs { id: String, tail: Option<usize> },
+    /// With `follow: true`, streams `Response::Log` lines and finishes with `Response::LogEnd`.
+    Logs {
+        id: String,
+        tail: Option<usize>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        follow: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until_ms: Option<u64>,
+    },
     Start { id: String },
     Stop { id: String },
     Restart { id: String },
@@ -1122,6 +1132,13 @@ pub enum Response {
     VolumeRemoved { name: String, freed_bytes: u64 },
     Network(NetworkInfo),
     Logs(Vec<LogLine>),
+    /// Single streamed line for `Request::Logs { follow: true, .. }`.
+    Log(LogLine),
+    /// Sent after `Response::Log` stream ends (container exited/removed or `--until` reached).
+    LogEnd {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+    },
     Container(ContainerSummary),
     Image(ImageSummary),
     PullProgress(PullProgress),
@@ -1523,6 +1540,9 @@ mod tests {
         let json = String::from_utf8(encode_line(&Request::Logs {
             id: "web".into(),
             tail: Some(10),
+            follow: false,
+            since_ms: None,
+            until_ms: None,
         }))
         .unwrap();
         assert_eq!(json, "{\"method\":\"logs\",\"params\":{\"id\":\"web\",\"tail\":10}}\n");
@@ -2019,5 +2039,40 @@ mod tests {
             decode_line::<Response>(&encode_line(&Response::ImageArchive)).unwrap(),
             Response::ImageArchive
         );
+    }
+
+    #[test]
+    fn streaming_logs_round_trip() {
+        let req = Request::Logs {
+            id: "api".into(),
+            tail: Some(25),
+            follow: true,
+            since_ms: Some(1_700_000_000_000),
+            until_ms: Some(1_700_000_060_000),
+        };
+        assert_eq!(decode_line::<Request>(&encode_line(&req)).unwrap(), req);
+
+        // Legacy clients omitting follow/since_ms/until_ms decode cleanly.
+        let legacy: Request = decode_line(br#"{"method":"logs","params":{"id":"web","tail":10}}"#).unwrap();
+        assert_eq!(
+            legacy,
+            Request::Logs { id: "web".into(), tail: Some(10), follow: false, since_ms: None, until_ms: None }
+        );
+
+        let log_resp = Response::Log(LogLine {
+            seq: 7,
+            timestamp_ms: 1_700_000_000_123,
+            level: LogLevel::Info,
+            message: "ready".into(),
+            stream: LogStream::Stdout,
+        });
+        assert_eq!(decode_line::<Response>(&encode_line(&log_resp)).unwrap(), log_resp);
+
+        let end_with_code = Response::LogEnd { exit_code: Some(42) };
+        assert_eq!(decode_line::<Response>(&encode_line(&end_with_code)).unwrap(), end_with_code);
+
+        let end_none = Response::LogEnd { exit_code: None };
+        assert_eq!(String::from_utf8(encode_line(&end_none)).unwrap(), "{\"type\":\"log_end\",\"data\":{}}\n");
+        assert_eq!(decode_line::<Response>(&encode_line(&end_none)).unwrap(), end_none);
     }
 }

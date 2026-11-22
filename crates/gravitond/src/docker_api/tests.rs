@@ -164,9 +164,10 @@ async fn unix_socket_keepalive_and_endpoints() {
     let listener = UnixListener::bind(&sock).unwrap();
     let state = DockerState::new(Backend::Demo(Arc::new(Mutex::new(Store::demo()))));
 
+    let srv_state = Arc::clone(&state);
     let server = tokio::spawn(async move {
         if let Ok((stream, _)) = listener.accept().await {
-            let _ = serve_connection(stream, state).await;
+            let _ = serve_connection(stream, srv_state).await;
         }
     });
 
@@ -268,6 +269,33 @@ async fn unix_socket_keepalive_and_endpoints() {
     assert_eq!(status, 501);
     assert_eq!(headers.get("content-length").map(String::as_str), Some("0"));
     assert!(body.is_empty());
+
+    // Filtered GET /containers/{id}/logs with timestamps, since, until, and tail.
+    let api_logs = state.backend.store().lock().unwrap().logs("api-gateway", None).unwrap();
+    let first_non_sys = api_logs
+        .iter()
+        .find(|l| !matches!(l.stream, graviton_proto::LogStream::System))
+        .unwrap()
+        .timestamp_ms;
+    let last_non_sys = api_logs
+        .iter()
+        .rev()
+        .find(|l| !matches!(l.stream, graviton_proto::LogStream::System))
+        .unwrap()
+        .timestamp_ms;
+    let req = format!(
+        "GET /v1.47/containers/api-gateway/logs?stdout=1&stderr=1&timestamps=1&since={}&until={}&tail=1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        first_non_sys / 1000,
+        last_non_sys.div_ceil(1000),
+    );
+    client.write_all(req.as_bytes()).await.unwrap();
+    let (status, _, body) = read_http_response(&mut client).await;
+    assert_eq!(status, 200);
+    assert!(body.len() >= 8);
+    let mux_len = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
+    assert_eq!(body.len(), 8 + mux_len);
+    let line_text = std::str::from_utf8(&body[8..]).unwrap();
+    assert!(line_text.contains("Z "), "expected RFC3339 timestamp prefix in {line_text:?}");
 
     client
         .write_all(b"GET /v1.47/does-not-exist HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")

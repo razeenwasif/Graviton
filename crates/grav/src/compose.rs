@@ -6,15 +6,17 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
+use std::net::Shutdown;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use graviton_core::compose::{ComposeProject, ComposeService, DependsCondition, LoadOptions};
 use graviton_proto::{
-    BuildSpec, ContainerStatus, ContainerSummary, LogStream, PortProtocol, Request, Response, RunSpec,
+    BuildSpec, ContainerStatus, ContainerSummary, LogLine, LogStream, PortProtocol, Request, Response, RunSpec,
 };
 
 use crate::remote::Target;
@@ -92,9 +94,18 @@ pub enum ComposeAction {
         /// Keep streaming new log lines.
         #[arg(short, long)]
         follow: bool,
-        /// Number of lines from the end per service.
+        /// Show RFC 3339 timestamps on each log line.
+        #[arg(short = 't', long)]
+        timestamps: bool,
+        /// Show logs since timestamp (RFC 3339, Unix seconds, or e.g. `10m`).
+        #[arg(long)]
+        since: Option<String>,
+        /// Show logs before a timestamp or relative duration (e.g. `5m`).
+        #[arg(long)]
+        until: Option<String>,
+        /// Number of lines from the end per service (or `all`).
         #[arg(short = 'n', long)]
-        tail: Option<usize>,
+        tail: Option<crate::TailArg>,
         /// Specific services to show (default: all).
         services: Vec<String>,
     },
@@ -152,9 +163,21 @@ pub fn run(args: ComposeArgs, client: &mut Client, target: &Target) -> Result<()
             let proj = load_project(&args)?;
             ps(client, &proj, all)
         }
-        ComposeAction::Logs { follow, tail, ref services } => {
+        ComposeAction::Logs { follow, timestamps, ref since, ref until, tail, ref services } => {
+            let since_ms = since.as_deref().map(crate::parse_time_arg).transpose()?;
+            let until_ms = until.as_deref().map(crate::parse_time_arg).transpose()?;
             let proj = load_project(&args)?;
-            logs(client, &proj, services, tail, follow)
+            logs(
+                client,
+                target,
+                &proj,
+                services,
+                tail.and_then(crate::TailArg::into_option),
+                follow,
+                timestamps,
+                since_ms,
+                until_ms,
+            )
         }
         ComposeAction::Stop { ref services } => {
             let proj = load_project(&args)?;
@@ -383,7 +406,7 @@ fn up(
     // Foreground mode: stream multiplexed logs until Ctrl-C (then stop stack cleanly) or all exit.
     install_sigint_handler();
     eprintln!("Attaching to {} (press Ctrl-C to stop)…", proj.name);
-    stream_multiplexed_logs(client, &started_ids, None, true, true)?;
+    stream_multiplexed_logs(client, target, &started_ids, None, true, false, None, None)?;
 
     if INTERRUPTED.load(Ordering::SeqCst) {
         eprintln!("\nGracefully stopping stack `{}`…", proj.name);
@@ -496,7 +519,18 @@ fn ps(client: &mut Client, proj: &ComposeProject, include_stopped: bool) -> Resu
     Ok(())
 }
 
-fn logs(client: &mut Client, proj: &ComposeProject, selected: &[String], tail: Option<usize>, follow: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn logs(
+    client: &mut Client,
+    target: &Target,
+    proj: &ComposeProject,
+    selected: &[String],
+    tail: Option<usize>,
+    follow: bool,
+    timestamps: bool,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
+) -> Result<()> {
     let filter: HashSet<&str> = selected.iter().map(String::as_str).collect();
     for s in selected {
         if !proj.services.contains_key(s) {
@@ -522,7 +556,7 @@ fn logs(client: &mut Client, proj: &ComposeProject, selected: &[String], tail: O
     if follow {
         install_sigint_handler();
     }
-    stream_multiplexed_logs(client, &targets, tail, follow, false)
+    stream_multiplexed_logs(client, target, &targets, tail, follow, timestamps, since_ms, until_ms)
 }
 
 #[derive(Clone, Copy)]
@@ -726,57 +760,139 @@ fn wait_for_healthy(client: &mut Client, id: &str, service: &str) -> Result<()> 
     }
 }
 
+fn write_compose_log_line(
+    out: &mut impl Write,
+    idx: usize,
+    svc: &str,
+    width: usize,
+    timestamps: bool,
+    line: &LogLine,
+) -> std::io::Result<()> {
+    const COLORS: [&str; 6] = ["\x1b[36m", "\x1b[33m", "\x1b[35m", "\x1b[32m", "\x1b[34m", "\x1b[96m"];
+    let color = COLORS[idx % COLORS.len()];
+    let ts = if timestamps {
+        format!("{} ", graviton_core::time::format_rfc3339_ms(line.timestamp_ms))
+    } else {
+        String::new()
+    };
+    match line.stream {
+        LogStream::System => writeln!(out, "{color}{svc:<width$}\x1b[0m \x1b[2m| {ts}{}\x1b[0m", line.message),
+        _ => writeln!(out, "{color}{svc:<width$}\x1b[0m | {ts}{}", line.message),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn stream_multiplexed_logs(
     client: &mut Client,
+    target: &Target,
     targets: &[(String, String)],
     tail: Option<usize>,
     follow: bool,
-    stop_when_all_exited: bool,
+    timestamps: bool,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
 ) -> Result<()> {
-    const COLORS: [&str; 6] = ["\x1b[36m", "\x1b[33m", "\x1b[35m", "\x1b[32m", "\x1b[34m", "\x1b[96m"];
+    if targets.is_empty() {
+        return Ok(());
+    }
     let width = targets.iter().map(|(name, _)| name.len()).max().unwrap_or(4).min(20);
-    let mut seen: HashMap<String, u64> = HashMap::new();
-    let mut first_pass = true;
 
-    loop {
-        if follow && INTERRUPTED.load(Ordering::SeqCst) {
-            break;
-        }
-        let mut out = std::io::stdout().lock();
+    if !follow {
+        let mut entries: Vec<(u64, u64, usize, &str, LogLine)> = Vec::new();
         for (idx, (svc, id)) in targets.iter().enumerate() {
-            let color = COLORS[idx % COLORS.len()];
-            let req_tail = if first_pass { tail } else { None };
-            if let Ok(Response::Logs(lines)) = client.call(&Request::Logs { id: id.clone(), tail: req_tail }) {
-                let from = *seen.get(id).unwrap_or(&0);
-                for l in lines.into_iter().filter(|l| l.seq > from) {
-                    seen.insert(id.clone(), l.seq);
-                    match l.stream {
-                        LogStream::System => {
-                            let _ = writeln!(out, "{color}{svc:<width$}\x1b[0m \x1b[2m| {}\x1b[0m", l.message);
-                        }
-                        _ => {
-                            let _ = writeln!(out, "{color}{svc:<width$}\x1b[0m | {}", l.message);
-                        }
-                    }
+            if let Response::Logs(lines) = client.call(&Request::Logs {
+                id: id.clone(),
+                tail,
+                follow: false,
+                since_ms,
+                until_ms,
+            })? {
+                for l in lines {
+                    entries.push((l.timestamp_ms, l.seq, idx, svc.as_str(), l));
                 }
             }
         }
-        let _ = out.flush();
-        first_pass = false;
-
-        if !follow {
-            break;
-        }
-        if stop_when_all_exited {
-            let all = list_containers(client)?;
-            let any_running = targets
-                .iter()
-                .any(|(_, id)| all.iter().any(|c| c.id == *id && c.status != ContainerStatus::Exited));
-            if !any_running {
-                break;
+        entries.sort_by_key(|(ts, seq, idx, _, _)| (*ts, *seq, *idx));
+        let mut out = std::io::stdout().lock();
+        for (_, _, idx, svc, l) in &entries {
+            if let Err(err) = write_compose_log_line(&mut out, *idx, svc, width, timestamps, l) {
+                if err.kind() == std::io::ErrorKind::BrokenPipe {
+                    return Ok(());
+                }
+                return Err(err.into());
             }
         }
-        std::thread::sleep(Duration::from_millis(150));
+        let _ = out.flush();
+        return Ok(());
+    }
+
+    let (tx, rx) = mpsc::channel::<(usize, String, LogLine)>();
+    let mut handles = Vec::with_capacity(targets.len());
+    let mut workers = Vec::with_capacity(targets.len());
+
+    for (idx, (svc, id)) in targets.iter().enumerate() {
+        let mut c = Client::connect(target)?;
+        handles.push(c.shutdown_handle()?);
+        c.send(&Request::Logs {
+            id: id.clone(),
+            tail,
+            follow: true,
+            since_ms,
+            until_ms,
+        })?;
+        let tx_i = tx.clone();
+        let svc_i = svc.clone();
+        workers.push(std::thread::spawn(move || {
+            while let Ok(Some(resp)) = c.recv() {
+                match resp {
+                    Response::Log(line) => {
+                        if tx_i.send((idx, svc_i.clone(), line)).is_err() {
+                            break;
+                        }
+                    }
+                    Response::LogEnd { .. } => break,
+                    _ => {}
+                }
+            }
+        }));
+    }
+    drop(tx);
+
+    let close_all = || {
+        for h in &handles {
+            let _ = h.shutdown(Shutdown::Both);
+        }
+    };
+
+    let mut write_err: Option<std::io::Error> = None;
+    loop {
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            close_all();
+            break;
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok((idx, svc, line)) => {
+                let mut out = std::io::stdout().lock();
+                if let Err(err) = write_compose_log_line(&mut out, idx, &svc, width, timestamps, &line) {
+                    close_all();
+                    if err.kind() != std::io::ErrorKind::BrokenPipe {
+                        write_err = Some(err);
+                    }
+                    break;
+                }
+                let _ = out.flush();
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    drop(rx);
+    for w in workers {
+        let _ = w.join();
+    }
+    if let Some(err) = write_err {
+        return Err(err.into());
     }
     Ok(())
 }

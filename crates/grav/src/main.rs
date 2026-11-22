@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -18,9 +19,38 @@ use std::sync::{Arc, Mutex};
 use graviton_proto::frame::{Decoder, Frame};
 use remote::Target;
 use graviton_proto::{
-    BuildSecret, BuildSpec, CommitSpec, ContainerStatus, ContainerSummary, ExecSpec, FileKind, ImagePushProgress, LogStream, PullProgress, Request,
-    Response, RestartPolicy, RunSpec, decode_line, encode_line,
+    BuildSecret, BuildSpec, CommitSpec, ContainerStatus, ContainerSummary, ExecSpec, FileKind, ImagePushProgress, LogLine, LogStream, PullProgress,
+    Request, Response, RestartPolicy, RunSpec, decode_line, encode_line,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TailArg {
+    All,
+    Lines(usize),
+}
+
+impl TailArg {
+    pub(crate) fn into_option(self) -> Option<usize> {
+        match self {
+            Self::All => None,
+            Self::Lines(n) => Some(n),
+        }
+    }
+}
+
+impl FromStr for TailArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("all") {
+            Ok(Self::All)
+        } else {
+            s.parse::<usize>()
+                .map(Self::Lines)
+                .map_err(|_| format!("invalid --tail value `{s}` (expected non-negative integer or `all`)"))
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Native containers for macOS")]
@@ -55,9 +85,21 @@ enum Command {
     /// Show a container's logs.
     Logs {
         container: String,
-        /// Number of lines from the end.
+        /// Number of lines from the end (or `all`).
         #[arg(short = 'n', long)]
-        tail: Option<usize>,
+        tail: Option<TailArg>,
+        /// Keep streaming new log output until the container exits.
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Show RFC 3339 timestamps.
+        #[arg(short = 't', long)]
+        timestamps: bool,
+        /// Show logs since timestamp (RFC 3339, Unix seconds, or e.g. `10m`, `1h30m`).
+        #[arg(long)]
+        since: Option<String>,
+        /// Show logs before a timestamp or relative duration (e.g. `5m`).
+        #[arg(long)]
+        until: Option<String>,
     },
     /// Start a stopped container.
     Start { container: String },
@@ -580,14 +622,19 @@ fn run(cli: Cli) -> Result<()> {
             }
             other => unexpected(other)?,
         },
-        Command::Logs { container, tail } => match client.call(&Request::Logs { id: container, tail })? {
-            Response::Logs(lines) => {
-                for l in lines {
-                    println!("{} {:<5} {}", clock(l.timestamp_ms), format!("{:?}", l.level).to_uppercase(), l.message);
-                }
-            }
-            other => unexpected(other)?,
-        },
+        Command::Logs { container, tail, follow, timestamps, since, until } => {
+            let since_ms = since.as_deref().map(parse_time_arg).transpose()?;
+            let until_ms = until.as_deref().map(parse_time_arg).transpose()?;
+            stream_logs(
+                &mut client,
+                &container,
+                tail.and_then(TailArg::into_option),
+                follow,
+                timestamps,
+                since_ms,
+                until_ms,
+            )?;
+        }
         Command::Start { container } => lifecycle(&mut client, Request::Start { id: container }, "started")?,
         Command::Stop { container } => lifecycle(&mut client, Request::Stop { id: container }, "stopped")?,
         Command::Pause { container } => lifecycle(&mut client, Request::Pause { id: container }, "paused")?,
@@ -1164,21 +1211,35 @@ pub(crate) struct Client {
 }
 
 impl Client {
-    fn connect(target: &Target) -> Result<Self> {
+    pub(crate) fn connect(target: &Target) -> Result<Self> {
         let stream = target.connect()?;
         Ok(Self { reader: BufReader::new(stream.try_clone()?), writer: stream })
     }
 
-    pub(crate) fn call(&mut self, request: &Request) -> Result<Response> {
+    pub(crate) fn send(&mut self, request: &Request) -> Result<()> {
         self.writer.write_all(&encode_line(request))?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    pub(crate) fn recv(&mut self) -> Result<Option<Response>> {
         let mut line = String::new();
         if self.reader.read_line(&mut line)? == 0 {
-            bail!("gravitond closed the connection");
+            return Ok(None);
         }
         match decode_line::<Response>(line.as_bytes())? {
             Response::Error { message } => bail!(message),
-            response => Ok(response),
+            response => Ok(Some(response)),
         }
+    }
+
+    pub(crate) fn call(&mut self, request: &Request) -> Result<Response> {
+        self.send(request)?;
+        self.recv()?.ok_or_else(|| anyhow::anyhow!("gravitond closed the connection"))
+    }
+
+    pub(crate) fn shutdown_handle(&self) -> Result<UnixStream> {
+        Ok(self.writer.try_clone()?)
     }
 }
 
@@ -2138,39 +2199,107 @@ fn push_image(client: &mut Client, reference: &str) -> Result<()> {
     }
 }
 
+pub(crate) fn parse_time_arg(raw: &str) -> Result<u64> {
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    let now_secs = (now_ms / 1000) as libc::time_t;
+    // SAFETY: `localtime_r` initializes `tm` for a valid stack `time_t`.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let offset_secs = if unsafe { libc::localtime_r(&now_secs, &mut tm) }.is_null() {
+        0
+    } else {
+        tm.tm_gmtoff
+    };
+    graviton_core::time::parse_timestamp_ms_with_offset(raw, now_ms, offset_secs).map_err(anyhow::Error::msg)
+}
+
+fn print_log_line(l: &LogLine, timestamps: bool, flush_stdout: bool) -> std::io::Result<()> {
+    let prefix = timestamps.then(|| graviton_core::time::format_rfc3339_ms(l.timestamp_ms));
+    match l.stream {
+        LogStream::Stdout => {
+            let mut out = std::io::stdout().lock();
+            if let Some(ts) = prefix {
+                writeln!(out, "{ts} {}", l.message)?;
+            } else {
+                writeln!(out, "{}", l.message)?;
+            }
+            if flush_stdout {
+                out.flush()?;
+            }
+        }
+        LogStream::Stderr => {
+            let mut err = std::io::stderr().lock();
+            if let Some(ts) = prefix {
+                writeln!(err, "{ts} {}", l.message)?;
+            } else {
+                writeln!(err, "{}", l.message)?;
+            }
+        }
+        LogStream::System => {
+            let mut err = std::io::stderr().lock();
+            let text = if let Some(ts) = prefix {
+                format!("{ts} graviton: {}", l.message)
+            } else {
+                format!("graviton: {}", l.message)
+            };
+            if err.is_terminal() {
+                writeln!(err, "\x1b[2m{text}\x1b[0m")?;
+            } else {
+                writeln!(err, "{text}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stream_logs(
+    client: &mut Client,
+    id: &str,
+    tail: Option<usize>,
+    follow: bool,
+    timestamps: bool,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
+) -> Result<Option<i32>> {
+    let req = Request::Logs { id: id.to_string(), tail, follow, since_ms, until_ms };
+    if !follow {
+        return match client.call(&req)? {
+            Response::Logs(lines) => {
+                for l in &lines {
+                    match print_log_line(l, timestamps, false) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => return Ok(None),
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+                Ok(None)
+            }
+            other => unexpected(other).map(|()| None),
+        };
+    }
+
+    client.send(&req)?;
+    while let Some(resp) = client.recv()? {
+        match resp {
+            Response::Log(l) => match print_log_line(&l, timestamps, true) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => return Ok(None),
+                Err(err) => return Err(err.into()),
+            },
+            Response::LogEnd { exit_code } => return Ok(exit_code),
+            other => return unexpected(other).map(|()| None),
+        }
+    }
+    Ok(None)
+}
+
 /// Stream a container's output until it exits; returns its exit code.
 fn follow(client: &mut Client, id: &str) -> Result<i32> {
-    let mut seen = 0u64;
-    let mut print_new = |client: &mut Client| -> Result<()> {
-        if let Response::Logs(lines) = client.call(&Request::Logs { id: id.to_string(), tail: None })? {
-            let mut out = std::io::stdout().lock();
-            let from = seen;
-            for l in lines.into_iter().filter(|l| l.seq > from) {
-                seen = l.seq;
-                match l.stream {
-                    LogStream::Stdout => writeln!(out, "{}", l.message)?,
-                    LogStream::Stderr => eprintln!("{}", l.message),
-                    LogStream::System => eprintln!("\x1b[2mgraviton: {}\x1b[0m", l.message),
-                }
-            }
-            out.flush()?;
-        }
-        Ok(())
-    };
-    loop {
-        print_new(client)?;
-        let status = match client.call(&Request::ListContainers)? {
-            Response::Containers(list) => list.into_iter().find(|c| c.id == id),
-            other => return unexpected(other).map(|_| 1),
-        };
-        match status {
-            Some(c) if c.status == ContainerStatus::Exited => {
-                print_new(client)?;
-                return Ok(c.exit_code.unwrap_or(0));
-            }
-            Some(_) => std::thread::sleep(std::time::Duration::from_millis(80)),
-            None => bail!("container {id} disappeared"),
-        }
+    if let Some(code) = stream_logs(client, id, None, true, false, None, None)? {
+        return Ok(code);
+    }
+    match client.call(&Request::ListContainers)? {
+        Response::Containers(list) => Ok(list.into_iter().find(|c| c.id == id).and_then(|c| c.exit_code).unwrap_or(0)),
+        other => unexpected(other).map(|()| 1),
     }
 }
 
@@ -2464,6 +2593,47 @@ mod tests {
                 ref container,
                 ref image,
             } if a == "Dev" && m == "snapshot" && changes == &["ENV FOO=bar", "WORKDIR /app"] && container == "web" && image == "web:snap"
+        ));
+    }
+
+    #[test]
+    fn parses_logs_and_compose_logs_flags() {
+        let l = Cli::try_parse_from([
+            "grav", "logs", "-f", "-t", "-n", "all", "--since", "10m", "--until", "5m", "web",
+        ])
+        .unwrap();
+        assert!(matches!(
+            l.command,
+            Command::Logs {
+                ref container,
+                tail: Some(TailArg::All),
+                follow: true,
+                timestamps: true,
+                since: Some(ref s),
+                until: Some(ref u),
+            } if container == "web" && s == "10m" && u == "5m"
+        ));
+
+        let l2 = Cli::try_parse_from(["grav", "logs", "--tail", "20", "web"]).unwrap();
+        assert!(matches!(l2.command, Command::Logs { tail: Some(TailArg::Lines(20)), follow: false, .. }));
+
+        let cl = Cli::try_parse_from([
+            "grav", "compose", "logs", "-f", "--timestamps", "--since", "5m", "--until", "1m", "-n", "15", "api", "db",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cl.command,
+            Command::Compose(compose::ComposeArgs {
+                action: compose::ComposeAction::Logs {
+                    follow: true,
+                    timestamps: true,
+                    since: Some(ref s),
+                    until: Some(ref u),
+                    tail: Some(TailArg::Lines(15)),
+                    ref services,
+                },
+                ..
+            }) if s == "5m" && u == "1m" && services == &["api", "db"]
         ));
     }
 }

@@ -34,7 +34,7 @@ use graviton_image::{BlobStore, Credentials, HealthcheckConfig, ImageError, Imag
 use graviton_proto::{
     AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ContainerDetails, ContainerStats, ContainerStatus, ContainerSummary,
     DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats, HealthLog, HealthState, HealthStatus,
-    Healthcheck, HostEntry, ImageSummary, LogLevel, LogStream, Mount, NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION,
+    Healthcheck, HostEntry, ImageSummary, LogLevel, LogLine, LogStream, Mount, NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION,
     PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy, RunSpec, SnapshotInfo, StatSample, VolumeMountRef,
     VolumeSummary, decode_line, encode_line,
 };
@@ -169,6 +169,13 @@ struct StatsHistory {
     processes: Vec<ProcessInfo>,
 }
 
+/// Real-time log notification broadcast to streaming `grav logs -f` and Docker `/logs` clients.
+#[derive(Debug, Clone)]
+pub enum LogEvent {
+    Line { container_id: String, line: LogLine },
+    Ended { container_id: String, exit_code: Option<i32> },
+}
+
 pub struct Engine {
     pub store: Arc<Mutex<Store>>,
     pub(crate) blobs: BlobStore,
@@ -179,6 +186,7 @@ pub struct Engine {
     stats: Mutex<HashMap<String, StatsHistory>>,
     health: Mutex<HashMap<String, HealthState>>,
     log_io: Mutex<()>,
+    log_tx: tokio::sync::broadcast::Sender<LogEvent>,
     switch: crate::switch::Switch,
     /// Serialises guest DNS table broadcasts so concurrent starts/stops never reorder.
     hosts_sync: Mutex<()>,
@@ -205,6 +213,7 @@ impl Engine {
         let blobs = BlobStore::new(paths::blobs_dir());
         fs::create_dir_all(blobs.root().join("sha256")).context("creating the blob store")?;
         let index = ImageIndex::load(paths::support_dir().join("images.json"))?;
+        let (log_tx, _) = tokio::sync::broadcast::channel(1024);
         let engine = Arc::new(Self {
             store: Arc::new(Mutex::new(Store::new())),
             blobs,
@@ -215,6 +224,7 @@ impl Engine {
             stats: Mutex::new(HashMap::new()),
             health: Mutex::new(HashMap::new()),
             log_io: Mutex::new(()),
+            log_tx,
             switch: crate::switch::Switch::new(),
             hosts_sync: Mutex::new(()),
             hosts_gen: AtomicU64::new(0),
@@ -1046,6 +1056,7 @@ impl Engine {
 
     pub fn remove(&self, key: &str) -> Result<String> {
         let removed = self.store.lock().unwrap().remove(key)?;
+        let _ = self.log_tx.send(LogEvent::Ended { container_id: removed.id.clone(), exit_code: removed.exit_code });
         self.events.record(graviton_proto::EventKind::Removed, Some((&removed.id, &removed.name)), Some(&removed.image), format!("{} removed", removed.name));
         {
             self.specs.lock().unwrap().remove(&removed.id);
@@ -1119,6 +1130,7 @@ impl Engine {
                         c.status = ContainerStatus::Exited;
                         c.exit_code = Some(125);
                     });
+                    let _ = self.log_tx.send(LogEvent::Ended { container_id: id.to_string(), exit_code: Some(125) });
                     if clear_want_on_err {
                         if let Some(spec) = self.specs.lock().unwrap().get_mut(id) {
                             spec.want_running = false;
@@ -1266,6 +1278,7 @@ impl Engine {
             c.memory_bytes = None;
             c.health = None;
         });
+        let _ = self.log_tx.send(LogEvent::Ended { container_id: id.to_string(), exit_code: Some(code) });
         self.save();
         let (name, image) = self.store.lock().unwrap().container(id).map(|c| (c.name.clone(), c.image.clone())).unwrap_or_default();
         let (kind, message) = match (&failure, requested, code) {
@@ -2321,10 +2334,17 @@ impl Engine {
         Ok((pid, OwnedFd::from(conn)))
     }
 
+    pub fn subscribe_logs(&self) -> tokio::sync::broadcast::Receiver<LogEvent> {
+        self.log_tx.subscribe()
+    }
+
     fn log(&self, id: &str, level: LogLevel, stream: LogStream, message: String) {
         let line = self.store.lock().unwrap().push_log(id, level, stream, message);
-        let _guard = self.log_io.lock().unwrap();
-        crate::persistence::append_log(&log_path(id), &line);
+        {
+            let _guard = self.log_io.lock().unwrap();
+            crate::persistence::append_log(&log_path(id), &line);
+        }
+        let _ = self.log_tx.send(LogEvent::Line { container_id: id.to_string(), line });
     }
 
     fn generated_name(&self, image: &str) -> String {
@@ -2675,6 +2695,10 @@ pub(crate) fn new_id() -> String {
 
 pub(crate) fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
 pub(crate) fn host_memory() -> u64 {

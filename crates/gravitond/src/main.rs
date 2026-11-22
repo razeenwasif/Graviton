@@ -332,6 +332,12 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
             exec_stream(Arc::clone(engine), spec.clone(), &mut write).await?;
             continue;
         }
+        if let Request::Logs { id, tail, follow: true, since_ms, until_ms } = &request {
+            if !logs_stream(&backend, id.clone(), *tail, *since_ms, *until_ms, lines.get_mut(), &mut write).await? {
+                return Ok(());
+            }
+            continue;
+        }
         let response = handle(request, &backend).await;
         write.write_all(&encode_line(&response)).await?;
     }
@@ -756,6 +762,203 @@ pub(crate) async fn load_image_stream(
     Ok(())
 }
 
+fn is_log_active(status: graviton_proto::ContainerStatus) -> bool {
+    use graviton_proto::ContainerStatus;
+    matches!(status, ContainerStatus::Created | ContainerStatus::Running | ContainerStatus::Paused)
+}
+
+fn drain_after_and_active(
+    backend: &Backend,
+    id: &str,
+    last_seq: u64,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
+) -> (Vec<graviton_proto::LogLine>, bool, Option<i32>) {
+    let store = backend.store().lock().unwrap();
+    let trailing = store.logs_after(id, last_seq, since_ms, until_ms);
+    let (active, ec) = match store.container(id) {
+        Ok(c) => (is_log_active(c.status), c.exit_code),
+        Err(_) => (false, None),
+    };
+    (trailing, active, ec)
+}
+
+async fn emit_log_lines<W>(
+    write: &mut W,
+    lines: Vec<graviton_proto::LogLine>,
+    last_seq: &mut u64,
+) -> bool
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    for line in lines {
+        *last_seq = (*last_seq).max(line.seq);
+        if write.write_all(&encode_line(&Response::Log(line))).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Stream historical and live container logs as `Response::Log` lines followed by `Response::LogEnd`.
+/// Returns `Ok(true)` when the stream finished cleanly so further requests can reuse the connection.
+pub(crate) async fn logs_stream<R, W>(
+    backend: &Backend,
+    id: String,
+    tail: Option<usize>,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
+    read: &mut BufReader<R>,
+    write: &mut W,
+) -> Result<bool>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use crate::runtime::LogEvent;
+    use tokio::io::AsyncBufReadExt;
+    use tokio::sync::broadcast::error::RecvError;
+
+    // Subscribe before inspecting Store so no log line or exit transition can fall between them.
+    let rx = match backend {
+        Backend::Engine(engine) => Some(engine.subscribe_logs()),
+        Backend::Demo(_) => None,
+    };
+
+    let resolved = {
+        let store = backend.store().lock().unwrap();
+        store.container(&id).map(|c| {
+            let lines = store.logs_filtered(&c.id, tail, since_ms, until_ms).unwrap_or_default();
+            let last_seq = store.last_log_seq(&c.id);
+            (c.id.clone(), lines, last_seq, c.status, c.exit_code)
+        })
+    };
+    let (canonical_id, initial_lines, mut last_seq, initial_status, initial_exit_code) = match resolved {
+        Ok(tuple) => tuple,
+        Err(err) => {
+            if write.write_all(&encode_line(&Response::Error { message: err.to_string() })).await.is_err()
+                || write.flush().await.is_err()
+            {
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+    };
+
+    if !emit_log_lines(write, initial_lines, &mut last_seq).await || write.flush().await.is_err() {
+        return Ok(false);
+    }
+
+    if !is_log_active(initial_status) || rx.is_none() || until_ms.is_some_and(|u| crate::runtime::now_ms() >= u) {
+        let exit_code = (!is_log_active(initial_status)).then_some(initial_exit_code).flatten();
+        if write.write_all(&encode_line(&Response::LogEnd { exit_code })).await.is_err() || write.flush().await.is_err() {
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+
+    let mut rx = rx.expect("checked Some above");
+    loop {
+        let until_rem = until_ms.map(|u| u.saturating_sub(crate::runtime::now_ms()));
+        if until_rem == Some(0) {
+            let trailing = backend.store().lock().unwrap().logs_after(&canonical_id, last_seq, since_ms, until_ms);
+            if !emit_log_lines(write, trailing, &mut last_seq).await
+                || write.write_all(&encode_line(&Response::LogEnd { exit_code: None })).await.is_err()
+                || write.flush().await.is_err()
+            {
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+
+        let check_eof = read.buffer().is_empty();
+        tokio::select! {
+            ev = rx.recv() => match ev {
+                Ok(LogEvent::Line { container_id, line }) if container_id == canonical_id => {
+                    if line.seq <= last_seq {
+                        continue;
+                    }
+                    last_seq = line.seq;
+                    if until_ms.is_some_and(|u| line.timestamp_ms > u) {
+                        if write.write_all(&encode_line(&Response::LogEnd { exit_code: None })).await.is_err()
+                            || write.flush().await.is_err()
+                        {
+                            return Ok(false);
+                        }
+                        return Ok(true);
+                    }
+                    if since_ms.is_some_and(|s| line.timestamp_ms < s) {
+                        continue;
+                    }
+                    if write.write_all(&encode_line(&Response::Log(line))).await.is_err() || write.flush().await.is_err() {
+                        return Ok(false);
+                    }
+                }
+                Ok(LogEvent::Ended { container_id, exit_code }) if container_id == canonical_id => {
+                    let (trailing, still_active, store_exit) =
+                        drain_after_and_active(backend, &canonical_id, last_seq, since_ms, until_ms);
+                    if !emit_log_lines(write, trailing, &mut last_seq).await {
+                        return Ok(false);
+                    }
+                    if !still_active {
+                        if write.write_all(&encode_line(&Response::LogEnd { exit_code: store_exit.or(exit_code) })).await.is_err()
+                            || write.flush().await.is_err()
+                        {
+                            return Ok(false);
+                        }
+                        return Ok(true);
+                    }
+                    if write.flush().await.is_err() {
+                        return Ok(false);
+                    }
+                }
+                Ok(_) => {}
+                Err(RecvError::Lagged(_)) => {
+                    let (trailing, still_active, store_exit) =
+                        drain_after_and_active(backend, &canonical_id, last_seq, since_ms, until_ms);
+                    if !emit_log_lines(write, trailing, &mut last_seq).await {
+                        return Ok(false);
+                    }
+                    if !still_active {
+                        if write.write_all(&encode_line(&Response::LogEnd { exit_code: store_exit })).await.is_err()
+                            || write.flush().await.is_err()
+                        {
+                            return Ok(false);
+                        }
+                        return Ok(true);
+                    }
+                    if write.flush().await.is_err() {
+                        return Ok(false);
+                    }
+                }
+                Err(RecvError::Closed) => {
+                    if write.write_all(&encode_line(&Response::LogEnd { exit_code: None })).await.is_err()
+                        || write.flush().await.is_err()
+                    {
+                        return Ok(false);
+                    }
+                    return Ok(true);
+                }
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_millis(until_rem.unwrap_or(0))), if until_rem.is_some() => {
+                let trailing = backend.store().lock().unwrap().logs_after(&canonical_id, last_seq, since_ms, until_ms);
+                if !emit_log_lines(write, trailing, &mut last_seq).await
+                    || write.write_all(&encode_line(&Response::LogEnd { exit_code: None })).await.is_err()
+                    || write.flush().await.is_err()
+                {
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
+            res = read.fill_buf(), if check_eof => match res {
+                Ok([]) => return Ok(false),
+                Err(_) => return Ok(false),
+                Ok(_) => {}
+            }
+        }
+    }
+}
+
 pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
     // Reads answer straight from the store.
     {
@@ -764,7 +967,9 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
             Request::Ping => return Response::Pong { protocol: PROTOCOL_VERSION },
             Request::ListContainers => return Response::Containers(store.containers().to_vec()),
             Request::ListImages => return Response::Images(store.images().to_vec()),
-            Request::Logs { id, tail } => return result(store.logs(id, *tail).map(Response::Logs)),
+            Request::Logs { id, tail, since_ms, until_ms, .. } => {
+                return result(store.logs_filtered(id, *tail, *since_ms, *until_ms).map(Response::Logs));
+            }
             Request::EngineInfo if matches!(backend, Backend::Demo(_)) => return Response::Engine(store.engine_info()),
             _ => {}
         }
@@ -954,5 +1159,44 @@ mod tests {
             Response::Error { message } => assert!(message.contains("demo")),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn filtered_and_streaming_logs_on_demo_backend() {
+        let backend = Backend::Demo(Arc::new(Mutex::new(Store::demo())));
+        let sample = handle(
+            Request::Logs { id: "api-gateway".into(), tail: Some(2), follow: false, since_ms: None, until_ms: None },
+            &backend,
+        )
+        .await;
+        let Response::Logs(lines) = sample else { panic!("expected logs, got {sample:?}") };
+        assert_eq!(lines.len(), 2);
+
+        let cutoff = lines[1].timestamp_ms;
+        let windowed = handle(
+            Request::Logs { id: "api-gateway".into(), tail: None, follow: false, since_ms: Some(cutoff), until_ms: Some(cutoff) },
+            &backend,
+        )
+        .await;
+        let Response::Logs(w) = windowed else { panic!("expected logs, got {windowed:?}") };
+        assert!(w.iter().all(|l| l.timestamp_ms == cutoff));
+        assert!(w.iter().any(|l| l.seq == lines[1].seq));
+
+        let mut reader = BufReader::new(tokio::io::empty());
+        let mut out = Vec::new();
+        let reusable = logs_stream(&backend, "api-gateway".into(), Some(2), None, None, &mut reader, &mut out)
+            .await
+            .unwrap();
+        assert!(reusable);
+
+        let decoded: Vec<Response> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| decode_line::<Response>(l.as_bytes()).unwrap())
+            .collect();
+        assert_eq!(decoded.len(), 3);
+        assert!(matches!(decoded[0], Response::Log(_)));
+        assert!(matches!(decoded[1], Response::Log(_)));
+        assert_eq!(decoded[2], Response::LogEnd { exit_code: None });
     }
 }
