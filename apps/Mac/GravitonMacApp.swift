@@ -276,15 +276,37 @@ struct EngineCard: View {
                 }
             }
             if let e = store.engine, e.memoryBytes > 0 {
+                let hostColor: Color = e.hostMemoryFraction >= 0.93 ? G.danger
+                    : e.hostMemoryFraction >= 0.85 ? G.warning
+                    : Color(hex: 0x646E82)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("Memory")
+                        Text(e.hasHostMemory ? "Memory" : "VM memory")
                         Spacer()
-                        Text("\(Format.bytes(e.memoryUsedBytes)) / \(Format.bytes(e.memoryBytes))").font(G.mono(11))
+                        Text("\(Format.bytes(e.totalMemoryUsedBytes)) / \(Format.bytes(e.memoryBytes))").font(G.mono(11))
                     }
                     .font(.system(size: 12))
                     .foregroundStyle(G.muted)
-                    MeterBar(Double(e.memoryUsedBytes) / Double(e.memoryBytes))
+                    StackedMeterBar([
+                        .init(e.vmMemoryFraction, color: G.accent),
+                        .init(e.otherHostMemoryFraction, color: hostColor),
+                    ], height: 5)
+                    if e.hasHostMemory {
+                        HStack(spacing: 8) {
+                            HStack(spacing: 4) {
+                                Circle().fill(G.accent).frame(width: 6, height: 6)
+                                Text("VMs \(Format.bytes(e.vmMemoryUsedBytes))")
+                                    .foregroundStyle(e.vmMemoryUsedBytes > 0 ? G.textSecondary : G.faint)
+                            }
+                            Spacer()
+                            HStack(spacing: 4) {
+                                Circle().fill(hostColor).frame(width: 6, height: 6)
+                                Text("macOS \(Format.bytes(e.otherHostMemoryUsedBytes))")
+                                    .foregroundStyle(G.faint)
+                            }
+                        }
+                        .font(G.mono(10))
+                    }
                 }
                 Text("\(e.kernel) · \(e.arch) · \(e.cpus) vCPU")
                     .font(.system(size: 11.5))

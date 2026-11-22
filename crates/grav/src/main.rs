@@ -453,7 +453,17 @@ fn run(cli: Cli) -> Result<()> {
                     "Rosetta:   {}",
                     if e.rosetta { "available (linux/amd64)" } else { "not installed" }
                 );
-                println!("Memory:    {} in VMs of {} on this Mac", bytes(e.memory_used_bytes), bytes(e.memory_bytes));
+                if let Some(host_used) = e.host_memory_used_bytes {
+                    let total_used = host_used.max(e.memory_used_bytes).min(e.memory_bytes);
+                    println!(
+                        "Memory:    {} / {} ({} in VMs)",
+                        bytes(total_used),
+                        bytes(e.memory_bytes),
+                        bytes(e.memory_used_bytes),
+                    );
+                } else {
+                    println!("Memory:    {} in VMs of {} on this Mac", bytes(e.memory_used_bytes), bytes(e.memory_bytes));
+                }
                 if e.disk_bytes > 0 {
                     println!("Disk:      {} / {}", bytes(e.disk_used_bytes), bytes(e.disk_bytes));
                 } else {

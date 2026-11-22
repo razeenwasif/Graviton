@@ -61,6 +61,7 @@ impl Store {
             disk_bytes: 0,
             disk_used_bytes: 0,
             rosetta: false,
+            host_memory_used_bytes: None,
         })
     }
 
@@ -300,6 +301,7 @@ impl Store {
             disk_bytes: 64 * 1024 * mib,
             disk_used_bytes: 6963 * mib,
             rosetta: true,
+            host_memory_used_bytes: Some(5800 * mib),
         });
         store
     }

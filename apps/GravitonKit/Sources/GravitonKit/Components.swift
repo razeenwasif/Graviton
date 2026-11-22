@@ -121,6 +121,53 @@ public struct MeterBar: View {
     }
 }
 
+public struct StackedMeterBar: View {
+    public struct Segment: Sendable {
+        public var fraction: Double
+        public var color: Color
+
+        public init(_ fraction: Double, color: Color) {
+            self.fraction = fraction
+            self.color = color
+        }
+    }
+
+    public var segments: [Segment]
+    public var height: CGFloat
+
+    public init(_ segments: [Segment], height: CGFloat = 5) {
+        self.segments = segments
+        self.height = height
+    }
+
+    public var body: some View {
+        GeometryReader { geo in
+            let active = segments.filter { $0.fraction > 0 }
+            let rawSum = active.reduce(0) { $0 + $1.fraction }
+            let scale = rawSum > 1 ? 1.0 / rawSum : 1.0
+            let gap: CGFloat = active.count > 1 ? 1.5 : 0
+            let available = max(0, geo.size.width - gap * CGFloat(max(0, active.count - 1)))
+
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.white.opacity(0.06))
+                if !active.isEmpty, available > 0 {
+                    HStack(spacing: gap) {
+                        ForEach(Array(active.enumerated()), id: \.offset) { _, seg in
+                            Rectangle()
+                                .fill(seg.color)
+                                .frame(width: min(available, max(2, available * seg.fraction * scale)))
+                        }
+                    }
+                    .frame(width: geo.size.width, alignment: .leading)
+                    .clipShape(Capsule())
+                }
+            }
+        }
+        .frame(height: height)
+        .accessibilityHidden(true)
+    }
+}
+
 /// "12.4 %" with the unit dimmed.
 public struct MetricValue: View {
     public var value: String

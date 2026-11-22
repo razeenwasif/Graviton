@@ -40,6 +40,37 @@ import Testing
         let err = try Wire.decoder.decode(EngineResponse.self, from: Data(#"{"type":"error","data":{"message":"no such container: x"}}"#.utf8))
         guard case .error("no such container: x") = err else { Issue.record("expected error"); return }
     }
+
+    @Test func engineInfoDecodesHostMemoryAndComputesSegments() throws {
+        let withHost = #"""
+        {"type":"engine","data":{"version":"0.1.0","protocol":1,"kernel":"Linux 6.12.118-graviton",
+        "arch":"arm64","cpus":12,"memory_bytes":17179869184,"memory_used_bytes":2147483648,
+        "disk_bytes":0,"disk_used_bytes":2000,"rosetta":true,"host_memory_used_bytes":10737418240}}
+        """#
+        guard case let .engine(info) = try Wire.decoder.decode(EngineResponse.self, from: Data(withHost.utf8)) else {
+            Issue.record("expected engine"); return
+        }
+        #expect(info.hasHostMemory)
+        #expect(info.vmMemoryUsedBytes == 2_147_483_648)
+        #expect(info.totalMemoryUsedBytes == 10_737_418_240)
+        #expect(info.otherHostMemoryUsedBytes == 8_589_934_592)
+        #expect(abs(info.vmMemoryFraction - 0.125) < 0.001)
+        #expect(abs(info.otherHostMemoryFraction - 0.5) < 0.001)
+        #expect(abs(info.hostMemoryFraction - 0.625) < 0.001)
+
+        // Backwards compatibility when daemon omits host_memory_used_bytes
+        let legacy = #"""
+        {"type":"engine","data":{"version":"0.1.0","protocol":1,"kernel":"Linux 6.12",
+        "arch":"arm64","cpus":10,"memory_bytes":17179869184,"memory_used_bytes":1073741824,
+        "disk_bytes":0,"disk_used_bytes":1000}}
+        """#
+        guard case let .engine(oldInfo) = try Wire.decoder.decode(EngineResponse.self, from: Data(legacy.utf8)) else {
+            Issue.record("expected legacy engine"); return
+        }
+        #expect(!oldInfo.hasHostMemory)
+        #expect(oldInfo.totalMemoryUsedBytes == 1_073_741_824)
+        #expect(oldInfo.otherHostMemoryUsedBytes == 0)
+    }
 }
 
 @Suite struct DemoEngineTests {

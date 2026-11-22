@@ -177,6 +177,37 @@ public struct EngineInfo: Codable, Hashable, Sendable {
     public var diskBytes: UInt64
     public var diskUsedBytes: UInt64
     public var rosetta: Bool? = nil
+    public var hostMemoryUsedBytes: UInt64? = nil
+
+    public var hasHostMemory: Bool { hostMemoryUsedBytes != nil }
+
+    public var vmMemoryUsedBytes: UInt64 {
+        memoryBytes > 0 ? min(memoryBytes, memoryUsedBytes) : memoryUsedBytes
+    }
+
+    public var totalMemoryUsedBytes: UInt64 {
+        guard let host = hostMemoryUsedBytes else { return vmMemoryUsedBytes }
+        let combined = max(host, memoryUsedBytes)
+        return memoryBytes > 0 ? min(memoryBytes, combined) : combined
+    }
+
+    public var otherHostMemoryUsedBytes: UInt64 {
+        let total = totalMemoryUsedBytes
+        let vm = vmMemoryUsedBytes
+        return total > vm ? total - vm : 0
+    }
+
+    public var hostMemoryFraction: Double {
+        memoryBytes > 0 ? Double(totalMemoryUsedBytes) / Double(memoryBytes) : 0
+    }
+
+    public var vmMemoryFraction: Double {
+        memoryBytes > 0 ? Double(vmMemoryUsedBytes) / Double(memoryBytes) : 0
+    }
+
+    public var otherHostMemoryFraction: Double {
+        memoryBytes > 0 ? Double(otherHostMemoryUsedBytes) / Double(memoryBytes) : 0
+    }
 }
 
 /// What to run (mirrors `RunSpec` in `graviton-proto`).

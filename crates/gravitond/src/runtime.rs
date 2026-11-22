@@ -272,6 +272,7 @@ impl Engine {
             disk_bytes: 0,
             disk_used_bytes: disk_used,
             rosetta: AppleHypervisor::rosetta_available(),
+            host_memory_used_bytes: host_memory_used(),
         }
     }
 
@@ -2034,13 +2035,62 @@ pub(crate) fn now_secs() -> u64 {
 }
 
 fn host_memory() -> u64 {
-    std::process::Command::new("/usr/sbin/sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
+    static TOTAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TOTAL.get_or_init(|| {
+        std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Physical host memory currently in use on macOS (Activity Monitor definition:
+/// anonymous non-purgeable app memory + wired kernel memory + compressed memory).
+#[cfg(target_os = "macos")]
+#[allow(deprecated)] // libc marks mach_host_self deprecated in favor of mach2, which we don't depend on.
+fn host_memory_used() -> Option<u64> {
+    static HOST: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+    static PAGE_SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+    let host = *HOST.get_or_init(|| unsafe { libc::mach_host_self() });
+    let page_size = *PAGE_SIZE.get_or_init(|| {
+        let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if p > 0 { p as u64 } else { 16384 }
+    });
+
+    let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    let rc = unsafe {
+        libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            stats.as_mut_ptr().cast(),
+            &mut count,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let stats = unsafe { stats.assume_init() };
+    let internal = u64::from(stats.internal_page_count);
+    let purgeable = u64::from(stats.purgeable_count);
+    let wired = u64::from(stats.wire_count);
+    let compressed = u64::from(stats.compressor_page_count);
+    let used = internal
+        .saturating_sub(purgeable)
+        .saturating_add(wired)
+        .saturating_add(compressed)
+        .saturating_mul(page_size);
+    let total = host_memory();
+    Some(if total > 0 { used.min(total) } else { used })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_memory_used() -> Option<u64> {
+    None
 }
 
 /// Read the active guest kernel's banner (`Linux version X.Y.Z-...`) from
@@ -2305,5 +2355,14 @@ mod tests {
 
         assert_eq!(ipv4_subnet_and_gateway("192.168.64.9"), Some(("192.168.64.0/24".into(), "192.168.64.1".into())));
         assert_eq!(ipv4_subnet_and_gateway("not-an-ip"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_memory_stats_are_sane() {
+        let total = host_memory();
+        let used = host_memory_used().expect("macOS host_statistics64 should succeed");
+        assert!(total > 0);
+        assert!(used > 0 && used <= total, "used={used}, total={total}");
     }
 }

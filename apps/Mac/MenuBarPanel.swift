@@ -210,11 +210,18 @@ private struct Totals: View {
             }
 
             tile("Memory") {
-                Text(Format.bytes(store.engine?.memoryUsedBytes ?? store.totalMemory))
+                Text(Format.bytes(store.engine?.totalMemoryUsedBytes ?? store.totalMemory))
                     .font(.system(size: 17, weight: .semibold)).monospacedDigit()
             } footer: {
                 if let e = store.engine, e.memoryBytes > 0 {
-                    MeterBar(Double(e.memoryUsedBytes) / Double(e.memoryBytes), height: 3)
+                    let hostColor: Color = e.hostMemoryFraction >= 0.93 ? G.danger
+                        : e.hostMemoryFraction >= 0.85 ? G.warning
+                        : Color(hex: 0x646E82)
+                    StackedMeterBar([
+                        .init(e.vmMemoryFraction, color: G.accent),
+                        .init(e.otherHostMemoryFraction, color: hostColor),
+                    ], height: 3)
+                    .help("Total \(Format.bytes(e.totalMemoryUsedBytes)) / \(Format.bytes(e.memoryBytes)) · VMs \(Format.bytes(e.vmMemoryUsedBytes)) · macOS \(Format.bytes(e.otherHostMemoryUsedBytes))")
                 } else {
                     MeterBar(0, height: 3)
                 }

@@ -666,6 +666,9 @@ pub struct EngineInfo {
     /// Whether Apple's Rosetta for Linux is available for running `linux/amd64` images.
     #[serde(default)]
     pub rosetta: bool,
+    /// Real host memory currently in use (macOS Activity Monitor definition: app + wired + compressed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_memory_used_bytes: Option<u64>,
 }
 
 /// Cached VM memory snapshot pool for one VM shape (`grav snapshot status`).
@@ -1499,5 +1502,21 @@ mod tests {
             }],
         };
         assert_eq!(decode_line::<Response>(&encode_line(&Response::Network(net.clone()))).unwrap(), Response::Network(net));
+    }
+
+    #[test]
+    fn engine_info_host_memory_round_trip_and_backcompat() {
+        let legacy = br#"{"type":"engine","data":{"version":"0.1.0","protocol":1,"kernel":"Linux 6.12","arch":"arm64","cpus":10,"memory_bytes":17179869184,"memory_used_bytes":1073741824,"disk_bytes":0,"disk_used_bytes":1000,"rosetta":true}}"#;
+        let Response::Engine(decoded) = decode_line::<Response>(legacy).unwrap() else {
+            panic!("expected engine");
+        };
+        assert_eq!(decoded.host_memory_used_bytes, None);
+
+        let with_host = EngineInfo {
+            host_memory_used_bytes: Some(10_737_418_240),
+            ..decoded
+        };
+        let encoded = encode_line(&Response::Engine(with_host.clone()));
+        assert_eq!(decode_line::<Response>(&encoded).unwrap(), Response::Engine(with_host));
     }
 }
