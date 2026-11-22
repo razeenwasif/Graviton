@@ -86,10 +86,7 @@ impl AppleHypervisor {
         let login_done = cf_dict_bool(dict, "kCGSessionLoginDoneKey");
         // SAFETY: `dict` is a non-null +1 CF object returned by `CGSessionCopyCurrentDictionary`.
         unsafe { CFRelease(dict) };
-        if screen_locked == Some(true) || on_console == Some(false) || login_done != Some(true) {
-            return false;
-        }
-        true
+        screen_locked != Some(true) && on_console != Some(false) && login_done == Some(true)
     }
 
     /// Boot and return the concrete handle (gives access to the console log path).
