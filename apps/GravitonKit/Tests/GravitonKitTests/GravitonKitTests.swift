@@ -1303,4 +1303,121 @@ import Testing
         #expect(try await demo.registryLogout(registry: "docker.io") == "docker.io")
         await #expect(throws: EngineError.self) { _ = try await demo.registryLogout(registry: "docker.io") }
     }
+
+    @Test func semVerParsingAndComparison() throws {
+        let v010 = try #require(SemVer("v0.1.0"))
+        let v012 = try #require(SemVer("0.1.2"))
+        let v0110 = try #require(SemVer("0.1.10"))
+        #expect(v010 < v012)
+        #expect(v012 < v0110)
+
+        let short = try #require(SemVer("V1.2"))
+        #expect(short == SemVer(major: 1, minor: 2, patch: 0))
+
+        // Build metadata does not change precedence or equality.
+        let withBuild = try #require(SemVer("v1.0.0+build.42"))
+        let plain = try #require(SemVer("1.0.0"))
+        #expect(withBuild == plain)
+        #expect(!(withBuild < plain) && !(plain < withBuild))
+
+        // Pre-release ordering (SemVer 2.0.0): alpha < beta.2 < rc.1 < stable
+        let alpha = try #require(SemVer("1.0.0-alpha"))
+        let beta2 = try #require(SemVer("1.0.0-beta.2"))
+        let beta10 = try #require(SemVer("1.0.0-beta.10"))
+        let rc1 = try #require(SemVer("1.0.0-rc.1"))
+        #expect(alpha < beta2)
+        #expect(beta2 < beta10)
+        #expect(beta10 < rc1)
+        #expect(rc1 < plain)
+
+        #expect(SemVer("") == nil)
+        #expect(SemVer("1") == nil)
+        #expect(SemVer("v1.2.3-") == nil)
+        #expect(SemVer("abc") == nil)
+    }
+
+    @Test @MainActor func updateCheckerGitHubReleaseFlows() async throws {
+        let suiteName = "dev.graviton.tests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        final class MockHTTP: @unchecked Sendable {
+            var calls = 0
+            var status = 200
+            var body = Data()
+
+            func set(status: Int, json: String) {
+                self.status = status
+                self.body = Data(json.utf8)
+            }
+        }
+        let mock = MockHTTP()
+        let checker = UpdateChecker(
+            currentVersion: SemVer(major: 0, minor: 1, patch: 0),
+            feedURL: URL(string: "https://example.test/releases/latest")!,
+            defaults: defaults,
+            fetcher: { req in
+                mock.calls += 1
+                let resp = HTTPURLResponse(
+                    url: try #require(req.url),
+                    statusCode: mock.status,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: nil
+                )!
+                return (mock.body, resp)
+            },
+            authTokenProvider: { nil },
+            demoModeProvider: { false }
+        )
+
+        // 1. Auto-check disabled skips background check.
+        checker.autoCheckEnabled = false
+        await checker.checkIfDue()
+        #expect(mock.calls == 0)
+        checker.autoCheckEnabled = true
+
+        // 2. Private / unpublished 404 yields calm .unavailable (and throttles next due check).
+        mock.set(status: 404, json: #"{"message":"Not Found"}"#)
+        await checker.checkIfDue()
+        #expect(mock.calls == 1)
+        guard case .unavailable = checker.state else {
+            Issue.record("expected .unavailable on 404"); return
+        }
+        await checker.checkIfDue()
+        #expect(mock.calls == 1) // Throttled within 6h window.
+
+        // 3. Same version yields .upToDate.
+        mock.set(status: 200, json: #"{"tag_name":"v0.1.0","name":"v0.1.0","html_url":"https://github.com/razeenwasif/Graviton/releases/tag/v0.1.0","draft":false,"prerelease":false,"assets":[]}"#)
+        await checker.checkNow(userInitiated: true)
+        #expect(checker.state == .upToDate(current: SemVer(major: 0, minor: 1, patch: 0), latest: SemVer(major: 0, minor: 1, patch: 0)))
+        #expect(!checker.hasVisibleUpdate)
+
+        // 4. Draft or prerelease is ignored.
+        mock.set(status: 200, json: #"{"tag_name":"v0.9.0-beta.1","name":"Beta","html_url":"https://github.com/razeenwasif/Graviton/releases/tag/v0.9.0-beta.1","draft":false,"prerelease":true,"assets":[]}"#)
+        await checker.checkNow(userInitiated: true)
+        #expect(!checker.hasVisibleUpdate)
+
+        // 5. Newer release selects .dmg asset and honors skip / clearSkipped.
+        mock.set(status: 200, json: #"{"tag_name":"v0.2.0","name":"Graviton v0.2.0","body":"Faster snapshots","html_url":"https://github.com/razeenwasif/Graviton/releases/tag/v0.2.0","published_at":"2026-12-01T00:00:00Z","draft":false,"prerelease":false,"assets":[{"name":"Graviton-0.2.0.zip","browser_download_url":"https://github.com/razeenwasif/Graviton/releases/download/v0.2.0/Graviton-0.2.0.zip"},{"name":"Graviton-0.2.0.dmg","browser_download_url":"https://github.com/razeenwasif/Graviton/releases/download/v0.2.0/Graviton-0.2.0.dmg"}]}"#)
+        await checker.checkNow(userInitiated: true)
+        guard case let .available(release) = checker.state else {
+            Issue.record("expected .available for v0.2.0"); return
+        }
+        #expect(release.version == SemVer(major: 0, minor: 2, patch: 0))
+        #expect(release.dmgDownloadURL?.lastPathComponent == "Graviton-0.2.0.dmg")
+        #expect(release.preferredDownloadURL == release.dmgDownloadURL)
+        #expect(checker.hasVisibleUpdate)
+
+        checker.skip(release)
+        #expect(!checker.hasVisibleUpdate)
+        checker.clearSkipped()
+        #expect(checker.hasVisibleUpdate)
+
+        // 6. Rate-limit 403/429 yields calm .unavailable.
+        mock.set(status: 403, json: #"{"message":"API rate limit exceeded"}"#)
+        await checker.checkNow(userInitiated: true)
+        guard case .unavailable = checker.state else {
+            Issue.record("expected .unavailable on 403"); return
+        }
+    }
 }

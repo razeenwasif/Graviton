@@ -49,6 +49,40 @@ design/
 The UI follows the mockups on the Graviton design canvas (dark, minimal, one
 periwinkle accent `#7C8CFF`; green, amber and red only for status).
 
+## Installation
+
+On Apple silicon (`arm64`) Macs running macOS 15 or later:
+
+- **Disk image (DMG):** Download the signed and Apple-notarized `Graviton-0.1.0.dmg`
+  from [GitHub Releases](https://github.com/razeenwasif/Graviton/releases/tag/v0.1.0),
+  drag **Graviton.app** to **Applications**, and start the background engine with
+  `/Applications/Graviton.app/Contents/MacOS/grav service install`. **GravitonMac**
+  also checks GitHub Releases quietly in **Settings (`⌘,`) ▸ Updates**.
+- **Homebrew Cask:** Defined in [`Casks/graviton.rb`](Casks/graviton.rb). Tap this
+  repository directly and install via Homebrew:
+
+  ```bash
+  brew tap razeenwasif/graviton https://github.com/razeenwasif/Graviton
+  brew install --cask razeenwasif/graviton/graviton
+  # Or tap a local checkout:
+  # brew tap graviton/local "$PWD" && brew install --cask graviton/local/graviton
+  ```
+
+- **Shell completions (`grav completions`):** Generate completion scripts for
+  `zsh`, `bash`, or `fish` (no running daemon required):
+
+  ```bash
+  # Zsh (with oh-my-zsh / standard fpath)
+  mkdir -p "${ZDOTDIR:-$HOME}/.zsh/completions"
+  grav completions zsh > "${ZDOTDIR:-$HOME}/.zsh/completions/_grav"
+
+  # Bash (with bash-completion)
+  grav completions bash > "$(brew --prefix)/etc/bash_completion.d/grav"
+
+  # Fish
+  grav completions fish > ~/.config/fish/completions/grav.fish
+  ```
+
 ## Running it
 
 ```bash
@@ -77,7 +111,8 @@ cargo run -p grav -- compose down -v            # tear down stack and project-ow
 ```
 
 - `grav login [REGISTRY]` / `grav logout [REGISTRY]` authenticate with Docker
-  Hub, GHCR or any OCI registry (Bearer or Basic auth). Usernames live in
+  Hub, GHCR or any OCI registry (Bearer or Basic auth), either in a terminal or
+  from the Mac app's **Settings (`⌘,`)** screen. Usernames live in
   `~/Library/Application Support/Graviton/registries.json` (`0600`) and
   passwords/tokens stay in the Mac's login Keychain (`grav login --list` shows
   saved logins; `--password-stdin` reads from stdin). Both `gzip` and `zstd`
@@ -87,6 +122,11 @@ cargo run -p grav -- compose down -v            # tear down stack and project-ow
   and `grav push IMAGE` uploads images to OCI registries using the saved
   `grav login` credentials (`grav push setup|status|test` remains for iPhone
   push alerts).
+- **Container runtime security & init**: `grav run` (plus `compose.yaml` and
+  the Docker Engine API) supports `--read-only` rootfs (in a private mount
+  namespace), `--cap-drop` / `--cap-add` (bounding + ambient + effective/permitted
+  bitmasks), `--tmpfs PATH[:opts]`, and `--init` (`docker-init` PID 1 zombie
+  reaping), all shown under **Security & Runtime** in Mac **Inspect**.
 - `-p [IP:]HOST:CONTAINER[/tcp|udp]` (or `-p PORT[/udp]`) publishes a TCP or
   UDP port forwarded to the container's VM. Without `IP:`, it binds `127.0.0.1`;
   pass `0.0.0.0:8080:80` (or `[::]:8080:80` / a specific interface IP) to accept
@@ -472,7 +512,7 @@ agent writes each step's changes as a layer.
 Inside a running container:
 
 ```bash
-cargo run -p grav -- stats web        # CPU, memory, network (sampled every 2 s, 5 min kept)
+cargo run -p grav -- stats web        # live CPU, memory, network, PIDs (--no-stream, --format json)
 cargo run -p grav -- top web          # its processes
 cargo run -p grav -- ls web /etc      # list a folder (volumes included)
 cargo run -p grav -- cat web /etc/os-release

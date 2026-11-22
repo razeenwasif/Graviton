@@ -9,6 +9,7 @@ struct GravitonMacApp: App {
     @State private var router = AppRouter()
     @State private var dialogs = Dialogs()
     @State private var fairy: FairyController
+    @State private var updates: UpdateChecker
     @AppStorage("showsMenuBarExtra") private var showsMenuBarExtra = true
 
     init() {
@@ -18,6 +19,7 @@ struct GravitonMacApp: App {
         let hosts = SharedHosts()
         let shells = ShellSessions()
         let router = AppRouter()
+        let updates = UpdateChecker()
         // Show the Mac picked last time.
         if !demo, let mac = hosts.current {
             store.use(RemoteEngine(host: mac.remoteHost, token: mac.token), named: mac.name)
@@ -27,8 +29,14 @@ struct GravitonMacApp: App {
         _shells = State(initialValue: shells)
         _router = State(initialValue: router)
         _fairy = State(initialValue: FairyController(store: store, hosts: hosts, shells: shells, router: router))
+        _updates = State(initialValue: updates)
         // Poll for the app's whole life, not just while a window is open: the menu bar item shows it too.
         Task { await store.run() }
+        // Quiet, non-intrusive background update check (respects opt-out, 6h interval, and offline/private 404).
+        Task {
+            try? await Task.sleep(for: .seconds(4))
+            await updates.checkIfDue()
+        }
     }
 
     var body: some Scene {
@@ -40,6 +48,7 @@ struct GravitonMacApp: App {
                 .environment(hosts)
                 .environment(dialogs)
                 .environment(fairy)
+                .environment(updates)
                 .preferredColorScheme(.dark)
                 .tint(G.accent)
                 .frame(minWidth: 980, minHeight: 620)
@@ -47,6 +56,12 @@ struct GravitonMacApp: App {
         .defaultSize(width: 1440, height: 900)
         .windowStyle(.hiddenTitleBar)
         .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") {
+                    router.pending = .settings
+                    Task { await updates.checkNow(userInitiated: true) }
+                }
+            }
             CommandGroup(after: .toolbar) {
                 Button("Refresh") { Task { await store.refresh() } }
                     .keyboardShortcut("r")
@@ -67,6 +82,7 @@ struct GravitonMacApp: App {
             MenuBarPanel()
                 .environment(store)
                 .environment(router)
+                .environment(updates)
         } label: {
             MenuBarLabel()
                 .environment(store)
@@ -173,6 +189,7 @@ struct RootView: View {
 struct Sidebar: View {
     @Environment(EngineStore.self) private var store
     @Environment(FairyController.self) private var fairy
+    @Environment(UpdateChecker.self) private var updates
     @Binding var selection: Section
 
     var body: some View {
@@ -203,6 +220,30 @@ struct Sidebar: View {
             .padding(.horizontal, 10)
 
             Spacer(minLength: 12)
+            if let release = updates.visibleUpdate {
+                Button {
+                    selection = .settings
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(G.accent)
+                        Text("Update v\(release.version.description) available")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(G.text)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(G.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(G.accent.opacity(0.32)))
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+                .help("Open Settings to review Graviton v\(release.version.description)")
+            }
             FairySidebarButton().padding(.horizontal, 12).padding(.bottom, 8)
             EngineCard().padding(12)
         }

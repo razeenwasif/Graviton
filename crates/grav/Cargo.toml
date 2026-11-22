@@ -11,6 +11,7 @@ graviton-core.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 clap = { workspace = true, features = ["env"] }
+clap_complete = "4"
 libc = "0.2"
 qrcode = { version = "0.14", default-features = false }
 serde.workspace = true

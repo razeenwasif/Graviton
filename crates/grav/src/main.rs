@@ -12,7 +12,8 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{Shell, generate};
 use graviton_core::{ImageReference, paths};
 use std::sync::{Arc, Mutex};
 
@@ -426,8 +427,42 @@ enum Command {
         #[arg(long)]
         unset: bool,
     },
+    /// Generate shell completion scripts for `grav`.
+    Completions {
+        /// Target shell (`zsh`, `bash`, or `fish`).
+        #[arg(value_enum)]
+        shell: CompletionShell,
+    },
     /// Parse and normalise an image reference (no daemon needed).
     Resolve { reference: String },
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionShell {
+    Zsh,
+    Bash,
+    Fish,
+}
+
+impl CompletionShell {
+    fn to_clap_shell(self) -> Shell {
+        match self {
+            Self::Zsh => Shell::Zsh,
+            Self::Bash => Shell::Bash,
+            Self::Fish => Shell::Fish,
+        }
+    }
+}
+
+fn write_completions<W: Write>(shell: CompletionShell, out: &mut W) -> std::io::Result<()> {
+    let mut cmd = Cli::command();
+    let mut buf = Vec::new();
+    generate(shell.to_clap_shell(), &mut cmd, "grav", &mut buf);
+    match out.write_all(&buf) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -609,6 +644,11 @@ fn run(cli: Cli) -> Result<()> {
                 println!("# Run this command to configure your shell:");
                 println!("# eval \"$(grav docker-env)\"");
             }
+            return Ok(());
+        }
+        Command::Completions { shell } => {
+            let mut stdout = std::io::stdout().lock();
+            write_completions(*shell, &mut stdout)?;
             return Ok(());
         }
         _ => {}
@@ -1257,7 +1297,7 @@ fn run(cli: Cli) -> Result<()> {
             Response::Revoked { id } => println!("{id} revoked"),
             other => unexpected(other)?,
         },
-        Command::Resolve { .. } | Command::DockerEnv { .. } | Command::Hosts { .. } | Command::Service { .. } => unreachable!(),
+        Command::Resolve { .. } | Command::DockerEnv { .. } | Command::Completions { .. } | Command::Hosts { .. } | Command::Service { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -2910,5 +2950,40 @@ mod tests {
             Command::Stats { ref containers, all: true, no_stream: true, ref format }
                 if containers == &["web", "db"] && format == "json"
         ));
+    }
+
+    #[test]
+    fn parses_completions_command() {
+        for (arg, expected) in [
+            ("zsh", CompletionShell::Zsh),
+            ("bash", CompletionShell::Bash),
+            ("fish", CompletionShell::Fish),
+        ] {
+            let parsed = Cli::try_parse_from(["grav", "completions", arg]).unwrap();
+            assert!(matches!(parsed.command, Command::Completions { shell } if shell == expected));
+        }
+        assert!(Cli::try_parse_from(["grav", "completions", "cmd"]).is_err());
+    }
+
+    #[test]
+    fn generates_non_empty_completions_for_all_shells() {
+        for (shell, marker) in [
+            (CompletionShell::Zsh, "#compdef grav"),
+            (CompletionShell::Bash, "_grav"),
+            (CompletionShell::Fish, "complete -c grav"),
+        ] {
+            let mut buf = Vec::new();
+            write_completions(shell, &mut buf).expect("write to Vec");
+            let script = String::from_utf8(buf).expect("valid utf-8 completion script");
+            assert!(script.contains(marker), "{shell:?} missing marker {marker}");
+            for needle in ["compose", "stats", "hosts", "completions", "docker-env"] {
+                assert!(script.contains(needle), "{shell:?} missing `{needle}`");
+            }
+            let prefix = if shell == CompletionShell::Fish { "-l " } else { "--" };
+            for flag in ["read-only", "cap-drop"] {
+                let needle = format!("{prefix}{flag}");
+                assert!(script.contains(&needle), "{shell:?} missing `{needle}`");
+            }
+        }
     }
 }

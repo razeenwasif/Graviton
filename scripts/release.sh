@@ -164,6 +164,10 @@ if [ "$notarize" = 1 ]; then
   xcrun stapler staple "$dmg"
 fi
 
+sums="$dist/SHA256SUMS.txt"
+(cd "$dist" && shasum -a 256 "$(basename "$dmg")" "$(basename "$zip")" > "$(basename "$sums")")
+dmg_sha=$(awk 'NR==1 {print $1}' "$sums")
+
 step "Done"
 if [ "$adhoc" = 1 ]; then
   echo "Ad hoc build (not for distribution: Gatekeeper will block it on other Macs):"
@@ -174,4 +178,5 @@ else
 fi
 echo "  $app"
 echo "  $zip"
-echo "  $dmg"
+echo "  $dmg (sha256: $dmg_sha)"
+echo "  $sums"

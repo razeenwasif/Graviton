@@ -5,6 +5,7 @@ import SwiftUI
 struct SettingsScreen: View {
     @Environment(EngineStore.self) private var store
     @Environment(Dialogs.self) private var dialogs
+    @Environment(UpdateChecker.self) private var updates
     @AppStorage("showsMenuBarExtra") private var showsMenuBarExtra = true
     @AppStorage("menuBarShowsCount") private var menuBarShowsCount = true
     @State private var showLogin = false
@@ -42,6 +43,7 @@ struct SettingsScreen: View {
                     }
 
                     loginsCard
+                    updatesCard
                     generalCard
                 }
                 .frame(maxWidth: 820, alignment: .leading)
@@ -137,6 +139,118 @@ struct SettingsScreen: View {
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
         .gravitonCard()
+    }
+
+    private var updatesCard: some View {
+        let checking = updates.state == .checking
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
+                GCaption("Updates")
+                GBadge("v\(updates.currentVersion)", color: G.muted)
+                Spacer()
+                Button {
+                    Task { await updates.checkNow(userInitiated: true) }
+                } label: {
+                    if checking {
+                        HStack(spacing: 6) {
+                            GSpinner(size: 11)
+                            Text("Checking…")
+                        }
+                    } else {
+                        Label("Check for Updates", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                }
+                .buttonStyle(.g(.secondary, size: .small))
+                .disabled(checking)
+            }
+
+            Toggle(
+                "Check for updates automatically",
+                isOn: Binding(
+                    get: { updates.autoCheckEnabled },
+                    set: { updates.autoCheckEnabled = $0 }
+                )
+            )
+            .toggleStyle(.gSwitch)
+
+            if let checkedAt = updates.lastCheckedAt {
+                Text("Last checked \(checkedAt.formatted(date: .abbreviated, time: .shortened)) against GitHub Releases.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(G.faint)
+            } else {
+                Text("Checks GitHub Releases (razeenwasif/Graviton) for new signed DMG releases.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(G.faint)
+            }
+
+            switch updates.state {
+            case .idle, .checking:
+                EmptyView()
+            case let .upToDate(current, _):
+                GStatusLine(.success, "Graviton v\(current) is up to date.")
+            case let .available(info):
+                let skipped = updates.skippedVersion == info.version.description
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 8) {
+                        Text(info.title)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(G.text)
+                        GBadge("v\(info.version)", color: G.accent)
+                        if skipped {
+                            GBadge("Skipped", color: G.muted)
+                        }
+                        Spacer()
+                    }
+                    if !info.notes.isEmpty {
+                        Text(Self.trimmedReleaseNotes(info.notes))
+                            .font(.system(size: 12))
+                            .foregroundStyle(G.textSecondary)
+                            .lineLimit(4)
+                    }
+                    HStack(spacing: 8) {
+                        Button("Download DMG", systemImage: "arrow.down.circle") {
+                            NSWorkspace.shared.open(info.preferredDownloadURL)
+                        }
+                        .buttonStyle(.g(.primary, size: .small))
+
+                        Button("Release Page", systemImage: "safari") {
+                            NSWorkspace.shared.open(info.releaseURL)
+                        }
+                        .buttonStyle(.g(.secondary, size: .small))
+
+                        Spacer()
+
+                        if skipped {
+                            Button("Clear Skip") { updates.clearSkipped() }
+                                .buttonStyle(.g(.ghost, size: .small))
+                        } else {
+                            Button("Skip Version") { updates.skip(info) }
+                                .buttonStyle(.g(.ghost, size: .small))
+                        }
+                    }
+                }
+                .padding(14)
+                .background(G.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(G.accent.opacity(0.28)))
+            case let .unavailable(message):
+                GStatusLine(.info, message)
+            case let .failed(message):
+                GStatusLine(.failure, message)
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .gravitonCard()
+    }
+
+    private static func trimmedReleaseNotes(_ notes: String) -> String {
+        let condensed = notes
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .prefix(4)
+            .joined(separator: "\n")
+        return condensed.count > 260 ? String(condensed.prefix(257)) + "…" : condensed
     }
 
     private var generalCard: some View {
