@@ -218,6 +218,32 @@ pub enum PullProgress {
     },
 }
 
+/// Progress reported while pushing an image (`grav push IMAGE`), streamed before `Response::ImagePushed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub enum ImagePushProgress {
+    Started { blobs: usize, total_bytes: u64 },
+    Blob {
+        index: usize,
+        total_blobs: usize,
+        digest: String,
+        done: u64,
+        total: u64,
+        skipped: bool,
+    },
+    Manifest { digest: String, size: u64 },
+}
+
+/// Summary of a completed `grav push IMAGE` upload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImagePushResult {
+    pub reference: String,
+    pub digest: String,
+    pub size_bytes: u64,
+    pub blobs_pushed: u32,
+    pub blobs_skipped: u32,
+}
+
 /// One saved registry login (username only; passwords stay in the Mac's Keychain).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistryLoginInfo {
@@ -397,6 +423,7 @@ pub enum EventKind {
     /// Exited on its own with a non-zero code, or couldn't start.
     Failed,
     Pulled,
+    Pushed,
     Built,
     BuildFailed,
     Removed,
@@ -736,6 +763,15 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         platform: Option<String>,
     },
+    /// Give an existing local image an additional name/tag without copying layers.
+    TagImage { source: String, target: String },
+    /// Push a local image to its registry; answers `ImagePushed` (preceded by
+    /// `ImagePushProgress` lines when `progress: true`).
+    PushImage {
+        reference: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        progress: bool,
+    },
     /// Verify and save credentials for an OCI registry (password goes in the Mac's Keychain).
     RegistryLogin {
         registry: String,
@@ -836,6 +872,8 @@ pub enum Response {
     Container(ContainerSummary),
     Image(ImageSummary),
     PullProgress(PullProgress),
+    ImagePushProgress(ImagePushProgress),
+    ImagePushed(ImagePushResult),
     LoggedIn { registry: String, username: String },
     LoggedOut { registry: String },
     Logins(Vec<RegistryLoginInfo>),
@@ -1532,5 +1570,50 @@ mod tests {
         };
         let encoded = encode_line(&Response::Engine(with_host.clone()));
         assert_eq!(decode_line::<Response>(&encoded).unwrap(), Response::Engine(with_host));
+    }
+
+    #[test]
+    fn tag_and_push_image_round_trip() {
+        let tag_req = Request::TagImage {
+            source: "app:1.0".into(),
+            target: "ghcr.io/me/app:1.0".into(),
+        };
+        assert_eq!(
+            String::from_utf8(encode_line(&tag_req)).unwrap(),
+            "{\"method\":\"tag_image\",\"params\":{\"source\":\"app:1.0\",\"target\":\"ghcr.io/me/app:1.0\"}}\n"
+        );
+        assert_eq!(decode_line::<Request>(&encode_line(&tag_req)).unwrap(), tag_req);
+
+        let push_req = Request::PushImage {
+            reference: "ghcr.io/me/app:1.0".into(),
+            progress: true,
+        };
+        assert_eq!(decode_line::<Request>(&encode_line(&push_req)).unwrap(), push_req);
+
+        // Older callers omitting `progress` default it to false.
+        let minimal = br#"{"method":"push_image","params":{"reference":"ghcr.io/me/app:1.0"}}"#;
+        assert_eq!(
+            decode_line::<Request>(minimal).unwrap(),
+            Request::PushImage { reference: "ghcr.io/me/app:1.0".into(), progress: false }
+        );
+
+        let prog = Response::ImagePushProgress(ImagePushProgress::Blob {
+            index: 0,
+            total_blobs: 2,
+            digest: "sha256:abcd".into(),
+            done: 512,
+            total: 1024,
+            skipped: false,
+        });
+        assert_eq!(decode_line::<Response>(&encode_line(&prog)).unwrap(), prog);
+
+        let res = Response::ImagePushed(ImagePushResult {
+            reference: "ghcr.io/me/app:1.0".into(),
+            digest: "sha256:ef01".into(),
+            size_bytes: 2048,
+            blobs_pushed: 1,
+            blobs_skipped: 1,
+        });
+        assert_eq!(decode_line::<Response>(&encode_line(&res)).unwrap(), res);
     }
 }

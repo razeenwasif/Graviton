@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex};
 use graviton_proto::frame::{Decoder, Frame};
 use remote::Target;
 use graviton_proto::{
-    BuildSecret, BuildSpec, ContainerStatus, ContainerSummary, ExecSpec, FileKind, LogStream, PullProgress, Request, Response, RestartPolicy, RunSpec,
-    decode_line, encode_line,
+    BuildSecret, BuildSpec, ContainerStatus, ContainerSummary, ExecSpec, FileKind, ImagePushProgress, LogStream, PullProgress, Request, Response,
+    RestartPolicy, RunSpec, decode_line, encode_line,
 };
 
 #[derive(Parser, Debug)]
@@ -70,6 +70,13 @@ enum Command {
         #[arg(long)]
         platform: Option<String>,
         reference: String,
+    },
+    /// Give a local image an additional name or tag (e.g. `grav tag app ghcr.io/me/app:1.0`).
+    Tag {
+        /// Existing local image reference or digest prefix.
+        source: String,
+        /// New repository[:tag] reference.
+        target: String,
     },
     /// Log in to an OCI registry (Docker Hub, GHCR, etc.); credentials stay in the Mac's Keychain.
     Login {
@@ -265,10 +272,13 @@ enum Command {
         #[arg(short, long)]
         follow: bool,
     },
-    /// Push alerts to paired phones (failed containers, finished builds).
+    /// Push a local image to its registry, or manage phone push alerts (`setup`, `status`, `test`).
+    #[command(args_conflicts_with_subcommands = true)]
     Push {
         #[command(subcommand)]
-        action: PushAction,
+        action: Option<PushAction>,
+        /// Image reference to push (`NAME[:TAG]` or `REGISTRY/REPO[:TAG]`).
+        image: Option<String>,
     },
     /// Pair a phone with this Mac (gravitond must run with --remote).
     Pair,
@@ -458,7 +468,7 @@ fn run(cli: Cli) -> Result<()> {
 
     let socket = cli.socket.clone().unwrap_or_else(paths::socket_path);
     let target = Target::resolve(cli.host.as_deref(), socket)?;
-    if target.is_remote() && matches!(cli.command, Command::Pair | Command::Devices { .. } | Command::Push { .. }) {
+    if target.is_remote() && matches!(cli.command, Command::Pair | Command::Devices { .. } | Command::Push { action: Some(_), .. }) {
         bail!("pairing and push alerts are managed on the Mac itself: run this there (or with --host local)");
     }
     let mut client = Client::connect(&target)?;
@@ -528,6 +538,14 @@ fn run(cli: Cli) -> Result<()> {
         Command::Stop { container } => lifecycle(&mut client, Request::Stop { id: container }, "stopped")?,
         Command::Restart { container } => lifecycle(&mut client, Request::Restart { id: container }, "restarted")?,
         Command::Pull { platform, reference } => pull_image(&mut client, &reference, platform.as_deref())?,
+        Command::Tag { source, target } => match client.call(&Request::TagImage { source: source.clone(), target: target.clone() })? {
+            Response::Image(i) => {
+                let disp = ImageReference::parse(&i.reference).map(|r| r.display_name()).unwrap_or(i.reference);
+                let short = &i.digest[..i.digest.len().min(19)];
+                println!("Tagged {source} -> {disp} ({short})");
+            }
+            other => unexpected(other)?,
+        },
         Command::Login { registry, username, password_stdin, list } => {
             if list {
                 match client.call(&Request::ListLogins)? {
@@ -863,7 +881,10 @@ fn run(cli: Cli) -> Result<()> {
                         for e in &list {
                             let marker = match e.kind {
                                 graviton_proto::EventKind::Failed | graviton_proto::EventKind::BuildFailed => "✗",
-                                graviton_proto::EventKind::Started | graviton_proto::EventKind::Built | graviton_proto::EventKind::Pulled => "✓",
+                                graviton_proto::EventKind::Started
+                                | graviton_proto::EventKind::Built
+                                | graviton_proto::EventKind::Pulled
+                                | graviton_proto::EventKind::Pushed => "✓",
                                 _ => "·",
                             };
                             println!("{}  {marker} {}", clock(e.timestamp_ms), e.message);
@@ -934,29 +955,34 @@ fn run(cli: Cli) -> Result<()> {
             Response::Removed { id } => println!("{id}"),
             other => unexpected(other)?,
         },
-        Command::Push { action } => {
-            let request = match action {
-                PushAction::Setup { key_id, team_id, file } => {
-                    let p8 = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
-                    Request::PushSetup { key_id, team_id, p8 }
-                }
-                PushAction::Status => Request::PushStatus,
-                PushAction::Test => Request::PushTest,
-            };
-            match client.call(&request)? {
-                Response::Push(info) => {
-                    match (&info.key_id, &info.team_id) {
-                        (Some(k), Some(t)) => println!("Push alerts are on: key {k}, team {t}, kept in the login Keychain."),
-                        _ => println!("Push alerts aren't set up: grav push setup --key-id ID --team-id TEAM AuthKey_ID.p8"),
+        Command::Push { action, image } => match (action, image) {
+            (Some(action), None) => {
+                let request = match action {
+                    PushAction::Setup { key_id, team_id, file } => {
+                        let p8 = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+                        Request::PushSetup { key_id, team_id, p8 }
                     }
-                    println!("{} phone{} registered for alerts.", info.devices, if info.devices == 1 { "" } else { "s" });
-                    if let Some(note) = info.note {
-                        println!("{note}");
+                    PushAction::Status => Request::PushStatus,
+                    PushAction::Test => Request::PushTest,
+                };
+                match client.call(&request)? {
+                    Response::Push(info) => {
+                        match (&info.key_id, &info.team_id) {
+                            (Some(k), Some(t)) => println!("Push alerts are on: key {k}, team {t}, kept in the login Keychain."),
+                            _ => println!("Push alerts aren't set up: grav push setup --key-id ID --team-id TEAM AuthKey_ID.p8"),
+                        }
+                        println!("{} phone{} registered for alerts.", info.devices, if info.devices == 1 { "" } else { "s" });
+                        if let Some(note) = info.note {
+                            println!("{note}");
+                        }
                     }
+                    other => unexpected(other)?,
                 }
-                other => unexpected(other)?,
             }
-        }
+            (None, Some(reference)) => push_image(&mut client, &reference)?,
+            (None, None) => bail!("pass an image reference (`grav push IMAGE`) or alert subcommand (`grav push setup|status|test`)"),
+            (Some(_), Some(_)) => bail!("pass either an image reference or an alert subcommand, not both"),
+        },
         Command::Pair => match client.call(&Request::PairBegin)? {
             Response::Pairing(p) => print_pairing(&p)?,
             other => unexpected(other)?,
@@ -1667,8 +1693,120 @@ fn prompt_password(prompt: &str) -> Result<String> {
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
+#[derive(Clone, Default)]
+struct ProgressRow {
+    digest: String,
+    done: u64,
+    total: u64,
+    skipped: bool,
+    started: bool,
+}
+
+fn render_progress_rows(rows: &[ProgressRow], drawn: &mut usize, item_noun: &str, skip_label: &str) {
+    let mut err = std::io::stderr().lock();
+    if *drawn > 0 {
+        let _ = write!(err, "\x1b[{}A", *drawn);
+    }
+    for (i, r) in rows.iter().enumerate() {
+        let short = r.digest.strip_prefix("sha256:").map(|h| &h[..h.len().min(12)]).unwrap_or(&r.digest);
+        let status = if !r.started {
+            "waiting".to_string()
+        } else if r.skipped {
+            format!("{skip_label} ({})", bytes(r.total))
+        } else if r.done >= r.total {
+            format!("done   ({})", bytes(r.total))
+        } else {
+            let pct = (r.done * 100).checked_div(r.total).unwrap_or(0).min(100);
+            let filled = (pct as usize * 20) / 100;
+            let bar: String = "█".repeat(filled) + &"░".repeat(20 - filled);
+            format!("[{bar}] {pct:>3}%  {} / {}", bytes(r.done), bytes(r.total))
+        };
+        let label = if short.is_empty() { format!("{item_noun} {}", i + 1) } else { short.to_string() };
+        let _ = writeln!(err, "\r\x1b[K  {label:<12}  {status}");
+    }
+    let _ = err.flush();
+    *drawn = rows.len();
+}
+
+struct ProgressTracker {
+    rows: Vec<ProgressRow>,
+    logged_done: Vec<bool>,
+    drawn: usize,
+    is_tty: bool,
+    item_noun: &'static str,
+    skip_label: &'static str,
+}
+
+struct ProgressItem {
+    index: usize,
+    total_items: usize,
+    digest: String,
+    done: u64,
+    total: u64,
+    skipped: bool,
+}
+
+impl ProgressTracker {
+    fn new(item_noun: &'static str, skip_label: &'static str) -> Self {
+        Self {
+            rows: Vec::new(),
+            logged_done: Vec::new(),
+            drawn: 0,
+            is_tty: unsafe { libc::isatty(libc::STDERR_FILENO) } == 1,
+            item_noun,
+            skip_label,
+        }
+    }
+
+    fn start(&mut self, count: usize, total_bytes: u64) {
+        self.rows = vec![ProgressRow::default(); count];
+        self.logged_done = vec![false; count];
+        if !self.is_tty || count > 24 {
+            let plural = if count == 1 { "" } else { "s" };
+            eprintln!("  {count} {}{plural}, {} total", self.item_noun, bytes(total_bytes));
+        } else if !self.rows.is_empty() {
+            render_progress_rows(&self.rows, &mut self.drawn, self.item_noun, self.skip_label);
+        }
+    }
+
+    fn update(&mut self, item: ProgressItem) {
+        let len = item.total_items.max(item.index + 1);
+        if self.rows.len() < len {
+            self.rows.resize(len, ProgressRow::default());
+            self.logged_done.resize(len, false);
+        }
+        self.rows[item.index] = ProgressRow {
+            digest: item.digest.clone(),
+            done: item.done,
+            total: item.total,
+            skipped: item.skipped,
+            started: true,
+        };
+        if self.is_tty && self.rows.len() <= 24 {
+            render_progress_rows(&self.rows, &mut self.drawn, self.item_noun, self.skip_label);
+        } else {
+            let is_done = item.skipped || item.done >= item.total;
+            if is_done && !self.logged_done[item.index] {
+                self.logged_done[item.index] = true;
+                let short = item
+                    .digest
+                    .strip_prefix("sha256:")
+                    .map(|h| &h[..h.len().min(12)])
+                    .unwrap_or(&item.digest);
+                let tag = if item.skipped { self.skip_label } else { "done" };
+                eprintln!(
+                    "  {} {}/{} {short}  {tag} ({})",
+                    self.item_noun,
+                    item.index + 1,
+                    self.rows.len(),
+                    bytes(item.total)
+                );
+            }
+        }
+    }
+}
+
 fn pull_image(client: &mut Client, reference: &str, platform: Option<&str>) -> Result<()> {
-    let is_tty = unsafe { libc::isatty(libc::STDERR_FILENO) } == 1;
     match platform {
         Some(p) => eprintln!("Pulling {reference} ({p})…"),
         None => eprintln!("Pulling {reference}…"),
@@ -1680,45 +1818,8 @@ fn pull_image(client: &mut Client, reference: &str, platform: Option<&str>) -> R
     }))?;
     client.writer.flush()?;
 
-    #[derive(Clone)]
-    struct Row {
-        digest: String,
-        done: u64,
-        total: u64,
-        cached: bool,
-        started: bool,
-    }
-
-    let mut rows: Vec<Row> = Vec::new();
-    let mut drawn = 0usize;
-    let mut logged_done: Vec<bool> = Vec::new();
+    let mut tracker = ProgressTracker::new("layer", "cached");
     let mut line = String::new();
-
-    let render_tty = |rows: &[Row], drawn: &mut usize| {
-        let mut err = std::io::stderr().lock();
-        if *drawn > 0 {
-            let _ = write!(err, "\x1b[{}A", *drawn);
-        }
-        for (i, r) in rows.iter().enumerate() {
-            let short = r.digest.strip_prefix("sha256:").map(|h| &h[..h.len().min(12)]).unwrap_or(&r.digest);
-            let status = if !r.started {
-                "waiting".to_string()
-            } else if r.cached {
-                format!("cached ({})", bytes(r.total))
-            } else if r.total > 0 && r.done >= r.total {
-                format!("done   ({})", bytes(r.total))
-            } else {
-                let pct = (r.done * 100).checked_div(r.total).unwrap_or(0).min(100);
-                let filled = (pct as usize * 20) / 100;
-                let bar: String = "█".repeat(filled) + &"░".repeat(20 - filled);
-                format!("[{bar}] {pct:>3}%  {} / {}", bytes(r.done), bytes(r.total))
-            };
-            let label = if short.is_empty() { format!("layer {}", i + 1) } else { short.to_string() };
-            let _ = writeln!(err, "\r\x1b[K  {label:<12}  {status}");
-        }
-        let _ = err.flush();
-        *drawn = rows.len();
-    };
 
     loop {
         line.clear();
@@ -1727,40 +1828,17 @@ fn pull_image(client: &mut Client, reference: &str, platform: Option<&str>) -> R
         }
         match decode_line::<Response>(line.as_bytes())? {
             Response::PullProgress(PullProgress::Resolved { layers, total_bytes }) => {
-                rows = vec![
-                    Row { digest: String::new(), done: 0, total: 0, cached: false, started: false };
-                    layers
-                ];
-                logged_done = vec![false; layers];
-                if !is_tty || layers > 24 {
-                    eprintln!("  {layers} layer{}, {} total", if layers == 1 { "" } else { "s" }, bytes(total_bytes));
-                } else if !rows.is_empty() {
-                    render_tty(&rows, &mut drawn);
-                }
+                tracker.start(layers, total_bytes);
             }
             Response::PullProgress(PullProgress::Layer { index, total_layers, digest, done, total, cached }) => {
-                if rows.len() < total_layers.max(index + 1) {
-                    rows.resize(
-                        total_layers.max(index + 1),
-                        Row { digest: String::new(), done: 0, total: 0, cached: false, started: false },
-                    );
-                    logged_done.resize(rows.len(), false);
-                }
-                rows[index] = Row { digest: digest.clone(), done, total, cached, started: true };
-                if is_tty && rows.len() <= 24 {
-                    render_tty(&rows, &mut drawn);
-                } else {
-                    let is_done = cached || (total > 0 && done >= total);
-                    if is_done && !logged_done[index] {
-                        logged_done[index] = true;
-                        let short = digest.strip_prefix("sha256:").map(|h| &h[..h.len().min(12)]).unwrap_or(&digest);
-                        if cached {
-                            eprintln!("  layer {}/{} {short}  cached ({})", index + 1, rows.len(), bytes(total));
-                        } else {
-                            eprintln!("  layer {}/{} {short}  done ({})", index + 1, rows.len(), bytes(total));
-                        }
-                    }
-                }
+                tracker.update(ProgressItem {
+                    index,
+                    total_items: total_layers,
+                    digest,
+                    done,
+                    total,
+                    skipped: cached,
+                });
             }
             Response::Image(i) => {
                 println!(
@@ -1770,6 +1848,64 @@ fn pull_image(client: &mut Client, reference: &str, platform: Option<&str>) -> R
                     bytes(i.size_bytes),
                     i.architecture,
                     &i.digest[..i.digest.len().min(19)]
+                );
+                return Ok(());
+            }
+            Response::Error { message } => bail!(message),
+            other => return unexpected(other),
+        }
+    }
+}
+
+fn push_image(client: &mut Client, reference: &str) -> Result<()> {
+    eprintln!("Pushing {reference}…");
+    client.writer.write_all(&encode_line(&Request::PushImage {
+        reference: reference.to_string(),
+        progress: true,
+    }))?;
+    client.writer.flush()?;
+
+    let mut tracker = ProgressTracker::new("blob", "exists");
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        if client.reader.read_line(&mut line)? == 0 {
+            bail!("gravitond closed the connection");
+        }
+        match decode_line::<Response>(line.as_bytes())? {
+            Response::ImagePushProgress(ImagePushProgress::Started { blobs, total_bytes }) => {
+                tracker.start(blobs, total_bytes);
+            }
+            Response::ImagePushProgress(ImagePushProgress::Blob {
+                index,
+                total_blobs,
+                digest,
+                done,
+                total,
+                skipped,
+            }) => {
+                tracker.update(ProgressItem {
+                    index,
+                    total_items: total_blobs,
+                    digest,
+                    done,
+                    total,
+                    skipped,
+                });
+            }
+            Response::ImagePushProgress(ImagePushProgress::Manifest { digest, size }) => {
+                let short = &digest[..digest.len().min(19)];
+                eprintln!("  manifest {short} ({})", bytes(size));
+            }
+            Response::ImagePushed(res) => {
+                let disp = ImageReference::parse(&res.reference)
+                    .map(|r| r.display_name())
+                    .unwrap_or_else(|_| res.reference.clone());
+                let short = &res.digest[..res.digest.len().min(19)];
+                println!(
+                    "Pushed {disp} ({short}, {} uploaded, {} existed)",
+                    res.blobs_pushed, res.blobs_skipped
                 );
                 return Ok(());
             }
@@ -1964,5 +2100,45 @@ mod tests {
         assert_eq!(uptime(11_520), "3h 12m");
         // Local time: only the seconds and milliseconds are the same everywhere.
         assert!(clock(3_723_004).ends_with(":03.004"));
+    }
+
+    #[test]
+    fn parses_tag_and_push_commands() {
+        let tagged = Cli::try_parse_from(["grav", "tag", "app:1", "ghcr.io/me/app:1.0"]).unwrap();
+        assert!(matches!(
+            tagged.command,
+            Command::Tag { ref source, ref target } if source == "app:1" && target == "ghcr.io/me/app:1.0"
+        ));
+
+        for img_ref in ["ghcr.io/me/app:1.0", "localhost:5000/app:v1", "test:1.0"] {
+            let parsed = Cli::try_parse_from(["grav", "push", img_ref]).unwrap();
+            assert!(
+                matches!(parsed.command, Command::Push { action: None, image: Some(ref r) } if r == img_ref),
+                "unexpected parse for `{img_ref}`: {:?}",
+                parsed.command
+            );
+        }
+
+        let st = Cli::try_parse_from(["grav", "push", "status"]).unwrap();
+        assert!(matches!(st.command, Command::Push { action: Some(PushAction::Status), image: None }));
+
+        let t = Cli::try_parse_from(["grav", "push", "test"]).unwrap();
+        assert!(matches!(t.command, Command::Push { action: Some(PushAction::Test), image: None }));
+
+        let setup = Cli::try_parse_from([
+            "grav",
+            "push",
+            "setup",
+            "--key-id",
+            "KEY1234567",
+            "--team-id",
+            "TEAM123456",
+            "AuthKey.p8",
+        ])
+        .unwrap();
+        assert!(matches!(
+            setup.command,
+            Command::Push { action: Some(PushAction::Setup { .. }), image: None }
+        ));
     }
 }

@@ -2,7 +2,10 @@
 //! pulls, manifest negotiation (OCI and Docker v2, single and multi-platform),
 //! and verified blob downloads.
 
+use std::collections::HashSet;
 use std::fmt;
+use std::fs::File;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -98,6 +101,24 @@ pub enum Progress {
     Layer { index: usize, digest: String, done: u64, total: u64, cached: bool },
 }
 
+/// Push progress, reported as blobs and the manifest upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushProgress {
+    Started { blobs: usize, total_bytes: u64 },
+    Blob { index: usize, digest: String, done: u64, total: u64, skipped: bool },
+    Manifest { digest: String, size: u64 },
+}
+
+/// Summary of a completed OCI registry push.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushResult {
+    pub reference: String,
+    pub digest: String,
+    pub size_bytes: u64,
+    pub blobs_pushed: u32,
+    pub blobs_skipped: u32,
+}
+
 pub struct Registry {
     agent: Agent,
 }
@@ -180,7 +201,7 @@ impl Registry {
         let canonical = normalize_registry(&reference.registry);
         let host = registry_host(&canonical);
         let repo = &reference.repository;
-        let mut session = Session::new(&self.agent, canonical, host, repo.clone(), opts.auth);
+        let mut session = Session::new(&self.agent, canonical, host, repo.clone(), opts.auth, "pull");
 
         let tag_or_digest = reference.digest.clone().or_else(|| reference.tag.clone()).unwrap_or_else(|| "latest".into());
         let (mut bytes, mut media_type, mut digest) = session.manifest(&tag_or_digest)?;
@@ -274,13 +295,188 @@ impl Registry {
             return Err(ImageError::Registry(format!("invalid registry name `{registry}`")));
         }
         let host = registry_host(&canonical);
-        let mut session = Session::new(&self.agent, canonical.clone(), host, String::new(), Some(creds));
+        let mut session = Session::new(&self.agent, canonical.clone(), host, String::new(), Some(creds), "pull");
         let response = session.get_path("/v2/", None)?;
         let status = response.status().as_u16();
         if status != 200 {
             return Err(ImageError::Registry(format!("{canonical} returned HTTP {status} for /v2/")));
         }
         Ok(canonical)
+    }
+
+    /// Push a local image (`image`) to `target` using OCI Distribution v1.1 endpoints.
+    pub fn push_with_auth(
+        &self,
+        image: &LocalImage,
+        target: &ImageReference,
+        blobs: &BlobStore,
+        auth: Option<&Credentials>,
+        mut progress: impl FnMut(PushProgress),
+    ) -> Result<PushResult> {
+        if target.tag.is_none() && target.digest.is_some() {
+            return Err(ImageError::Unsupported(
+                "pushing by digest is not supported; include a tag (e.g. repo:tag)".into(),
+            ));
+        }
+        let tag = target.tag.as_deref().unwrap_or("latest");
+        let canonical = normalize_registry(&target.registry);
+        let host = registry_host(&canonical);
+        let repo = &target.repository;
+
+        let manifest_digest = Digest::parse(&image.manifest_digest)?;
+        let manifest_bytes = if blobs.has(&manifest_digest) {
+            blobs.read(&manifest_digest)?
+        } else {
+            let config_digest = Digest::parse(&image.config_digest)?;
+            let config_size = blobs.size(&config_digest).ok_or_else(|| {
+                ImageError::Unsupported(format!("local image {} is missing config blob {}", image.reference, config_digest))
+            })?;
+            let layers_json: Vec<serde_json::Value> = image
+                .layers
+                .iter()
+                .map(|l| serde_json::json!({ "mediaType": l.media_type, "digest": l.digest, "size": l.size }))
+                .collect();
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": image.config_digest,
+                    "size": config_size,
+                },
+                "layers": layers_json,
+            }))
+            .map_err(|source| ImageError::Json { what: "manifest".into(), source })?
+        };
+        let manifest_parsed: Manifest = json(&manifest_bytes, "manifest")?;
+        let manifest_media_type = manifest_parsed
+            .media_type
+            .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".into());
+
+        // Deduplicate blob digests while preserving layer-then-config upload order.
+        let mut seen = HashSet::new();
+        let mut blob_list: Vec<(Digest, u64)> = Vec::new();
+        for raw_digest in image.layers.iter().map(|l| l.digest.as_str()).chain(std::iter::once(image.config_digest.as_str())) {
+            let d = Digest::parse(raw_digest)?;
+            if seen.insert(d.clone()) {
+                let size = blobs.size(&d).ok_or_else(|| {
+                    ImageError::Unsupported(format!("local image {} is missing blob {}", image.reference, d))
+                })?;
+                blob_list.push((d, size));
+            }
+        }
+
+        let total_blob_bytes: u64 = blob_list.iter().map(|(_, s)| *s).sum();
+        progress(PushProgress::Started {
+            blobs: blob_list.len(),
+            total_bytes: total_blob_bytes,
+        });
+
+        let mut session = Session::new(&self.agent, canonical, host, repo.clone(), auth, "pull,push");
+        let mut blobs_pushed = 0u32;
+        let mut blobs_skipped = 0u32;
+
+        for (index, (digest, size)) in blob_list.iter().enumerate() {
+            let size = *size;
+            let digest_str = digest.to_string();
+            let head_path = format!("/v2/{repo}/blobs/{digest}");
+            let mut head_resp = session.head_path(&head_path)?;
+            let head_status = head_resp.status().as_u16();
+            if head_status == 200 {
+                blobs_skipped += 1;
+                progress(PushProgress::Blob {
+                    index,
+                    digest: digest_str,
+                    done: size,
+                    total: size,
+                    skipped: true,
+                });
+                continue;
+            }
+            if head_status != 404 {
+                let why = error_snippet(&mut head_resp);
+                return Err(ImageError::Registry(format!(
+                    "returned HTTP {head_status} checking blob {}{why}",
+                    digest.short()
+                )));
+            }
+
+            let upload_init_path = format!("/v2/{repo}/blobs/uploads/");
+            let mut init_resp = session.post_empty_path(&upload_init_path)?;
+            let init_status = init_resp.status().as_u16();
+            match init_status {
+                201 => {}
+                202 => {
+                    let location = raw_header(&init_resp, "location").ok_or_else(|| {
+                        ImageError::Registry("upload initiation 202 response had no Location header".into())
+                    })?;
+                    let base_url = resolve_upload_url(session.scheme, &session.host, &location);
+                    let upload_url = append_digest_query(&base_url, digest);
+                    let blob_path = blobs.path(digest);
+                    let mut on_chunk = |done: u64| {
+                        progress(PushProgress::Blob {
+                            index,
+                            digest: digest_str.clone(),
+                            done,
+                            total: size,
+                            skipped: false,
+                        });
+                    };
+                    let mut put_resp = session.put_file_url(&upload_url, &blob_path, size, &mut on_chunk)?;
+                    let put_status = put_resp.status().as_u16();
+                    if put_status != 200 && put_status != 201 {
+                        let why = error_snippet(&mut put_resp);
+                        return Err(ImageError::Registry(format!(
+                            "returned HTTP {put_status} uploading blob {}{why}",
+                            digest.short()
+                        )));
+                    }
+                }
+                _ => {
+                    let why = error_snippet(&mut init_resp);
+                    return Err(ImageError::Registry(format!(
+                        "returned HTTP {init_status} starting blob upload for {}{why}",
+                        digest.short()
+                    )));
+                }
+            }
+
+            blobs_pushed += 1;
+            progress(PushProgress::Blob {
+                index,
+                digest: digest_str,
+                done: size,
+                total: size,
+                skipped: false,
+            });
+        }
+
+        let manifest_path = format!("/v2/{repo}/manifests/{tag}");
+        let mut man_resp = session.put_bytes_path(&manifest_path, &manifest_media_type, &manifest_bytes)?;
+        let man_status = man_resp.status().as_u16();
+        if man_status != 200 && man_status != 201 {
+            let why = error_snippet(&mut man_resp);
+            return Err(ImageError::Registry(format!(
+                "returned HTTP {man_status} pushing manifest {tag}{why}"
+            )));
+        }
+        let header_digest = raw_header(&man_resp, "docker-content-digest")
+            .and_then(|d| Digest::parse(&d).ok())
+            .map(|d| d.to_string());
+        let final_digest = header_digest.unwrap_or_else(|| Digest::of(&manifest_bytes).to_string());
+        let manifest_size = manifest_bytes.len() as u64;
+        progress(PushProgress::Manifest {
+            digest: final_digest.clone(),
+            size: manifest_size,
+        });
+
+        Ok(PushResult {
+            reference: target.to_string(),
+            digest: final_digest,
+            size_bytes: total_blob_bytes + manifest_size,
+            blobs_pushed,
+            blobs_skipped,
+        })
     }
 }
 
@@ -292,11 +488,19 @@ struct Session<'a> {
     repo: String,
     auth: Option<&'a Credentials>,
     authorization: Option<String>,
+    default_scope_action: &'static str,
 }
 
 impl<'a> Session<'a> {
-    fn new(agent: &'a Agent, registry: String, host: String, repo: String, auth: Option<&'a Credentials>) -> Self {
-        Self { agent, registry, host, scheme: "https", repo, auth, authorization: None }
+    fn new(
+        agent: &'a Agent,
+        registry: String,
+        host: String,
+        repo: String,
+        auth: Option<&'a Credentials>,
+        default_scope_action: &'static str,
+    ) -> Self {
+        Self { agent, registry, host, scheme: "https", repo, auth, authorization: None, default_scope_action }
     }
 
     /// Fetch a manifest; returns (bytes, media type, digest).
@@ -333,24 +537,15 @@ impl<'a> Session<'a> {
         blobs.write_verified(digest, reader, on_bytes)
     }
 
-    fn send_once(&mut self, path: &str, accept: Option<&str>) -> Result<ureq::http::Response<ureq::Body>> {
-        let make = |scheme: &str, host: &str, authorization: Option<&str>| {
-            let url = format!("{scheme}://{host}{path}");
-            let mut req = self.agent.get(&url);
-            if let Some(accept) = accept {
-                req = req.header("Accept", accept);
-            }
-            if let Some(auth_val) = authorization {
-                req = req.header("Authorization", auth_val);
-            }
-            req.call()
-        };
-
-        match make(self.scheme, &self.host, self.authorization.as_deref()) {
+    fn call_once(
+        &mut self,
+        mut make: impl FnMut(&Agent, &str, &str, Option<&str>) -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<ureq::http::Response<ureq::Body>> {
+        match make(self.agent, self.scheme, &self.host, self.authorization.as_deref()) {
             Ok(resp) => Ok(resp),
             // Standard Docker/OCI convenience: allow plain HTTP only for loopback registries (e.g. localhost:5000).
             Err(err) if self.scheme == "https" && is_loopback_host(&self.host) => {
-                match make("http", &self.host, self.authorization.as_deref()) {
+                match make(self.agent, "http", &self.host, self.authorization.as_deref()) {
                     Ok(resp) => {
                         self.scheme = "http";
                         Ok(resp)
@@ -362,29 +557,123 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// GET with Bearer or Basic auth, answering a 401 challenge on the first attempt.
-    fn get_path(&mut self, path: &str, accept: Option<&str>) -> Result<ureq::http::Response<ureq::Body>> {
+    /// Execute an HTTP request against this registry, answering a 401 Bearer or Basic challenge on the first attempt.
+    fn call_with_auth(
+        &mut self,
+        mut make: impl FnMut(&Agent, &str, &str, Option<&str>) -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<ureq::http::Response<ureq::Body>> {
         for attempt in 0..2 {
-            let response = self.send_once(path, accept)?;
+            let response = self.call_once(&mut make)?;
             let status = response.status().as_u16();
             if status == 401 && attempt == 0 {
-                let challenge = raw_header(&response, "www-authenticate")
-                    .ok_or_else(|| ImageError::Registry("asked for auth without a WWW-Authenticate challenge".into()))?;
-                match parse_auth_challenge(&challenge) {
-                    Some(Challenge::Bearer(params)) => {
-                        let token = self.fetch_token(&params)?;
-                        self.authorization = Some(format!("Bearer {token}"));
-                        continue;
-                    }
-                    Some(Challenge::Basic) => {
-                        let creds = self.auth.ok_or_else(|| {
-                            ImageError::Registry(format!("{} requires login (run `grav login {}`)", self.registry, self.registry))
-                        })?;
-                        self.authorization = Some(basic_header(creds));
-                        continue;
-                    }
-                    None => return Err(ImageError::Unsupported(format!("auth challenge `{challenge}`"))),
+                self.handle_401(&response)?;
+                continue;
+            }
+            if status == 401 || status == 403 {
+                return Err(self.denied_error());
+            }
+            return Ok(response);
+        }
+        unreachable!("loop returns on the second attempt")
+    }
+
+    fn handle_401(&mut self, response: &ureq::http::Response<ureq::Body>) -> Result<()> {
+        let challenge = raw_header(response, "www-authenticate")
+            .ok_or_else(|| ImageError::Registry("asked for auth without a WWW-Authenticate challenge".into()))?;
+        match parse_auth_challenge(&challenge) {
+            Some(Challenge::Bearer(params)) => {
+                let token = self.fetch_token(&params)?;
+                self.authorization = Some(format!("Bearer {token}"));
+                Ok(())
+            }
+            Some(Challenge::Basic) => {
+                let creds = self.auth.ok_or_else(|| {
+                    ImageError::Registry(format!("{} requires login (run `grav login {}`)", self.registry, self.registry))
+                })?;
+                self.authorization = Some(basic_header(creds));
+                Ok(())
+            }
+            None => Err(ImageError::Unsupported(format!("auth challenge `{challenge}`"))),
+        }
+    }
+
+    fn get_path(&mut self, path: &str, accept: Option<&str>) -> Result<ureq::http::Response<ureq::Body>> {
+        self.call_with_auth(|agent, scheme, host, auth_val| {
+            let url = format!("{scheme}://{host}{path}");
+            let mut req = agent.get(&url);
+            if let Some(accept) = accept {
+                req = req.header("Accept", accept);
+            }
+            if let Some(auth_val) = auth_val {
+                req = req.header("Authorization", auth_val);
+            }
+            req.call()
+        })
+    }
+
+    fn head_path(&mut self, path: &str) -> Result<ureq::http::Response<ureq::Body>> {
+        self.call_with_auth(|agent, scheme, host, auth_val| {
+            let url = format!("{scheme}://{host}{path}");
+            let mut req = agent.head(&url);
+            if let Some(auth_val) = auth_val {
+                req = req.header("Authorization", auth_val);
+            }
+            req.call()
+        })
+    }
+
+    fn post_empty_path(&mut self, path: &str) -> Result<ureq::http::Response<ureq::Body>> {
+        self.call_with_auth(|agent, scheme, host, auth_val| {
+            let url = format!("{scheme}://{host}{path}");
+            let mut req = agent.post(&url);
+            if let Some(auth_val) = auth_val {
+                req = req.header("Authorization", auth_val);
+            }
+            req.send_empty()
+        })
+    }
+
+    fn put_bytes_path(&mut self, path: &str, content_type: &str, bytes: &[u8]) -> Result<ureq::http::Response<ureq::Body>> {
+        self.call_with_auth(|agent, scheme, host, auth_val| {
+            let url = format!("{scheme}://{host}{path}");
+            let mut req = agent.put(&url).header("Content-Type", content_type);
+            if let Some(auth_val) = auth_val {
+                req = req.header("Authorization", auth_val);
+            }
+            req.send(bytes)
+        })
+    }
+
+    fn put_file_url(
+        &mut self,
+        url: &str,
+        file_path: &Path,
+        size: u64,
+        on_bytes: &mut impl FnMut(u64),
+    ) -> Result<ureq::http::Response<ureq::Body>> {
+        let same_host = url_same_host(url, &self.host);
+        let size_str = size.to_string();
+        for attempt in 0..2 {
+            if attempt > 0 {
+                on_bytes(0);
+            }
+            let file = File::open(file_path)?;
+            let mut reader = ProgressReader::new(file, &mut *on_bytes);
+            let mut req = self
+                .agent
+                .put(url)
+                .header("Content-Type", "application/octet-stream")
+                .header("Content-Length", &size_str);
+            if same_host {
+                if let Some(auth_val) = self.authorization.as_deref() {
+                    req = req.header("Authorization", auth_val);
                 }
+            }
+            let response = req.send(ureq::SendBody::from_reader(&mut reader)).map_err(http_err)?;
+            let status = response.status().as_u16();
+            if status == 401 && same_host && attempt == 0 {
+                self.handle_401(&response)?;
+                continue;
             }
             if status == 401 || status == 403 {
                 return Err(self.denied_error());
@@ -395,10 +684,22 @@ impl<'a> Session<'a> {
     }
 
     fn denied_error(&self) -> ImageError {
+        let is_push = self.default_scope_action.contains("push");
         if self.repo.is_empty() {
             match self.auth {
                 Some(_) => ImageError::Registry(format!("authentication failed for {} (invalid username or password)", self.registry)),
                 None => ImageError::Registry(format!("{} requires login (run `grav login {}`)", self.registry, self.registry)),
+            }
+        } else if is_push {
+            match self.auth {
+                Some(creds) => ImageError::Registry(format!(
+                    "denied push to {} on {} as {} (check permissions or run `grav login {}`)",
+                    self.repo, self.registry, creds.username, self.registry
+                )),
+                None => ImageError::Registry(format!(
+                    "push to {} on {} requires login (run `grav login {}`)",
+                    self.repo, self.registry, self.registry
+                )),
             }
         } else {
             match self.auth {
@@ -435,7 +736,7 @@ impl<'a> Session<'a> {
             }
         }
         if !has_scope && !self.repo.is_empty() {
-            req = req.query("scope", format!("repository:{}:pull", self.repo));
+            req = req.query("scope", format!("repository:{}:{}", self.repo, self.default_scope_action));
         }
         if let Some(creds) = self.auth {
             if !has_account {
@@ -621,9 +922,73 @@ fn http_err(err: ureq::Error) -> ImageError {
     ImageError::Registry(err.to_string())
 }
 
+struct ProgressReader<R, F> {
+    inner: R,
+    sent: u64,
+    on_bytes: F,
+}
+
+impl<R, F> ProgressReader<R, F> {
+    fn new(inner: R, on_bytes: F) -> Self {
+        Self { inner, sent: 0, on_bytes }
+    }
+}
+
+impl<R: std::io::Read, F: FnMut(u64)> std::io::Read for ProgressReader<R, F> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.sent += n as u64;
+            (self.on_bytes)(self.sent);
+        }
+        Ok(n)
+    }
+}
+
+fn resolve_upload_url(scheme: &str, host: &str, location: &str) -> String {
+    let trimmed = location.trim();
+    if trimmed.len() >= 8 && (trimmed[..8].eq_ignore_ascii_case("https://") || trimmed[..7].eq_ignore_ascii_case("http://")) {
+        trimmed.to_string()
+    } else if trimmed.starts_with('/') {
+        format!("{scheme}://{host}{trimmed}")
+    } else {
+        format!("{scheme}://{host}/{trimmed}")
+    }
+}
+
+fn append_digest_query(url: &str, digest: &Digest) -> String {
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let encoded = digest.as_str().replace(':', "%3A");
+    format!("{url}{sep}digest={encoded}")
+}
+
+fn url_same_host(url: &str, expected_host: &str) -> bool {
+    let after_scheme = if let Some(rest) = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) {
+        rest
+    } else if url.starts_with('/') {
+        return true;
+    } else {
+        url
+    };
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    authority.eq_ignore_ascii_case(expected_host)
+}
+
+fn error_snippet(resp: &mut ureq::http::Response<ureq::Body>) -> String {
+    match resp.body_mut().with_config().limit(4096).read_to_vec() {
+        Ok(bytes) if !bytes.is_empty() => {
+            let text = String::from_utf8_lossy(&bytes);
+            let compact: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let trimmed: String = compact.chars().take(240).collect();
+            if trimmed.is_empty() { String::new() } else { format!(": {trimmed}") }
+        }
+        _ => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::thread;
@@ -942,5 +1307,294 @@ mod tests {
             .unwrap();
         assert_eq!(img.architecture, "amd64");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolves_upload_urls_and_same_host_auth() {
+        assert_eq!(
+            resolve_upload_url("https", "ghcr.io", "/v2/u/app/blobs/uploads/123?_state=abc"),
+            "https://ghcr.io/v2/u/app/blobs/uploads/123?_state=abc"
+        );
+        assert_eq!(
+            resolve_upload_url("http", "127.0.0.1:5000", "http://127.0.0.1:5000/v2/app/blobs/uploads/1"),
+            "http://127.0.0.1:5000/v2/app/blobs/uploads/1"
+        );
+        let d = Digest::of(b"blob");
+        assert_eq!(
+            append_digest_query("https://ghcr.io/v2/app/blobs/uploads/1?_state=abc", &d),
+            format!("https://ghcr.io/v2/app/blobs/uploads/1?_state=abc&digest=sha256%3A{}", d.hex())
+        );
+        assert_eq!(
+            append_digest_query("http://127.0.0.1:5000/v2/app/blobs/uploads/1", &d),
+            format!("http://127.0.0.1:5000/v2/app/blobs/uploads/1?digest=sha256%3A{}", d.hex())
+        );
+        assert!(url_same_host("https://ghcr.io/v2/x", "ghcr.io"));
+        assert!(url_same_host("/v2/x", "ghcr.io"));
+        assert!(!url_same_host("https://s3.amazonaws.com/bucket/blob", "ghcr.io"));
+    }
+
+    fn spawn_stateful_push_registry(
+        use_bearer: bool,
+        expected_user: &'static str,
+        expected_pass: &'static str,
+    ) -> String {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let expected_basic = basic_header(&Credentials {
+            username: expected_user.into(),
+            password: expected_pass.into(),
+        });
+        let realm = format!("http://{addr}/token");
+        type StoredBlobs = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+        type StoredManifests = Arc<Mutex<HashMap<String, (Vec<u8>, String)>>>;
+        let blobs_store: StoredBlobs = Arc::new(Mutex::new(HashMap::new()));
+        let manifests_store: StoredManifests = Arc::new(Mutex::new(HashMap::new()));
+
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let mut parts = req_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let raw_target = parts.next().unwrap_or("").to_string();
+                let (path, query) = raw_target.split_once('?').unwrap_or((raw_target.as_str(), ""));
+
+                let mut auth_header = None;
+                let mut content_len = 0usize;
+                let mut content_type = String::from("application/vnd.oci.image.manifest.v1+json");
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':') {
+                        let k = k.trim();
+                        let v = v.trim();
+                        if k.eq_ignore_ascii_case("authorization") {
+                            auth_header = Some(v.to_string());
+                        } else if k.eq_ignore_ascii_case("content-length") {
+                            content_len = v.parse().unwrap_or(0);
+                        } else if k.eq_ignore_ascii_case("content-type") {
+                            content_type = v.to_string();
+                        }
+                    }
+                }
+                let mut req_body = vec![0u8; content_len];
+                if content_len > 0 {
+                    let _ = reader.read_exact(&mut req_body);
+                }
+
+                let write_resp = |s: &mut std::net::TcpStream, status: &str, headers: &[(&str, &str)], body: &[u8]| {
+                    let mut head = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n", body.len());
+                    for (k, v) in headers {
+                        head.push_str(&format!("{k}: {v}\r\n"));
+                    }
+                    head.push_str("\r\n");
+                    let _ = s.write_all(head.as_bytes());
+                    if !body.is_empty() {
+                        let _ = s.write_all(body);
+                    }
+                };
+
+                if path == "/token" {
+                    if auth_header.as_deref() == Some(expected_basic.as_str()) {
+                        let tok = if query.contains("push") { "tok-push" } else { "tok-pull" };
+                        let json_body = format!(r#"{{"token":"{tok}"}}"#);
+                        write_resp(&mut stream, "200 OK", &[("Content-Type", "application/json")], json_body.as_bytes());
+                    } else {
+                        write_resp(&mut stream, "401 Unauthorized", &[], b"bad credentials");
+                    }
+                    continue;
+                }
+
+                let needs_push = matches!(method.as_str(), "POST" | "PUT");
+                let authorized = if use_bearer {
+                    match auth_header.as_deref() {
+                        Some("Bearer tok-push") => true,
+                        Some("Bearer tok-pull") => !needs_push,
+                        _ => false,
+                    }
+                } else {
+                    auth_header.as_deref() == Some(expected_basic.as_str())
+                };
+                if !authorized {
+                    let scope = if needs_push { "repository:team/app:pull,push" } else { "repository:team/app:pull" };
+                    let challenge = if use_bearer {
+                        format!(r#"Bearer realm="{realm}",service="mock",scope="{scope}""#)
+                    } else {
+                        r#"Basic realm="mock""#.into()
+                    };
+                    write_resp(&mut stream, "401 Unauthorized", &[("WWW-Authenticate", &challenge)], b"auth required");
+                    continue;
+                }
+
+                if path == "/v2/" {
+                    write_resp(&mut stream, "200 OK", &[], b"{}");
+                } else if let Some(d) = path.strip_prefix("/v2/team/app/blobs/") {
+                    if d == "uploads/" && method == "POST" {
+                        write_resp(
+                            &mut stream,
+                            "202 Accepted",
+                            &[("Location", "/v2/team/app/blobs/uploads/u1?_state=xyz")],
+                            b"",
+                        );
+                    } else if d == "uploads/u1" && method == "PUT" {
+                        let expected_d = query
+                            .split('&')
+                            .find_map(|p| p.strip_prefix("digest="))
+                            .map(|v| v.replace("%3A", ":").replace("%3a", ":"))
+                            .unwrap_or_default();
+                        let actual = Digest::of(&req_body).to_string();
+                        assert_eq!(actual, expected_d);
+                        blobs_store.lock().unwrap().insert(actual.clone(), req_body);
+                        write_resp(&mut stream, "201 Created", &[("Docker-Content-Digest", &actual)], b"");
+                    } else if method == "HEAD" {
+                        if blobs_store.lock().unwrap().contains_key(d) {
+                            write_resp(&mut stream, "200 OK", &[], b"");
+                        } else {
+                            write_resp(&mut stream, "404 Not Found", &[], b"");
+                        }
+                    } else if method == "GET" {
+                        if let Some(data) = blobs_store.lock().unwrap().get(d).cloned() {
+                            write_resp(&mut stream, "200 OK", &[], &data);
+                        } else {
+                            write_resp(&mut stream, "404 Not Found", &[], b"missing");
+                        }
+                    } else {
+                        write_resp(&mut stream, "404 Not Found", &[], b"bad blob route");
+                    }
+                } else if let Some(mref) = path.strip_prefix("/v2/team/app/manifests/") {
+                    if method == "PUT" {
+                        let md = Digest::of(&req_body).to_string();
+                        manifests_store.lock().unwrap().insert(mref.to_string(), (req_body, content_type));
+                        write_resp(&mut stream, "201 Created", &[("Docker-Content-Digest", &md)], b"");
+                    } else if method == "GET" {
+                        if let Some((data, ct)) = manifests_store.lock().unwrap().get(mref).cloned() {
+                            let md = Digest::of(&data).to_string();
+                            write_resp(
+                                &mut stream,
+                                "200 OK",
+                                &[("Content-Type", &ct), ("Docker-Content-Digest", &md)],
+                                &data,
+                            );
+                        } else {
+                            write_resp(&mut stream, "404 Not Found", &[], b"missing manifest");
+                        }
+                    }
+                } else {
+                    write_resp(&mut stream, "404 Not Found", &[], b"not found");
+                }
+            }
+        });
+        addr
+    }
+
+    fn make_local_test_image(blobs: &BlobStore, reference: &str, layer_bytes: &[u8]) -> (LocalImage, Vec<u8>) {
+        let cfg_bytes = format!(r#"{{"architecture":"{}","os":"linux","config":{{"Cmd":["/bin/echo","ok"]}}}}"#, guest_arch()).into_bytes();
+        let cfg_digest = Digest::of(&cfg_bytes);
+        blobs.write_bytes(&cfg_digest, &cfg_bytes).unwrap();
+        let layer_digest = Digest::of(layer_bytes);
+        blobs.write_bytes(&layer_digest, layer_bytes).unwrap();
+        let manifest_bytes = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{cfg_digest}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{layer_digest}","size":{}}}]}}"#,
+            cfg_bytes.len(),
+            layer_bytes.len()
+        )
+        .into_bytes();
+        let man_digest = Digest::of(&manifest_bytes);
+        blobs.write_bytes(&man_digest, &manifest_bytes).unwrap();
+        let img = LocalImage {
+            reference: reference.into(),
+            manifest_digest: man_digest.to_string(),
+            config_digest: cfg_digest.to_string(),
+            layers: vec![Layer {
+                digest: layer_digest.to_string(),
+                size: layer_bytes.len() as u64,
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+            }],
+            architecture: guest_arch().into(),
+            pulled_at: 1,
+        };
+        (img, cfg_bytes)
+    }
+
+    #[test]
+    fn bearer_auth_push_skips_existing_and_roundtrips_pull() {
+        let addr = spawn_stateful_push_registry(true, "alice", "token_123");
+        let reg = Registry::new();
+        let creds = Credentials { username: "alice".into(), password: "token_123".into() };
+
+        let base = std::env::temp_dir().join(format!("graviton-push-bearer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src_blobs = BlobStore::new(base.join("src"));
+        let dst_blobs = BlobStore::new(base.join("dst"));
+
+        let target = ImageReference::parse(&format!("{addr}/team/app:1.0")).unwrap();
+        let layer_data = b"gzipped-layer-payload-hello".to_vec();
+        let (local, cfg_bytes) = make_local_test_image(&src_blobs, &target.to_string(), &layer_data);
+
+        // Anonymous push fails cleanly with grav login hint.
+        let err = reg.push_with_auth(&local, &target, &src_blobs, None, |_| {}).unwrap_err();
+        assert!(err.to_string().contains("grav login"), "got: {err}");
+
+        // First push upgrades pull->push scope cleanly and uploads both layer + config.
+        let mut events1 = Vec::new();
+        let res1 = reg
+            .push_with_auth(&local, &target, &src_blobs, Some(&creds), |p| events1.push(p))
+            .unwrap();
+        assert_eq!(res1.blobs_pushed, 2);
+        assert_eq!(res1.blobs_skipped, 0);
+        assert!(events1.iter().any(|p| matches!(p, PushProgress::Started { blobs: 2, .. })));
+        assert!(events1.iter().any(|p| matches!(p, PushProgress::Blob { skipped: false, .. })));
+        assert!(events1.iter().any(|p| matches!(p, PushProgress::Manifest { .. })));
+
+        // Second push detects existing blobs via HEAD and skips them all.
+        let mut events2 = Vec::new();
+        let res2 = reg
+            .push_with_auth(&local, &target, &src_blobs, Some(&creds), |p| events2.push(p))
+            .unwrap();
+        assert_eq!(res2.blobs_pushed, 0);
+        assert_eq!(res2.blobs_skipped, 2);
+        assert_eq!(res2.digest, res1.digest);
+        assert!(events2.iter().any(|p| matches!(p, PushProgress::Blob { skipped: true, .. })));
+
+        // Pulling into a clean BlobStore recovers identical config & layer bytes.
+        let pulled = reg.pull_with_auth(&target, &dst_blobs, Some(&creds), |_| {}).unwrap();
+        assert_eq!(pulled.config_digest, local.config_digest);
+        assert_eq!(dst_blobs.read(&Digest::parse(&pulled.config_digest).unwrap()).unwrap(), cfg_bytes);
+        assert_eq!(dst_blobs.read(&Digest::parse(&pulled.layers[0].digest).unwrap()).unwrap(), layer_data);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn basic_auth_push_and_rejects_digest_only_target() {
+        let addr = spawn_stateful_push_registry(false, "bob", "hunter2");
+        let reg = Registry::new();
+        let creds = Credentials { username: "bob".into(), password: "hunter2".into() };
+
+        let base = std::env::temp_dir().join(format!("graviton-push-basic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let blobs = BlobStore::new(&base);
+
+        let target = ImageReference::parse(&format!("{addr}/team/app:v2")).unwrap();
+        let (local, _) = make_local_test_image(&blobs, &target.to_string(), b"basic-layer");
+
+        let res = reg.push_with_auth(&local, &target, &blobs, Some(&creds), |_| {}).unwrap();
+        assert_eq!(res.blobs_pushed, 2);
+
+        let digest_target = ImageReference::parse(&format!("{addr}/team/app@{}", local.manifest_digest)).unwrap();
+        assert!(matches!(
+            reg.push_with_auth(&local, &digest_target, &blobs, Some(&creds), |_| {}),
+            Err(ImageError::Unsupported(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

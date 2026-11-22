@@ -284,6 +284,10 @@ async fn dispatch(
             if method == "POST" {
                 return images::tag_image(state, name, &head, reader, write).await;
             }
+        } else if let Some(name) = rest.strip_suffix("/push").filter(|n| !n.is_empty()) {
+            if method == "POST" {
+                return images::push_image(state, name, &head, reader, write).await;
+            }
         } else if !rest.is_empty() && !rest.ends_with('/') && method == "DELETE" {
             return images::remove_image(state, rest, &head, reader, write).await;
         }

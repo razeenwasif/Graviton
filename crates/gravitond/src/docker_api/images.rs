@@ -7,8 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use graviton_core::{ImageReference, paths};
-use graviton_proto::{BuildSpec, ContainerStatus, EventKind, PruneSpec, PullProgress};
+use graviton_image::Credentials;
+use graviton_proto::{BuildSpec, ContainerStatus, EventKind, ImagePushProgress, PruneSpec, PullProgress};
 use serde_json::{Value, json};
 use tokio::io::BufReader;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -210,6 +212,7 @@ pub async fn events(
                     EventKind::Stopped | EventKind::Failed => ("container", "die", ev.container_id.as_deref().unwrap_or(""), ev.container.as_deref().unwrap_or("")),
                     EventKind::Removed => ("container", "destroy", ev.container_id.as_deref().unwrap_or(""), ev.container.as_deref().unwrap_or("")),
                     EventKind::Pulled => ("image", "pull", ev.image.as_deref().unwrap_or(""), ev.image.as_deref().unwrap_or("")),
+                    EventKind::Pushed => ("image", "push", ev.image.as_deref().unwrap_or(""), ev.image.as_deref().unwrap_or("")),
                     EventKind::Built | EventKind::BuildFailed => ("image", "build", ev.image.as_deref().unwrap_or(""), ev.image.as_deref().unwrap_or("")),
                 };
                 let secs = ev.timestamp_ms / 1000;
@@ -483,6 +486,46 @@ pub async fn inspect_image(
     Ok(RouteOutcome::Continue)
 }
 
+fn join_image_tag(name: &str, tag: &str) -> String {
+    if tag.starts_with("sha256:") {
+        format!("{name}@{tag}")
+    } else if !tag.is_empty() && !name.contains('@') {
+        let last = name.rsplit('/').next().unwrap_or("");
+        if last.contains(':') {
+            name.to_string()
+        } else {
+            format!("{name}:{tag}")
+        }
+    } else {
+        name.to_string()
+    }
+}
+
+fn parse_registry_auth(head: &RequestHead) -> Option<Credentials> {
+    let raw = head.header("x-registry-auth")?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(raw))
+        .ok()?;
+    let val: Value = serde_json::from_slice(&decoded).ok()?;
+    let obj = val.as_object()?;
+    let username = obj.get("username").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let password = obj
+        .get("password")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| obj.get("identitytoken").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+        .unwrap_or("")
+        .to_string();
+    if username.is_empty() || password.is_empty() {
+        return None;
+    }
+    Some(Credentials { username, password })
+}
+
 pub async fn pull_image(
     state: &Arc<DockerState>,
     head: &RequestHead,
@@ -506,18 +549,7 @@ pub async fn pull_image(
         return Ok(RouteOutcome::Continue);
     }
 
-    let reference = if tag.starts_with("sha256:") {
-        format!("{from_image}@{tag}")
-    } else if !tag.is_empty() && !from_image.contains('@') {
-        let last = from_image.rsplit('/').next().unwrap_or("");
-        if last.contains(':') {
-            from_image.clone()
-        } else {
-            format!("{from_image}:{tag}")
-        }
-    } else {
-        from_image.clone()
-    };
+    let reference = join_image_tag(&from_image, &tag);
 
     write_chunked_head(write, 200, "application/json", &[]).await?;
     write_chunk_json(write, &json!({ "status": format!("Pulling from {from_image}"), "id": if tag.is_empty() { "latest" } else { &tag } })).await?;
@@ -551,6 +583,92 @@ pub async fn pull_image(
             Ok(img) => {
                 let _ = tx.send(json!({ "status": format!("Digest: {}", img.digest) }));
                 let _ = tx.send(json!({ "status": format!("Status: Downloaded newer image for {r}") }));
+            }
+            Err(err) => {
+                let msg = format!("{err:#}");
+                let _ = tx.send(json!({ "errorDetail": { "message": msg }, "error": msg }));
+            }
+        }
+    });
+
+    while let Some(msg) = rx.recv().await {
+        if write_chunk_json(write, &msg).await.is_err() {
+            return Ok(RouteOutcome::Done);
+        }
+    }
+    let _ = task.await;
+    finish_chunked(write).await?;
+    Ok(RouteOutcome::Continue)
+}
+
+pub async fn push_image(
+    state: &Arc<DockerState>,
+    raw_name: &str,
+    head: &RequestHead,
+    reader: &mut BufReader<OwnedReadHalf>,
+    write: &mut OwnedWriteHalf,
+) -> Result<RouteOutcome> {
+    drain_body(reader, write, head).await?;
+    let name = raw_name.trim();
+    let tag = head.query_param("tag").unwrap_or("").trim().to_string();
+    let Some(engine) = state.engine().cloned() else {
+        write_error(write, 501, "push requires a live engine", head.close_after).await?;
+        return Ok(RouteOutcome::Continue);
+    };
+    if name.is_empty() {
+        write_error(write, 400, "image name is required", head.close_after).await?;
+        return Ok(RouteOutcome::Continue);
+    }
+
+    let reference = join_image_tag(name, &tag);
+    let auth = parse_registry_auth(head);
+    write_chunked_head(write, 200, "application/json", &[]).await?;
+    write_chunk_json(write, &json!({ "status": format!("The push refers to repository [{name}]") })).await?;
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+    let ref_clone = reference.clone();
+    let tag_clone = tag.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let updates = tx.clone();
+        let res = engine.push_with_progress(&ref_clone, auth, |prog| {
+            let msg = match prog {
+                ImagePushProgress::Started { .. } => Some(json!({ "status": "Preparing" })),
+                ImagePushProgress::Blob { digest, done, total, skipped, .. } => {
+                    let short = digest.strip_prefix("sha256:").map(|h| &h[..h.len().min(12)]).unwrap_or(&digest);
+                    if skipped {
+                        Some(json!({ "status": "Layer already exists", "id": short }))
+                    } else if total == 0 || done >= total {
+                        Some(json!({ "status": "Pushed", "id": short }))
+                    } else {
+                        Some(json!({
+                            "status": "Pushing",
+                            "id": short,
+                            "progressDetail": { "current": done, "total": total }
+                        }))
+                    }
+                }
+                ImagePushProgress::Manifest { .. } => None,
+            };
+            if let Some(m) = msg {
+                let _ = updates.send(m);
+            }
+        });
+        match res {
+            Ok(pushed) => {
+                let tag_disp = if tag_clone.is_empty() {
+                    ImageReference::parse(&ref_clone)
+                        .ok()
+                        .and_then(|r| r.tag)
+                        .unwrap_or_else(|| "latest".into())
+                } else {
+                    tag_clone
+                };
+                let _ = tx.send(json!({
+                    "status": format!("{tag_disp}: digest: {} size: {}", pushed.digest, pushed.size_bytes)
+                }));
+                let _ = tx.send(json!({
+                    "aux": { "Tag": tag_disp, "Digest": pushed.digest, "Size": pushed.size_bytes }
+                }));
             }
             Err(err) => {
                 let msg = format!("{err:#}");

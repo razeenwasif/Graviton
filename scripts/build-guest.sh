@@ -13,7 +13,7 @@ set -eu
 
 ALPINE=${ALPINE:-v3.22}
 KERNEL_VERSION=${KERNEL_VERSION:-6.12.118}
-KERNEL_PKG=${KERNEL_PKG:-linux-virt-6.12.115-r0}
+KERNEL_PKG=${KERNEL_PKG:-linux-virt-6.12.118-r0}
 BUSYBOX_PKG=${BUSYBOX_PKG:-busybox-static-1.37.0-r20}
 # mke2fs, to format each VM's scratch disk, with the libraries it links against.
 E2FS_PKGS=${E2FS_PKGS:-"e2fsprogs-1.47.2-r2 e2fsprogs-libs-1.47.2-r2 libcom_err-1.47.2-r2 libblkid-2.41.6-r1 libuuid-2.41.6-r1 libeconf-0.6.3-r0 musl-1.2.5-r13"}

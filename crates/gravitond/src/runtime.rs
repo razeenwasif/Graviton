@@ -30,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use graviton_core::{ImageReference, Store, paths};
-use graviton_image::{BlobStore, ImageError, ImageIndex, LocalImage, Progress, PullOptions, Registry};
+use graviton_image::{BlobStore, Credentials, ImageError, ImageIndex, LocalImage, Progress, PullOptions, PushProgress, Registry};
 use graviton_proto::{
     AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ContainerDetails, ContainerStats, ContainerStatus, ContainerSummary,
     DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats, HostEntry, ImageSummary, LogLevel, LogLine, LogStream,
@@ -538,12 +538,103 @@ impl Engine {
             .resolve_local_image(source)
             .ok_or_else(|| anyhow!("No such image: {source}"))?;
         let parsed = ImageReference::parse(target)?;
+        if parsed.digest.is_some() {
+            bail!("cannot tag an image with a digest reference; use NAME[:TAG]");
+        }
         let mut tagged = src;
         tagged.reference = parsed.to_string();
         tagged.pulled_at = now_secs();
         self.index.lock().unwrap().insert(tagged.clone())?;
         self.refresh_images();
         Ok(tagged.summary(self.used_by(&tagged.reference)))
+    }
+
+    /// Push a local image to its registry using saved credentials (`grav login`).
+    pub fn push(&self, reference: &str) -> Result<graviton_proto::ImagePushResult> {
+        self.push_with_progress(reference, None, |_| {})
+    }
+
+    /// Push a local image to its registry, streaming progress updates.
+    pub fn push_with_progress(
+        &self,
+        reference: &str,
+        auth_override: Option<Credentials>,
+        mut on_progress: impl FnMut(graviton_proto::ImagePushProgress),
+    ) -> Result<graviton_proto::ImagePushResult> {
+        let target = ImageReference::parse(reference)?;
+        let local = self
+            .resolve_local_image(reference)
+            .or_else(|| self.resolve_local_image(&target.to_string()))
+            .ok_or_else(|| {
+                anyhow!(
+                    "image {reference} not found locally (build it or tag an image with `grav tag SRC {reference}`)"
+                )
+            })?;
+        let creds = match auth_override {
+            Some(c) => Some(c),
+            None => self.auth.credentials_for(&target.registry)?,
+        };
+        let display = target.display_name();
+        eprintln!("push {display}");
+        let t0 = Instant::now();
+        let mut last_log = Instant::now();
+        let mut last_emit = Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now);
+        let mut last_blob_idx: Option<usize> = None;
+        let mut total_blobs = 0usize;
+
+        let res = Registry::new().push_with_auth(&local, &target, &self.blobs, creds.as_ref(), |p| match p {
+            PushProgress::Started { blobs, total_bytes } => {
+                total_blobs = blobs;
+                eprintln!("  {blobs} blobs, {:.1} MiB", total_bytes as f64 / 1048576.0);
+                on_progress(graviton_proto::ImagePushProgress::Started { blobs, total_bytes });
+            }
+            PushProgress::Blob { index, digest, done, total, skipped } => {
+                let short = digest.strip_prefix("sha256:").map(|h| &h[..h.len().min(12)]).unwrap_or(&digest);
+                if skipped {
+                    eprintln!("  blob {} {short} (already exists)", index + 1);
+                } else if done == total || last_log.elapsed() > Duration::from_secs(1) {
+                    last_log = Instant::now();
+                    eprintln!(
+                        "  blob {} {short} {:>3}%",
+                        index + 1,
+                        (done * 100).checked_div(total).unwrap_or(100)
+                    );
+                }
+                let is_new_blob = last_blob_idx != Some(index);
+                let is_terminal = skipped || total == 0 || done >= total;
+                if is_new_blob || is_terminal || last_emit.elapsed() >= Duration::from_millis(100) {
+                    last_blob_idx = Some(index);
+                    last_emit = Instant::now();
+                    on_progress(graviton_proto::ImagePushProgress::Blob {
+                        index,
+                        total_blobs,
+                        digest,
+                        done,
+                        total,
+                        skipped,
+                    });
+                }
+            }
+            PushProgress::Manifest { digest, size } => {
+                eprintln!("  manifest {} ({} B)", &digest[..digest.len().min(19)], size);
+                on_progress(graviton_proto::ImagePushProgress::Manifest { digest, size });
+            }
+        })?;
+
+        eprintln!("  pushed in {:.1} s", t0.elapsed().as_secs_f64());
+        self.events.record(
+            graviton_proto::EventKind::Pushed,
+            None,
+            Some(&display),
+            format!("Pushed {display} ({:.1} MB)", res.size_bytes as f64 / 1048576.0),
+        );
+        Ok(graviton_proto::ImagePushResult {
+            reference: res.reference,
+            digest: res.digest,
+            size_bytes: res.size_bytes,
+            blobs_pushed: res.blobs_pushed,
+            blobs_skipped: res.blobs_skipped,
+        })
     }
 
     // -- Containers -------------------------------------------------------

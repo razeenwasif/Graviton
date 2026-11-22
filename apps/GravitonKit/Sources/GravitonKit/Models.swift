@@ -642,7 +642,7 @@ public struct NetworkRate: Identifiable, Sendable {
 /// Something that happened on the engine (`EngineEvent` in `graviton-proto`).
 public struct EngineEvent: Codable, Identifiable, Hashable, Sendable {
     public enum Kind: String, Codable, Sendable {
-        case started, stopped, failed, pulled, built, buildFailed = "build_failed", removed
+        case started, stopped, failed, pulled, pushed, built, buildFailed = "build_failed", removed
     }
 
     public var seq: UInt64

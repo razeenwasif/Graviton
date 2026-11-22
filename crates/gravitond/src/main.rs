@@ -293,6 +293,10 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
             pull_stream(Arc::clone(engine), reference.clone(), platform.clone(), &mut write).await?;
             continue;
         }
+        if let (Request::PushImage { reference, progress: true }, Backend::Engine(engine)) = (&request, &backend) {
+            push_stream(Arc::clone(engine), reference.clone(), &mut write).await?;
+            continue;
+        }
         if let (Request::Build(spec), Backend::Engine(engine)) = (&request, &backend) {
             build_stream(Arc::clone(engine), spec.clone(), lines.get_mut(), &mut write).await?;
             continue;
@@ -324,6 +328,26 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
     }
 }
 
+async fn stream_blocking<F>(write: &mut (impl tokio::io::AsyncWrite + Unpin), work: F) -> Result<()>
+where
+    F: FnOnce(tokio::sync::mpsc::UnboundedSender<Response>) + Send + 'static,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::task::spawn_blocking(move || work(tx));
+    let mut disconnected = false;
+    while let Some(response) = rx.recv().await {
+        if write.write_all(&encode_line(&response)).await.is_err() || write.flush().await.is_err() {
+            disconnected = true;
+            break; // client closed the sheet/terminal; operation carries on in the background
+        }
+    }
+    drop(rx);
+    if !disconnected {
+        let _ = task.await;
+    }
+    Ok(())
+}
+
 /// `grav pull` (and app Pull sheets): stream per-layer progress, then the image.
 pub(crate) async fn pull_stream(
     engine: Arc<Engine>,
@@ -331,8 +355,7 @@ pub(crate) async fn pull_stream(
     platform: Option<String>,
     write: &mut (impl tokio::io::AsyncWrite + Unpin),
 ) -> Result<()> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let task = tokio::task::spawn_blocking(move || {
+    stream_blocking(write, move |tx| {
         let updates = tx.clone();
         let result = engine.pull_with_progress(&reference, platform.as_deref(), |progress| {
             let _ = updates.send(Response::PullProgress(progress));
@@ -341,19 +364,27 @@ pub(crate) async fn pull_stream(
             Ok(image) => Response::Image(image),
             Err(err) => Response::Error { message: format!("{err:#}") },
         });
-    });
-    let mut disconnected = false;
-    while let Some(response) = rx.recv().await {
-        if write.write_all(&encode_line(&response)).await.is_err() || write.flush().await.is_err() {
-            disconnected = true;
-            break; // client closed the sheet/terminal; pull carries on in the background
-        }
-    }
-    drop(rx);
-    if !disconnected {
-        let _ = task.await;
-    }
-    Ok(())
+    })
+    .await
+}
+
+/// `grav push IMAGE`: stream per-blob upload progress, then `ImagePushed`.
+pub(crate) async fn push_stream(
+    engine: Arc<Engine>,
+    reference: String,
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> Result<()> {
+    stream_blocking(write, move |tx| {
+        let updates = tx.clone();
+        let result = engine.push_with_progress(&reference, None, |progress| {
+            let _ = updates.send(Response::ImagePushProgress(progress));
+        });
+        let _ = tx.send(match result {
+            Ok(res) => Response::ImagePushed(res),
+            Err(err) => Response::Error { message: format!("{err:#}") },
+        });
+    })
+    .await
 }
 
 /// `grav build`: stream the build's log lines, then the image. With an
@@ -652,6 +683,8 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                     }
                     Request::NetworkInfo => Response::Network(engine.network_info()),
                     Request::Pull { reference, platform, .. } => Response::Image(engine.pull(&reference, platform.as_deref())?),
+                    Request::TagImage { source, target } => Response::Image(engine.tag_image(&source, &target)?),
+                    Request::PushImage { reference, .. } => Response::ImagePushed(engine.push(&reference)?),
                     Request::RegistryLogin { registry, username, password } => {
                         let (registry, username) = engine.auth.login(&registry, &username, &password)?;
                         Response::LoggedIn { registry, username }

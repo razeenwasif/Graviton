@@ -56,6 +56,8 @@ scripts/build-guest.sh                      # once: guest kernel + initramfs
 scripts/dev-gravitond.sh                    # build, sign and run the daemon
 cargo run -p grav -- login ghcr.io          # optional: log in to a private registry (Keychain)
 cargo run -p grav -- pull alpine            # in another terminal (streams per-layer progress)
+cargo run -p grav -- tag myapp ghcr.io/me/myapp:1.0   # alias an image without copying layers
+cargo run -p grav -- push ghcr.io/me/myapp:1.0        # push a local image (uses `grav login` creds)
 cargo run -p grav -- run alpine cat /etc/os-release
 cargo run -p grav -- run -it --rm alpine sh     # interactive PTY shell; stops & removes on exit
 cargo run -p grav -- run -d --name web -p 8080:8000 -v ~/site:/srv python:3.13-slim \
@@ -80,8 +82,11 @@ cargo run -p grav -- compose down -v            # tear down stack and project-ow
   passwords/tokens stay in the Mac's login Keychain (`grav login --list` shows
   saved logins; `--password-stdin` reads from stdin). Both `gzip` and `zstd`
   image layers (including multi-frame and skippable-frame `zstd:chunked`) are
-  supported, and `grav pull` plus the Mac and iPhone Pull sheets stream
-  per-layer progress.
+  supported, `grav pull` plus the Mac and iPhone Pull sheets stream per-layer
+  progress, `grav tag SRC DST` aliases a local image without copying layers,
+  and `grav push IMAGE` uploads images to OCI registries using the saved
+  `grav login` credentials (`grav push setup|status|test` remains for iPhone
+  push alerts).
 - `-p [IP:]HOST:CONTAINER[/tcp|udp]` (or `-p PORT[/udp]`) publishes a TCP or
   UDP port forwarded to the container's VM. Without `IP:`, it binds `127.0.0.1`;
   pass `0.0.0.0:8080:80` (or `[::]:8080:80` / a specific interface IP) to accept
@@ -187,7 +192,7 @@ cargo run -p grav -- compose down -v            # tear down stack and project-ow
   (interactive TTY resize, streaming non-TTY `exec -i` stdin + EOF, `--workdir`
   and `--user` overrides also exposed via `grav exec -w/-u`), `/images/*`
   (inspect with full OCI labels including `devcontainer.metadata`, `tag`,
-  `pull`, `rmi`, `prune`), `/volumes/*`, and `/networks/*`.
+  `pull`, `push`, `rmi`, `prune`), `/volumes/*`, and `/networks/*`.
 - `scripts/install-launch-agent.sh` installs gravitond as a launch agent so it
   starts at login (`--remote` to accept phones, `--uninstall` to remove it).
 
