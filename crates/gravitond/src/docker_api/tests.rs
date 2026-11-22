@@ -11,9 +11,22 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::Backend;
 use crate::runtime::ContainerSpec;
 
-use super::containers::{matches_container_filters, normalize_docker_bind, normalize_docker_mount, parse_filters};
+use super::containers::{
+    exec_error_status, matches_container_filters, normalize_docker_bind, normalize_docker_mount, parse_filters,
+};
 use super::http::{encode_mux_frame, read_request_head, strip_api_version, write_empty};
 use super::{DockerState, serve_connection};
+
+#[test]
+fn maps_exec_start_errors_to_http_statuses() {
+    assert_eq!(exec_error_status("container web isn't running"), 409);
+    assert_eq!(exec_error_status("container web is not running"), 409);
+    assert_eq!(exec_error_status("no such container abc"), 404);
+    assert_eq!(exec_error_status("exec: No such file or directory (os error 2)"), 400);
+    assert_eq!(exec_error_status("give a command to run"), 400);
+    assert_eq!(exec_error_status("permission denied"), 400);
+    assert_eq!(exec_error_status("unexpected vsock failure"), 500);
+}
 
 #[test]
 fn strips_version_prefixes_safely() {

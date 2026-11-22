@@ -2100,28 +2100,75 @@ pub async fn exec_start(
     };
 
     if detach {
-        {
-            let mut map = state.execs.lock().unwrap();
-            if let Some(entry) = map.get_mut(exec_id) {
-                entry.running = true;
-                entry.exit_code = None;
+        let e = Arc::clone(&engine);
+        let (pid, guest_fd) = match tokio::task::spawn_blocking(move || e.exec_interactive(&spec, false)).await? {
+            Ok(res) => res,
+            Err(err) => {
+                let msg = format!("{err:#}");
+                let status = exec_error_status(&msg);
+                if let Some(entry) = state.execs.lock().unwrap().get_mut(exec_id) {
+                    entry.running = false;
+                    entry.exit_code = Some(126);
+                }
+                write_error(write, status, &msg, head.close_after).await?;
+                return Ok(RouteOutcome::Continue);
             }
+        };
+
+        if let Some(entry) = state.execs.lock().unwrap().get_mut(exec_id) {
+            entry.running = true;
+            entry.exit_code = None;
+            entry.pid = Some(pid);
         }
+
+        let guest = std::os::unix::net::UnixStream::from(guest_fd);
+        guest.set_nonblocking(true)?;
+        let mut guest = UnixStream::from_std(guest)?;
         let st = Arc::clone(state);
         let eid = exec_id.to_string();
+        let is_tty = rec.tty;
         tokio::spawn(async move {
-            let (tx, mut rx) = mpsc::channel(64);
-            let e = Arc::clone(&engine);
-            let task = tokio::task::spawn_blocking(move || e.exec_stream(&spec, tx));
-            let mut final_code = 0i32;
-            while let Some(resp) = rx.recv().await {
-                if let graviton_proto::Response::ExecExited { code } = resp {
-                    final_code = code;
+            let mut final_code = 126i32;
+            if is_tty {
+                let mut decoder = Decoder::default();
+                let mut buf = [0u8; 8192];
+                'drain: loop {
+                    match guest.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => decoder.push(&buf[..n]),
+                    }
+                    loop {
+                        match decoder.next_frame() {
+                            Ok(Some(Frame::Exit(code))) => {
+                                final_code = code;
+                                break 'drain;
+                            }
+                            Ok(Some(_)) => {}
+                            Ok(None) => break,
+                            Err(_) => break 'drain,
+                        }
+                    }
+                }
+            } else {
+                let mut lines = BufReader::new(&mut guest).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let Ok(ev) = decode_line::<AgentEvent>(line.as_bytes()) else {
+                        continue;
+                    };
+                    match ev {
+                        AgentEvent::Exited { code, .. } => {
+                            final_code = code;
+                            break;
+                        }
+                        AgentEvent::Error { .. } => {
+                            final_code = 126;
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
             }
-            if let Ok(Err(_)) = task.await {
-                final_code = 126;
-            }
+            drop(guest);
             if let Some(entry) = st.execs.lock().unwrap().get_mut(&eid) {
                 entry.running = false;
                 entry.exit_code = Some(final_code);
@@ -2141,8 +2188,8 @@ pub async fn exec_start(
 
     if rec.tty {
         let e = Arc::clone(&engine);
-        let tty_fd = match tokio::task::spawn_blocking(move || e.exec_tty(&spec)).await? {
-            Ok(fd) => fd,
+        let (pid, tty_fd) = match tokio::task::spawn_blocking(move || e.exec_interactive(&spec, false)).await? {
+            Ok(res) => res,
             Err(err) => {
                 let _ = write.write_all(format!("{err:#}\r\n").as_bytes()).await;
                 if let Some(entry) = state.execs.lock().unwrap().get_mut(exec_id) {
@@ -2157,6 +2204,7 @@ pub async fn exec_start(
         if let Some(entry) = state.execs.lock().unwrap().get_mut(exec_id) {
             entry.running = true;
             entry.exit_code = None;
+            entry.pid = Some(pid);
             entry.resize_tx = Some(resize_tx);
         }
 
@@ -2408,6 +2456,18 @@ pub async fn exec_inspect(
     });
     write_json(write, 200, &json, head.close_after).await?;
     Ok(RouteOutcome::Continue)
+}
+
+pub(super) fn exec_error_status(msg: &str) -> u16 {
+    if msg.contains("isn't running") || msg.contains("not running") {
+        409
+    } else if msg.contains("no such container") {
+        404
+    } else if msg.contains("exec:") || msg.contains("give a command") || msg.contains("No such file") || msg.contains("permission denied") {
+        400
+    } else {
+        500
+    }
 }
 
 /// Percent-decode an arbitrary name segment when needed.
