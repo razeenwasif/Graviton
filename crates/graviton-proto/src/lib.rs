@@ -456,6 +456,9 @@ pub struct BuildSpec {
     /// Target platform for base images and output config (e.g. `linux/amd64`, `linux/arm64`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
+    /// Extra labels added to the built image's config (`docker build --label`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
 
 /// Where an uploaded build folder's Dockerfile goes when it lives outside the folder.
@@ -533,6 +536,12 @@ pub struct ExecSpec {
     pub cols: u16,
     #[serde(default)]
     pub env: Vec<String>,
+    /// Working directory override inside the container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// User override (`uid[:gid]` or `name[:group]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 /// One sample of a container's resource use.
@@ -971,6 +980,9 @@ pub enum AgentRequest {
         /// Optional bytes written to the non-TTY child's stdin (used for `#!` heredoc scripts).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stdin: Option<Vec<u8>>,
+        /// Keep non-TTY child stdin open as a pipe fed by subsequent `AgentRequest::Stdin` frames (empty data = EOF).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stdin_pipe: bool,
         /// Ephemeral per-RUN mounts (cache, secret, bind, tmpfs), visible only inside this process's mount namespace.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         mounts: Vec<ExecMount>,
@@ -1338,10 +1350,11 @@ mod tests {
         assert!(dbg.contains("npm"));
         assert!(!dbg.contains("super-secret"));
 
-        // Swift's BuildSpec omits `secrets`; Rust defaults it to empty.
+        // Swift's BuildSpec omits `secrets` and `labels`; Rust defaults them to empty.
         let from_swift = br#"{"method":"build","params":{"build_args":["PY=3.12"],"context":"/Users/me/app","no_cache":true,"tag":"app:1"}}"#;
         let Request::Build(spec) = decode_line::<Request>(from_swift).unwrap() else { panic!("not build") };
         assert!(spec.secrets.is_empty());
+        assert!(spec.labels.is_empty());
 
         let exec = AgentRequest::Exec {
             argv: vec!["/bin/sh".into()],
@@ -1354,6 +1367,7 @@ mod tests {
             rows: 0,
             cols: 0,
             stdin: Some(b"echo hi\n".to_vec()),
+            stdin_pipe: false,
             mounts: vec![ExecMount {
                 kind: ExecMountKind::Cache,
                 source: "pip".into(),

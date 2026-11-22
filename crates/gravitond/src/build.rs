@@ -535,6 +535,10 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
     }
     let _ = fs::remove_dir_all(&build_dir);
     let state = result?;
+    let mut state = state;
+    for (k, v) in &spec.labels {
+        state.labels.insert(k.clone(), v.clone());
+    }
     let image = write_image(engine, &reference, &state)?;
     engine.index.lock().unwrap().insert(image.clone())?;
     engine.refresh_images();
@@ -1092,6 +1096,7 @@ fn run(
         rows: 0,
         cols: 0,
         stdin: stdin.map(|s| s.as_bytes().to_vec()),
+        stdin_pipe: false,
         mounts,
     }))?;
     let (mut out, mut err) = (LineBuffer::default(), LineBuffer::default());
@@ -1202,7 +1207,7 @@ fn human(bytes: u64) -> String {
 }
 
 /// Unix seconds as `2026-11-10T20:55:00Z`.
-fn rfc3339(secs: u64) -> String {
+pub(crate) fn rfc3339(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     // Howard Hinnant's civil_from_days.
@@ -1247,6 +1252,7 @@ mod tests {
             upload: None,
             secrets: vec![],
             platform: None,
+            labels: BTreeMap::new(),
         };
         assert_eq!(image_reference(&spec(None), Path::new("/Users/me/My App")).unwrap(), "docker.io/library/my-app:latest");
         assert_eq!(image_reference(&spec(Some("web:1.2")), Path::new("/x")).unwrap(), "docker.io/library/web:1.2");

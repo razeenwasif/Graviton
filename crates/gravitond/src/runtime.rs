@@ -70,39 +70,39 @@ enum BoundPort {
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ContainerSpec {
     pub(crate) image: LocalImage,
-    argv: Vec<String>,
-    env: Vec<String>,
-    cwd: String,
-    user: Option<String>,
-    cpus: u32,
-    memory_mib: u64,
+    pub(crate) argv: Vec<String>,
+    pub(crate) env: Vec<String>,
+    pub(crate) cwd: String,
+    pub(crate) user: Option<String>,
+    pub(crate) cpus: u32,
+    pub(crate) memory_mib: u64,
     #[serde(default)]
-    ports: Vec<PortMapping>,
+    pub(crate) ports: Vec<PortMapping>,
     #[serde(default)]
-    volumes: Vec<Volume>,
+    pub(crate) volumes: Vec<Volume>,
     #[serde(default)]
-    restart: RestartPolicy,
+    pub(crate) restart: RestartPolicy,
     /// True while a container with a restart policy should stay up (including across daemon restarts).
     #[serde(default)]
-    want_running: bool,
+    pub(crate) want_running: bool,
     /// Remove the container automatically after it stops (`grav run --rm -it`).
     #[serde(default)]
-    auto_remove: bool,
+    pub(crate) auto_remove: bool,
     /// Optional explicit hostname (defaults to the container's name).
     #[serde(default)]
-    hostname: Option<String>,
+    pub(crate) hostname: Option<String>,
     /// Compose stack/project name, if created by `grav compose`.
     #[serde(default)]
-    project: Option<String>,
+    pub(crate) project: Option<String>,
     /// Compose service name within `project`.
     #[serde(default)]
-    service: Option<String>,
+    pub(crate) service: Option<String>,
     /// Arbitrary key-value labels (`-l KEY=VALUE`, Compose `labels:`).
     #[serde(default)]
-    labels: BTreeMap<String, String>,
+    pub(crate) labels: BTreeMap<String, String>,
     /// Additional project-scoped DNS aliases.
     #[serde(default)]
-    dns_aliases: Vec<String>,
+    pub(crate) dns_aliases: Vec<String>,
 }
 
 /// Interactive `grav run -it` handle returned to the control connection.
@@ -121,14 +121,14 @@ struct TtyAttach {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct Volume {
+pub(crate) struct Volume {
     /// Host directory shared into the VM.
-    source: PathBuf,
+    pub(crate) source: PathBuf,
     /// Absolute path inside the container.
-    target: String,
-    read_only: bool,
+    pub(crate) target: String,
+    pub(crate) read_only: bool,
     /// Set for named volumes (`name:/path`).
-    name: Option<String>,
+    pub(crate) name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -500,9 +500,72 @@ impl Engine {
         self.store.lock().unwrap().set_images(summaries);
     }
 
+    /// Resolve a local image by name/reference (`alpine`, `alpine:3.22`, `ghcr.io/...`)
+    /// or by full/prefix digest (`sha256:...` or hex prefix of config/manifest digest).
+    pub fn resolve_local_image(&self, key: &str) -> Option<LocalImage> {
+        let key = key.trim();
+        let index = self.index.lock().unwrap();
+        if let Some(img) = index.get(key) {
+            return Some(img.clone());
+        }
+        let hex = key.strip_prefix("sha256:").unwrap_or(key).to_ascii_lowercase();
+        if hex.len() >= 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let mut hits = index.images().filter(|img| {
+                let c = img.config_digest.strip_prefix("sha256:").unwrap_or(&img.config_digest);
+                let m = img.manifest_digest.strip_prefix("sha256:").unwrap_or(&img.manifest_digest);
+                c.starts_with(&hex) || m.starts_with(&hex)
+            });
+            if let (Some(first), None) = (hits.next(), hits.next()) {
+                return Some(first.clone());
+            }
+        }
+        None
+    }
+
+    /// Inspect a local image, returning its metadata and raw OCI config JSON.
+    pub fn inspect_image(&self, key: &str) -> Result<(LocalImage, serde_json::Value)> {
+        let img = self
+            .resolve_local_image(key)
+            .ok_or_else(|| anyhow!("No such image: {key}"))?;
+        let raw = self.blobs.read(&graviton_image::Digest::parse(&img.config_digest)?)?;
+        let json: serde_json::Value = serde_json::from_slice(&raw).context("parsing image config")?;
+        Ok((img, json))
+    }
+
+    /// Tag an existing local image under a new reference without copying layers.
+    pub fn tag_image(&self, source: &str, target: &str) -> Result<ImageSummary> {
+        let src = self
+            .resolve_local_image(source)
+            .ok_or_else(|| anyhow!("No such image: {source}"))?;
+        let parsed = ImageReference::parse(target)?;
+        let mut tagged = src;
+        tagged.reference = parsed.to_string();
+        tagged.pulled_at = now_secs();
+        self.index.lock().unwrap().insert(tagged.clone())?;
+        self.refresh_images();
+        Ok(tagged.summary(self.used_by(&tagged.reference)))
+    }
+
     // -- Containers -------------------------------------------------------
 
     fn create_container(&self, spec: RunSpec) -> Result<String> {
+        let image = self.image_for_platform(&spec.image, spec.platform.as_deref())?;
+        self.create_with_image(spec, image)
+    }
+
+    /// Create a container using only locally available images (does not auto-pull).
+    /// Used by the Docker REST API where `POST /containers/create` must return 404
+    /// on missing images so the Docker client performs `POST /images/create` first.
+    pub fn create_container_local(&self, spec: RunSpec) -> Result<String> {
+        let want_arch = spec.platform.as_deref().map(graviton_image::normalize_platform).transpose()?;
+        let image = self
+            .resolve_local_image(&spec.image)
+            .filter(|img| want_arch.as_deref().is_none_or(|a| img.architecture == a))
+            .ok_or_else(|| anyhow!("No such image: {}", spec.image))?;
+        self.create_with_image(spec, image)
+    }
+
+    fn create_with_image(&self, spec: RunSpec, image: LocalImage) -> Result<String> {
         let ports = spec.ports.iter().map(|p| parse_port(p)).collect::<Result<Vec<_>>>()?;
         let volumes = spec.volumes.iter().map(|v| parse_volume(v)).collect::<Result<Vec<_>>>()?;
         if let Some(name) = &spec.name {
@@ -510,7 +573,6 @@ impl Engine {
                 bail!("the name {name} is already in use");
             }
         }
-        let image = self.image_for_platform(&spec.image, spec.platform.as_deref())?;
         if image.architecture == "amd64" && graviton_image::guest_arch() != "amd64" && !AppleHypervisor::rosetta_available() {
             bail!(
                 "{} is a linux/amd64 image, which needs Apple Rosetta for Linux (run `softwareupdate --install-rosetta`)",
@@ -606,8 +668,30 @@ impl Engine {
         let rows = spec.rows;
         let cols = spec.cols;
         let id = self.create_container(spec)?;
-        let bound = self.bind_ports(&id, true)?;
-        self.store.lock().unwrap().update(&id, |c| {
+        self.launch_tty(&id, rows, cols)
+    }
+
+    /// Boot an already-created container attached to a PTY (used by `docker.sock` attach + start).
+    pub fn start_tty(self: &Arc<Self>, key: &str, rows: u16, cols: u16) -> Result<AttachedRun> {
+        let id = self.store.lock().unwrap().container(key)?.id.clone();
+        if self.running.lock().unwrap().contains_key(&id) {
+            bail!("container {key} is already running");
+        }
+        {
+            let mut specs = self.specs.lock().unwrap();
+            let Some(spec) = specs.get_mut(&id) else {
+                bail!("container {key} has no saved settings, so it can't be started again");
+            };
+            spec.want_running = false;
+        }
+        self.cancel_restart(&id);
+        self.save();
+        self.launch_tty(&id, rows, cols)
+    }
+
+    fn launch_tty(self: &Arc<Self>, id: &str, rows: u16, cols: u16) -> Result<AttachedRun> {
+        let bound = self.bind_ports(id, true)?;
+        self.store.lock().unwrap().update(id, |c| {
             c.status = ContainerStatus::Created;
             c.exit_code = None;
         });
@@ -616,7 +700,7 @@ impl Engine {
         let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
         let attach = TtyAttach { rows, cols, ready_tx, exit_rx, stopped_tx };
         let engine = Arc::clone(self);
-        let owned = id.clone();
+        let owned = id.to_string();
         std::thread::Builder::new()
             .name(format!("container-{id}"))
             .spawn(move || engine.supervise(&owned, bound, 0, Some(attach)))?;
@@ -707,6 +791,33 @@ impl Engine {
         }
         self.save();
         self.launch(&id)
+    }
+
+    /// Send a POSIX signal to a running container's main process.
+    pub fn signal_container(&self, key: &str, signal: i32) -> Result<()> {
+        let id = self.store.lock().unwrap().container(key)?.id.clone();
+        let (agent, pid) = {
+            let running = self.running.lock().unwrap();
+            let Some(r) = running.get(&id) else {
+                bail!("container {key} isn't running");
+            };
+            (Arc::clone(&r.agent), r.pid)
+        };
+        if matches!(signal, 9 | 15) {
+            if let Some(spec) = self.specs.lock().unwrap().get_mut(&id) {
+                spec.want_running = false;
+            }
+            self.cancel_restart(&id);
+            self.stopping.lock().unwrap().insert(id.clone());
+        }
+        if let Some(pid) = pid {
+            agent
+                .lock()
+                .unwrap()
+                .write_all(&encode_line(&AgentRequest::Signal { pid, signal }))
+                .context("sending signal to guest agent")?;
+        }
+        Ok(())
     }
 
     pub fn remove(&self, key: &str) -> Result<String> {
@@ -1111,6 +1222,7 @@ impl Engine {
                 rows,
                 cols,
                 stdin: None,
+                stdin_pipe: false,
                 mounts: vec![],
             }))?;
             let pid = match read_event_unbuffered(&mut tty_conn)? {
@@ -1146,6 +1258,7 @@ impl Engine {
             rows: 0,
             cols: 0,
             stdin: None,
+            stdin_pipe: false,
             mounts: vec![],
         })?;
 
@@ -1616,8 +1729,8 @@ impl Engine {
     // -- exec -------------------------------------------------------------
 
     /// Open a fresh agent connection and start `spec` in the container.
-    /// Returns the connection, positioned just after the agent's `started` line.
-    fn exec_start(&self, spec: &ExecSpec) -> Result<File> {
+    /// Returns `(pid, conn)` positioned just after the agent's `started` line.
+    fn exec_start_inner(&self, spec: &ExecSpec, stdin_pipe: bool) -> Result<(i32, File)> {
         let (id, name) = {
             let store = self.store.lock().unwrap();
             let c = store.container(&spec.id)?;
@@ -1630,6 +1743,16 @@ impl Engine {
         }
         let mut env = cs.env.clone();
         env.extend(spec.env.iter().cloned());
+        let cwd = spec
+            .working_dir
+            .clone()
+            .filter(|w| !w.is_empty())
+            .unwrap_or_else(|| cs.cwd.clone());
+        let user = spec
+            .user
+            .clone()
+            .filter(|u| !u.is_empty())
+            .or_else(|| cs.user.clone());
 
         let fd: OwnedFd = vm.connect(AGENT_VSOCK_PORT)?;
         let mut conn = File::from(fd);
@@ -1640,18 +1763,19 @@ impl Engine {
         conn.write_all(&encode_line(&AgentRequest::Exec {
             argv: spec.command.clone(),
             env,
-            cwd: cs.cwd.clone(),
+            cwd,
             tty: spec.tty,
             container: Some(id),
-            user: cs.user.clone(),
+            user,
             hostname: Some(name),
             rows: spec.rows,
             cols: spec.cols,
             stdin: None,
+            stdin_pipe,
             mounts: vec![],
         }))?;
         match read_event_unbuffered(&mut conn)? {
-            AgentEvent::Started { .. } => Ok(conn),
+            AgentEvent::Started { pid } => Ok((pid, conn)),
             AgentEvent::Error { message } => bail!("{message}"),
             other => bail!("expected started from the agent, got {other:?}"),
         }
@@ -1659,7 +1783,7 @@ impl Engine {
 
     /// Run a command without a TTY, sending its output and exit code to `out`.
     pub fn exec_stream(&self, spec: &ExecSpec, out: tokio::sync::mpsc::Sender<Response>) -> Result<()> {
-        let conn = self.exec_start(spec)?;
+        let (_, conn) = self.exec_start_inner(spec, false)?;
         let mut events = Events::new(BufReader::new(conn));
         loop {
             let response = match events.next()? {
@@ -1680,7 +1804,13 @@ impl Engine {
 
     /// Start a command on a TTY; the returned stream carries terminal frames.
     pub fn exec_tty(&self, spec: &ExecSpec) -> Result<OwnedFd> {
-        Ok(OwnedFd::from(self.exec_start(spec)?))
+        Ok(OwnedFd::from(self.exec_start_inner(spec, false)?.1))
+    }
+
+    /// Start an interactive non-TTY command, returning `(pid, agent_vsock_fd)`.
+    pub fn exec_interactive(&self, spec: &ExecSpec, stdin_pipe: bool) -> Result<(i32, OwnedFd)> {
+        let (pid, conn) = self.exec_start_inner(spec, stdin_pipe)?;
+        Ok((pid, OwnedFd::from(conn)))
     }
 
     fn log(&self, id: &str, level: LogLevel, stream: LogStream, message: String) {
@@ -2034,7 +2164,7 @@ pub(crate) fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-fn host_memory() -> u64 {
+pub(crate) fn host_memory() -> u64 {
     static TOTAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *TOTAL.get_or_init(|| {
         std::process::Command::new("/usr/sbin/sysctl")
@@ -2095,7 +2225,7 @@ fn host_memory_used() -> Option<u64> {
 
 /// Read the active guest kernel's banner (`Linux version X.Y.Z-...`) from
 /// `vmlinux`, cached by `(path, len, mtime)` so `grav info` / `inspect` stay instant.
-fn detect_guest_kernel() -> String {
+pub(crate) fn detect_guest_kernel() -> String {
     type CacheKey = (PathBuf, u64, u64);
     static CACHE: std::sync::OnceLock<Mutex<Option<(CacheKey, String)>>> = std::sync::OnceLock::new();
     let path = paths::guest_dir().join("vmlinux");

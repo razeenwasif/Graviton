@@ -1,4 +1,7 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// The parts of an OCI image config Graviton uses
 /// (<https://github.com/opencontainers/image-spec/blob/main/config.md>).
@@ -25,6 +28,10 @@ pub struct RuntimeConfig {
     pub working_dir: Option<String>,
     #[serde(default)]
     pub user: Option<String>,
+    #[serde(default)]
+    pub labels: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub exposed_ports: Option<BTreeMap<String, Value>>,
 }
 
 impl RuntimeConfig {
@@ -76,5 +83,16 @@ mod tests {
         assert_eq!(bare.config.argv(None), ["/bin/sh"]);
         assert!(bare.config.env(&[])[0].starts_with("PATH="));
         assert_eq!(bare.config.working_dir(), "/");
+        assert_eq!(bare.config.labels, None);
+
+        let with_labels: ImageConfig = serde_json::from_str(
+            r#"{"config":{"Labels":{"devcontainer.metadata":"[{\"remoteUser\":\"vscode\"}]"},"ExposedPorts":{"8000/tcp":{}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            with_labels.config.labels.as_ref().and_then(|l| l.get("devcontainer.metadata")).map(String::as_str),
+            Some("[{\"remoteUser\":\"vscode\"}]")
+        );
+        assert!(with_labels.config.exposed_ports.as_ref().is_some_and(|p| p.contains_key("8000/tcp")));
     }
 }

@@ -207,6 +207,12 @@ enum Command {
         /// Set an environment variable (KEY=value); repeatable.
         #[arg(short, long = "env")]
         env: Vec<String>,
+        /// Working directory inside the container.
+        #[arg(short = 'w', long = "workdir")]
+        workdir: Option<String>,
+        /// User (`uid[:gid]` or `name[:group]`).
+        #[arg(short = 'u', long = "user")]
+        user: Option<String>,
         container: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
@@ -280,6 +286,12 @@ enum Command {
     Service {
         #[command(subcommand)]
         action: ServiceAction,
+    },
+    /// Print shell commands to point Docker CLI, Compose, and Dev Containers at Graviton.
+    DockerEnv {
+        /// Print commands to unset DOCKER_HOST instead.
+        #[arg(long)]
+        unset: bool,
     },
     /// Parse and normalise an image reference (no daemon needed).
     Resolve { reference: String },
@@ -428,6 +440,19 @@ fn run(cli: Cli) -> Result<()> {
         Command::Service { action: ServiceAction::Install { remote } } => return service::install(*remote),
         Command::Service { action: ServiceAction::Uninstall } => return service::uninstall(),
         Command::Service { action: ServiceAction::Status } => return service::status(),
+        Command::DockerEnv { unset } => {
+            if *unset {
+                println!("unset DOCKER_HOST DOCKER_BUILDKIT");
+            } else {
+                let sock = paths::docker_socket_path();
+                let quoted = sock.display().to_string().replace('\'', "'\\''");
+                println!("export DOCKER_HOST='unix://{quoted}'");
+                println!("export DOCKER_BUILDKIT=0");
+                println!("# Run this command to configure your shell:");
+                println!("# eval \"$(grav docker-env)\"");
+            }
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -468,6 +493,12 @@ fn run(cli: Cli) -> Result<()> {
                     println!("Disk:      {} / {}", bytes(e.disk_used_bytes), bytes(e.disk_bytes));
                 } else {
                     println!("Images:    {}", bytes(e.disk_used_bytes));
+                }
+                if !target.is_remote() {
+                    let docker_sock = paths::docker_socket_path();
+                    if docker_sock.exists() {
+                        println!("Docker:    unix://{}", docker_sock.display());
+                    }
                 }
             }
             other => unexpected(other)?,
@@ -610,11 +641,21 @@ fn run(cli: Cli) -> Result<()> {
                 std::process::exit(code);
             }
         }
-        Command::Exec { interactive, tty, env, container, command } => {
+        Command::Exec { interactive, tty, env, workdir, user, container, command } => {
+            let spec = ExecSpec {
+                id: container,
+                command,
+                tty,
+                rows: 0,
+                cols: 0,
+                env,
+                working_dir: workdir,
+                user,
+            };
             let code = if tty {
-                exec_tty(&target, ExecSpec { id: container, command, tty: true, rows: 0, cols: 0, env }, interactive)?
+                exec_tty(&target, spec, interactive)?
             } else {
-                exec_stream(&mut client, ExecSpec { id: container, command, tty: false, rows: 0, cols: 0, env })?
+                exec_stream(&mut client, spec)?
             };
             std::process::exit(code);
         }
@@ -809,6 +850,7 @@ fn run(cli: Cli) -> Result<()> {
                 upload: None,
                 secrets,
                 platform,
+                labels: BTreeMap::new(),
             };
             run_build_spec(&mut client, &target, &context, spec)?;
         }
@@ -935,7 +977,7 @@ fn run(cli: Cli) -> Result<()> {
             Response::Revoked { id } => println!("{id} revoked"),
             other => unexpected(other)?,
         },
-        Command::Resolve { .. } | Command::Hosts { .. } | Command::Service { .. } => unreachable!(),
+        Command::Resolve { .. } | Command::DockerEnv { .. } | Command::Hosts { .. } | Command::Service { .. } => unreachable!(),
     }
     Ok(())
 }

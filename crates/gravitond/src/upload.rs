@@ -61,6 +61,12 @@ pub async fn receive(reader: &mut (impl AsyncRead + Unpin), size: u64) -> Result
     }
 }
 
+/// Unpack a tar (or gzipped tar) archive at `archive` into `dir` without
+/// allowing path traversal outside `dir`.
+pub(crate) fn unpack_archive(archive: &Path, dir: &Path) -> Result<u64> {
+    unpack(archive, dir)
+}
+
 fn unpack(archive: &Path, dir: &Path) -> Result<u64> {
     fs::create_dir_all(dir)?;
     let mut file = File::open(archive)?;

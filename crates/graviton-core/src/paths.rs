@@ -8,6 +8,9 @@ use std::path::PathBuf;
 /// Environment variable that overrides the control socket location.
 pub const SOCKET_ENV: &str = "GRAVITON_SOCKET";
 
+/// Environment variable that overrides the Docker-compatible REST API socket location.
+pub const DOCKER_SOCKET_ENV: &str = "GRAVITON_DOCKER_SOCKET";
+
 /// Environment variable that overrides the Graviton support directory.
 pub const DATA_DIR_ENV: &str = "GRAVITON_DATA_DIR";
 
@@ -25,6 +28,13 @@ pub fn socket_path() -> PathBuf {
     std::env::var_os(SOCKET_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| support_dir().join("gravitond.sock"))
+}
+
+/// Docker Engine REST API compatibility socket: `$GRAVITON_DOCKER_SOCKET`, else `<support_dir>/docker.sock`.
+pub fn docker_socket_path() -> PathBuf {
+    std::env::var_os(DOCKER_SOCKET_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| support_dir().join("docker.sock"))
 }
 
 /// Content-addressed blob store for image layers.

@@ -47,11 +47,12 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux {
+    use std::collections::HashMap;
     use std::ffi::CString;
     use std::fs::{self, File};
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::process::{Command, Stdio};
+    use std::process::{ChildStdin, Command, Stdio};
     use std::sync::{Arc, Mutex};
     use std::thread;
 
@@ -122,6 +123,7 @@ pub(crate) mod linux {
         send(&writer, &AgentEvent::Ready { kernel });
 
         let mut reader = BufReader::new(conn);
+        let mut stdins: HashMap<i32, ChildStdin> = HashMap::new();
         let mut line = String::new();
         loop {
             line.clear();
@@ -151,7 +153,7 @@ pub(crate) mod linux {
                         Err(err) => send(&writer, &AgentEvent::Error { message: format!("preparing {container}: {err}") }),
                     }
                 }
-                Ok(AgentRequest::Exec { argv, env, cwd, tty, container, user, hostname, rows, cols, stdin, mounts }) => {
+                Ok(AgentRequest::Exec { argv, env, cwd, tty, container, user, hostname, rows, cols, stdin, stdin_pipe, mounts }) => {
                     let has_term = env.iter().any(|e| e.starts_with("TERM="));
                     let prepared: io::Result<(Command, Option<crate::build::MountCleanup>)> = match &container {
                         Some(id) => {
@@ -178,7 +180,7 @@ pub(crate) mod linux {
                             drop(writer);
                             return crate::tty::run(cmd, reader.into_inner(), pending, rows, cols, has_term);
                         }
-                        Ok((cmd, cleanup)) => exec(cmd, argv.first().cloned().unwrap_or_default(), stdin, cleanup, Arc::clone(&writer)),
+                        Ok((cmd, cleanup)) => exec(cmd, argv.first().cloned().unwrap_or_default(), stdin, stdin_pipe, &mut stdins, cleanup, Arc::clone(&writer)),
                         Err(err) => send(&writer, &AgentEvent::Error { message: format!("exec: {err}") }),
                     }
                 }
@@ -188,8 +190,14 @@ pub(crate) mod linux {
                         send(&writer, &AgentEvent::Error { message: format!("kill {pid}: {}", io::Error::last_os_error()) });
                     }
                 }
-                Ok(AgentRequest::Stdin { .. }) => {
-                    send(&writer, &AgentEvent::Error { message: "stdin is only forwarded for TTY sessions".into() });
+                Ok(AgentRequest::Stdin { pid, data }) => {
+                    if data.is_empty() {
+                        stdins.remove(&pid);
+                    } else if let Some(pipe) = stdins.get_mut(&pid) {
+                        if pipe.write_all(&data).is_err() || pipe.flush().is_err() {
+                            stdins.remove(&pid);
+                        }
+                    }
                 }
                 Ok(AgentRequest::Stats { processes }) => send(&writer, &AgentEvent::Stats(crate::stats::collect(processes))),
                 Ok(AgentRequest::ListDir { container, path }) => match crate::files::list(&container, &path) {
@@ -282,19 +290,25 @@ pub(crate) mod linux {
         mut cmd: Command,
         program: String,
         stdin_bytes: Option<Vec<u8>>,
+        stdin_pipe: bool,
+        stdins: &mut HashMap<i32, ChildStdin>,
         cleanup: Option<crate::build::MountCleanup>,
         writer: Writer,
     ) {
-        let stdin_stdio = match stdin_bytes {
-            Some(bytes) => match make_stdin_file(&bytes) {
-                Ok(file) => Stdio::from(file),
-                Err(err) => {
-                    drop(cleanup);
-                    send(&writer, &AgentEvent::Error { message: format!("preparing stdin for {program}: {err}") });
-                    return;
-                }
-            },
-            None => Stdio::null(),
+        let stdin_stdio = if stdin_pipe {
+            Stdio::piped()
+        } else {
+            match stdin_bytes {
+                Some(bytes) => match make_stdin_file(&bytes) {
+                    Ok(file) => Stdio::from(file),
+                    Err(err) => {
+                        drop(cleanup);
+                        send(&writer, &AgentEvent::Error { message: format!("preparing stdin for {program}: {err}") });
+                        return;
+                    }
+                },
+                None => Stdio::null(),
+            }
         };
         cmd.stdin(stdin_stdio).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = match crate::reap::spawn(&mut cmd) {
@@ -306,6 +320,9 @@ pub(crate) mod linux {
             }
         };
         let pid = child.id() as i32;
+        if let Some(pipe) = child.stdin.take() {
+            stdins.insert(pid, pipe);
+        }
         send(&writer, &AgentEvent::Started { pid });
 
         let out = child.stdout.take().map(|s| pump(s, pid, false, Arc::clone(&writer)));

@@ -617,6 +617,7 @@ fn build_one(
         upload: None,
         secrets: vec![],
         platform: b.platform.clone().or_else(|| svc.platform.clone()),
+        labels: BTreeMap::new(),
     };
     run_build_spec(client, target, &context, spec)
 }

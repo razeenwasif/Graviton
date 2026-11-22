@@ -167,6 +167,27 @@ cargo run -p grav -- compose down -v            # tear down stack and project-ow
     `exec`, `build`, `remove_image`, `remove` volume, `copy_files`,
     `disk_and_prune prune`, `snapshots warm`/`clear`, and
     `compose up`/`down`/`stop`/`build`.
+- **Docker Engine REST API compatibility (`docker.sock`)**: `gravitond` also
+  exposes a Docker Engine REST API v1.47 Unix socket at
+  `$GRAVITON_DOCKER_SOCKET` (else `~/Library/Application Support/Graviton/docker.sock`;
+  pass `--docker-socket PATH` or `--no-docker-socket` to override/disable) so
+  standard tools (`docker` CLI, VS Code / Proton Dev Containers,
+  Testcontainers, and Docker SDKs) drive Graviton VMs directly:
+
+  ```bash
+  eval "$(grav docker-env)"   # exports DOCKER_HOST and DOCKER_BUILDKIT=0 (classic POST /build)
+  docker ps -a
+  docker run --rm --label devcontainer.local_folder="$PWD" -v "$PWD":/workspace alpine:3.22 uname -a
+  ```
+
+  Includes classic `POST /build` (`Builder-Version: 1`), `GET /_ping`, `/version`,
+  `/info`, `/system/df`, `/events`, `/containers/*` (with Go map & array label
+  filters, `HostConfig.Binds` + `HostConfig.Mounts`, `AutoRemove`, `wait`,
+  `logs`, TTY & multiplexed `attach`, `archive` `docker cp`), `/exec/*`
+  (interactive TTY resize, streaming non-TTY `exec -i` stdin + EOF, `--workdir`
+  and `--user` overrides also exposed via `grav exec -w/-u`), `/images/*`
+  (inspect with full OCI labels including `devcontainer.metadata`, `tag`,
+  `pull`, `rmi`, `prune`), `/volumes/*`, and `/networks/*`.
 - `scripts/install-launch-agent.sh` installs gravitond as a launch agent so it
   starts at login (`--remote` to accept phones, `--uninstall` to remove it).
 
@@ -231,7 +252,8 @@ Virtualization.framework requires the `com.apple.security.virtualization`
 entitlement, so gravitond must be signed (the script does it ad hoc). The guest
 console is written to `~/Library/Application Support/Graviton/vms/boot-check/console.log`.
 
-Socket: `$GRAVITON_SOCKET`, else `~/Library/Application Support/Graviton/gravitond.sock`.
+Socket: `$GRAVITON_SOCKET`, else `~/Library/Application Support/Graviton/gravitond.sock`
+(and `$GRAVITON_DOCKER_SOCKET`, else `docker.sock` alongside it).
 
 Apps:
 

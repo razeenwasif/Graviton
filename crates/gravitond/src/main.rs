@@ -9,6 +9,7 @@ mod auth;
 mod boot_check;
 mod build;
 mod cleanup;
+mod docker_api;
 mod events;
 mod push;
 mod remote;
@@ -35,6 +36,14 @@ struct Args {
     /// Control socket path (default: $GRAVITON_SOCKET or ~/Library/Application Support/Graviton/gravitond.sock)
     #[arg(long)]
     socket: Option<PathBuf>,
+
+    /// Docker-compatible REST API socket path (default: $GRAVITON_DOCKER_SOCKET or <support_dir>/docker.sock)
+    #[arg(long)]
+    docker_socket: Option<PathBuf>,
+
+    /// Disable the Docker Engine REST API compatibility socket (`docker.sock`).
+    #[arg(long)]
+    no_docker_socket: bool,
 
     /// Serve the sample containers from the design mockups instead of real ones.
     #[arg(long)]
@@ -83,7 +92,18 @@ fn main() -> Result<()> {
 }
 
 async fn serve_forever(args: Args) -> Result<()> {
+    let explicit_socket = args.socket.is_some();
     let socket = args.socket.unwrap_or_else(paths::socket_path);
+    let docker_socket = if args.no_docker_socket {
+        None
+    } else if let Some(p) = args.docker_socket {
+        Some(p)
+    } else if explicit_socket {
+        // Keep test/custom `--socket` daemons isolated from the user's primary `docker.sock`.
+        Some(socket.parent().unwrap_or(std::path::Path::new("/tmp")).join("docker.sock"))
+    } else {
+        Some(paths::docker_socket_path())
+    };
 
     if let Some(dir) = socket.parent() {
         tokio::fs::create_dir_all(dir).await.with_context(|| format!("creating {}", dir.display()))?;
@@ -94,6 +114,17 @@ async fn serve_forever(args: Args) -> Result<()> {
             anyhow::bail!("another gravitond is already listening on {}", socket.display());
         }
         tokio::fs::remove_file(&socket).await.ok();
+    }
+    if let Some(ds) = &docker_socket {
+        if let Some(dir) = ds.parent() {
+            tokio::fs::create_dir_all(dir).await.with_context(|| format!("creating {}", dir.display()))?;
+        }
+        if ds.exists() {
+            if UnixStream::connect(ds).await.is_ok() {
+                anyhow::bail!("another daemon is already listening on {}", ds.display());
+            }
+            tokio::fs::remove_file(ds).await.ok();
+        }
     }
 
     let backend = if args.demo {
@@ -132,6 +163,16 @@ async fn serve_forever(args: Args) -> Result<()> {
         if args.demo { " (demo data)" } else { "" }
     );
 
+    let docker_endpoint = if let Some(ds) = &docker_socket {
+        let dl = UnixListener::bind(ds).with_context(|| format!("binding {}", ds.display()))?;
+        restrict_permissions(ds)?;
+        let state = docker_api::DockerState::new(backend.clone());
+        eprintln!("Docker API listening on {}", ds.display());
+        Some((dl, ds.clone(), state))
+    } else {
+        None
+    };
+
     // launchd stops agents with SIGTERM; Ctrl-C sends SIGINT.
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
@@ -147,6 +188,23 @@ async fn serve_forever(args: Args) -> Result<()> {
                     }
                 });
             }
+            accepted = async {
+                match &docker_endpoint {
+                    Some((dl, _, _)) => dl.accept().await.map(Some),
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some((stream, _)) = accepted? {
+                    if let Some((_, _, ds)) = &docker_endpoint {
+                        let ds = Arc::clone(ds);
+                        tokio::spawn(async move {
+                            if let Err(err) = docker_api::serve_connection(stream, ds).await {
+                                eprintln!("docker api connection error: {err:#}");
+                            }
+                        });
+                    }
+                }
+            }
             _ = tokio::signal::ctrl_c() => break,
         }
     }
@@ -156,6 +214,9 @@ async fn serve_forever(args: Args) -> Result<()> {
         let _ = tokio::task::spawn_blocking(move || engine.shutdown()).await;
     }
     tokio::fs::remove_file(&socket).await.ok();
+    if let Some((_, ds, _)) = docker_endpoint {
+        tokio::fs::remove_file(&ds).await.ok();
+    }
     eprintln!("gravitond stopped");
     Ok(())
 }

@@ -151,6 +151,7 @@ fn talk_to_agent(vm: &dyn VmHandle, command: Vec<String>, t0: Instant) -> Result
         rows: 0,
         cols: 0,
         stdin: None,
+        stdin_pipe: false,
         mounts: vec![],
     }))?;
     let code = loop {
