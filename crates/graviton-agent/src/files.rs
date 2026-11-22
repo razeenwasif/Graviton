@@ -117,6 +117,7 @@ pub fn get_archive(container: &str, path: &str, mut conn: File) -> io::Result<()
         append_entry(&mut tar, &resolved, Path::new(&name), &meta, &mut seen_inodes)?;
     } else {
         let is_root = resolved == root;
+        let root_dev = meta.dev();
         let prefix = if is_root { PathBuf::new() } else { PathBuf::from(&name) };
         if !prefix.as_os_str().is_empty() {
             tar.append_path_with_name(&resolved, &prefix)?;
@@ -141,7 +142,7 @@ pub fn get_archive(container: &str, path: &str, mut conn: File) -> io::Result<()
                 }
                 let archive_path = if prefix.as_os_str().is_empty() { child.clone() } else { prefix.join(&child) };
                 append_entry(&mut tar, &abs, &archive_path, &m, &mut seen_inodes)?;
-                if m.is_dir() {
+                if m.is_dir() && !(is_root && m.dev() != root_dev) {
                     stack.push(child);
                 }
             }

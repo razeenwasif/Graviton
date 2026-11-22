@@ -707,6 +707,22 @@ pub struct BuildSpec {
     pub labels: BTreeMap<String, String>,
 }
 
+/// Parameters for `Request::Commit` (`grav commit CONTAINER IMAGE`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitSpec {
+    pub container: String,
+    /// Target image reference (`repo[:tag]`); empty defaults to `committed:<short_id>`.
+    #[serde(default)]
+    pub reference: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Dockerfile config instructions (`ENV`, `CMD`, `ENTRYPOINT`, `WORKDIR`, `USER`, `EXPOSE`, `LABEL`, `VOLUME`, `STOPSIGNAL`, `HEALTHCHECK`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<String>,
+}
+
 /// Where an uploaded build folder's Dockerfile goes when it lives outside the folder.
 pub const UPLOADED_DOCKERFILE: &str = ".graviton-dockerfile";
 
@@ -1002,6 +1018,13 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         progress: bool,
     },
+    /// Export one or more local images into a tar archive stream (`grav save`).
+    /// Answers `ImageArchive` followed by raw tar bytes until EOF.
+    SaveImage { references: Vec<String> },
+    /// Load one or more images from `size` tar/tar.gz bytes following this request line (`grav load`).
+    LoadImage { size: u64 },
+    /// Snapshot a container's filesystem + config changes into a local image (`grav commit`).
+    Commit(CommitSpec),
     /// Verify and save credentials for an OCI registry (password goes in the Mac's Keychain).
     RegistryLogin {
         registry: String,
@@ -1122,6 +1145,8 @@ pub enum Response {
     File(FileContents),
     /// Sent before streaming raw tar bytes for `Request::GetArchive`.
     Archive { is_dir: bool, name: String },
+    /// Sent before streaming raw tar bytes for `Request::SaveImage`.
+    ImageArchive,
     /// Sent after `Request::PutArchive` unpacks into the container.
     Copied { files: u64 },
     Details(Box<ContainerDetails>),
@@ -1965,5 +1990,34 @@ mod tests {
         let clk = AgentRequest::SetClock { now_secs: 1_795_000_000 };
         assert_eq!(decode_line::<AgentRequest>(&encode_line(&clk)).unwrap(), clk);
         assert_eq!(decode_line::<AgentEvent>(&encode_line(&AgentEvent::Connected)).unwrap(), AgentEvent::Connected);
+    }
+
+    #[test]
+    fn save_load_commit_round_trip() {
+        let save = Request::SaveImage { references: vec!["alpine:3.22".into(), "app:1".into()] };
+        assert_eq!(decode_line::<Request>(&encode_line(&save)).unwrap(), save);
+
+        let load = Request::LoadImage { size: 42_000 };
+        assert_eq!(decode_line::<Request>(&encode_line(&load)).unwrap(), load);
+
+        let commit = Request::Commit(CommitSpec {
+            container: "web".into(),
+            reference: "myrepo/web:v2".into(),
+            author: Some("Jane".into()),
+            message: Some("snapshot".into()),
+            changes: vec!["ENV FOO=bar".into(), "CMD [\"sh\"]".into()],
+        });
+        assert_eq!(decode_line::<Request>(&encode_line(&commit)).unwrap(), commit);
+
+        let min_commit: Request = decode_line(br#"{"method":"commit","params":{"container":"c1"}}"#).unwrap();
+        assert_eq!(
+            min_commit,
+            Request::Commit(CommitSpec { container: "c1".into(), ..Default::default() })
+        );
+
+        assert_eq!(
+            decode_line::<Response>(&encode_line(&Response::ImageArchive)).unwrap(),
+            Response::ImageArchive
+        );
     }
 }

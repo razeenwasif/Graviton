@@ -253,9 +253,12 @@ async fn dispatch(
 
         // Images & Build
         ("GET", "/images/json") => return images::list_images(state, &head, reader, write).await,
+        ("GET", "/images/get") => return images::save_images(state, None, &head, reader, write).await,
         ("POST", "/images/create") => return images::pull_image(state, &head, reader, write).await,
+        ("POST", "/images/load") => return images::load_images(state, &head, reader, write).await,
         ("POST", "/images/prune") => return images::prune_images(state, &head, reader, write).await,
         ("POST", "/build") => return images::build_image(state, &head, reader, write).await,
+        ("POST", "/commit") => return images::commit_container(state, &head, reader, write).await,
 
         // Volumes
         ("GET", "/volumes") => return images::list_volumes(state, &head, reader, write).await,
@@ -279,6 +282,10 @@ async fn dispatch(
         if let Some(name) = rest.strip_suffix("/json").filter(|n| !n.is_empty()) {
             if method == "GET" {
                 return images::inspect_image(state, name, &head, reader, write).await;
+            }
+        } else if let Some(name) = rest.strip_suffix("/get").filter(|n| !n.is_empty()) {
+            if method == "GET" {
+                return images::save_images(state, Some(name), &head, reader, write).await;
             }
         } else if let Some(name) = rest.strip_suffix("/tag").filter(|n| !n.is_empty()) {
             if method == "POST" {

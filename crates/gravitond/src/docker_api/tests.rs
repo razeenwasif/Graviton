@@ -238,6 +238,28 @@ async fn unix_socket_keepalive_and_endpoints() {
     let (status, _, _) = read_http_response(&mut client).await;
     assert_eq!(status, 404);
 
+    client.write_all(b"GET /v1.47/images/get?names=alpine:3.22 HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+    let (status, _, _) = read_http_response(&mut client).await;
+    assert_eq!(status, 501);
+
+    client.write_all(b"GET /v1.47/images/alpine:3.22/get HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+    let (status, _, _) = read_http_response(&mut client).await;
+    assert_eq!(status, 501);
+
+    client
+        .write_all(b"POST /v1.47/images/load HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+        .await
+        .unwrap();
+    let (status, _, _) = read_http_response(&mut client).await;
+    assert_eq!(status, 501);
+
+    client
+        .write_all(b"POST /v1.47/commit?container=worker&repo=snap&tag=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+        .await
+        .unwrap();
+    let (status, _, _) = read_http_response(&mut client).await;
+    assert_eq!(status, 501);
+
     client
         .write_all(b"HEAD /v1.47/containers/worker/archive?path=/tmp HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .await

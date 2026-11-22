@@ -35,14 +35,14 @@ use sha2::{Digest as _, Sha256};
 
 use crate::runtime::{Engine, Events, LineBuffer, new_id, now_secs, read_event_unbuffered};
 
-const GZIP_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+pub(crate) const GZIP_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct BuiltLayer {
-    digest: String,
-    diff_id: String,
-    size: u64,
-    media_type: String,
+pub(crate) struct BuiltLayer {
+    pub(crate) digest: String,
+    pub(crate) diff_id: String,
+    pub(crate) size: u64,
+    pub(crate) media_type: String,
 }
 
 /// One cached step: the layer it made (`None`: it changed no files) and when.
@@ -156,32 +156,33 @@ fn ensure_cache_mount_dir(key: &str) -> Result<PathBuf> {
 
 /// Where a stage has got to.
 #[derive(Clone)]
-struct State {
-    architecture: String,
-    layers: Vec<BuiltLayer>,
+pub(crate) struct State {
+    pub(crate) architecture: String,
+    pub(crate) layers: Vec<BuiltLayer>,
     /// The base image's whole OCI config; `config` is rewritten at the end.
-    base_config: Value,
-    env: Vec<String>,
-    entrypoint: Option<Vec<String>>,
-    cmd: Option<Vec<String>>,
-    workdir: String,
-    user: Option<String>,
-    shell: Vec<String>,
-    exposed: BTreeSet<String>,
-    labels: BTreeMap<String, String>,
-    volumes: BTreeSet<String>,
-    stop_signal: Option<String>,
-    healthcheck: Option<graviton_image::HealthcheckConfig>,
-    history: Vec<Value>,
-    key: String,
+    pub(crate) base_config: Value,
+    pub(crate) env: Vec<String>,
+    pub(crate) entrypoint: Option<Vec<String>>,
+    pub(crate) cmd: Option<Vec<String>>,
+    pub(crate) workdir: String,
+    pub(crate) user: Option<String>,
+    pub(crate) shell: Vec<String>,
+    pub(crate) exposed: BTreeSet<String>,
+    pub(crate) labels: BTreeMap<String, String>,
+    pub(crate) volumes: BTreeSet<String>,
+    pub(crate) stop_signal: Option<String>,
+    pub(crate) healthcheck: Option<graviton_image::HealthcheckConfig>,
+    pub(crate) history: Vec<Value>,
+    pub(crate) key: String,
     /// The stage's ARGs in scope, with their values.
-    args: BTreeMap<String, String>,
+    pub(crate) args: BTreeMap<String, String>,
     /// When its newest file-changing step was made (Unix seconds).
-    created: Option<u64>,
+    pub(crate) created: Option<u64>,
+    pub(crate) author: Option<String>,
 }
 
 impl State {
-    fn vars(&self) -> BTreeMap<String, String> {
+    pub(crate) fn vars(&self) -> BTreeMap<String, String> {
         let mut v = self.args.clone();
         for e in &self.env {
             if let Some((k, val)) = e.split_once('=') {
@@ -965,6 +966,7 @@ fn base_state(engine: &Engine, base: &str, platform: Option<&str>, log: &mut dyn
         key: hash(&["scratch", &target_arch]),
         args: BTreeMap::new(),
         created: None,
+        author: None,
     };
     if base == "scratch" {
         return Ok(empty);
@@ -984,9 +986,18 @@ fn base_state(engine: &Engine, base: &str, platform: Option<&str>, log: &mut dyn
     let image = engine.image_for_platform(base, platform)?;
     let raw = engine.blobs.read(&Digest::parse(&image.config_digest)?)?;
     let config: Value = serde_json::from_slice(&raw).context("reading the base image's config")?;
-    let diff_ids: Vec<String> = config["rootfs"]["diff_ids"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+    state_from_base(&image, config)
+}
+
+pub(crate) fn state_from_base(image: &LocalImage, config: Value) -> Result<State> {
+    let default_env = vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()];
+    let default_shell = vec!["/bin/sh".into(), "-c".into()];
+    let diff_ids: Vec<String> = config["rootfs"]["diff_ids"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
     if diff_ids.len() != image.layers.len() {
-        bail!("{base}'s config lists {} layers but its manifest has {}", diff_ids.len(), image.layers.len());
+        bail!("{}'s config lists {} layers but its manifest has {}", image.reference, diff_ids.len(), image.layers.len());
     }
     let c = &config["config"];
     let strings = |v: &Value| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>());
@@ -1001,12 +1012,12 @@ fn base_state(engine: &Engine, base: &str, platform: Option<&str>, log: &mut dyn
             .zip(&diff_ids)
             .map(|(l, d)| BuiltLayer { digest: l.digest.clone(), diff_id: d.clone(), size: l.size, media_type: l.media_type.clone() })
             .collect(),
-        env: strings(&c["Env"]).unwrap_or(empty.env.clone()),
+        env: strings(&c["Env"]).unwrap_or(default_env),
         entrypoint: strings(&c["Entrypoint"]),
         cmd: strings(&c["Cmd"]),
         workdir: c["WorkingDir"].as_str().filter(|w| !w.is_empty()).unwrap_or("/").to_string(),
         user: c["User"].as_str().filter(|u| !u.is_empty()).map(String::from),
-        shell: strings(&c["Shell"]).filter(|s| !s.is_empty()).unwrap_or(empty.shell.clone()),
+        shell: strings(&c["Shell"]).filter(|s| !s.is_empty()).unwrap_or(default_shell),
         exposed: c["ExposedPorts"].as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default(),
         labels: c["Labels"].as_object().map(|o| o.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect()).unwrap_or_default(),
         volumes: c["Volumes"].as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default(),
@@ -1014,18 +1025,19 @@ fn base_state(engine: &Engine, base: &str, platform: Option<&str>, log: &mut dyn
         healthcheck,
         history: config["history"].as_array().cloned().unwrap_or_default(),
         key: hash(&["image", &image.manifest_digest, &image.architecture]),
+        author: config["author"].as_str().map(String::from),
         base_config: config,
         args: BTreeMap::new(),
         created: None,
     })
 }
 
-fn absolute(path: &str, cwd: &str) -> String {
+pub(crate) fn absolute(path: &str, cwd: &str) -> String {
     let joined = if path.starts_with('/') { path.to_string() } else { format!("{}/{path}", cwd.trim_end_matches('/')) };
     format!("/{}", graviton_proto::build::components(&joined).join("/"))
 }
 
-fn apply_config(s: &mut State, kind: &Kind, vars: &BTreeMap<String, String>, build_args: &BTreeMap<String, String>) -> Result<()> {
+pub(crate) fn apply_config(s: &mut State, kind: &Kind, vars: &BTreeMap<String, String>, build_args: &BTreeMap<String, String>) -> Result<()> {
     let argv = |c: &Command, shell: &[String]| match c {
         Command::Exec(v) => v.clone(),
         Command::Shell(line) => shell.iter().cloned().chain([line.clone()]).collect(),
@@ -1275,6 +1287,10 @@ fn store_layer(engine: &Engine, out_dir: &Path, info: LayerInfo) -> Result<Optio
 }
 
 fn write_image(engine: &Engine, reference: &str, s: &State) -> Result<LocalImage> {
+    write_image_with_creator(engine, reference, s, "grav build")
+}
+
+pub(crate) fn write_image_with_creator(engine: &Engine, reference: &str, s: &State, built_by: &str) -> Result<LocalImage> {
     let mut config = s.base_config.clone();
     let obj = |v: BTreeSet<String>| Value::Object(v.into_iter().map(|k| (k, json!({}))).collect());
     let mut rc = serde_json::Map::new();
@@ -1313,6 +1329,9 @@ fn write_image(engine: &Engine, reference: &str, s: &State) -> Result<LocalImage
     config["architecture"] = json!(s.architecture);
     config["os"] = json!("linux");
     config["created"] = json!(created);
+    if let Some(author) = &s.author {
+        config["author"] = json!(author);
+    }
     config["rootfs"] = json!({"type": "layers", "diff_ids": s.layers.iter().map(|l| l.diff_id.clone()).collect::<Vec<_>>()});
     config["history"] = json!(s.history);
     if let Some(map) = config.as_object_mut() {
@@ -1328,7 +1347,7 @@ fn write_image(engine: &Engine, reference: &str, s: &State) -> Result<LocalImage
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
         "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config_digest.as_str(), "size": config_bytes.len()},
         "layers": s.layers.iter().map(|l| json!({"mediaType": l.media_type, "digest": l.digest, "size": l.size})).collect::<Vec<_>>(),
-        "annotations": {"org.opencontainers.image.created": created, "dev.graviton.built-by": "grav build"},
+        "annotations": {"org.opencontainers.image.created": created, "dev.graviton.built-by": built_by},
     });
     let manifest_bytes = serde_json::to_vec(&manifest)?;
     let manifest_digest = Digest::of(&manifest_bytes);
@@ -1389,7 +1408,7 @@ fn write_image_index(engine: &Engine, reference: &str, built: &[LocalImage]) -> 
     })
 }
 
-fn human(bytes: u64) -> String {
+pub(crate) fn human(bytes: u64) -> String {
     match bytes {
         b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
         b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
@@ -1518,6 +1537,7 @@ mod tests {
             key: String::new(),
             args: BTreeMap::new(),
             created: None,
+            author: None,
         }
     }
 }

@@ -10,19 +10,19 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use graviton_core::{ImageReference, paths};
 use graviton_image::Credentials;
-use graviton_proto::{BuildSpec, ContainerStatus, EventKind, ImagePushProgress, PruneSpec, PullProgress};
+use graviton_proto::{BuildSpec, CommitSpec, ContainerStatus, EventKind, ImagePushProgress, PruneSpec, PullProgress};
 use serde_json::{Value, json};
 use tokio::io::BufReader;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 
-use crate::{Backend, build, cleanup, upload};
+use crate::{Backend, SyncChannelWriter, archive, build, cleanup, upload};
 use crate::runtime::{detect_guest_kernel, host_memory, is_valid_volume_name, new_id, now_secs};
 
 use super::containers::parse_filters;
 use super::http::{
     API_VERSION, MAX_JSON_BODY, MIN_API_VERSION, RequestHead, drain_body, finish_chunked, read_body_bytes,
-    read_body_to_file, write_chunk_json, write_chunked_head, write_empty, write_error, write_json, write_text,
+    read_body_to_file, write_chunk, write_chunk_json, write_chunked_head, write_empty, write_error, write_json, write_text,
 };
 use super::{DockerState, LogicalNetwork, RouteOutcome, make_network_id, now_rfc3339};
 
@@ -1420,5 +1420,206 @@ pub async fn prune_networks(
     drain_body(reader, write, head).await?;
     let deleted: Vec<String> = state.networks.lock().unwrap().drain().map(|(_, n)| n.name).collect();
     write_json(write, 200, &json!({ "NetworksDeleted": deleted }), head.close_after).await?;
+    Ok(RouteOutcome::Continue)
+}
+
+// ---------------------------------------------------------------------------
+// Image Save (`GET /images/get`, `GET /images/{name}/get`), Load, & Commit
+// ---------------------------------------------------------------------------
+
+pub async fn save_images(
+    state: &Arc<DockerState>,
+    single_name: Option<&str>,
+    head: &RequestHead,
+    reader: &mut BufReader<OwnedReadHalf>,
+    write: &mut OwnedWriteHalf,
+) -> Result<RouteOutcome> {
+    drain_body(reader, write, head).await?;
+    let Some(engine) = state.engine().cloned() else {
+        write_error(write, 501, "save requires a live engine", head.close_after).await?;
+        return Ok(RouteOutcome::Continue);
+    };
+
+    let names: Vec<String> = match single_name {
+        Some(n) => vec![n.to_string()],
+        None => head
+            .query_params("names")
+            .into_iter()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+    };
+    if names.is_empty() {
+        write_error(write, 400, "missing image name(s)", head.close_after).await?;
+        return Ok(RouteOutcome::Continue);
+    }
+
+    let check_engine = Arc::clone(&engine);
+    let check_names = names.clone();
+    let images = match tokio::task::spawn_blocking(move || archive::resolve_save_images(&check_engine, &check_names)).await? {
+        Ok(imgs) => imgs,
+        Err(err) => {
+            write_error(write, 404, &format!("{err:#}"), head.close_after).await?;
+            return Ok(RouteOutcome::Continue);
+        }
+    };
+
+    write_chunked_head(write, 200, "application/x-tar", &[]).await?;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(16);
+    let blobs = engine.blobs.clone();
+    let writer_task = tokio::task::spawn_blocking(move || archive::save_images_from_store(&blobs, &images, SyncChannelWriter(tx)));
+    while let Some(chunk) = rx.recv().await {
+        if write_chunk(write, &chunk).await.is_err() {
+            return Ok(RouteOutcome::Done);
+        }
+    }
+    if let Ok(Err(err)) = writer_task.await {
+        eprintln!("docker /images/get stream error: {err:#}");
+    }
+    finish_chunked(write).await?;
+    Ok(RouteOutcome::Continue)
+}
+
+pub async fn load_images(
+    state: &Arc<DockerState>,
+    head: &RequestHead,
+    reader: &mut BufReader<OwnedReadHalf>,
+    write: &mut OwnedWriteHalf,
+) -> Result<RouteOutcome> {
+    let Some(engine) = state.engine().cloned() else {
+        drain_body(reader, write, head).await?;
+        write_error(write, 501, "load requires a live engine", head.close_after).await?;
+        return Ok(RouteOutcome::Continue);
+    };
+
+    let tmp_path = std::env::temp_dir().join(format!("graviton-docker-load-{}.tar", new_id()));
+    let _guard = TempFileGuard(tmp_path.clone());
+    if let Err(err) = read_body_to_file(reader, write, head, &tmp_path, archive::MAX_IMAGE_LOAD).await {
+        write_error(write, 400, &format!("reading image archive: {err:#}"), head.close_after).await?;
+        return Ok(RouteOutcome::Done);
+    }
+
+    let quiet = matches!(head.query_param("quiet"), Some("1" | "true" | "True"));
+    let load_path = tmp_path.clone();
+    let res = tokio::task::spawn_blocking(move || archive::load_images_from_path(&engine, &load_path)).await?;
+    match res {
+        Ok(loaded) => {
+            if quiet {
+                let mut streams = Vec::new();
+                for img in &loaded {
+                    streams.push(json!({ "stream": format!("Loaded image: {}:{}\n", img.repository, img.tag) }));
+                }
+                write_json(write, 200, &streams.into_iter().next().unwrap_or_else(|| json!({})), head.close_after).await?;
+            } else {
+                write_chunked_head(write, 200, "application/json", &[]).await?;
+                for img in loaded {
+                    let line = format!("Loaded image: {}:{}\n", img.repository, img.tag);
+                    write_chunk_json(write, &json!({ "stream": line })).await?;
+                }
+                finish_chunked(write).await?;
+            }
+        }
+        Err(err) => {
+            write_error(write, 400, &format!("{err:#}"), head.close_after).await?;
+        }
+    }
+    Ok(RouteOutcome::Continue)
+}
+
+pub async fn commit_container(
+    state: &Arc<DockerState>,
+    head: &RequestHead,
+    reader: &mut BufReader<OwnedReadHalf>,
+    write: &mut OwnedWriteHalf,
+) -> Result<RouteOutcome> {
+    let body = read_body_bytes(reader, write, head, MAX_JSON_BODY).await?;
+    let Some(engine) = state.engine().cloned() else {
+        write_error(write, 501, "commit requires a live engine", head.close_after).await?;
+        return Ok(RouteOutcome::Continue);
+    };
+
+    let container = head.query_param("container").unwrap_or("").trim().to_string();
+    if container.is_empty() {
+        write_error(write, 400, "missing container query parameter", head.close_after).await?;
+        return Ok(RouteOutcome::Continue);
+    }
+
+    let repo = head.query_param("repo").unwrap_or("").trim();
+    let tag = head.query_param("tag").unwrap_or("").trim();
+    let reference = if repo.is_empty() {
+        String::new()
+    } else if tag.is_empty() {
+        repo.to_string()
+    } else {
+        format!("{repo}:{tag}")
+    };
+
+    let mut changes: Vec<String> = head
+        .query_params("changes")
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+
+    if let Ok(payload) = serde_json::from_slice::<Value>(&body) {
+        if let Some(arr) = payload["Cmd"].as_array() {
+            let items: Vec<String> = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+            if !items.is_empty() {
+                changes.push(format!("CMD {}", serde_json::to_string(&items)?));
+            }
+        }
+        if let Some(arr) = payload["Entrypoint"].as_array() {
+            let items: Vec<String> = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+            if !items.is_empty() {
+                changes.push(format!("ENTRYPOINT {}", serde_json::to_string(&items)?));
+            }
+        }
+        if let Some(wd) = payload["WorkingDir"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            changes.push(format!("WORKDIR {wd}"));
+        }
+        if let Some(u) = payload["User"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            changes.push(format!("USER {u}"));
+        }
+        if let Some(obj) = payload["Labels"].as_object() {
+            for (k, v) in obj {
+                if let Some(vs) = v.as_str() {
+                    changes.push(format!("LABEL {}={}", serde_json::to_string(k)?, serde_json::to_string(vs)?));
+                }
+            }
+        }
+        if let Some(obj) = payload["ExposedPorts"].as_object() {
+            for k in obj.keys() {
+                changes.push(format!("EXPOSE {k}"));
+            }
+        }
+    }
+
+    let spec = CommitSpec {
+        container,
+        reference,
+        author: head.query_param("author").map(str::trim).filter(|s| !s.is_empty()).map(String::from),
+        message: head.query_param("comment").map(str::trim).filter(|s| !s.is_empty()).map(String::from),
+        changes,
+    };
+
+    let res = tokio::task::spawn_blocking(move || archive::commit_container(&engine, &spec)).await?;
+    match res {
+        Ok(summary) => {
+            write_json(write, 201, &json!({ "Id": summary.digest }), head.close_after).await?;
+        }
+        Err(err) => {
+            let msg = format!("{err:#}");
+            let status = if msg.contains("is paused") {
+                409
+            } else if msg.contains("not found") || msg.contains("No such container") {
+                404
+            } else {
+                400
+            };
+            write_error(write, status, &msg, head.close_after).await?;
+        }
+    }
     Ok(RouteOutcome::Continue)
 }

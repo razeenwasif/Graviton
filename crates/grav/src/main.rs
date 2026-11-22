@@ -5,7 +5,7 @@ mod remote;
 mod service;
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex};
 use graviton_proto::frame::{Decoder, Frame};
 use remote::Target;
 use graviton_proto::{
-    BuildSecret, BuildSpec, ContainerStatus, ContainerSummary, ExecSpec, FileKind, ImagePushProgress, LogStream, PullProgress, Request, Response,
-    RestartPolicy, RunSpec, decode_line, encode_line,
+    BuildSecret, BuildSpec, CommitSpec, ContainerStatus, ContainerSummary, ExecSpec, FileKind, ImagePushProgress, LogStream, PullProgress, Request,
+    Response, RestartPolicy, RunSpec, decode_line, encode_line,
 };
 
 #[derive(Parser, Debug)]
@@ -82,6 +82,37 @@ enum Command {
         source: String,
         /// New repository[:tag] reference.
         target: String,
+    },
+    /// Save one or more images to a tar archive (stdout or `-o FILE`).
+    Save {
+        /// Write to a file instead of stdout.
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+        /// Image reference(s) or digest prefix(es) to export.
+        #[arg(required = true)]
+        images: Vec<String>,
+    },
+    /// Load image(s) from a tar or tar.gz archive (stdin or `-i FILE`).
+    Load {
+        /// Read from a tar archive instead of stdin.
+        #[arg(short = 'i', long)]
+        input: Option<PathBuf>,
+    },
+    /// Create a new image from a container's changes.
+    Commit {
+        /// Author (e.g. "Jane Doe <jane@example.com>").
+        #[arg(short = 'a', long)]
+        author: Option<String>,
+        /// Commit message.
+        #[arg(short = 'm', long)]
+        message: Option<String>,
+        /// Apply Dockerfile instruction (ENV, CMD, ENTRYPOINT, WORKDIR, USER, EXPOSE, LABEL, VOLUME, STOPSIGNAL, HEALTHCHECK).
+        #[arg(short = 'c', long = "change")]
+        changes: Vec<String>,
+        /// Container id, prefix, or name.
+        container: String,
+        /// Target image reference (`NAME[:TAG]`).
+        image: String,
     },
     /// Log in to an OCI registry (Docker Hub, GHCR, etc.); credentials stay in the Mac's Keychain.
     Login {
@@ -571,6 +602,19 @@ fn run(cli: Cli) -> Result<()> {
             }
             other => unexpected(other)?,
         },
+        Command::Save { output, images } => save_images(&target, output, images)?,
+        Command::Load { input } => load_images(&mut client, input)?,
+        Command::Commit { author, message, changes, container, image } => {
+            let spec = CommitSpec { container: container.clone(), reference: image, author, message, changes };
+            match client.call(&Request::Commit(spec))? {
+                Response::Image(i) => {
+                    let disp = ImageReference::parse(&i.reference).map(|r| r.display_name()).unwrap_or(i.reference);
+                    let short = &i.digest[..i.digest.len().min(19)];
+                    println!("Committed {container} -> {disp} ({short}, {})", bytes(i.size_bytes));
+                }
+                other => unexpected(other)?,
+            }
+        }
         Command::Login { registry, username, password_stdin, list } => {
             if list {
                 match client.call(&Request::ListLogins)? {
@@ -1504,14 +1548,87 @@ fn copy_files(client: &mut Client, target: &Target, src: &str, dst: &str) -> Res
     }
 }
 
-fn cp_from_container(target: &Target, container: &str, remote_path: &str, local_dst: &str) -> Result<()> {
-    let mut stream = target.connect()?;
-    stream.write_all(&encode_line(&Request::GetArchive { id: container.into(), path: remote_path.into() }))?;
+fn read_raw_response_line(stream: &mut dyn Read) -> Result<Vec<u8>> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     while stream.read(&mut byte)? == 1 && byte[0] != b'\n' {
         line.push(byte[0]);
     }
+    Ok(line)
+}
+
+fn save_images(target: &Target, output: Option<PathBuf>, images: Vec<String>) -> Result<()> {
+    if output.is_none() && std::io::stdout().is_terminal() {
+        bail!("cowardly refusing to save to a terminal; pass -o FILE or redirect stdout");
+    }
+    let mut stream = target.connect()?;
+    stream.write_all(&encode_line(&Request::SaveImage { references: images }))?;
+    stream.flush()?;
+    let line = read_raw_response_line(&mut stream)?;
+    match decode_line::<Response>(&line)? {
+        Response::ImageArchive => {}
+        Response::Error { message } => bail!(message),
+        other => unexpected(other)?,
+    }
+    if let Some(path) = output {
+        let mut file = std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+        std::io::copy(&mut stream, &mut file)?;
+        file.flush()?;
+    } else {
+        let mut out = std::io::stdout().lock();
+        std::io::copy(&mut stream, &mut out)?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
+fn load_images(client: &mut Client, input: Option<PathBuf>) -> Result<()> {
+    struct TempFileGuard(PathBuf);
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    let _guard;
+    let mut file = if let Some(path) = input {
+        std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?
+    } else {
+        let tmp = std::env::temp_dir().join(format!("grav-load-{}.tar", std::process::id()));
+        let mut f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&tmp)?;
+        _guard = TempFileGuard(tmp);
+        std::io::copy(&mut std::io::stdin().lock(), &mut f)?;
+        f.flush()?;
+        f.seek(SeekFrom::Start(0))?;
+        f
+    };
+
+    let size = file.metadata()?.len();
+    client.writer.write_all(&encode_line(&Request::LoadImage { size }))?;
+    std::io::copy(&mut file, &mut client.writer)?;
+    client.writer.flush()?;
+
+    let mut line = String::new();
+    if client.reader.read_line(&mut line)? == 0 {
+        bail!("gravitond closed the connection");
+    }
+    match decode_line::<Response>(line.as_bytes())? {
+        Response::Images(list) => {
+            for img in list {
+                let disp = ImageReference::parse(&img.reference).map(|r| r.display_name()).unwrap_or(img.reference);
+                println!("Loaded image: {disp} ({}, {})", bytes(img.size_bytes), img.architecture);
+            }
+            Ok(())
+        }
+        Response::Error { message } => bail!(message),
+        other => unexpected(other),
+    }
+}
+
+fn cp_from_container(target: &Target, container: &str, remote_path: &str, local_dst: &str) -> Result<()> {
+    let mut stream = target.connect()?;
+    stream.write_all(&encode_line(&Request::GetArchive { id: container.into(), path: remote_path.into() }))?;
+    let line = read_raw_response_line(&mut stream)?;
     let (is_dir, name) = match decode_line::<Response>(&line)? {
         Response::Archive { is_dir, name } => (is_dir, name),
         Response::Error { message } => bail!(message),
@@ -2303,6 +2420,50 @@ mod tests {
         assert!(matches!(
             b.command,
             Command::Build { platform: Some(plat), .. } if plat == "linux/arm64,linux/amd64"
+        ));
+    }
+
+    #[test]
+    fn parses_save_load_commit_commands() {
+        let s = Cli::try_parse_from(["grav", "save", "-o", "/tmp/out.tar", "alpine:3.22", "app:1"]).unwrap();
+        assert!(matches!(
+            s.command,
+            Command::Save { output: Some(ref p), ref images } if p == std::path::Path::new("/tmp/out.tar") && images == &["alpine:3.22", "app:1"]
+        ));
+
+        let l = Cli::try_parse_from(["grav", "load", "-i", "/tmp/in.tar"]).unwrap();
+        assert!(matches!(
+            l.command,
+            Command::Load { input: Some(ref p) } if p == std::path::Path::new("/tmp/in.tar")
+        ));
+
+        let l_stdin = Cli::try_parse_from(["grav", "load"]).unwrap();
+        assert!(matches!(l_stdin.command, Command::Load { input: None }));
+
+        let c = Cli::try_parse_from([
+            "grav",
+            "commit",
+            "-a",
+            "Dev",
+            "-m",
+            "snapshot",
+            "-c",
+            "ENV FOO=bar",
+            "-c",
+            "WORKDIR /app",
+            "web",
+            "web:snap",
+        ])
+        .unwrap();
+        assert!(matches!(
+            c.command,
+            Command::Commit {
+                author: Some(ref a),
+                message: Some(ref m),
+                ref changes,
+                ref container,
+                ref image,
+            } if a == "Dev" && m == "snapshot" && changes == &["ENV FOO=bar", "WORKDIR /app"] && container == "web" && image == "web:snap"
         ));
     }
 }

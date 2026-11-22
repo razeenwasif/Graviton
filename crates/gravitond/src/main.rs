@@ -5,6 +5,7 @@
 //! Containers run in their own guest VMs (see `runtime.rs`); `--demo` serves
 //! the sample containers from the design mockups instead.
 
+mod archive;
 mod auth;
 mod boot_check;
 mod build;
@@ -313,6 +314,13 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
         }
         if let (Request::PutArchive { id, path, size }, Backend::Engine(engine)) = (&request, &backend) {
             put_archive_stream(Arc::clone(engine), id.clone(), path.clone(), *size, lines.get_mut(), &mut write).await?;
+            continue;
+        }
+        if let (Request::SaveImage { references }, Backend::Engine(engine)) = (&request, &backend) {
+            return save_image_stream(Arc::clone(engine), references.clone(), write).await;
+        }
+        if let (Request::LoadImage { size }, Backend::Engine(engine)) = (&request, &backend) {
+            load_image_stream(Arc::clone(engine), *size, lines.get_mut(), &mut write).await?;
             continue;
         }
         if let (Request::Exec(spec), Backend::Engine(engine)) = (&request, &backend) {
@@ -643,6 +651,111 @@ pub(crate) async fn put_archive_stream(
     Ok(())
 }
 
+pub(crate) struct SyncChannelWriter(pub(crate) tokio::sync::mpsc::Sender<Vec<u8>>);
+
+impl std::io::Write for SyncChannelWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.0.blocking_send(buf.to_vec()).is_err() {
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client disconnected"));
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `grav save`: verify requested images exist, send `ImageArchive`, then stream tar bytes until EOF.
+pub(crate) async fn save_image_stream<W>(engine: Arc<Engine>, references: Vec<String>, mut write: W) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let check_engine = Arc::clone(&engine);
+    let check_refs = references.clone();
+    let images = match tokio::task::spawn_blocking(move || archive::resolve_save_images(&check_engine, &check_refs)).await? {
+        Ok(imgs) => imgs,
+        Err(err) => {
+            write.write_all(&encode_line(&Response::Error { message: format!("{err:#}") })).await?;
+            let _ = write.flush().await;
+            return Ok(());
+        }
+    };
+    write.write_all(&encode_line(&Response::ImageArchive)).await?;
+    write.flush().await?;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let blobs = engine.blobs.clone();
+    let writer_task = tokio::task::spawn_blocking(move || archive::save_images_from_store(&blobs, &images, SyncChannelWriter(tx)));
+    while let Some(chunk) = rx.recv().await {
+        if write.write_all(&chunk).await.is_err() {
+            break;
+        }
+    }
+    let _ = write.flush().await;
+    let _ = write.shutdown().await;
+    if let Ok(Err(err)) = writer_task.await {
+        eprintln!("save_image_stream error: {err:#}");
+    }
+    Ok(())
+}
+
+/// `grav load`: receive `size` tar/tar.gz bytes, unpack into BlobStore + ImageIndex, and answer `Images`.
+pub(crate) async fn load_image_stream(
+    engine: Arc<Engine>,
+    size: u64,
+    read: &mut (impl tokio::io::AsyncRead + Unpin),
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    if size > archive::MAX_IMAGE_LOAD {
+        write
+            .write_all(&encode_line(&Response::Error {
+                message: format!("image archive is {} GB; limit is {} GB", size >> 30, archive::MAX_IMAGE_LOAD >> 30),
+            }))
+            .await?;
+        anyhow::bail!("image archive too large ({size} bytes)");
+    }
+
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp_path = std::env::temp_dir().join(format!(
+        "graviton-load-upload-{}-{}.tar",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _guard = Cleanup(tmp_path.clone());
+
+    let mut out = tokio::fs::File::create(&tmp_path).await?;
+    let mut limited = read.take(size);
+    let copied = tokio::io::copy(&mut limited, &mut out).await.context("receiving image archive")?;
+    out.flush().await?;
+    drop(out);
+    if copied != size {
+        let msg = format!("upload ended early ({copied} of {size} bytes)");
+        let _ = write.write_all(&encode_line(&Response::Error { message: msg.clone() })).await;
+        anyhow::bail!(msg);
+    }
+
+    let load_path = tmp_path.clone();
+    let reply = match tokio::task::spawn_blocking(move || archive::load_images_from_path(&engine, &load_path)).await? {
+        Ok(list) => Response::Images(list),
+        Err(err) => Response::Error { message: format!("{err:#}") },
+    };
+    write.write_all(&encode_line(&reply)).await?;
+    write.flush().await?;
+    Ok(())
+}
+
 pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
     // Reads answer straight from the store.
     {
@@ -688,6 +801,7 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                     Request::Pull { reference, platform, .. } => Response::Image(engine.pull(&reference, platform.as_deref())?),
                     Request::TagImage { source, target } => Response::Image(engine.tag_image(&source, &target)?),
                     Request::PushImage { reference, .. } => Response::ImagePushed(engine.push(&reference)?),
+                    Request::Commit(spec) => Response::Image(archive::commit_container(&engine, &spec)?),
                     Request::RegistryLogin { registry, username, password } => {
                         let (registry, username) = engine.auth.login(&registry, &username, &password)?;
                         Response::LoggedIn { registry, username }
@@ -720,7 +834,11 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                     Request::ReadFile { id, path } => Response::File(engine.read_file(&id, &path)?),
                     Request::Inspect { id } => Response::Details(Box::new(engine.inspect(&id)?)),
                     Request::Events { since, limit } => Response::Events(engine.events.since(since, limit)),
-                    Request::Exec(_) | Request::GetArchive { .. } | Request::PutArchive { .. } => {
+                    Request::Exec(_)
+                    | Request::GetArchive { .. }
+                    | Request::PutArchive { .. }
+                    | Request::SaveImage { .. }
+                    | Request::LoadImage { .. } => {
                         unreachable!("handled by serve()")
                     }
                     Request::Build(_) => Response::Error { message: "builds run on the Mac itself: use grav build there".into() },
