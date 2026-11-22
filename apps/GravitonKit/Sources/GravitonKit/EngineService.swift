@@ -37,6 +37,10 @@ public protocol EngineService: Sendable {
     func restart(id: String) async throws -> Container
     /// Pull an image from its registry (may take minutes).
     func pull(reference: String) async throws -> ImageInfo
+    /// Tag a local image with an additional name/reference.
+    func tagImage(source: String, target: String) async throws -> ImageInfo
+    /// Push a local image to its registry using Keychain credentials.
+    func pushImage(reference: String) async throws -> ImagePushResult
     /// Create a container and start it in its own VM; returns once it's running or has failed.
     func run(_ spec: RunSpec) async throws -> Container
     /// Remove a stopped container; returns its id.
@@ -129,6 +133,16 @@ public final class SocketEngine: EngineService {
     public func pull(reference: String) async throws -> ImageInfo {
         guard case let .image(image) = try await call(.pull(reference: reference), timeout: 1800) else { throw EngineError.unexpectedResponse }
         return image
+    }
+
+    public func tagImage(source: String, target: String) async throws -> ImageInfo {
+        guard case let .image(image) = try await call(.tagImage(source: source, target: target)) else { throw EngineError.unexpectedResponse }
+        return image
+    }
+
+    public func pushImage(reference: String) async throws -> ImagePushResult {
+        guard case let .imagePushed(res) = try await call(.pushImage(reference: reference), timeout: 1800) else { throw EngineError.unexpectedResponse }
+        return res
     }
 
     /// Pull an image, streaming per-layer progress before the final image.

@@ -186,6 +186,22 @@ public final class EngineStore {
         return image
     }
 
+    /// Give an existing local image an additional name or registry tag.
+    @discardableResult
+    public func tagImage(source: String, target: String) async throws -> ImageInfo {
+        let image = try await service.tagImage(source: source, target: target)
+        await refresh()
+        return image
+    }
+
+    /// Push a local image to its registry using Keychain credentials.
+    @discardableResult
+    public func pushImage(reference: String) async throws -> ImagePushResult {
+        let result = try await service.pushImage(reference: reference)
+        await refresh()
+        return result
+    }
+
     /// Pull an image with streamed per-layer progress. Refreshes the image list when done.
     public func pullStream(_ reference: String, platform: String? = nil) -> AsyncThrowingStream<PullEvent, Error> {
         let upstream: AsyncThrowingStream<PullEvent, Error>

@@ -546,15 +546,28 @@ import Testing
             Issue.record("expected exec_exited"); return
         }
         #expect(code == 7)
+
+        #expect(try line(.tagImage(source: "app:1", target: "ghcr.io/me/app:1"))
+            == #"{"method":"tag_image","params":{"source":"app:1","target":"ghcr.io/me/app:1"}}"# + "\n")
+        #expect(try line(.pushImage(reference: "ghcr.io/me/app:1"))
+            == #"{"method":"push_image","params":{"reference":"ghcr.io/me/app:1"}}"# + "\n")
+        #expect(try line(.pushImage(reference: "ghcr.io/me/app:1", progress: true))
+            == #"{"method":"push_image","params":{"progress":true,"reference":"ghcr.io/me/app:1"}}"# + "\n")
+
+        let pushedJSON = #"{"type":"image_pushed","data":{"reference":"ghcr.io/me/app:1","digest":"sha256:ef01","size_bytes":2048,"blobs_pushed":1,"blobs_skipped":2}}"#
+        guard case let .imagePushed(pushed) = try Wire.decoder.decode(EngineResponse.self, from: Data(pushedJSON.utf8)) else {
+            Issue.record("expected image_pushed"); return
+        }
+        #expect(pushed.reference == "ghcr.io/me/app:1" && pushed.digest == "sha256:ef01" && pushed.blobsPushed == 1 && pushed.blobsSkipped == 2)
     }
 
     @Test func approvalPolicyMatchesTieredRules() {
-        #expect(FairyApprovalPolicy.supportedTools.count == 25)
+        #expect(FairyApprovalPolicy.supportedTools.count == 27)
 
         // Auto-run reads & reversible operations
         for readTool in ["status", "events", "containers", "inspect", "logs", "stats",
                          "list_files", "read_file", "images", "volumes", "network",
-                         "navigate", "switch_host", "pull"] {
+                         "navigate", "switch_host", "pull", "tag_image"] {
             #expect(!FairyApprovalPolicy.requiresTouchID(tool: readTool, args: [:]), "\(readTool) should not need Touch ID")
         }
         #expect(!FairyApprovalPolicy.requiresTouchID(tool: "container_action", args: ["action": .string("start")]))
@@ -579,9 +592,28 @@ import Testing
         for gatedCompose in ["up", "down", "stop", "build"] {
             #expect(FairyApprovalPolicy.requiresTouchID(tool: "compose", args: ["action": .string(gatedCompose)]))
         }
-        for gatedTool in ["run", "exec", "build", "remove_image", "copy_files", "unknown_future_tool"] {
+        for gatedTool in ["run", "exec", "build", "push_image", "remove_image", "copy_files", "unknown_future_tool"] {
             #expect(FairyApprovalPolicy.requiresTouchID(tool: gatedTool, args: [:]), "\(gatedTool) must require Touch ID")
         }
+
+        let tagSummary = FairyApprovalPolicy.summarize(
+            tool: "tag_image",
+            args: ["source": .string("app:1"), "target": .string("ghcr.io/me/app:1"), "reason": .string("prepare push")],
+            host: "mini"
+        )
+        #expect(tagSummary.title == "Tag image app:1 → ghcr.io/me/app:1")
+        #expect(!tagSummary.isDestructive)
+        #expect(tagSummary.touchIDReason.contains("mini"))
+
+        let pushSummary = FairyApprovalPolicy.summarize(
+            tool: "push_image",
+            args: ["reference": .string("ghcr.io/me/app:1"), "reason": .string("publish build")],
+            host: "mini"
+        )
+        #expect(pushSummary.title == "Push image ghcr.io/me/app:1")
+        #expect(!pushSummary.isDestructive)
+        #expect(pushSummary.touchIDReason.contains("ghcr.io/me/app:1"))
+        #expect(pushSummary.touchIDReason.contains("mini"))
     }
 
     @Test func redactsSecretsByDefaultAndPreservesWhenAsked() {

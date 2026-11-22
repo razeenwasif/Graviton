@@ -112,20 +112,20 @@ public enum FairyApprovalPolicy {
         "containers", "inspect", "logs", "stats",
         "container_action", "run", "exec", "stack_action", "compose",
         "list_files", "read_file", "copy_files",
-        "images", "pull", "build", "remove_image",
+        "images", "pull", "build", "tag_image", "push_image", "remove_image",
         "volumes", "volume_action", "network", "disk_and_prune", "snapshots",
     ]
 
     /// Tiered Touch ID gate:
-    /// - Reads & reversible low-risk actions (`start`, `restart`, `pull`, `create` volume, `navigate`, `switch_host`, dry-runs) run automatically.
-    /// - High-impact execution & destructive mutations require Touch ID approval.
+    /// - Reads & reversible low-risk actions (`start`, `restart`, `pull`, `tag_image`, `create` volume, `navigate`, `switch_host`, dry-runs) run automatically.
+    /// - High-impact execution & destructive mutations (or registry uploads using credentials) require Touch ID approval.
     /// - Unknown tools/actions fail closed (`true`).
     public static func requiresTouchID(tool: String, args: [String: FairyJSON]) -> Bool {
         let action = args["action"]?.stringValue ?? ""
         switch tool {
         case "status", "events", "containers", "inspect", "logs", "stats",
              "list_files", "read_file", "images", "volumes", "network",
-             "navigate", "switch_host", "pull":
+             "navigate", "switch_host", "pull", "tag_image":
             return false
         case "container_action", "stack_action":
             return action != "start" && action != "restart"
@@ -137,7 +137,7 @@ public enum FairyApprovalPolicy {
             return action != "status"
         case "compose":
             return !["config", "ps", "logs", "start", "restart"].contains(action)
-        case "run", "exec", "build", "remove_image", "copy_files":
+        case "run", "exec", "build", "push_image", "remove_image", "copy_files":
             return true
         default:
             return true
@@ -268,6 +268,19 @@ public enum FairyApprovalPolicy {
             title = "Pull image \(ref)"
             detail = reasonArg.isEmpty ? ref : "\(ref) — \(reasonArg)"
             macReason = "let Fairy pull \(ref)\(suffix)"
+        case "tag_image":
+            let src = str("source")
+            let dst = str("target")
+            destructive = false
+            title = "Tag image \(src) → \(dst)"
+            detail = reasonArg.isEmpty ? "\(src) → \(dst)" : "\(src) → \(dst)\n\(reasonArg)"
+            macReason = "let Fairy tag image \(src) as \(dst)\(suffix)"
+        case "push_image":
+            let ref = str("reference")
+            destructive = false
+            title = "Push image \(ref)"
+            detail = reasonArg.isEmpty ? ref : "\(ref) — \(reasonArg)"
+            macReason = "let Fairy push image \(ref) to its registry\(suffix)"
         default:
             destructive = requiresTouchID(tool: tool, args: args)
             title = "Run \(tool)"

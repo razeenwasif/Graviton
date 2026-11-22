@@ -411,11 +411,7 @@ struct FairyPanel: View {
                     }
                 }
                 if !msg.text.isEmpty {
-                    Text(msg.text)
-                        .font(.system(size: 13))
-                        .foregroundStyle(G.textSecondary)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
+                    AssistantMessageBubble(text: msg.text)
                 } else if fairy.isAnswering && fairy.messages.last?.id == msg.id {
                     HStack(spacing: 8) {
                         GSpinner(size: 11)
@@ -492,21 +488,84 @@ struct FairyPanel: View {
 
 // MARK: - Subviews
 
+private struct AssistantMessageBubble: View {
+    let text: String
+    @State private var hovering = false
+    @State private var copied = false
+
+    private var formatted: Text {
+        if let attr = try? AttributedString(
+            markdown: text,
+            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) {
+            return Text(attr)
+        }
+        return Text(text)
+    }
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            formatted
+                .font(.system(size: 13))
+                .foregroundStyle(G.textSecondary)
+                .tint(G.accent)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.trailing, 24)
+
+            if hovering || copied {
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(text, forType: .string)
+                    copied = true
+                    Task {
+                        try? await Task.sleep(for: .seconds(1.2))
+                        copied = false
+                    }
+                } label: {
+                    Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(copied ? G.running : G.muted)
+                        .padding(5)
+                        .background(G.card, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(G.border))
+                }
+                .buttonStyle(.plain)
+                .help("Copy reply")
+                .transition(.opacity)
+            }
+        }
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovering)
+    }
+}
+
 private struct ToolStepRow: View {
     var step: FairyToolStep
 
     var body: some View {
-        HStack(spacing: 7) {
-            stepIcon
-            Text(step.title)
-                .font(.system(size: 11.5, weight: .medium))
-                .foregroundStyle(step.status == .denied || step.status == .failed ? G.danger : G.textSecondary)
-                .lineLimit(1)
-            Spacer(minLength: 4)
-            if step.touchIDVerified {
-                Label("Touch ID", systemImage: "touchid")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(G.running)
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 7) {
+                stepIcon
+                Text(step.title)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(step.status == .denied || step.status == .failed ? G.danger : G.textSecondary)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                if step.touchIDVerified {
+                    Label("Touch ID", systemImage: "touchid")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(G.running)
+                }
+            }
+            if (step.status == .denied || step.status == .failed),
+               let note = step.note, !note.isEmpty {
+                Text(note)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(G.danger.opacity(0.85))
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(.horizontal, 9)
@@ -578,15 +637,15 @@ private struct ApprovalCard: View {
                     fairy.denyPending()
                 }
                 .buttonStyle(.g(.secondary, size: .regular, fullWidth: true))
-                .disabled(pending.isAuthenticating)
+                .keyboardShortcut(.cancelAction)
 
                 Button {
                     fairy.approvePendingWithTouchID()
                 } label: {
                     if pending.isAuthenticating {
-                        Label("Authenticating…", systemImage: "touchid")
+                        Label("Authenticating…", systemImage: fairy.approveButtonSymbol)
                     } else {
-                        Label("Approve with Touch ID", systemImage: "touchid")
+                        Label(fairy.approveButtonLabel, systemImage: fairy.approveButtonSymbol)
                     }
                 }
                 .buttonStyle(.g(pending.summary.isDestructive ? .dangerSolid : .primary, size: .regular, fullWidth: true))

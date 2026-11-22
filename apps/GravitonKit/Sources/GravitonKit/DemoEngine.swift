@@ -195,6 +195,39 @@ public actor DemoEngine: EngineService {
         throw EngineError.daemon("Pulling images needs gravitond. Start it with scripts/dev-gravitond.sh.")
     }
 
+    public func tagImage(source: String, target: String) throws -> ImageInfo {
+        guard let existing = imageList.first(where: { $0.reference == source || "\($0.repository):\($0.tag)" == source }) else {
+            throw EngineError.daemon("no image \(source) here")
+        }
+        let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw EngineError.daemon("target image reference is required") }
+        let lastSlash = trimmed.lastIndex(of: "/")
+        let lastColon = trimmed.lastIndex(of: ":")
+        let (repo, tag): (String, String) = if let c = lastColon, lastSlash == nil || c > lastSlash! {
+            (String(trimmed[..<c]), String(trimmed[trimmed.index(after: c)...]))
+        } else {
+            (trimmed, "latest")
+        }
+        let fullRef = tag.isEmpty ? repo : "\(repo):\(tag)"
+        let alias = ImageInfo(
+            reference: fullRef,
+            repository: repo,
+            tag: tag.isEmpty ? "latest" : tag,
+            digest: existing.digest,
+            sizeBytes: existing.sizeBytes,
+            architecture: existing.architecture,
+            usedBy: 0
+        )
+        if !imageList.contains(where: { $0.reference == alias.reference }) {
+            imageList.append(alias)
+        }
+        return alias
+    }
+
+    public func pushImage(reference: String) throws -> ImagePushResult {
+        throw EngineError.daemon("Pushing images needs gravitond. Start it with scripts/dev-gravitond.sh.")
+    }
+
     public func run(_ spec: RunSpec) throws -> Container {
         throw EngineError.daemon("Running containers needs gravitond. Start it with scripts/dev-gravitond.sh.")
     }

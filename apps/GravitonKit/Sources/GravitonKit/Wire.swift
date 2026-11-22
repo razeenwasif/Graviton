@@ -15,6 +15,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case stop(id: String)
     case restart(id: String)
     case pull(reference: String, progress: Bool = false, platform: String? = nil)
+    case tagImage(source: String, target: String)
+    case pushImage(reference: String, progress: Bool = false)
     case run(RunSpec)
     case build(BuildSpec)
     case remove(id: String)
@@ -48,6 +50,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         let progress: Bool?
         let platform: String?
     }
+    private struct TagParams: Encodable { let source: String; let target: String }
+    private struct PushImageParams: Encodable { let reference: String; let progress: Bool? }
     private struct PairParams: Encodable { let code: String; let device: String }
     private struct AuthParams: Encodable { let token: String }
     private struct PathParams: Encodable { let id: String; let path: String }
@@ -76,6 +80,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .stop: "stop"
         case .restart: "restart"
         case .pull: "pull"
+        case .tagImage: "tag_image"
+        case .pushImage: "push_image"
         case .run: "run"
         case .build: "build"
         case .remove: "remove"
@@ -128,6 +134,10 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case let .registerPush(token, sandbox): try c.encode(PushParams(token: token, sandbox: sandbox), forKey: .params)
         case let .pull(reference, progress, platform):
             try c.encode(PullParams(reference: reference, progress: progress ? true : nil, platform: platform), forKey: .params)
+        case let .tagImage(source, target):
+            try c.encode(TagParams(source: source, target: target), forKey: .params)
+        case let .pushImage(reference, progress):
+            try c.encode(PushImageParams(reference: reference, progress: progress ? true : nil), forKey: .params)
         case let .run(spec): try c.encode(spec, forKey: .params)
         case let .build(spec): try c.encode(spec, forKey: .params)
         }
@@ -148,6 +158,7 @@ public enum EngineResponse: Decodable, Sendable {
     case container(Container)
     case image(ImageInfo)
     case pullProgress(PullProgress)
+    case imagePushed(ImagePushResult)
     case removed(id: String)
     case diskUsage(DiskUsage)
     case imageRemoved(reference: String, freedBytes: UInt64, keptBytes: UInt64)
@@ -204,6 +215,7 @@ public enum EngineResponse: Decodable, Sendable {
         case "container": self = .container(try c.decode(Container.self, forKey: .data))
         case "image": self = .image(try c.decode(ImageInfo.self, forKey: .data))
         case "pull_progress": self = .pullProgress(try c.decode(PullProgress.self, forKey: .data))
+        case "image_pushed": self = .imagePushed(try c.decode(ImagePushResult.self, forKey: .data))
         case "removed": self = .removed(id: try c.decode(Removed.self, forKey: .data).id)
         case "disk_usage": self = .diskUsage(try c.decode(DiskUsage.self, forKey: .data))
         case "image_removed":

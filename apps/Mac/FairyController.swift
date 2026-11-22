@@ -7,23 +7,73 @@ import Observation
 // MARK: - Touch ID Authentication
 
 protocol BiometricAuthenticator: Sendable {
+    var prefersTouchID: Bool { get }
     func authenticate(reason: String) async throws
+    func cancelPending()
 }
 
-struct TouchIDAuthenticator: BiometricAuthenticator {
+final class TouchIDAuthenticator: BiometricAuthenticator, @unchecked Sendable {
+    private let lock = NSLock()
+    private var activeContext: LAContext?
+
+    var prefersTouchID: Bool {
+        let ctx = LAContext()
+        var err: NSError?
+        return ctx.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &err) && ctx.biometryType == .touchID
+    }
+
+    func cancelPending() {
+        lock.lock()
+        let ctx = activeContext
+        activeContext = nil
+        lock.unlock()
+        ctx?.invalidate()
+    }
+
+    private func setActiveContext(_ ctx: LAContext?) {
+        lock.lock()
+        let prev = activeContext
+        activeContext = ctx
+        lock.unlock()
+        if let prev, prev !== ctx {
+            prev.invalidate()
+        }
+    }
+
+    private func clearActiveContextIfSame(_ ctx: LAContext) {
+        lock.lock()
+        if activeContext === ctx {
+            activeContext = nil
+        }
+        lock.unlock()
+    }
+
     func authenticate(reason: String) async throws {
-        try await Task.detached(priority: .userInitiated) {
+        try await Task.detached(priority: .userInitiated) { [self] in
             let context = LAContext()
             context.localizedCancelTitle = "Deny"
-            var policyError: NSError?
-            let policy: LAPolicy = context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometricsOrCompanion, error: &policyError)
-                ? .deviceOwnerAuthenticationWithBiometricsOrCompanion
-                : .deviceOwnerAuthentication
             var evalError: NSError?
-            guard context.canEvaluatePolicy(policy, error: &evalError) else {
+            guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &evalError) else {
                 throw EngineError.daemon(evalError?.localizedDescription ?? "Touch ID or Mac authentication is unavailable.")
             }
-            try await context.evaluatePolicy(policy, localizedReason: reason)
+            self.setActiveContext(context)
+            defer { self.clearActiveContextIfSame(context) }
+            do {
+                try await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason)
+            } catch let laError as LAError {
+                switch laError.code {
+                case .userCancel:
+                    throw EngineError.daemon("Authentication cancelled — click Approve to try again or Deny to reject.")
+                case .appCancel, .systemCancel:
+                    throw EngineError.daemon("Authentication was interrupted — click Approve to retry.")
+                case .biometryLockout:
+                    throw EngineError.daemon("Touch ID is locked — enter your Mac password to approve.")
+                case .passcodeNotSet:
+                    throw EngineError.daemon("Set a Mac login password in System Settings to approve sensitive actions.")
+                default:
+                    throw EngineError.daemon(laError.localizedDescription)
+                }
+            }
         }.value
     }
 }
@@ -117,7 +167,25 @@ final class FairyController {
             messages.append(FairyChatMessage(role: .error, text: "Couldn't open Fairy tool socket: \(error.localizedDescription)"))
         }
 
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.shutdown()
+            }
+        }
+
         Task { await refreshStatus() }
+    }
+
+    var approveButtonLabel: String {
+        authenticator.prefersTouchID ? "Approve with Touch ID" : "Approve with Password"
+    }
+
+    var approveButtonSymbol: String {
+        authenticator.prefersTouchID ? "touchid" : "lock.shield"
     }
 
     var activeHostDisplay: String {
@@ -205,6 +273,7 @@ final class FairyController {
     }
 
     func stop() {
+        authenticator.cancelPending()
         activeTask?.cancel()
         activeTask = nil
         linkClient.stop()
@@ -226,6 +295,11 @@ final class FairyController {
         isAnswering = false
         isWaking = false
         isSpeaking = false
+    }
+
+    func shutdown() {
+        stop()
+        toolServer.stop()
     }
 
     func send(_ rawText: String) {
@@ -341,6 +415,7 @@ final class FairyController {
     }
 
     func denyPending() {
+        authenticator.cancelPending()
         settlePendingApproval(allowed: false)
     }
 
@@ -418,11 +493,20 @@ final class FairyController {
 
     private func buildContext(continuation: String? = nil) -> FairyAskContext {
         let selected = store.container(router.selectedContainerID)
-        var summaryLines = [
+        var summaryItems = [
             "Containers: \(store.runningCount) running / \(store.containers.count) total",
             "Stacks: \(store.stacks.map { "\($0.name) (\($0.runningCount)/\($0.containers.count))" }.joined(separator: ", "))",
             "Images: \(store.images.count) · Volumes: \(store.volumes.count)",
-        ].joined(separator: "\n")
+        ]
+        if let e = store.engine, e.memoryBytes > 0 {
+            if e.hasHostMemory {
+                summaryItems.append("Memory: \(Format.bytes(e.totalMemoryUsedBytes)) / \(Format.bytes(e.memoryBytes)) (VMs \(Format.bytes(e.vmMemoryUsedBytes)), macOS \(Format.bytes(e.otherHostMemoryUsedBytes)))")
+            } else {
+                summaryItems.append("VM memory: \(Format.bytes(e.vmMemoryUsedBytes)) / \(Format.bytes(e.memoryBytes))")
+            }
+            summaryItems.append("Engine: \(e.kernel) · \(e.arch) · \(e.cpus) vCPU\(e.rosetta == true ? " · Rosetta" : "")")
+        }
+        var summaryLines = summaryItems.joined(separator: "\n")
         if let continuation, !continuation.isEmpty {
             summaryLines += "\n\n" + continuation
         }
@@ -808,6 +892,17 @@ final class FairyController {
             let ref = try requireString(args, "reference")
             let freed = try await store.removeImage(reference: ref)
             return .object(["removed": .string(ref), "freed_bytes": .int(Int64(freed))])
+
+        case "tag_image":
+            let source = try requireString(args, "source")
+            let target = try requireString(args, "target")
+            let tagged = try await store.tagImage(source: source, target: target)
+            return try FairyJSON.fromEncodable(tagged)
+
+        case "push_image":
+            let ref = try requireString(args, "reference")
+            let pushed = try await store.pushImage(reference: ref)
+            return try FairyJSON.fromEncodable(pushed)
 
         case "volumes":
             await store.loadVolumes()

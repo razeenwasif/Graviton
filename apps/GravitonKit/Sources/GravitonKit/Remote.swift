@@ -392,6 +392,16 @@ public actor RemoteEngine: EngineService {
         return image
     }
 
+    public func tagImage(source: String, target: String) async throws -> ImageInfo {
+        guard case let .image(image) = try await call(.tagImage(source: source, target: target)) else { throw EngineError.unexpectedResponse }
+        return image
+    }
+
+    public func pushImage(reference: String) async throws -> ImagePushResult {
+        guard case let .imagePushed(res) = try await separately(.pushImage(reference: reference)) else { throw EngineError.unexpectedResponse }
+        return res
+    }
+
     /// Pull an image on the paired Mac, streaming per-layer progress before the final image.
     public nonisolated func pullStream(reference: String, platform: String? = nil) -> AsyncThrowingStream<PullEvent, Error> {
         let host = self.host, token = self.token

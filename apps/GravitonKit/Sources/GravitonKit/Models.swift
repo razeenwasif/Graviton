@@ -917,6 +917,23 @@ public struct SnapshotInfo: Codable, Hashable, Sendable {
     }
 }
 
+/// Result of pushing a local OCI image to a registry (`grav push IMAGE`).
+public struct ImagePushResult: Codable, Hashable, Sendable {
+    public var reference: String
+    public var digest: String
+    public var sizeBytes: UInt64
+    public var blobsPushed: UInt32
+    public var blobsSkipped: UInt32
+
+    public init(reference: String, digest: String, sizeBytes: UInt64, blobsPushed: UInt32, blobsSkipped: UInt32) {
+        self.reference = reference
+        self.digest = digest
+        self.sizeBytes = sizeBytes
+        self.blobsPushed = blobsPushed
+        self.blobsSkipped = blobsSkipped
+    }
+}
+
 /// Result of running a non-interactive command inside a running container (`grav exec`).
 public struct ExecResult: Hashable, Sendable {
     public var exitCode: Int32
