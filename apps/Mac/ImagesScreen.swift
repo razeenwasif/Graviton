@@ -120,7 +120,7 @@ struct ImageCard: View {
             }
             HStack(spacing: 14) {
                 Text(Format.bytes(image.sizeBytes))
-                Text(image.architecture == "amd64" ? "amd64 · Rosetta" : image.architecture)
+                Text(image.architecture == "amd64" ? "amd64 · Rosetta" : image.architecture.replacingOccurrences(of: ",", with: " · "))
                 Spacer()
                 if image.usedBy == 0 {
                     Text("Unused")

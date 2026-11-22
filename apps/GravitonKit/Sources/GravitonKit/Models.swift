@@ -135,6 +135,8 @@ public struct Container: Codable, Identifiable, Hashable, Sendable {
     public var health: HealthStatus? = nil
 
     public var isRunning: Bool { status == .running }
+    public var isPaused: Bool { status == .paused }
+    public var isActive: Bool { status == .running || status == .paused }
 
     /// "Up 3h 12m", "Exited (137)".
     public func statusText(now: Date = .now) -> String {
@@ -705,7 +707,7 @@ public struct NetworkRate: Identifiable, Sendable {
 /// Something that happened on the engine (`EngineEvent` in `graviton-proto`).
 public struct EngineEvent: Codable, Identifiable, Hashable, Sendable {
     public enum Kind: String, Codable, Sendable {
-        case started, stopped, failed, healthy, unhealthy, pulled, pushed, built, buildFailed = "build_failed", removed
+        case started, stopped, paused, unpaused, failed, healthy, unhealthy, pulled, pushed, built, buildFailed = "build_failed", removed
     }
 
     public var seq: UInt64
@@ -848,6 +850,8 @@ public struct NetworkEndpoint: Codable, Hashable, Sendable, Identifiable {
 
     public var id: String { containerId }
     public var isRunning: Bool { status == .running }
+    public var isPaused: Bool { status == .paused }
+    public var isActive: Bool { status == .running || status == .paused }
 
     public init(containerId: String, containerName: String, image: String, status: ContainerStatus,
                 ipAddress: String? = nil, dnsNames: [String] = [], dnsEnabled: Bool = false, ports: [PortMapping] = []) {

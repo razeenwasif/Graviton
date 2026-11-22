@@ -63,6 +63,10 @@ enum Command {
     Start { container: String },
     /// Stop a running container.
     Stop { container: String },
+    /// Pause a running container's VM.
+    Pause { container: String },
+    /// Unpause a paused container's VM.
+    Unpause { container: String },
     /// Restart a container.
     Restart { container: String },
     /// Pull an image from its registry.
@@ -194,7 +198,7 @@ enum Command {
         /// Rebuild every step.
         #[arg(long)]
         no_cache: bool,
-        /// Target platform for base images and output image (e.g. linux/amd64, linux/arm64).
+        /// Target platform(s), comma-separated (e.g. linux/amd64, linux/arm64,linux/amd64).
         #[arg(long)]
         platform: Option<String>,
         /// The build context.
@@ -533,14 +537,14 @@ fn run(cli: Cli) -> Result<()> {
             other => unexpected(other)?,
         },
         Command::Ps { all } => match client.call(&Request::ListContainers)? {
-            Response::Containers(list) => print_containers(list.iter().filter(|c| all || c.status == ContainerStatus::Running)),
+            Response::Containers(list) => print_containers(list.iter().filter(|c| all || matches!(c.status, ContainerStatus::Running | ContainerStatus::Paused))),
             other => unexpected(other)?,
         },
         Command::Images => match client.call(&Request::ListImages)? {
             Response::Images(list) => {
-                println!("{:<28} {:<16} {:>9}  {:<6}  USED BY", "REPOSITORY", "TAG", "SIZE", "ARCH");
+                println!("{:<28} {:<16} {:>9}  {:<11}  USED BY", "REPOSITORY", "TAG", "SIZE", "ARCH");
                 for i in list {
-                    println!("{:<28} {:<16} {:>9}  {:<6}  {}", i.repository, i.tag, bytes(i.size_bytes), i.architecture, i.used_by);
+                    println!("{:<28} {:<16} {:>9}  {:<11}  {}", i.repository, i.tag, bytes(i.size_bytes), i.architecture, i.used_by);
                 }
             }
             other => unexpected(other)?,
@@ -555,6 +559,8 @@ fn run(cli: Cli) -> Result<()> {
         },
         Command::Start { container } => lifecycle(&mut client, Request::Start { id: container }, "started")?,
         Command::Stop { container } => lifecycle(&mut client, Request::Stop { id: container }, "stopped")?,
+        Command::Pause { container } => lifecycle(&mut client, Request::Pause { id: container }, "paused")?,
+        Command::Unpause { container } => lifecycle(&mut client, Request::Unpause { id: container }, "unpaused")?,
         Command::Restart { container } => lifecycle(&mut client, Request::Restart { id: container }, "restarted")?,
         Command::Pull { platform, reference } => pull_image(&mut client, &reference, platform.as_deref())?,
         Command::Tag { source, target } => match client.call(&Request::TagImage { source: source.clone(), target: target.clone() })? {
@@ -972,6 +978,8 @@ fn run(cli: Cli) -> Result<()> {
                                 graviton_proto::EventKind::Failed
                                 | graviton_proto::EventKind::Unhealthy
                                 | graviton_proto::EventKind::BuildFailed => "✗",
+                                graviton_proto::EventKind::Paused => "⏸",
+                                graviton_proto::EventKind::Unpaused => "▶",
                                 graviton_proto::EventKind::Started
                                 | graviton_proto::EventKind::Healthy
                                 | graviton_proto::EventKind::Built
@@ -2061,6 +2069,8 @@ fn print_containers<'a>(list: impl Iterator<Item = &'a ContainerSummary>) {
                     None => up,
                 }
             }
+            (ContainerStatus::Paused, Some(t), _) => format!("Up {} (Paused)", uptime(now.saturating_sub(t))),
+            (ContainerStatus::Paused, None, _) => "Paused".to_string(),
             (ContainerStatus::Exited, _, Some(code)) => format!("Exited ({code})"),
             (s, _, _) => format!("{s:?}"),
         };
@@ -2273,5 +2283,20 @@ mod tests {
         // Delta = (600 + 200 + 150, 300 + 100 + 80) = (950, 480)
         assert_eq!(network_delta_totals(&samples), (950, 480));
         assert_eq!(network_delta_totals(&[]), (0, 0));
+    }
+
+    #[test]
+    fn parses_pause_and_multi_arch_build_commands() {
+        let p = Cli::try_parse_from(["grav", "pause", "api"]).unwrap();
+        assert!(matches!(p.command, Command::Pause { container } if container == "api"));
+
+        let u = Cli::try_parse_from(["grav", "unpause", "api"]).unwrap();
+        assert!(matches!(u.command, Command::Unpause { container } if container == "api"));
+
+        let b = Cli::try_parse_from(["grav", "build", "--platform", "linux/arm64,linux/amd64", "-t", "app:v1", "."]).unwrap();
+        assert!(matches!(
+            b.command,
+            Command::Build { platform: Some(plat), .. } if plat == "linux/arm64,linux/amd64"
+        ));
     }
 }

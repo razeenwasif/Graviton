@@ -43,8 +43,8 @@ struct ContainerListView: View {
                     GSegmented(selection: $filter, options: ContainerFilter.allCases.map { f in
                         let n = switch f {
                         case .all: store.containers.count
-                        case .running: store.runningCount
-                        case .stopped: store.containers.count - store.runningCount
+                        case .running: store.activeCount
+                        case .stopped: store.containers.count - store.activeCount
                         }
                         return (f, "\(f.rawValue) \(n)")
                     }, stretch: true)
@@ -272,15 +272,20 @@ struct ContainerRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            StatusDot(running: container.isRunning, size: 9)
+            StatusDot(status: container.status, size: 9)
             VStack(alignment: .leading, spacing: 1) {
                 Text(container.name).font(.system(size: 15, weight: .medium)).foregroundStyle(G.text)
                 Text(container.image).font(G.mono(11.5)).foregroundStyle(G.muted).lineLimit(1)
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 2) {
-                Text(container.isRunning ? String(format: "%.0f%%", container.cpuPercent ?? 0) : "Exited")
-                    .font(G.mono(12.5, weight: .medium)).foregroundStyle(container.isRunning ? G.textSecondary : G.faint).monospacedDigit()
+                if container.isPaused {
+                    Text("Paused")
+                        .font(G.mono(12.5, weight: .medium)).foregroundStyle(G.warning).monospacedDigit()
+                } else {
+                    Text(container.isRunning ? String(format: "%.0f%%", container.cpuPercent ?? 0) : "Exited")
+                        .font(G.mono(12.5, weight: .medium)).foregroundStyle(container.isRunning ? G.textSecondary : G.faint).monospacedDigit()
+                }
                 if container.isRunning, let mem = container.memoryBytes {
                     Text(Format.bytes(mem)).font(G.mono(11)).foregroundStyle(G.faint)
                 }
@@ -299,6 +304,11 @@ struct LifecycleMenu: View {
 
     var body: some View {
         if container.isRunning {
+            Button("Pause", systemImage: "pause.fill") { Task { await store.pause(container) } }
+            Button("Stop", systemImage: "stop.fill", role: .destructive) { Task { await store.stop(container) } }
+            Button("Restart", systemImage: "arrow.clockwise") { Task { await store.restart(container) } }
+        } else if container.isPaused {
+            Button("Resume", systemImage: "play.fill") { Task { await store.unpause(container) } }
             Button("Stop", systemImage: "stop.fill", role: .destructive) { Task { await store.stop(container) } }
             Button("Restart", systemImage: "arrow.clockwise") { Task { await store.restart(container) } }
         } else {

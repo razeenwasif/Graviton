@@ -22,6 +22,8 @@ use super::{DockerState, serve_connection};
 fn maps_exec_start_errors_to_http_statuses() {
     assert_eq!(exec_error_status("container web isn't running"), 409);
     assert_eq!(exec_error_status("container web is not running"), 409);
+    assert_eq!(exec_error_status("container web is paused"), 409);
+    assert_eq!(exec_error_status("container web is already paused"), 409);
     assert_eq!(exec_error_status("no such container abc"), 404);
     assert_eq!(exec_error_status("exec: No such file or directory (os error 2)"), 400);
     assert_eq!(exec_error_status("give a command to run"), 400);
@@ -75,6 +77,7 @@ fn filters_containers_with_label_and_semantics() {
             layers: vec![],
             architecture: "arm64".into(),
             pulled_at: 1,
+            variants: Vec::new(),
         },
         argv: vec!["sleep".into(), "infinity".into()],
         env: vec![],
@@ -211,6 +214,29 @@ async fn unix_socket_keepalive_and_endpoints() {
     client.write_all(b"POST /v1.47/containers/worker/start HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
     let (status, _, _) = read_http_response(&mut client).await;
     assert_eq!(status, 304);
+
+    // Pause / unpause workflow over Docker REST API.
+    client.write_all(b"POST /v1.47/containers/worker/pause HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+    let (status, _, _) = read_http_response(&mut client).await;
+    assert_eq!(status, 204);
+
+    client.write_all(b"POST /v1.47/containers/worker/pause HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+    let (status, _, _) = read_http_response(&mut client).await;
+    assert_eq!(status, 409);
+
+    client.write_all(b"GET /v1.47/containers/json HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+    let (status, _, body) = read_http_response(&mut client).await;
+    assert_eq!(status, 200);
+    let running_and_paused: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert!(running_and_paused.iter().any(|c| c["Names"][0] == "/worker" && c["State"] == "paused"));
+
+    client.write_all(b"POST /v1.47/containers/worker/unpause HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+    let (status, _, _) = read_http_response(&mut client).await;
+    assert_eq!(status, 204);
+
+    client.write_all(b"POST /v1.47/containers/ghost/pause HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+    let (status, _, _) = read_http_response(&mut client).await;
+    assert_eq!(status, 404);
 
     client
         .write_all(b"HEAD /v1.47/containers/worker/archive?path=/tmp HTTP/1.1\r\nHost: localhost\r\n\r\n")

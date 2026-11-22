@@ -19,8 +19,13 @@ struct ContainerDetailView: View {
 
                     HStack(spacing: 10) {
                         if c.isRunning {
+                            ActionTile(title: "Pause", symbol: "pause.fill", tint: G.warning) { Task { await store.pause(c) } }
+                            ActionTile(title: "Restart", symbol: "arrow.clockwise", tint: G.accent) { Task { await store.restart(c) } }
                             ActionTile(title: "Stop", symbol: "stop.fill", tint: G.danger) { Task { await store.stop(c) } }
-                            ActionTile(title: "Restart", symbol: "arrow.clockwise", tint: G.warning) { Task { await store.restart(c) } }
+                        } else if c.isPaused {
+                            ActionTile(title: "Resume", symbol: "play.fill", tint: G.running) { Task { await store.unpause(c) } }
+                            ActionTile(title: "Restart", symbol: "arrow.clockwise", tint: G.accent) { Task { await store.restart(c) } }
+                            ActionTile(title: "Stop", symbol: "stop.fill", tint: G.danger) { Task { await store.stop(c) } }
                         } else {
                             ActionTile(title: "Start", symbol: "play.fill", tint: G.running) { Task { await store.start(c) } }
                         }

@@ -13,6 +13,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case logs(id: String, tail: Int?)
     case start(id: String)
     case stop(id: String)
+    case pause(id: String)
+    case unpause(id: String)
     case restart(id: String)
     case pull(reference: String, progress: Bool = false, platform: String? = nil)
     case tagImage(source: String, target: String)
@@ -78,6 +80,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .logs: "logs"
         case .start: "start"
         case .stop: "stop"
+        case .pause: "pause"
+        case .unpause: "unpause"
         case .restart: "restart"
         case .pull: "pull"
         case .tagImage: "tag_image"
@@ -123,7 +127,7 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case let .prune(spec): try c.encode(spec, forKey: .params)
         case let .snapshotWarm(cpus, memoryMib, rosetta, slots):
             try c.encode(SnapshotWarmParams(cpus: cpus, memoryMib: memoryMib, rosetta: rosetta ? true : nil, slots: slots), forKey: .params)
-        case let .start(id), let .stop(id), let .restart(id), let .remove(id), let .stats(id), let .inspect(id):
+        case let .start(id), let .stop(id), let .pause(id), let .unpause(id), let .restart(id), let .remove(id), let .stats(id), let .inspect(id):
             try c.encode(IDParams(id: id), forKey: .params)
         case let .listFiles(id, path), let .readFile(id, path), let .getArchive(id, path):
             try c.encode(PathParams(id: id, path: path), forKey: .params)

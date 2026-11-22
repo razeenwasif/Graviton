@@ -1026,4 +1026,39 @@ import Testing
         #expect(encoded.contains(#""interval_secs":2"#))
         #expect(encoded.contains(#""CMD-SHELL""#))
     }
+
+    @Test func pauseAndUnpauseWireEventsAndDemoTransitions() async throws {
+        let pauseWire = String(decoding: try Wire.line(.pause(id: "web")), as: UTF8.self)
+        let unpauseWire = String(decoding: try Wire.line(.unpause(id: "web")), as: UTF8.self)
+        #expect(pauseWire.contains(#""method":"pause""#) && pauseWire.contains(#""id":"web""#))
+        #expect(unpauseWire.contains(#""method":"unpause""#) && unpauseWire.contains(#""id":"web""#))
+
+        let evJSON = #"""
+        {"type":"events","data":[
+            {"seq":1,"timestamp_ms":1000,"kind":"paused","container_id":"abc","container":"web","message":"web paused"},
+            {"seq":2,"timestamp_ms":2000,"kind":"unpaused","container_id":"abc","container":"web","message":"web unpaused"}
+        ]}
+        """#
+        guard case let .events(evs) = try Wire.decoder.decode(EngineResponse.self, from: Data(evJSON.utf8)) else {
+            Issue.record("expected events"); return
+        }
+        #expect(evs.map(\.kind) == [.paused, .unpaused])
+
+        let engine = DemoEngine()
+        let paused = try await engine.pause(id: "web")
+        #expect(paused.isPaused && paused.isActive && !paused.isRunning)
+        #expect(paused.statusText() == "Paused")
+        await #expect(throws: EngineError.self) { try await engine.start(id: "web") }
+        await #expect(throws: EngineError.self) { try await engine.remove(id: "web") }
+
+        let allWhilePaused = await engine.containers()
+        #expect(ContainerFilter.running.apply(allWhilePaused).contains { $0.name == "web" })
+        #expect(!ContainerFilter.stopped.apply(allWhilePaused).contains { $0.name == "web" })
+
+        let unpaused = try await engine.unpause(id: "web")
+        #expect(unpaused.isRunning)
+        _ = try await engine.pause(id: "web")
+        let stopped = try await engine.stop(id: "web")
+        #expect(stopped.status == .exited)
+    }
 }

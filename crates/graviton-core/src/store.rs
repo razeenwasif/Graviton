@@ -103,6 +103,9 @@ impl Store {
         if c.status == ContainerStatus::Running {
             return Err(StoreError::InvalidState { name: c.name.clone(), state: "running" });
         }
+        if c.status == ContainerStatus::Paused {
+            return Err(StoreError::InvalidState { name: c.name.clone(), state: "paused" });
+        }
         c.status = ContainerStatus::Running;
         c.exit_code = None;
         c.started_at = Some(now_secs());
@@ -125,9 +128,33 @@ impl Store {
         Ok(c.clone())
     }
 
+    pub fn pause(&mut self, key: &str) -> Result<ContainerSummary, StoreError> {
+        let i = self.resolve(key)?;
+        let c = &mut self.containers[i];
+        if c.status == ContainerStatus::Paused {
+            return Err(StoreError::InvalidState { name: c.name.clone(), state: "paused" });
+        }
+        if c.status != ContainerStatus::Running {
+            return Err(StoreError::InvalidState { name: c.name.clone(), state: "not running" });
+        }
+        c.status = ContainerStatus::Paused;
+        c.cpu_percent = Some(0.0);
+        Ok(c.clone())
+    }
+
+    pub fn unpause(&mut self, key: &str) -> Result<ContainerSummary, StoreError> {
+        let i = self.resolve(key)?;
+        let c = &mut self.containers[i];
+        if c.status != ContainerStatus::Paused {
+            return Err(StoreError::InvalidState { name: c.name.clone(), state: "not paused" });
+        }
+        c.status = ContainerStatus::Running;
+        Ok(c.clone())
+    }
+
     pub fn restart(&mut self, key: &str) -> Result<ContainerSummary, StoreError> {
         let i = self.resolve(key)?;
-        if self.containers[i].status == ContainerStatus::Running {
+        if matches!(self.containers[i].status, ContainerStatus::Running | ContainerStatus::Paused) {
             self.stop(key)?;
         }
         self.start(key)
@@ -325,9 +352,19 @@ mod tests {
     fn lifecycle_transitions() {
         let mut s = Store::demo();
         assert!(matches!(s.start("api-gateway"), Err(StoreError::InvalidState { .. })));
+        let paused = s.pause("api-gateway").unwrap();
+        assert_eq!(paused.status, ContainerStatus::Paused);
+        assert_eq!(paused.cpu_percent, Some(0.0));
+        assert!(matches!(s.pause("api-gateway"), Err(StoreError::InvalidState { state: "paused", .. })));
+        assert!(matches!(s.start("api-gateway"), Err(StoreError::InvalidState { state: "paused", .. })));
+        let unpaused = s.unpause("api-gateway").unwrap();
+        assert_eq!(unpaused.status, ContainerStatus::Running);
+        assert!(matches!(s.unpause("api-gateway"), Err(StoreError::InvalidState { state: "not paused", .. })));
+        assert_eq!(s.restart("api-gateway").unwrap().status, ContainerStatus::Running);
         let stopped = s.stop("api-gateway").unwrap();
         assert_eq!(stopped.status, ContainerStatus::Exited);
         assert!(s.stop("api-gateway").is_err());
+        assert!(s.pause("worker").is_err());
         let started = s.start("worker").unwrap();
         assert_eq!(started.status, ContainerStatus::Running);
         assert!(started.started_at.is_some());

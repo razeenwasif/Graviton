@@ -23,7 +23,7 @@ use crate::runtime::Engine;
 const FRESH: Duration = Duration::from_secs(10 * 60);
 
 fn image_blobs(image: &LocalImage) -> impl Iterator<Item = String> + '_ {
-    [image.manifest_digest.clone(), image.config_digest.clone()].into_iter().chain(image.layers.iter().map(|l| l.digest.clone()))
+    image.all_blob_digests().into_iter()
 }
 
 /// What refers to which blobs.

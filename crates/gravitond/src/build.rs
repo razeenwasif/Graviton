@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use graviton_core::{ImageReference, paths};
 use graviton_image::dockerfile::{Command, Dockerfile, Heredoc, Kind, RunMount, expand, parse_octal_mode};
-use graviton_image::{Digest, Layer, LocalImage};
+use graviton_image::{Digest, ImageVariant, Layer, LocalImage};
 use graviton_proto::build::{Ignore, expand_source, walk};
 use graviton_proto::{
     AGENT_VSOCK_PORT, AgentEvent, AgentRequest, BuildSpec, ExecMount, ExecMountKind, ImageSummary, InlineFile, LayerInfo, StagedFile, encode_line,
@@ -246,6 +246,18 @@ struct PreparedCopy {
     source_key: String,
 }
 
+struct BuildPlan<'a> {
+    context: &'a Path,
+    dockerfile_path: &'a Path,
+    reference: &'a str,
+    df: &'a Dockerfile,
+    ignore_lines: &'a [String],
+    ignore: &'a Ignore,
+    needed: &'a BTreeSet<usize>,
+    steps: usize,
+    spec: &'a BuildSpec,
+}
+
 pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> Result<ImageSummary> {
     let t0 = Instant::now();
     let context = PathBuf::from(&spec.context);
@@ -267,7 +279,18 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
         let (k, v) = pair.split_once('=').ok_or_else(|| anyhow!("--build-arg {pair} should be KEY=value"))?;
         build_args.insert(k.into(), v.into());
     }
-    let global: BTreeMap<String, String> = df
+    let target_archs: Vec<Option<String>> = match &spec.platform {
+        None => vec![None],
+        Some(raw) => graviton_image::parse_platforms(raw)?.into_iter().map(Some).collect(),
+    };
+    if target_archs.iter().any(|p| p.as_deref() == Some("amd64"))
+        && graviton_image::guest_arch() != "amd64"
+        && !AppleHypervisor::rosetta_available()
+    {
+        bail!("building a linux/amd64 image needs Apple Rosetta for Linux (run `softwareupdate --install-rosetta`)");
+    }
+
+    let prelim_global: BTreeMap<String, String> = df
         .global_args
         .iter()
         .filter_map(|(k, d)| build_args.get(k).cloned().or_else(|| d.clone()).map(|v| (k.clone(), v)))
@@ -282,7 +305,7 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
     let mut queue = vec![target];
     while let Some(i) = queue.pop() {
         let stage = &df.stages[i];
-        let mut deps: Vec<usize> = df.stage_index(&expand(&stage.base, &global)).filter(|d| *d < i).into_iter().collect();
+        let mut deps: Vec<usize> = df.stage_index(&expand(&stage.base, &prelim_global)).filter(|d| *d < i).into_iter().collect();
         for ins in &stage.instructions {
             match &ins.kind {
                 Kind::Copy { from: Some(f), .. } => {
@@ -307,7 +330,106 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
 
     let reference = image_reference(spec, &context)?;
     let steps: usize = needed.iter().map(|&i| df.stages[i].instructions.len() + 1).sum();
-    log(format!("Building {} from {} ({} stage{}, {steps} steps)", display(&reference), dockerfile_path.display(), needed.len(), if needed.len() == 1 { "" } else { "s" }));
+    let multi = target_archs.len() > 1;
+    let plat_desc = if multi {
+        let names: Vec<String> = target_archs.iter().flatten().map(|a| format!("linux/{a}")).collect();
+        format!(" for {}", names.join(", "))
+    } else {
+        String::new()
+    };
+    log(format!(
+        "Building {} from {} ({} stage{}, {steps} steps{plat_desc})",
+        display(&reference),
+        dockerfile_path.display(),
+        needed.len(),
+        if needed.len() == 1 { "" } else { "s" }
+    ));
+
+    let plan = BuildPlan {
+        context: &context,
+        dockerfile_path: &dockerfile_path,
+        reference: &reference,
+        df: &df,
+        ignore_lines: &ignore_lines,
+        ignore: &ignore,
+        needed: &needed,
+        steps,
+        spec,
+    };
+
+    let mut built = Vec::with_capacity(target_archs.len());
+    for (idx, arch_opt) in target_archs.iter().enumerate() {
+        let plat_str = arch_opt.as_ref().map(|a| format!("linux/{a}"));
+        let eff_arch = arch_opt.as_deref().unwrap_or(graviton_image::guest_arch());
+        if multi {
+            log(format!("=== [{}/{}] linux/{eff_arch} ===", idx + 1, target_archs.len()));
+        }
+        let mut plat_build_args = build_args.clone();
+        inject_platform_args(&mut plat_build_args, eff_arch);
+        built.push(build_one_platform(engine, &plan, plat_str.as_deref(), &plat_build_args, log)?);
+    }
+
+    let image = if built.len() == 1 {
+        built.into_iter().next().unwrap()
+    } else {
+        write_image_index(engine, &reference, &built)?
+    };
+
+    engine.index.lock().unwrap().insert(image.clone())?;
+    engine.refresh_images();
+    if image.is_multi_arch() {
+        log(format!(
+            "Built {} ({}, architectures: {}) in {:.1} s",
+            display(&reference),
+            human(image.size()),
+            image.architectures().join(", "),
+            t0.elapsed().as_secs_f64()
+        ));
+    } else {
+        log(format!(
+            "Built {} ({}, {} layers) in {:.1} s",
+            display(&reference),
+            human(image.size()),
+            image.layers.len(),
+            t0.elapsed().as_secs_f64()
+        ));
+    }
+    let used_by = 0;
+    Ok(image.summary(used_by))
+}
+
+fn inject_platform_args(args: &mut BTreeMap<String, String>, target_arch: &str) {
+    let build_arch = graviton_image::guest_arch();
+    for (k, v) in [
+        ("TARGETOS", "linux".to_string()),
+        ("TARGETARCH", target_arch.to_string()),
+        ("TARGETPLATFORM", format!("linux/{target_arch}")),
+        ("BUILDOS", "linux".to_string()),
+        ("BUILDARCH", build_arch.to_string()),
+        ("BUILDPLATFORM", format!("linux/{build_arch}")),
+    ] {
+        args.entry(k.into()).or_insert(v);
+    }
+}
+
+fn build_one_platform(
+    engine: &Engine,
+    plan: &BuildPlan<'_>,
+    platform: Option<&str>,
+    build_args: &BTreeMap<String, String>,
+    log: &mut dyn FnMut(String),
+) -> Result<LocalImage> {
+    let df = plan.df;
+    let context = plan.context;
+    let spec = plan.spec;
+    let steps = plan.steps;
+    let _ = plan.dockerfile_path;
+
+    let global: BTreeMap<String, String> = df
+        .global_args
+        .iter()
+        .filter_map(|(k, d)| build_args.get(k).cloned().or_else(|| d.clone()).map(|v| (k.clone(), v)))
+        .collect();
 
     // Per-build working folder (always deleted on exit so secrets & downloads never linger).
     let build_id = new_id();
@@ -345,7 +467,7 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
 
     let result = (|| -> Result<State> {
         let mut last = None;
-        for &i in &needed {
+        for &i in plan.needed {
             let stage = &df.stages[i];
             step += 1;
             let base = expand(&stage.base, &global);
@@ -356,7 +478,7 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
                     s.args.clear();
                     s
                 }
-                None => base_state(engine, &base, spec.platform.as_deref(), log)?,
+                None => base_state(engine, &base, platform, log)?,
             };
             if state.architecture == "amd64" && graviton_image::guest_arch() != "amd64" && !AppleHypervisor::rosetta_available() {
                 bail!(
@@ -381,7 +503,7 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
                             Command::Shell(s) => format!("shell:{s}"),
                         };
                         let stdin_key = stdin.as_deref().map(|s| hash(&["stdin", s])).unwrap_or_default();
-                        let mount_key = run_mounts_cache_key(engine, &df, mounts, &context, &vars, &ignore, &finished)
+                        let mount_key = run_mounts_cache_key(engine, df, mounts, context, &vars, plan.ignore, &finished, platform)
                             .with_context(|| format!("Dockerfile line {}: {}", ins.line, ins.text))?;
                         Some(format!(
                             "{}|cmd:{cmd_key}|in:{stdin_key}|mnt:{mount_key}|args:{}|wd:{}|u:{}",
@@ -394,8 +516,8 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
                     Kind::Copy { sources, heredocs, dest, from, chown, chmod, checksum, add } => {
                         let prep = prepare_copy(
                             engine,
-                            &df,
-                            &context,
+                            df,
+                            context,
                             &staged_dir,
                             &mut staged_seq,
                             sources,
@@ -407,8 +529,9 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
                             checksum.as_deref(),
                             *add,
                             &vars,
-                            &ignore,
+                            plan.ignore,
                             &finished,
+                            platform,
                             log,
                         )
                         .with_context(|| format!("Dockerfile line {}: {}", ins.line, ins.text))?;
@@ -430,7 +553,7 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
 
                 // Steps that only change the config.
                 let Some(material) = fs_step else {
-                    apply_config(&mut state, &ins.kind, &vars, &build_args)?;
+                    apply_config(&mut state, &ins.kind, &vars, build_args)?;
                     state.key = hash(&[&state.key, &ins.text]);
                     state.history.push(json!({"created_by": ins.text, "empty_layer": true}));
                     continue;
@@ -455,7 +578,7 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
                 // Run the step in the builder VM.
                 let b = match builder.as_mut() {
                     Some(b) => b,
-                    None => builder.insert(boot_builder(engine, &context, &build_dir, &out_dir, &staged_dir, &secrets_dir, &cache_root, log)?),
+                    None => builder.insert(boot_builder(engine, context, &build_dir, &out_dir, &staged_dir, &secrets_dir, &cache_root, log)?),
                 };
                 if !live {
                     prepare(b, &container, &state.layers)?;
@@ -467,12 +590,13 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
                         let (exec_mounts, extra_env) = resolve_exec_mounts(
                             engine,
                             b,
-                            &df,
+                            df,
                             mounts,
                             &vars,
                             &build_id,
                             &mut finished,
                             &secrets_map,
+                            platform,
                         )
                         .with_context(|| format!("Dockerfile line {}: {}", ins.line, ins.text))?;
                         run(b, &container, &state, command, stdin.as_deref(), exec_mounts, &extra_env, log)
@@ -482,7 +606,7 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
                         let prep = prepared_copy.take().unwrap();
                         let from_container = match from {
                             None => None,
-                            Some(f) => Some(source_container(engine, b, &df, f, &build_id, &mut finished)?),
+                            Some(f) => Some(source_container(engine, b, df, f, &build_id, &mut finished, platform)?),
                         };
                         let copied = b.request(&AgentRequest::Copy {
                             container: container.clone(),
@@ -493,7 +617,7 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
                             chown: prep.chown,
                             chmod: prep.chmod,
                             extract: *add,
-                            ignore: if from.is_some() { vec![] } else { ignore_lines.clone() },
+                            ignore: if from.is_some() { vec![] } else { plan.ignore_lines.to_vec() },
                             inline: prep.inline,
                             staged: prep.staged,
                         });
@@ -535,17 +659,11 @@ pub fn build(engine: &Engine, spec: &BuildSpec, log: &mut dyn FnMut(String)) -> 
         b.shutdown();
     }
     let _ = fs::remove_dir_all(&build_dir);
-    let state = result?;
-    let mut state = state;
+    let mut state = result?;
     for (k, v) in &spec.labels {
         state.labels.insert(k.clone(), v.clone());
     }
-    let image = write_image(engine, &reference, &state)?;
-    engine.index.lock().unwrap().insert(image.clone())?;
-    engine.refresh_images();
-    log(format!("Built {} ({}, {} layers) in {:.1} s", display(&reference), human(image.size()), image.layers.len(), t0.elapsed().as_secs_f64()));
-    let used_by = 0;
-    Ok(image.summary(used_by))
+    write_image(engine, plan.reference, &state)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -566,6 +684,7 @@ fn prepare_copy(
     vars: &BTreeMap<String, String>,
     ignore: &Ignore,
     finished: &HashMap<usize, (State, Option<String>)>,
+    platform: Option<&str>,
     log: &mut dyn FnMut(String),
 ) -> Result<PreparedCopy> {
     let dest = expand(dest, vars);
@@ -601,7 +720,7 @@ fn prepare_copy(
         let h = match from {
             Some(f) => match df.stage_index(f) {
                 Some(d) => finished.get(&d).map(|(s, _)| s.key.clone()).ok_or_else(|| anyhow!("COPY --from={f}: that stage comes later"))?,
-                None => engine.image_for(f)?.manifest_digest,
+                None => engine.image_for_platform(f, platform)?.manifest_digest,
             },
             None => content_hash(context, &local_sources, ignore)?,
         };
@@ -662,6 +781,7 @@ fn url_filename(url: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_mounts_cache_key(
     engine: &Engine,
     df: &Dockerfile,
@@ -670,6 +790,7 @@ fn run_mounts_cache_key(
     vars: &BTreeMap<String, String>,
     ignore: &Ignore,
     finished: &HashMap<usize, (State, Option<String>)>,
+    platform: Option<&str>,
 ) -> Result<String> {
     let mut parts = Vec::new();
     for m in mounts {
@@ -694,7 +815,7 @@ fn run_mounts_cache_key(
                 let h = match from {
                     Some(f) => match df.stage_index(f) {
                         Some(d) => finished.get(&d).map(|(s, _)| s.key.clone()).ok_or_else(|| anyhow!("--mount=type=bind,from={f}: that stage comes later"))?,
-                        None => engine.image_for(f)?.manifest_digest,
+                        None => engine.image_for_platform(f, platform)?.manifest_digest,
                     },
                     None => content_hash(context, std::slice::from_ref(&src), ignore)?,
                 };
@@ -718,6 +839,7 @@ fn resolve_exec_mounts(
     build_id: &str,
     finished: &mut HashMap<usize, (State, Option<String>)>,
     secrets: &HashMap<String, (String, Vec<u8>)>,
+    platform: Option<&str>,
 ) -> Result<(Vec<ExecMount>, Vec<String>)> {
     let mut out = Vec::new();
     let mut extra_env = Vec::new();
@@ -768,7 +890,7 @@ fn resolve_exec_mounts(
                 let target = expand(target, vars);
                 let from_container = match from {
                     None => None,
-                    Some(f) => Some(source_container(engine, b, df, f, build_id, finished)?),
+                    Some(f) => Some(source_container(engine, b, df, f, build_id, finished, platform)?),
                 };
                 out.push(ExecMount {
                     kind: ExecMountKind::Bind,
@@ -852,7 +974,7 @@ fn base_state(engine: &Engine, base: &str, platform: Option<&str>, log: &mut dyn
         .lock()
         .unwrap()
         .get(base)
-        .is_none_or(|i| platform.is_some() && i.architecture != target_arch);
+        .is_none_or(|i| i.for_arch(&target_arch).is_none());
     if need_pull {
         log(format!(
             " ---> pulling {base}{}",
@@ -1064,6 +1186,7 @@ fn source_container(
     from: &str,
     build_id: &str,
     finished: &mut HashMap<usize, (State, Option<String>)>,
+    platform: Option<&str>,
 ) -> Result<String> {
     if let Some(d) = df.stage_index(from) {
         let (state, live) = finished.get(&d).ok_or_else(|| anyhow!("COPY --from={from}: that stage comes later"))?;
@@ -1077,7 +1200,7 @@ fn source_container(
         }
         return Ok(name);
     }
-    let image = engine.image_for(from)?;
+    let image = engine.image_for_platform(from, platform)?;
     let name = format!("b{build_id}i{}", &image.manifest_digest[7..19]);
     if !b.prepared.contains(&name) {
         let layers: Vec<BuiltLayer> = image.layers.iter().map(|l| BuiltLayer { digest: l.digest.clone(), diff_id: String::new(), size: l.size, media_type: l.media_type.clone() }).collect();
@@ -1218,6 +1341,51 @@ fn write_image(engine: &Engine, reference: &str, s: &State) -> Result<LocalImage
         layers: s.layers.iter().map(|l| Layer { digest: l.digest.clone(), size: l.size, media_type: l.media_type.clone() }).collect(),
         architecture: s.architecture.clone(),
         pulled_at: now_secs(),
+        variants: Vec::new(),
+    })
+}
+
+fn write_image_index(engine: &Engine, reference: &str, built: &[LocalImage]) -> Result<LocalImage> {
+    let mut manifests = Vec::with_capacity(built.len());
+    let mut variants = Vec::with_capacity(built.len());
+    for img in built {
+        let md = Digest::parse(&img.manifest_digest)?;
+        let size = engine.blobs.size(&md).ok_or_else(|| anyhow!("missing manifest blob {md}"))?;
+        manifests.push(json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": img.manifest_digest,
+            "size": size,
+            "platform": { "os": "linux", "architecture": img.architecture },
+        }));
+        variants.push(ImageVariant {
+            architecture: img.architecture.clone(),
+            manifest_digest: img.manifest_digest.clone(),
+            config_digest: img.config_digest.clone(),
+            layers: img.layers.clone(),
+        });
+    }
+    let index = json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": manifests,
+    });
+    let index_bytes = serde_json::to_vec(&index)?;
+    let index_digest = Digest::of(&index_bytes);
+    engine.blobs.write_bytes(&index_digest, &index_bytes)?;
+
+    let primary = built
+        .iter()
+        .find(|i| i.architecture == graviton_image::guest_arch())
+        .unwrap_or(&built[0]);
+
+    Ok(LocalImage {
+        reference: reference.to_string(),
+        manifest_digest: index_digest.to_string(),
+        config_digest: primary.config_digest.clone(),
+        layers: primary.layers.clone(),
+        architecture: primary.architecture.clone(),
+        pulled_at: now_secs(),
+        variants,
     })
 }
 
@@ -1318,6 +1486,16 @@ mod tests {
         );
         apply_config(&mut s, &Kind::Healthcheck(None), &v, &BTreeMap::new()).unwrap();
         assert_eq!(s.healthcheck.as_ref().map(|h| h.test.as_slice()), Some(&["NONE".to_string()][..]));
+    }
+
+    #[test]
+    fn platform_args_respect_overrides() {
+        let mut args = BTreeMap::from([("TARGETARCH".into(), "custom".into())]);
+        inject_platform_args(&mut args, "amd64");
+        assert_eq!(args["TARGETARCH"], "custom");
+        assert_eq!(args["TARGETOS"], "linux");
+        assert_eq!(args["TARGETPLATFORM"], "linux/amd64");
+        assert_eq!(args["BUILDARCH"], graviton_image::guest_arch());
     }
 
     fn base_state_for_test() -> State {

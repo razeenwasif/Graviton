@@ -357,6 +357,12 @@ async fn dispatch(
             ("POST", [id, "restart"]) if !id.is_empty() => {
                 return containers::restart_container(state, id, &head, reader, write).await;
             }
+            ("POST", [id, "pause"]) if !id.is_empty() => {
+                return containers::pause_container(state, id, &head, reader, write).await;
+            }
+            ("POST", [id, "unpause"]) if !id.is_empty() => {
+                return containers::unpause_container(state, id, &head, reader, write).await;
+            }
             ("POST", [id, "wait"]) if !id.is_empty() => {
                 return containers::wait_container(state, id, &head, reader, write).await;
             }

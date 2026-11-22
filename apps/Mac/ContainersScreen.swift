@@ -62,7 +62,10 @@ struct ContainersScreen: View {
     }
 
     private var headerSubtitle: String {
-        let base = "\(store.runningCount) running · \(store.containers.count - store.runningCount) stopped"
+        var parts = ["\(store.runningCount) running"]
+        if store.pausedCount > 0 { parts.append("\(store.pausedCount) paused") }
+        parts.append("\(store.containers.count - store.activeCount) stopped")
+        let base = parts.joined(separator: " · ")
         guard !store.stacks.isEmpty else { return base }
         return "\(base) · \(store.stacks.count) \(store.stacks.count == 1 ? "stack" : "stacks")"
     }
@@ -121,8 +124,8 @@ struct ContainersScreen: View {
     private func label(for filter: ContainerFilter) -> String {
         switch filter {
         case .all: "All  \(store.containers.count)"
-        case .running: "Running  \(store.runningCount)"
-        case .stopped: "Stopped  \(store.containers.count - store.runningCount)"
+        case .running: "Running  \(store.activeCount)"
+        case .stopped: "Stopped  \(store.containers.count - store.activeCount)"
         }
     }
 }
@@ -310,7 +313,7 @@ struct ContainerTable: View {
     private func row(_ c: Container, indented: Bool) -> some View {
         HStack(spacing: 12) {
             HStack(spacing: 12) {
-                StatusDot(running: c.isRunning)
+                StatusDot(status: c.status)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
                         Text(c.name).font(.system(size: 13, weight: .medium)).foregroundStyle(G.text).lineLimit(1)
@@ -336,7 +339,7 @@ struct ContainerTable: View {
                 .frame(width: 64, alignment: .trailing)
             Text(c.memoryBytes.map(Format.bytes) ?? "—").font(G.mono(12)).foregroundStyle(G.textSecondary)
                 .frame(width: 80, alignment: .trailing)
-            Text(c.statusText()).font(.system(size: 12.5)).foregroundStyle(G.muted).lineLimit(1)
+            Text(c.statusText()).font(.system(size: 12.5)).foregroundStyle(c.isPaused ? G.warning : G.muted).lineLimit(1)
                 .frame(width: 92, alignment: .leading)
             RowMenu(container: c, open: { open(c.id) }).frame(width: 28)
         }
@@ -424,6 +427,11 @@ struct LifecycleButtons: View {
 
     var body: some View {
         if container.isRunning {
+            Button("Pause") { Task { await store.pause(container) } }
+            Button("Stop") { Task { await store.stop(container) } }
+            Button("Restart") { Task { await store.restart(container) } }
+        } else if container.isPaused {
+            Button("Resume") { Task { await store.unpause(container) } }
             Button("Stop") { Task { await store.stop(container) } }
             Button("Restart") { Task { await store.restart(container) } }
         } else {
@@ -451,6 +459,11 @@ struct Inspector: View {
 
             HStack(spacing: 8) {
                 if container.isRunning {
+                    Button("Pause") { Task { await store.pause(container) } }.buttonStyle(.g(.secondary, fullWidth: true))
+                    Button("Stop") { Task { await store.stop(container) } }.buttonStyle(.g(.danger, fullWidth: true))
+                    Button("Restart") { Task { await store.restart(container) } }.buttonStyle(.g(.secondary, fullWidth: true))
+                } else if container.isPaused {
+                    Button("Resume") { Task { await store.unpause(container) } }.buttonStyle(.g(.primary, fullWidth: true))
                     Button("Stop") { Task { await store.stop(container) } }.buttonStyle(.g(.danger, fullWidth: true))
                     Button("Restart") { Task { await store.restart(container) } }.buttonStyle(.g(.secondary, fullWidth: true))
                 } else {

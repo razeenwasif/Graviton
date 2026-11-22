@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +14,15 @@ pub struct Layer {
     pub media_type: String,
 }
 
+/// One platform-specific manifest inside a multi-arch OCI image index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageVariant {
+    pub architecture: String,
+    pub manifest_digest: String,
+    pub config_digest: String,
+    pub layers: Vec<Layer>,
+}
+
 /// An image available locally: its manifest, config and layers are all in the blob store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalImage {
@@ -25,11 +34,78 @@ pub struct LocalImage {
     pub architecture: String,
     /// Unix seconds.
     pub pulled_at: u64,
+    /// Non-empty when built as a multi-arch OCI image index (top-level fields hold the primary variant).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<ImageVariant>,
 }
 
 impl LocalImage {
+    pub fn is_multi_arch(&self) -> bool {
+        self.variants.len() > 1
+    }
+
+    pub fn architectures(&self) -> Vec<String> {
+        if self.variants.is_empty() {
+            vec![self.architecture.clone()]
+        } else {
+            self.variants.iter().map(|v| v.architecture.clone()).collect()
+        }
+    }
+
+    /// Resolve a single-architecture view of this image (`None` if not present).
+    pub fn for_arch(&self, arch: &str) -> Option<LocalImage> {
+        if self.variants.is_empty() {
+            return (self.architecture == arch).then(|| self.clone());
+        }
+        self.variants.iter().find(|v| v.architecture == arch).map(|v| LocalImage {
+            reference: self.reference.clone(),
+            manifest_digest: v.manifest_digest.clone(),
+            config_digest: v.config_digest.clone(),
+            layers: v.layers.clone(),
+            architecture: v.architecture.clone(),
+            pulled_at: self.pulled_at,
+            variants: Vec::new(),
+        })
+    }
+
+    /// Every unique blob digest referenced by this image (index, manifests, configs, layers).
+    pub fn all_blob_digests(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        let mut push = |d: &str| {
+            if !d.is_empty() && seen.insert(d.to_string()) {
+                out.push(d.to_string());
+            }
+        };
+        push(&self.manifest_digest);
+        push(&self.config_digest);
+        for l in &self.layers {
+            push(&l.digest);
+        }
+        for v in &self.variants {
+            push(&v.manifest_digest);
+            push(&v.config_digest);
+            for l in &v.layers {
+                push(&l.digest);
+            }
+        }
+        out
+    }
+
     pub fn size(&self) -> u64 {
-        self.layers.iter().map(|l| l.size).sum()
+        if self.variants.is_empty() {
+            return self.layers.iter().map(|l| l.size).sum();
+        }
+        let mut seen = HashSet::new();
+        let mut total = 0u64;
+        for v in &self.variants {
+            for l in &v.layers {
+                if seen.insert(l.digest.as_str()) {
+                    total += l.size;
+                }
+            }
+        }
+        total
     }
 
     pub fn config(&self, blobs: &BlobStore) -> Result<ImageConfig> {
@@ -45,13 +121,18 @@ impl LocalImage {
             Some((repo, tag)) if !tag.contains('/') => (repo.to_string(), tag.to_string()),
             _ => (display.clone(), String::new()),
         };
+        let architecture = if self.variants.len() > 1 {
+            self.architectures().join(",")
+        } else {
+            self.architecture.clone()
+        };
         ImageSummary {
             reference: self.reference.clone(),
             repository,
             tag,
             digest: self.manifest_digest.clone(),
             size_bytes: self.size(),
-            architecture: self.architecture.clone(),
+            architecture,
             used_by,
         }
     }
@@ -129,13 +210,50 @@ mod tests {
                 layers: vec![Layer { digest: "sha256:cc".into(), size: 3_600_000, media_type: "x".into() }],
                 architecture: "arm64".into(),
                 pulled_at: 1,
+                variants: vec![],
             })
             .unwrap();
         let reloaded = ImageIndex::load(&path).unwrap();
         let img = reloaded.get("alpine").expect("found by short name");
         assert_eq!(img.size(), 3_600_000);
+        assert_eq!(img.for_arch("arm64").unwrap().config_digest, "sha256:bb");
+        assert!(img.for_arch("amd64").is_none());
         let s = img.summary(2);
         assert_eq!((s.repository.as_str(), s.tag.as_str(), s.used_by), ("alpine", "latest", 2));
+
+        // Multi-arch index entry round-trip & size deduplication.
+        let shared = Layer { digest: "sha256:shared".into(), size: 1000, media_type: "x".into() };
+        let multi = LocalImage {
+            reference: "docker.io/library/multi:1".into(),
+            manifest_digest: "sha256:idx".into(),
+            config_digest: "sha256:cfg-arm".into(),
+            layers: vec![shared.clone()],
+            architecture: "arm64".into(),
+            pulled_at: 2,
+            variants: vec![
+                ImageVariant {
+                    architecture: "arm64".into(),
+                    manifest_digest: "sha256:man-arm".into(),
+                    config_digest: "sha256:cfg-arm".into(),
+                    layers: vec![shared.clone()],
+                },
+                ImageVariant {
+                    architecture: "amd64".into(),
+                    manifest_digest: "sha256:man-amd".into(),
+                    config_digest: "sha256:cfg-amd".into(),
+                    layers: vec![shared, Layer { digest: "sha256:amd-only".into(), size: 500, media_type: "x".into() }],
+                },
+            ],
+        };
+        index.insert(multi).unwrap();
+        let reloaded = ImageIndex::load(&path).unwrap();
+        let m = reloaded.get("multi:1").unwrap();
+        assert!(m.is_multi_arch());
+        assert_eq!(m.architectures(), vec!["arm64", "amd64"]);
+        assert_eq!(m.size(), 1500);
+        assert_eq!(m.summary(1).architecture, "arm64,amd64");
+        assert_eq!(m.for_arch("amd64").unwrap().manifest_digest, "sha256:man-amd");
+        assert_eq!(m.all_blob_digests().len(), 7);
         let _ = fs::remove_dir_all(dir);
     }
 }

@@ -34,6 +34,8 @@ public protocol EngineService: Sendable {
     func logs(id: String, tail: Int?) async throws -> [LogLine]
     func start(id: String) async throws -> Container
     func stop(id: String) async throws -> Container
+    func pause(id: String) async throws -> Container
+    func unpause(id: String) async throws -> Container
     func restart(id: String) async throws -> Container
     /// Pull an image from its registry (may take minutes).
     func pull(reference: String) async throws -> ImageInfo
@@ -128,6 +130,8 @@ public final class SocketEngine: EngineService {
 
     public func start(id: String) async throws -> Container { try await lifecycle(.start(id: id)) }
     public func stop(id: String) async throws -> Container { try await lifecycle(.stop(id: id)) }
+    public func pause(id: String) async throws -> Container { try await lifecycle(.pause(id: id)) }
+    public func unpause(id: String) async throws -> Container { try await lifecycle(.unpause(id: id)) }
     public func restart(id: String) async throws -> Container { try await lifecycle(.restart(id: id)) }
 
     public func pull(reference: String) async throws -> ImageInfo {

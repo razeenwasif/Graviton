@@ -35,6 +35,31 @@ struct ContainerDetailScreen: View {
                         .disabled(!c.isRunning)
                         if c.isRunning {
                             Button {
+                                Task { await store.pause(c) }
+                            } label: {
+                                Label("Pause", systemImage: "pause.fill")
+                            }
+                            .buttonStyle(.gSecondary)
+                            Button {
+                                Task { await store.restart(c) }
+                            } label: {
+                                Label("Restart", systemImage: "arrow.clockwise")
+                            }
+                            .buttonStyle(.gSecondary)
+                            Button {
+                                Task { await store.stop(c) }
+                            } label: {
+                                Label("Stop", systemImage: "stop.fill")
+                            }
+                            .buttonStyle(.gDanger)
+                        } else if c.isPaused {
+                            Button {
+                                Task { await store.unpause(c) }
+                            } label: {
+                                Label("Resume", systemImage: "play.fill")
+                            }
+                            .buttonStyle(.gPrimary)
+                            Button {
                                 Task { await store.restart(c) }
                             } label: {
                                 Label("Restart", systemImage: "arrow.clockwise")

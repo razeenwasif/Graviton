@@ -79,6 +79,8 @@ struct EventRow: View {
         switch event.kind {
         case .started: ("play.circle.fill", G.running)
         case .stopped: ("stop.circle", G.muted)
+        case .paused: ("pause.circle.fill", G.warning)
+        case .unpaused: ("play.circle.fill", G.running)
         case .failed: ("exclamationmark.triangle.fill", G.danger)
         case .healthy: ("heart.circle.fill", G.running)
         case .unhealthy: ("heart.slash.circle.fill", G.danger)

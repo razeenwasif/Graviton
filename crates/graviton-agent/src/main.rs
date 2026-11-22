@@ -311,6 +311,15 @@ pub(crate) mod linux {
                 Ok(AgentRequest::SetHosts { generation, hosts }) => {
                     crate::dns::set_hosts(generation, &hosts);
                 }
+                Ok(AgentRequest::DialTcp { port }) => {
+                    let pending = reader.buffer().to_vec();
+                    drop(writer);
+                    return dial_tcp(port, reader.into_inner(), pending);
+                }
+                Ok(AgentRequest::SetClock { now_secs }) => {
+                    set_wall_clock(now_secs);
+                    send(&writer, &AgentEvent::Done);
+                }
                 Ok(AgentRequest::Shutdown) => power_off(),
                 Err(err) => send(&writer, &AgentEvent::Error { message: format!("bad request: {err}") }),
             }
@@ -507,6 +516,52 @@ pub(crate) mod linux {
         unsafe {
             let _ = libc::clock_settime(libc::CLOCK_REALTIME, &raw const ts);
         }
+    }
+
+    /// Connect to `127.0.0.1:<port>` (or `[::1]:<port>`) inside the guest network
+    /// namespace, announce `AgentEvent::Connected`, and splice bytes over vsock.
+    fn dial_tcp(port: u16, mut vsock: File, pending: Vec<u8>) -> io::Result<()> {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream};
+        use std::time::Duration;
+
+        let timeout = Duration::from_secs(5);
+        let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port);
+        let mut tcp = match TcpStream::connect_timeout(&v4, timeout) {
+            Ok(s) => s,
+            Err(err_v4) => match TcpStream::connect_timeout(&v6, timeout) {
+                Ok(s) => s,
+                Err(_) => {
+                    let _ = vsock.write_all(&encode_line(&AgentEvent::Error {
+                        message: format!("connect 127.0.0.1:{port}: {err_v4}"),
+                    }));
+                    let _ = vsock.flush();
+                    return Ok(());
+                }
+            },
+        };
+        let _ = tcp.set_nodelay(true);
+        vsock.write_all(&encode_line(&AgentEvent::Connected))?;
+        vsock.flush()?;
+        if !pending.is_empty() {
+            tcp.write_all(&pending)?;
+        }
+
+        let mut tcp_w = tcp.try_clone()?;
+        let mut vsock_r = vsock.try_clone()?;
+        let pump_to_tcp = thread::spawn(move || {
+            let _ = io::copy(&mut vsock_r, &mut tcp_w);
+            let _ = tcp_w.shutdown(Shutdown::Write);
+        });
+        let _ = io::copy(&mut tcp, &mut vsock);
+        let _ = vsock.flush();
+        // SAFETY: shutdown(SHUT_WR) on the connected vsock socket fd delivers EOF
+        // to the host forwarder without closing the read half before `pump_to_tcp` finishes.
+        unsafe {
+            libc::shutdown(vsock.as_raw_fd(), libc::SHUT_WR);
+        }
+        let _ = pump_to_tcp.join();
+        Ok(())
     }
 
     /// Mount Apple's `rosetta` virtiofs share (if attached) and register the

@@ -14,9 +14,10 @@ mod registry;
 pub use blobs::{BlobStore, Digest};
 pub use dockerfile::Dockerfile;
 pub use config::{HealthcheckConfig, ImageConfig, RuntimeConfig};
-pub use index::{ImageIndex, LocalImage, Layer};
+pub use index::{ImageIndex, ImageVariant, LocalImage, Layer};
 pub use registry::{
-    Credentials, Progress, PullOptions, PushProgress, PushResult, Registry, fetch_url, normalize_platform, normalize_registry,
+    Credentials, Progress, PullOptions, PushProgress, PushResult, Registry, fetch_url, normalize_platform,
+    normalize_registry, parse_platforms,
 };
 
 use thiserror::Error;

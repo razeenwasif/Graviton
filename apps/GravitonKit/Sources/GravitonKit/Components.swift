@@ -3,22 +3,45 @@ import SwiftUI
 // MARK: - Status
 
 public struct StatusDot: View {
-    public var running: Bool
+    public var status: ContainerStatus
     public var size: CGFloat
 
     public init(running: Bool, size: CGFloat = 8) {
-        self.running = running
+        self.status = running ? .running : .exited
         self.size = size
+    }
+
+    public init(status: ContainerStatus, size: CGFloat = 8) {
+        self.status = status
+        self.size = size
+    }
+
+    private var tint: Color {
+        switch status {
+        case .running: G.running
+        case .paused: G.warning
+        case .exited, .created: G.stopped
+        }
+    }
+
+    private var label: String {
+        switch status {
+        case .running: "Running"
+        case .paused: "Paused"
+        case .exited, .created: "Stopped"
+        }
     }
 
     public var body: some View {
         Circle()
-            .fill(running ? G.running : G.stopped)
+            .fill(tint)
             .frame(width: size, height: size)
             .background {
-                if running { Circle().fill(G.running.opacity(0.18)).frame(width: size + 6, height: size + 6) }
+                if status == .running || status == .paused {
+                    Circle().fill(tint.opacity(0.18)).frame(width: size + 6, height: size + 6)
+                }
             }
-            .accessibilityLabel(running ? "Running" : "Stopped")
+            .accessibilityLabel(label)
     }
 }
 
@@ -60,15 +83,23 @@ public struct StatusPill: View {
     }
 
     public var body: some View {
-        let running = container.isRunning
-        let tint: Color = switch (running, container.health) {
-        case (true, .unhealthy): G.danger
-        case (true, .starting): G.warning
-        case (true, _): G.running
-        case (false, _): G.muted
+        let tint: Color = switch (container.status, container.health) {
+        case (.running, .unhealthy): G.danger
+        case (.running, .starting): G.warning
+        case (.running, _): G.running
+        case (.paused, _): G.warning
+        case (.exited, _), (.created, _): G.muted
         }
-        let suffix = running ? (container.health.map { " · \($0.label)" } ?? "") : ""
-        let label = running ? (showUptime ? "Running · \(container.statusText())\(suffix)" : "Running\(suffix)") : container.statusText()
+        let label: String = switch container.status {
+        case .running:
+            showUptime
+                ? "Running · \(container.statusText())\(container.health.map { " · \($0.label)" } ?? "")"
+                : "Running\(container.health.map { " · \($0.label)" } ?? "")"
+        case .paused:
+            "Paused"
+        case .exited, .created:
+            container.statusText()
+        }
         HStack(spacing: 6) {
             Circle().fill(tint).frame(width: 6, height: 6)
             Text(label)

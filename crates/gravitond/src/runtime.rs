@@ -148,6 +148,7 @@ struct Running {
     dns_aliases: Vec<String>,
     vm: Arc<AppleVm>,
     agent: Arc<Mutex<File>>,
+    paused: Arc<AtomicBool>,
     pid: Option<i32>,
     /// IPv4 address on the container network once DHCP has finished.
     ip: Option<String>,
@@ -253,6 +254,10 @@ impl Engine {
             }
             if let Some(h) = &r.healthcheck {
                 h.abort();
+            }
+            if r.paused.load(Ordering::Acquire) {
+                let _ = r.vm.resume();
+                r.paused.store(false, Ordering::Release);
             }
             let _ = r.agent.lock().unwrap().write_all(&encode_line(&AgentRequest::Shutdown));
         }
@@ -485,29 +490,28 @@ impl Engine {
         Ok(summary)
     }
 
-    pub(crate) fn image_for(&self, reference: &str) -> Result<LocalImage> {
-        self.image_for_platform(reference, None)
-    }
-
     pub(crate) fn image_for_platform(&self, reference: &str, platform: Option<&str>) -> Result<LocalImage> {
         let want_arch = platform.map(graviton_image::normalize_platform).transpose()?;
-        let matches = |img: &LocalImage| want_arch.as_deref().is_none_or(|a| img.architecture == a);
-        if let Some(img) = self.index.lock().unwrap().get(reference).filter(|i| matches(i)) {
-            return Ok(img.clone());
+        let pick = |img: &LocalImage| match want_arch.as_deref() {
+            Some(a) => img.for_arch(a),
+            None => Some(img.for_arch(graviton_image::guest_arch()).unwrap_or_else(|| img.clone())),
+        };
+        if let Some(img) = self.index.lock().unwrap().get(reference).and_then(&pick) {
+            return Ok(img);
         }
         // Two containers of a new image+platform at once: one pull, and the other waits for it.
         let key = format!("{}|{}", reference, want_arch.as_deref().unwrap_or(""));
         let gate = Arc::clone(self.pulling.lock().unwrap().entry(key).or_default());
         let _turn = gate.lock().unwrap();
-        if let Some(img) = self.index.lock().unwrap().get(reference).filter(|i| matches(i)) {
-            return Ok(img.clone());
+        if let Some(img) = self.index.lock().unwrap().get(reference).and_then(&pick) {
+            return Ok(img);
         }
         self.pull(reference, platform)?;
         self.index
             .lock()
             .unwrap()
             .get(reference)
-            .cloned()
+            .and_then(pick)
             .ok_or_else(|| anyhow!("pulled {reference} but can't find it"))
     }
 
@@ -537,7 +541,13 @@ impl Engine {
             let mut hits = index.images().filter(|img| {
                 let c = img.config_digest.strip_prefix("sha256:").unwrap_or(&img.config_digest);
                 let m = img.manifest_digest.strip_prefix("sha256:").unwrap_or(&img.manifest_digest);
-                c.starts_with(&hex) || m.starts_with(&hex)
+                c.starts_with(&hex)
+                    || m.starts_with(&hex)
+                    || img.variants.iter().any(|v| {
+                        let vc = v.config_digest.strip_prefix("sha256:").unwrap_or(&v.config_digest);
+                        let vm = v.manifest_digest.strip_prefix("sha256:").unwrap_or(&v.manifest_digest);
+                        vc.starts_with(&hex) || vm.starts_with(&hex)
+                    })
             });
             if let (Some(first), None) = (hits.next(), hits.next()) {
                 return Some(first.clone());
@@ -675,7 +685,10 @@ impl Engine {
         let want_arch = spec.platform.as_deref().map(graviton_image::normalize_platform).transpose()?;
         let image = self
             .resolve_local_image(&spec.image)
-            .filter(|img| want_arch.as_deref().is_none_or(|a| img.architecture == a))
+            .and_then(|img| match want_arch.as_deref() {
+                Some(a) => img.for_arch(a),
+                None => Some(img.for_arch(graviton_image::guest_arch()).unwrap_or(img)),
+            })
             .ok_or_else(|| anyhow!("No such image: {}", spec.image))?;
         self.create_with_image(spec, image)
     }
@@ -832,7 +845,10 @@ impl Engine {
 
     pub fn start(self: &Arc<Self>, key: &str) -> Result<ContainerSummary> {
         let id = self.store.lock().unwrap().container(key)?.id.clone();
-        if self.running.lock().unwrap().contains_key(&id) {
+        if let Some(r) = self.running.lock().unwrap().get(&id) {
+            if r.paused.load(Ordering::Acquire) {
+                bail!("container {key} is paused (use `grav unpause`)");
+            }
             bail!("container {key} is already running");
         }
         {
@@ -860,9 +876,9 @@ impl Engine {
         };
         let running_entry = {
             let running = self.running.lock().unwrap();
-            running.get(&id).map(|r| (Arc::clone(&r.agent), r.pid, Arc::clone(&r.vm)))
+            running.get(&id).map(|r| (Arc::clone(&r.agent), r.pid, Arc::clone(&r.vm), Arc::clone(&r.paused)))
         };
-        let Some((agent, pid, vm)) = running_entry else {
+        let Some((agent, pid, vm, paused)) = running_entry else {
             if cancelled {
                 self.save();
                 self.log(&id, LogLevel::Info, LogStream::System, "auto-restart cancelled".into());
@@ -870,6 +886,11 @@ impl Engine {
             }
             bail!("container {key} isn't running");
         };
+        if paused.load(Ordering::Acquire) {
+            // A paused VM cannot process SIGTERM or Shutdown until its vCPUs resume.
+            let _ = vm.resume();
+            paused.store(false, Ordering::Release);
+        }
         self.stopping.lock().unwrap().insert(id.clone());
         if let Some(pid) = pid {
             let _ = agent.lock().unwrap().write_all(&encode_line(&AgentRequest::Signal { pid, signal: 15 }));
@@ -898,6 +919,83 @@ impl Engine {
         Ok(self.store.lock().unwrap().container(&id)?.clone())
     }
 
+    pub fn pause(&self, key: &str) -> Result<ContainerSummary> {
+        let (id, name, image) = {
+            let store = self.store.lock().unwrap();
+            let c = store.container(key)?;
+            (c.id.clone(), c.name.clone(), c.image.clone())
+        };
+        let (vm, paused) = {
+            let running = self.running.lock().unwrap();
+            let Some(r) = running.get(&id) else {
+                bail!("container {key} isn't running");
+            };
+            if r.paused.load(Ordering::Acquire) {
+                bail!("container {key} is already paused");
+            }
+            (Arc::clone(&r.vm), Arc::clone(&r.paused))
+        };
+        paused.store(true, Ordering::Release);
+        if let Err(err) = vm.pause() {
+            paused.store(false, Ordering::Release);
+            return Err(err).context("pausing container VM");
+        }
+        let updated = self
+            .store
+            .lock()
+            .unwrap()
+            .update(&id, |c| {
+                c.status = ContainerStatus::Paused;
+                c.cpu_percent = Some(0.0);
+            })
+            .ok_or_else(|| anyhow!("container {key} disappeared"))?;
+        self.save();
+        self.log(&id, LogLevel::Info, LogStream::System, "container paused".into());
+        self.events.record(graviton_proto::EventKind::Paused, Some((&id, &name)), Some(&image), format!("{name} paused"));
+        Ok(updated)
+    }
+
+    pub fn unpause(&self, key: &str) -> Result<ContainerSummary> {
+        let (id, name, image) = {
+            let store = self.store.lock().unwrap();
+            let c = store.container(key)?;
+            (c.id.clone(), c.name.clone(), c.image.clone())
+        };
+        let (vm, paused) = {
+            let running = self.running.lock().unwrap();
+            let Some(r) = running.get(&id) else {
+                bail!("container {key} isn't running");
+            };
+            if !r.paused.load(Ordering::Acquire) {
+                bail!("container {key} isn't paused");
+            }
+            (Arc::clone(&r.vm), Arc::clone(&r.paused))
+        };
+        vm.resume().context("resuming container VM")?;
+        paused.store(false, Ordering::Release);
+        // Best-effort wall-clock resync so guest UTC matches host after a long pause.
+        if let Ok(fd) = vm.connect(AGENT_VSOCK_PORT) {
+            let mut conn = File::from(fd);
+            if matches!(read_event_unbuffered(&mut conn), Ok(AgentEvent::Ready { .. })) {
+                let _ = conn.write_all(&encode_line(&AgentRequest::SetClock { now_secs: now_secs() }));
+                let _ = read_event_unbuffered(&mut conn);
+            }
+        }
+        let updated = self
+            .store
+            .lock()
+            .unwrap()
+            .update(&id, |c| {
+                c.status = ContainerStatus::Running;
+            })
+            .ok_or_else(|| anyhow!("container {key} disappeared"))?;
+        self.save();
+        self.sync_hosts();
+        self.log(&id, LogLevel::Info, LogStream::System, "container unpaused".into());
+        self.events.record(graviton_proto::EventKind::Unpaused, Some((&id, &name)), Some(&image), format!("{name} unpaused"));
+        Ok(updated)
+    }
+
     pub fn restart(self: &Arc<Self>, key: &str) -> Result<ContainerSummary> {
         let id = self.store.lock().unwrap().container(key)?.id.clone();
         self.cancel_restart(&id);
@@ -914,13 +1012,21 @@ impl Engine {
     /// Send a POSIX signal to a running container's main process.
     pub fn signal_container(&self, key: &str, signal: i32) -> Result<()> {
         let id = self.store.lock().unwrap().container(key)?.id.clone();
-        let (agent, pid) = {
+        let (agent, pid, vm, paused) = {
             let running = self.running.lock().unwrap();
             let Some(r) = running.get(&id) else {
                 bail!("container {key} isn't running");
             };
-            (Arc::clone(&r.agent), r.pid)
+            (Arc::clone(&r.agent), r.pid, Arc::clone(&r.vm), Arc::clone(&r.paused))
         };
+        if paused.load(Ordering::Acquire) {
+            if signal == 9 {
+                vm.resume().context("resuming VM for SIGKILL")?;
+                paused.store(false, Ordering::Release);
+            } else {
+                bail!("container {key} is paused");
+            }
+        }
         if matches!(signal, 9 | 15) {
             if let Some(spec) = self.specs.lock().unwrap().get_mut(&id) {
                 spec.want_running = false;
@@ -1247,6 +1353,7 @@ impl Engine {
             AgentEvent::Ready { .. } => {}
             other => bail!("expected ready from the agent, got {other:?}"),
         }
+        let paused = Arc::new(AtomicBool::new(false));
         self.running.lock().unwrap().insert(
             id.to_string(),
             Running {
@@ -1256,6 +1363,7 @@ impl Engine {
                 dns_aliases: spec.dns_aliases.clone(),
                 vm: Arc::clone(&vm),
                 agent: Arc::clone(&agent),
+                paused: Arc::clone(&paused),
                 pid: None,
                 ip: None,
                 dns: false,
@@ -1308,23 +1416,31 @@ impl Engine {
             self.snapshots.maybe_warm_background(self.blobs.root().to_path_buf(), spec.cpus, spec.memory_mib, rosetta);
         }
 
-        // Publish ports now that the guest has an address.
+        // Publish ports: TCP uses vsock DialTcp (bypassing host Local Network Privacy),
+        // falling back to guest IP when talking to an older agent; UDP still uses NAT IP.
         if !bound.is_empty() {
-            match address {
-                Some(ip) => {
-                    let mut handles = Vec::new();
-                    for port in bound {
-                        let handle = match port {
-                            BoundPort::Tcp { listener, container_port } => self.forward_tcp(listener, SocketAddr::new(ip, container_port))?,
-                            BoundPort::Udp { socket, container_port } => self.forward_udp(socket, SocketAddr::new(ip, container_port))?,
-                        };
-                        handles.push(handle);
+            let mut handles = Vec::new();
+            let mut dropped_udp = false;
+            for port in bound {
+                match port {
+                    BoundPort::Tcp { listener, container_port } => {
+                        let fallback = address.map(|ip| SocketAddr::new(ip, container_port));
+                        handles.push(self.forward_tcp(listener, Arc::clone(&vm), Arc::clone(&paused), container_port, fallback)?);
                     }
-                    if let Some(r) = self.running.lock().unwrap().get_mut(id) {
-                        r.forwards = handles;
+                    BoundPort::Udp { socket, container_port } => {
+                        if let Some(ip) = address {
+                            handles.push(self.forward_udp(socket, SocketAddr::new(ip, container_port))?);
+                        } else {
+                            dropped_udp = true;
+                        }
                     }
                 }
-                None => self.log(id, LogLevel::Warn, LogStream::System, "the VM got no network address, so its ports aren't published".into()),
+            }
+            if dropped_udp {
+                self.log(id, LogLevel::Warn, LogStream::System, "the VM got no network address, so its UDP ports aren't published".into());
+            }
+            if let Some(r) = self.running.lock().unwrap().get_mut(id) {
+                r.forwards = handles;
             }
         }
 
@@ -1365,9 +1481,9 @@ impl Engine {
                 c.ip_address = ip.clone();
             });
             self.save();
-            self.start_monitor(id, Arc::clone(&vm));
+            self.start_monitor(id, Arc::clone(&vm), Arc::clone(&paused));
             if let Some(hc) = spec.healthcheck.clone() {
-                self.start_healthcheck(id, Arc::clone(&vm), hc);
+                self.start_healthcheck(id, Arc::clone(&vm), Arc::clone(&paused), hc);
             }
             let (cname, image) = self.store.lock().unwrap().container(id).map(|c| (c.name.clone(), c.image.clone())).unwrap_or_default();
             self.events.record(graviton_proto::EventKind::Started, Some((id, &cname)), Some(&image), format!("{cname} started"));
@@ -1405,9 +1521,9 @@ impl Engine {
                         c.ip_address = ip.clone();
                     });
                     self.save();
-                    self.start_monitor(id, Arc::clone(&vm));
+                    self.start_monitor(id, Arc::clone(&vm), Arc::clone(&paused));
                     if let Some(hc) = spec.healthcheck.clone() {
-                        self.start_healthcheck(id, Arc::clone(&vm), hc);
+                        self.start_healthcheck(id, Arc::clone(&vm), Arc::clone(&paused), hc);
                     }
                     let (cname, image) = self.store.lock().unwrap().container(id).map(|c| (c.name.clone(), c.image.clone())).unwrap_or_default();
                     self.events.record(graviton_proto::EventKind::Started, Some((id, &cname)), Some(&image), format!("{cname} started"));
@@ -1471,7 +1587,7 @@ impl Engine {
                 .collect();
             let targets = running
                 .values()
-                .filter(|r| r.dns && r.ip.is_some())
+                .filter(|r| r.dns && r.ip.is_some() && !r.paused.load(Ordering::Acquire))
                 .map(|r| SyncTarget { project: r.project.clone(), agent: Arc::clone(&r.agent) })
                 .collect();
             (peers, targets)
@@ -1509,17 +1625,59 @@ impl Engine {
         }
     }
 
-    /// Forward TCP connections on `listener` to `target` in the guest.
-    fn forward_tcp(&self, listener: TcpListener, target: SocketAddr) -> Result<tokio::task::JoinHandle<()>> {
+    /// Forward TCP connections on `listener` to `127.0.0.1:<container_port>` inside the guest over vsock,
+    /// falling back to `fallback` (guest NAT IP) only when talking to an older guest agent without `DialTcp`.
+    fn forward_tcp(
+        &self,
+        listener: TcpListener,
+        vm: Arc<AppleVm>,
+        paused: Arc<AtomicBool>,
+        container_port: u16,
+        fallback: Option<SocketAddr>,
+    ) -> Result<tokio::task::JoinHandle<()>> {
         listener.set_nonblocking(true)?;
         let _guard = self.rt.enter();
         let listener = tokio::net::TcpListener::from_std(listener)?;
         Ok(self.rt.spawn(async move {
             loop {
                 let Ok((mut inbound, _)) = listener.accept().await else { continue };
+                if paused.load(Ordering::Acquire) {
+                    continue;
+                }
+                let vm = Arc::clone(&vm);
                 tokio::spawn(async move {
-                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
-                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    let _ = inbound.set_nodelay(true);
+                    match tokio::task::spawn_blocking(move || dial_guest_tcp(&vm, container_port)).await {
+                        Ok(Ok(fd)) => {
+                            let std_stream = std::os::unix::net::UnixStream::from(fd);
+                            if std_stream.set_nonblocking(true).is_ok() {
+                                if let Ok(mut guest) = tokio::net::UnixStream::from_std(std_stream) {
+                                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut guest).await;
+                                }
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            let msg = format!("{err:#}");
+                            if msg.contains("bad request") || msg.contains("unknown variant") {
+                                if let Some(target) = fallback {
+                                    match tokio::net::TcpStream::connect(target).await {
+                                        Ok(mut outbound) => {
+                                            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                                        }
+                                        Err(fb_err) => {
+                                            eprintln!("port forward :{container_port} fallback {target}: {fb_err}");
+                                        }
+                                    }
+                                    return;
+                                }
+                            }
+                            if !msg.contains("Connection refused") {
+                                eprintln!("port forward :{container_port}: {msg}");
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("port forward :{container_port} task error: {err}");
+                        }
                     }
                 });
             }
@@ -1537,7 +1695,7 @@ impl Engine {
 
     /// Sample the container every [`STATS_INTERVAL`] on its own agent
     /// connection, until its VM stops.
-    fn start_monitor(self: &Arc<Self>, id: &str, vm: Arc<AppleVm>) {
+    fn start_monitor(self: &Arc<Self>, id: &str, vm: Arc<AppleVm>, paused: Arc<AtomicBool>) {
         let engine = Arc::clone(self);
         let id = id.to_string();
         let (spec_cpus, limit) = self
@@ -1567,7 +1725,15 @@ impl Engine {
             let mut previous: Option<GuestStats> = None;
             loop {
                 let still_running = engine.running.lock().unwrap().get(&id).is_some_and(|r| Arc::ptr_eq(&r.vm, &vm));
-                if !still_running || conn.write_all(&encode_line(&AgentRequest::Stats { processes: true })).is_err() {
+                if !still_running {
+                    break;
+                }
+                if paused.load(Ordering::Acquire) {
+                    previous = None;
+                    std::thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+                if conn.write_all(&encode_line(&AgentRequest::Stats { processes: true })).is_err() {
                     break;
                 }
                 let Ok(AgentEvent::Stats(now)) = events.next() else { break };
@@ -1595,7 +1761,7 @@ impl Engine {
         });
     }
 
-    fn start_healthcheck(self: &Arc<Self>, id: &str, vm: Arc<AppleVm>, hc: Healthcheck) {
+    fn start_healthcheck(self: &Arc<Self>, id: &str, vm: Arc<AppleVm>, paused: Arc<AtomicBool>, hc: Healthcheck) {
         let Some(argv) = hc.exec_command() else { return };
         let Some(cs) = self.specs.lock().unwrap().get(id).cloned() else { return };
         let engine = Arc::clone(self);
@@ -1621,6 +1787,9 @@ impl Engine {
                     let Some(r) = running.get(&id_owned).filter(|r| Arc::ptr_eq(&r.vm, &vm_for_task)) else {
                         break;
                     };
+                    if r.paused.load(Ordering::Acquire) {
+                        continue;
+                    }
                     let (cname, image) = engine
                         .store
                         .lock()
@@ -1674,6 +1843,9 @@ impl Engine {
                         if !still_running {
                             break;
                         }
+                        if paused.load(Ordering::Acquire) {
+                            continue;
+                        }
                         (-1, format!("healthcheck error: {err:#}"))
                     }
                     Ok(Err(err)) => {
@@ -1686,9 +1858,15 @@ impl Engine {
                         if !still_running {
                             break;
                         }
+                        if paused.load(Ordering::Acquire) {
+                            continue;
+                        }
                         (-1, format!("healthcheck task panicked: {err}"))
                     }
                     Err(_elapsed) => {
+                        if paused.load(Ordering::Acquire) {
+                            continue;
+                        }
                         let pid = probe_pid.load(Ordering::Acquire);
                         if pid > 0 {
                             let _ = agent.lock().unwrap().write_all(&encode_line(&AgentRequest::Signal {
@@ -1700,6 +1878,9 @@ impl Engine {
                     }
                 };
 
+                if paused.load(Ordering::Acquire) {
+                    continue;
+                }
                 let end = now_secs().max(start);
                 let still_running = engine
                     .running
@@ -1720,7 +1901,7 @@ impl Engine {
                     (transition, state.status, state.failing_streak)
                 };
                 engine.store.lock().unwrap().update(&id_owned, |c| {
-                    if c.status == ContainerStatus::Running {
+                    if matches!(c.status, ContainerStatus::Running | ContainerStatus::Paused) {
                         c.health = Some(new_status);
                     }
                 });
@@ -1778,10 +1959,22 @@ impl Engine {
 
     // -- Files and details --------------------------------------------------
 
+    /// Return a cloned VM handle only when container `id` is live and unpaused.
+    fn active_vm(&self, id: &str, key: &str) -> Result<Arc<AppleVm>> {
+        let running = self.running.lock().unwrap();
+        let Some(r) = running.get(id) else {
+            bail!("container {key} isn't running");
+        };
+        if r.paused.load(Ordering::Acquire) {
+            bail!("container {key} is paused");
+        }
+        Ok(Arc::clone(&r.vm))
+    }
+
     /// Send one request on a fresh agent connection and return its answer.
     fn agent_call(&self, key: &str, request: impl FnOnce(String) -> AgentRequest) -> Result<AgentEvent> {
         let id = self.store.lock().unwrap().container(key)?.id.clone();
-        let vm = self.running.lock().unwrap().get(&id).map(|r| Arc::clone(&r.vm)).ok_or_else(|| anyhow!("container {key} isn't running"))?;
+        let vm = self.active_vm(&id, key)?;
         let mut conn = File::from(vm.connect(AGENT_VSOCK_PORT)?);
         match read_event_unbuffered(&mut conn)? {
             AgentEvent::Ready { .. } => {}
@@ -1812,7 +2005,7 @@ impl Engine {
     /// Returns `(is_dir, name, fd)` positioned immediately after `ArchiveReady\n`.
     pub fn get_archive_open(&self, key: &str, path: &str) -> Result<(bool, String, OwnedFd)> {
         let id = self.store.lock().unwrap().container(key)?.id.clone();
-        let vm = self.running.lock().unwrap().get(&id).map(|r| Arc::clone(&r.vm)).ok_or_else(|| anyhow!("container {key} isn't running"))?;
+        let vm = self.active_vm(&id, key)?;
         let mut conn = File::from(vm.connect(AGENT_VSOCK_PORT)?);
         match read_event_unbuffered(&mut conn)? {
             AgentEvent::Ready { .. } => {}
@@ -1829,7 +2022,7 @@ impl Engine {
     /// Open a dedicated agent connection ready to receive `size` bytes of tar to unpack into `path`.
     pub fn put_archive_open(&self, key: &str, path: &str, size: u64) -> Result<OwnedFd> {
         let id = self.store.lock().unwrap().container(key)?.id.clone();
-        let vm = self.running.lock().unwrap().get(&id).map(|r| Arc::clone(&r.vm)).ok_or_else(|| anyhow!("container {key} isn't running"))?;
+        let vm = self.active_vm(&id, key)?;
         let mut conn = File::from(vm.connect(AGENT_VSOCK_PORT)?);
         match read_event_unbuffered(&mut conn)? {
             AgentEvent::Ready { .. } => {}
@@ -1876,7 +2069,7 @@ impl Engine {
             let store = self.store.lock().unwrap();
             for (id, spec) in specs.iter() {
                 let Ok(container) = store.container(id) else { continue };
-                let running = container.status == ContainerStatus::Running;
+                let running = matches!(container.status, ContainerStatus::Running | ContainerStatus::Paused);
                 for v in &spec.volumes {
                     let Some(name) = &v.name else { continue };
                     users.entry(name.clone()).or_default().push(VolumeMountRef {
@@ -1989,14 +2182,14 @@ impl Engine {
         let containers = self.store.lock().unwrap().containers().to_vec();
         let (subnet, gateway) = containers
             .iter()
-            .filter(|c| c.status == ContainerStatus::Running)
+            .filter(|c| matches!(c.status, ContainerStatus::Running | ContainerStatus::Paused))
             .filter_map(|c| c.ip_address.as_deref())
             .find_map(ipv4_subnet_and_gateway)
             .unwrap_or_else(|| ("192.168.64.0/24".into(), "192.168.64.1".into()));
         let mut endpoints: Vec<NetworkEndpoint> = containers
             .into_iter()
             .map(|c| {
-                let is_running = c.status == ContainerStatus::Running;
+                let is_running = matches!(c.status, ContainerStatus::Running | ContainerStatus::Paused);
                 let (live_ip, dns_enabled, aliases) = running.get(&c.id).cloned().unwrap_or((None, false, vec![]));
                 let ip = if is_running { live_ip.or(c.ip_address) } else { None };
                 let mut dns_names = if is_running && ip.is_some() {
@@ -2022,8 +2215,8 @@ impl Engine {
             })
             .collect();
         endpoints.sort_by(|a, b| {
-            (b.status == ContainerStatus::Running)
-                .cmp(&(a.status == ContainerStatus::Running))
+            matches!(b.status, ContainerStatus::Running | ContainerStatus::Paused)
+                .cmp(&matches!(a.status, ContainerStatus::Running | ContainerStatus::Paused))
                 .then_with(|| a.container_name.cmp(&b.container_name))
         });
         NetworkInfo {
@@ -2051,7 +2244,7 @@ impl Engine {
             let c = store.container(&spec.id)?;
             (c.id.clone(), c.name.clone())
         };
-        let vm = self.running.lock().unwrap().get(&id).map(|r| Arc::clone(&r.vm)).ok_or_else(|| anyhow!("container {} isn't running", spec.id))?;
+        let vm = self.active_vm(&id, &spec.id)?;
         let cs = self.specs.lock().unwrap().get(&id).cloned().ok_or_else(|| anyhow!("unknown container {}", spec.id))?;
         if spec.command.is_empty() {
             bail!("give a command to run");
@@ -2452,6 +2645,20 @@ fn sample_between(prev: &GuestStats, now: &GuestStats, limit: u64) -> StatSample
         memory_limit_bytes,
         net_rx_bytes: now.net_rx_bytes,
         net_tx_bytes: now.net_tx_bytes,
+    }
+}
+
+fn dial_guest_tcp(vm: &AppleVm, port: u16) -> Result<OwnedFd> {
+    let mut conn = File::from(vm.connect(AGENT_VSOCK_PORT)?);
+    match read_event_unbuffered(&mut conn)? {
+        AgentEvent::Ready { .. } => {}
+        other => bail!("expected ready from the agent, got {other:?}"),
+    }
+    conn.write_all(&encode_line(&AgentRequest::DialTcp { port }))?;
+    match read_event_unbuffered(&mut conn)? {
+        AgentEvent::Connected => Ok(OwnedFd::from(conn)),
+        AgentEvent::Error { message } => bail!("{message}"),
+        other => bail!("expected connected from the agent, got {other:?}"),
     }
 }
 

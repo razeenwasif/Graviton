@@ -664,6 +664,8 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                 Request::Start { id } => result(store.start(&id).map(Response::Container)),
                 Request::Stop { id } => result(store.stop(&id).map(Response::Container)),
                 Request::Restart { id } => result(store.restart(&id).map(Response::Container)),
+                Request::Pause { id } => result(store.pause(&id).map(Response::Container)),
+                Request::Unpause { id } => result(store.unpause(&id).map(Response::Container)),
                 Request::ListVolumes => Response::Volumes(demo_volumes(&store)),
                 Request::NetworkInfo => Response::Network(demo_network(&store)),
                 Request::SnapshotStatus => Response::Snapshots(graviton_proto::SnapshotInfo::default()),
@@ -699,6 +701,8 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                     Request::Start { id } => Response::Container(engine.start(&id)?),
                     Request::Stop { id } => Response::Container(engine.stop(&id)?),
                     Request::Restart { id } => Response::Container(engine.restart(&id)?),
+                    Request::Pause { id } => Response::Container(engine.pause(&id)?),
+                    Request::Unpause { id } => Response::Container(engine.unpause(&id)?),
                     Request::Remove { id } => Response::Removed { id: engine.remove(&id)? },
                     Request::DiskUsage => Response::DiskUsage(cleanup::disk_usage(&engine)),
                     Request::RemoveImage { reference } => {
@@ -812,6 +816,14 @@ mod tests {
     async fn demo_backend_handles_requests() {
         let backend = Backend::Demo(Arc::new(Mutex::new(Store::demo())));
         assert_eq!(handle(Request::Ping, &backend).await, Response::Pong { protocol: PROTOCOL_VERSION });
+        match handle(Request::Pause { id: "web".into() }, &backend).await {
+            Response::Container(c) => assert_eq!(c.status, graviton_proto::ContainerStatus::Paused),
+            other => panic!("unexpected {other:?}"),
+        }
+        match handle(Request::Unpause { id: "web".into() }, &backend).await {
+            Response::Container(c) => assert_eq!(c.status, graviton_proto::ContainerStatus::Running),
+            other => panic!("unexpected {other:?}"),
+        }
         match handle(Request::Stop { id: "web".into() }, &backend).await {
             Response::Container(c) => assert_eq!(c.name, "web"),
             other => panic!("unexpected {other:?}"),

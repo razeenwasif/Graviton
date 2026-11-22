@@ -637,6 +637,8 @@ pub enum EventKind {
     Stopped,
     /// Exited on its own with a non-zero code, or couldn't start.
     Failed,
+    Paused,
+    Unpaused,
     Healthy,
     Unhealthy,
     Pulled,
@@ -977,6 +979,8 @@ pub enum Request {
     Start { id: String },
     Stop { id: String },
     Restart { id: String },
+    Pause { id: String },
+    Unpause { id: String },
     /// Pull an image from its registry; answers `Image` when done.
     /// With `progress: true`, streams `PullProgress` lines before the final `Image`.
     Pull {
@@ -1310,6 +1314,10 @@ pub enum AgentRequest {
         generation: u64,
         hosts: Vec<HostEntry>,
     },
+    /// Open a direct bidirectional TCP tunnel over vsock to `127.0.0.1:<port>` inside the guest VM.
+    DialTcp { port: u16 },
+    /// Sync guest wall clock (`CLOCK_REALTIME`) to host UTC seconds (e.g. after VM unpause).
+    SetClock { now_secs: u64 },
     Shutdown,
 }
 
@@ -1340,7 +1348,9 @@ pub enum AgentEvent {
     File(FileContents),
     /// Precedes raw tar bytes for `AgentRequest::GetArchive`.
     ArchiveReady { is_dir: bool, name: String },
-    /// A step finished that has nothing else to report (snapshot, mkdir).
+    /// Precedes raw TCP bytes for `AgentRequest::DialTcp`.
+    Connected,
+    /// A step finished that has nothing else to report (snapshot, mkdir, clock sync).
     Done,
     /// `copy` placed this many files.
     Copied { files: u64 },
@@ -1918,5 +1928,25 @@ mod tests {
         .unwrap();
         assert_eq!(legacy_details.healthcheck, None);
         assert_eq!(legacy_details.health, None);
+    }
+
+    #[test]
+    fn pause_and_dial_tcp_round_trip() {
+        let pause = Request::Pause { id: "web".into() };
+        assert_eq!(String::from_utf8(encode_line(&pause)).unwrap(), "{\"method\":\"pause\",\"params\":{\"id\":\"web\"}}\n");
+        assert_eq!(decode_line::<Request>(&encode_line(&pause)).unwrap(), pause);
+
+        let unpause = Request::Unpause { id: "web".into() };
+        assert_eq!(String::from_utf8(encode_line(&unpause)).unwrap(), "{\"method\":\"unpause\",\"params\":{\"id\":\"web\"}}\n");
+        assert_eq!(decode_line::<Request>(&encode_line(&unpause)).unwrap(), unpause);
+
+        assert!(!EventKind::Paused.is_alert());
+        assert!(!EventKind::Unpaused.is_alert());
+
+        let dial = AgentRequest::DialTcp { port: 18092 };
+        assert_eq!(decode_line::<AgentRequest>(&encode_line(&dial)).unwrap(), dial);
+        let clk = AgentRequest::SetClock { now_secs: 1_795_000_000 };
+        assert_eq!(decode_line::<AgentRequest>(&encode_line(&clk)).unwrap(), clk);
+        assert_eq!(decode_line::<AgentEvent>(&encode_line(&AgentEvent::Connected)).unwrap(), AgentEvent::Connected);
     }
 }

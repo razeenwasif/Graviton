@@ -11,6 +11,7 @@ struct BuildImageSheet: View {
     @State private var tag = ""
     @State private var dockerfile = ""
     @State private var buildArgs = ""
+    @State private var platform = ""
     @State private var noCache = false
     @State private var lines: [String] = []
     @State private var phase: Phase = .idle
@@ -65,6 +66,16 @@ struct BuildImageSheet: View {
                 GFormRow("Dockerfile") { field("Dockerfile", text: $dockerfile) }.frame(width: 190)
             }
             GFormRow("Build args") { field("KEY=value, KEY2=value", text: $buildArgs) }
+            if store.engine?.rosetta == true {
+                GFormRow("Platform") {
+                    GSegmented(selection: $platform, options: [
+                        ("", "Native"),
+                        ("linux/amd64", "amd64 (Rosetta)"),
+                        ("linux/arm64,linux/amd64", "Multi-arch"),
+                    ])
+                    .disabled(building)
+                }
+            }
             Toggle("Rebuild every step (no cache)", isOn: $noCache).toggleStyle(.gCheckbox).disabled(building)
 
             ScrollViewReader { proxy in
@@ -157,7 +168,8 @@ struct BuildImageSheet: View {
         let name = tag.trimmingCharacters(in: .whitespaces)
         let file = dockerfile.trimmingCharacters(in: .whitespaces)
         let spec = BuildSpec(context: folder, dockerfile: file.isEmpty ? nil : file, tag: name.isEmpty ? nil : name,
-                             buildArgs: RunSpec.list(buildArgs), noCache: noCache)
+                             buildArgs: RunSpec.list(buildArgs), noCache: noCache,
+                             platform: platform.isEmpty ? nil : platform)
         lines = []
         let since = Date.now
         phase = .building(since: since)

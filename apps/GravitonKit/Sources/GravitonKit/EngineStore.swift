@@ -86,6 +86,8 @@ public final class EngineStore {
     }
 
     public var runningCount: Int { containers.filter(\.isRunning).count }
+    public var pausedCount: Int { containers.filter(\.isPaused).count }
+    public var activeCount: Int { containers.filter(\.isActive).count }
     public var totalCPU: Double { containers.compactMap(\.cpuPercent).reduce(0, +) }
     public var totalMemory: UInt64 { containers.compactMap(\.memoryBytes).reduce(0, +) }
     public var stacks: [ContainerStack] { ContainerStack.group(containers).stacks }
@@ -372,6 +374,8 @@ public final class EngineStore {
 
     public func start(_ c: Container) async { await lifecycle { try await $0.start(id: c.id) } }
     public func stop(_ c: Container) async { await lifecycle { try await $0.stop(id: c.id) } }
+    public func pause(_ c: Container) async { await lifecycle { try await $0.pause(id: c.id) } }
+    public func unpause(_ c: Container) async { await lifecycle { try await $0.unpause(id: c.id) } }
     public func restart(_ c: Container) async { await lifecycle { try await $0.restart(id: c.id) } }
 
     /// Throwing lifecycle variants for programmatic callers (e.g. Fairy) that surface errors inline.
@@ -379,6 +383,10 @@ public final class EngineStore {
     public func performStart(_ c: Container) async throws -> Container { try await throwingLifecycle { try await $0.start(id: c.id) } }
     @discardableResult
     public func performStop(_ c: Container) async throws -> Container { try await throwingLifecycle { try await $0.stop(id: c.id) } }
+    @discardableResult
+    public func performPause(_ c: Container) async throws -> Container { try await throwingLifecycle { try await $0.pause(id: c.id) } }
+    @discardableResult
+    public func performUnpause(_ c: Container) async throws -> Container { try await throwingLifecycle { try await $0.unpause(id: c.id) } }
     @discardableResult
     public func performRestart(_ c: Container) async throws -> Container { try await throwingLifecycle { try await $0.restart(id: c.id) } }
     @discardableResult
@@ -477,8 +485,8 @@ public enum ContainerFilter: String, CaseIterable, Identifiable, Sendable {
         list.filter { c in
             let statusOK = switch self {
             case .all: true
-            case .running: c.isRunning
-            case .stopped: !c.isRunning
+            case .running: c.isActive
+            case .stopped: !c.isActive
             }
             let q = search.trimmingCharacters(in: .whitespaces).lowercased()
             return statusOK && (

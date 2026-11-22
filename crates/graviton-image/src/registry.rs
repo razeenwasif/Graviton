@@ -85,6 +85,26 @@ pub fn normalize_platform(raw: &str) -> Result<String> {
     }
 }
 
+/// Parse a comma-separated platform list (e.g. `linux/arm64,linux/amd64`) into
+/// deduplicated normalized OCI architecture names preserving caller order.
+pub fn parse_platforms(raw: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let arch = normalize_platform(trimmed)?;
+        if !out.contains(&arch) {
+            out.push(arch);
+        }
+    }
+    if out.is_empty() {
+        return Err(ImageError::Unsupported("empty platform".into()));
+    }
+    Ok(out)
+}
+
 fn normalize_arch_label(arch: &str) -> String {
     match arch.trim().to_ascii_lowercase().as_str() {
         "" => guest_arch().into(),
@@ -284,6 +304,7 @@ impl Registry {
             layers: layers.into_iter().map(|l| Layer { digest: l.digest, size: l.size, media_type: l.media_type }).collect(),
             architecture: actual_arch,
             pulled_at: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+            variants: Vec::new(),
         })
     }
 
@@ -324,39 +345,12 @@ impl Registry {
         let repo = &target.repository;
 
         let manifest_digest = Digest::parse(&image.manifest_digest)?;
-        let manifest_bytes = if blobs.has(&manifest_digest) {
-            blobs.read(&manifest_digest)?
-        } else {
-            let config_digest = Digest::parse(&image.config_digest)?;
-            let config_size = blobs.size(&config_digest).ok_or_else(|| {
-                ImageError::Unsupported(format!("local image {} is missing config blob {}", image.reference, config_digest))
-            })?;
-            let layers_json: Vec<serde_json::Value> = image
-                .layers
-                .iter()
-                .map(|l| serde_json::json!({ "mediaType": l.media_type, "digest": l.digest, "size": l.size }))
-                .collect();
-            serde_json::to_vec(&serde_json::json!({
-                "schemaVersion": 2,
-                "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                "config": {
-                    "mediaType": "application/vnd.oci.image.config.v1+json",
-                    "digest": image.config_digest,
-                    "size": config_size,
-                },
-                "layers": layers_json,
-            }))
-            .map_err(|source| ImageError::Json { what: "manifest".into(), source })?
-        };
-        let manifest_parsed: Manifest = json(&manifest_bytes, "manifest")?;
-        let manifest_media_type = manifest_parsed
-            .media_type
-            .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".into());
+        let is_multi_arch = image.variants.len() > 1;
 
-        // Deduplicate blob digests while preserving layer-then-config upload order.
+        // Collect all blobs to upload (deduplicated across all variants), plus manifests to push.
         let mut seen = HashSet::new();
         let mut blob_list: Vec<(Digest, u64)> = Vec::new();
-        for raw_digest in image.layers.iter().map(|l| l.digest.as_str()).chain(std::iter::once(image.config_digest.as_str())) {
+        let mut add_blob = |raw_digest: &str| -> Result<()> {
             let d = Digest::parse(raw_digest)?;
             if seen.insert(d.clone()) {
                 let size = blobs.size(&d).ok_or_else(|| {
@@ -364,7 +358,48 @@ impl Registry {
                 })?;
                 blob_list.push((d, size));
             }
-        }
+            Ok(())
+        };
+
+        // Child manifests `(digest_str, media_type, bytes)` pushed by digest before the top-level index.
+        let mut child_manifests: Vec<(String, String, Vec<u8>)> = Vec::new();
+        let (top_media_type, top_bytes): (String, Vec<u8>) = if is_multi_arch {
+            let mut descriptors = Vec::with_capacity(image.variants.len());
+            for v in &image.variants {
+                for l in &v.layers {
+                    add_blob(&l.digest)?;
+                }
+                add_blob(&v.config_digest)?;
+                let (v_bytes, v_media) = load_or_synthesize_manifest(blobs, &image.reference, &v.manifest_digest, &v.config_digest, &v.layers)?;
+                let v_digest = Digest::of(&v_bytes).to_string();
+                descriptors.push(serde_json::json!({
+                    "mediaType": v_media,
+                    "digest": v_digest,
+                    "size": v_bytes.len(),
+                    "platform": { "os": "linux", "architecture": v.architecture },
+                }));
+                child_manifests.push((v_digest, v_media, v_bytes));
+            }
+            let idx_bytes = if blobs.has(&manifest_digest) {
+                let bytes = blobs.read(&manifest_digest)?;
+                let parsed: Manifest = json(&bytes, "image index")?;
+                if parsed.manifests.is_some() {
+                    bytes
+                } else {
+                    synthesize_oci_index(&descriptors)?
+                }
+            } else {
+                synthesize_oci_index(&descriptors)?
+            };
+            ("application/vnd.oci.image.index.v1+json".to_string(), idx_bytes)
+        } else {
+            for l in &image.layers {
+                add_blob(&l.digest)?;
+            }
+            add_blob(&image.config_digest)?;
+            let (m_bytes, m_media) = load_or_synthesize_manifest(blobs, &image.reference, &image.manifest_digest, &image.config_digest, &image.layers)?;
+            (m_media, m_bytes)
+        };
 
         let total_blob_bytes: u64 = blob_list.iter().map(|(_, s)| *s).sum();
         progress(PushProgress::Started {
@@ -451,8 +486,26 @@ impl Registry {
             });
         }
 
+        let mut manifests_size = 0u64;
+        for (child_digest, child_media, child_bytes) in &child_manifests {
+            let child_path = format!("/v2/{repo}/manifests/{child_digest}");
+            let mut resp = session.put_bytes_path(&child_path, child_media, child_bytes)?;
+            let status = resp.status().as_u16();
+            if status != 200 && status != 201 {
+                let why = error_snippet(&mut resp);
+                return Err(ImageError::Registry(format!(
+                    "returned HTTP {status} pushing manifest {child_digest}{why}"
+                )));
+            }
+            manifests_size += child_bytes.len() as u64;
+            progress(PushProgress::Manifest {
+                digest: child_digest.clone(),
+                size: child_bytes.len() as u64,
+            });
+        }
+
         let manifest_path = format!("/v2/{repo}/manifests/{tag}");
-        let mut man_resp = session.put_bytes_path(&manifest_path, &manifest_media_type, &manifest_bytes)?;
+        let mut man_resp = session.put_bytes_path(&manifest_path, &top_media_type, &top_bytes)?;
         let man_status = man_resp.status().as_u16();
         if man_status != 200 && man_status != 201 {
             let why = error_snippet(&mut man_resp);
@@ -463,21 +516,69 @@ impl Registry {
         let header_digest = raw_header(&man_resp, "docker-content-digest")
             .and_then(|d| Digest::parse(&d).ok())
             .map(|d| d.to_string());
-        let final_digest = header_digest.unwrap_or_else(|| Digest::of(&manifest_bytes).to_string());
-        let manifest_size = manifest_bytes.len() as u64;
+        let final_digest = header_digest.unwrap_or_else(|| Digest::of(&top_bytes).to_string());
+        let top_size = top_bytes.len() as u64;
+        manifests_size += top_size;
         progress(PushProgress::Manifest {
             digest: final_digest.clone(),
-            size: manifest_size,
+            size: top_size,
         });
 
         Ok(PushResult {
             reference: target.to_string(),
             digest: final_digest,
-            size_bytes: total_blob_bytes + manifest_size,
+            size_bytes: total_blob_bytes + manifests_size,
             blobs_pushed,
             blobs_skipped,
         })
     }
+}
+
+fn load_or_synthesize_manifest(
+    blobs: &BlobStore,
+    reference: &str,
+    manifest_digest: &str,
+    config_digest: &str,
+    layers: &[Layer],
+) -> Result<(Vec<u8>, String)> {
+    let md = Digest::parse(manifest_digest)?;
+    let bytes = if blobs.has(&md) {
+        blobs.read(&md)?
+    } else {
+        let cd = Digest::parse(config_digest)?;
+        let config_size = blobs.size(&cd).ok_or_else(|| {
+            ImageError::Unsupported(format!("local image {reference} is missing config blob {cd}"))
+        })?;
+        let layers_json: Vec<serde_json::Value> = layers
+            .iter()
+            .map(|l| serde_json::json!({ "mediaType": l.media_type, "digest": l.digest, "size": l.size }))
+            .collect();
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config_size,
+            },
+            "layers": layers_json,
+        }))
+        .map_err(|source| ImageError::Json { what: "manifest".into(), source })?
+    };
+    let parsed: Manifest = json(&bytes, "manifest")?;
+    let media_type = parsed
+        .media_type
+        .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".into());
+    Ok((bytes, media_type))
+}
+
+fn synthesize_oci_index(manifests: &[serde_json::Value]) -> Result<Vec<u8>> {
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": manifests,
+    }))
+    .map_err(|source| ImageError::Json { what: "image index".into(), source })
 }
 
 struct Session<'a> {
@@ -1520,6 +1621,37 @@ mod tests {
             }],
             architecture: guest_arch().into(),
             pulled_at: 1,
+            variants: Vec::new(),
+        };
+        (img, cfg_bytes)
+    }
+
+    fn make_local_test_image_arch(blobs: &BlobStore, reference: &str, arch: &str, layer_bytes: &[u8]) -> (LocalImage, Vec<u8>) {
+        let cfg_bytes = format!(r#"{{"architecture":"{arch}","os":"linux","config":{{"Cmd":["/bin/echo","{arch}"]}}}}"#).into_bytes();
+        let cfg_digest = Digest::of(&cfg_bytes);
+        blobs.write_bytes(&cfg_digest, &cfg_bytes).unwrap();
+        let layer_digest = Digest::of(layer_bytes);
+        blobs.write_bytes(&layer_digest, layer_bytes).unwrap();
+        let manifest_bytes = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{cfg_digest}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{layer_digest}","size":{}}}]}}"#,
+            cfg_bytes.len(),
+            layer_bytes.len()
+        )
+        .into_bytes();
+        let man_digest = Digest::of(&manifest_bytes);
+        blobs.write_bytes(&man_digest, &manifest_bytes).unwrap();
+        let img = LocalImage {
+            reference: reference.into(),
+            manifest_digest: man_digest.to_string(),
+            config_digest: cfg_digest.to_string(),
+            layers: vec![Layer {
+                digest: layer_digest.to_string(),
+                size: layer_bytes.len() as u64,
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+            }],
+            architecture: arch.into(),
+            pulled_at: 1,
+            variants: Vec::new(),
         };
         (img, cfg_bytes)
     }
@@ -1594,6 +1726,116 @@ mod tests {
             reg.push_with_auth(&local, &digest_target, &blobs, Some(&creds), |_| {}),
             Err(ImageError::Unsupported(_))
         ));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn parses_comma_separated_platforms() {
+        assert_eq!(parse_platforms("linux/arm64, linux/amd64, arm64").unwrap(), vec!["arm64", "amd64"]);
+        assert_eq!(parse_platforms("linux/amd64").unwrap(), vec!["amd64"]);
+        assert!(parse_platforms("").is_err());
+        assert!(parse_platforms(" , ").is_err());
+        assert!(parse_platforms("windows/amd64").is_err());
+    }
+
+    #[test]
+    fn multi_arch_index_push_and_pull_both_platforms() {
+        let addr = spawn_stateful_push_registry(true, "alice", "token_123");
+        let reg = Registry::new();
+        let creds = Credentials { username: "alice".into(), password: "token_123".into() };
+
+        let base = std::env::temp_dir().join(format!("graviton-push-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src_blobs = BlobStore::new(base.join("src"));
+        let dst_blobs = BlobStore::new(base.join("dst"));
+
+        let target = ImageReference::parse(&format!("{addr}/team/app:multi")).unwrap();
+        let (arm_img, arm_cfg) = make_local_test_image_arch(&src_blobs, &target.to_string(), "arm64", b"shared-base-layer");
+        let (amd_img, amd_cfg) = make_local_test_image_arch(&src_blobs, &target.to_string(), "amd64", b"shared-base-layer");
+
+        let descriptors = vec![
+            serde_json::json!({
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": arm_img.manifest_digest,
+                "size": src_blobs.size(&Digest::parse(&arm_img.manifest_digest).unwrap()).unwrap(),
+                "platform": { "os": "linux", "architecture": "arm64" }
+            }),
+            serde_json::json!({
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": amd_img.manifest_digest,
+                "size": src_blobs.size(&Digest::parse(&amd_img.manifest_digest).unwrap()).unwrap(),
+                "platform": { "os": "linux", "architecture": "amd64" }
+            }),
+        ];
+        let idx_bytes = synthesize_oci_index(&descriptors).unwrap();
+        let idx_digest = Digest::of(&idx_bytes);
+        src_blobs.write_bytes(&idx_digest, &idx_bytes).unwrap();
+
+        let multi = LocalImage {
+            reference: target.to_string(),
+            manifest_digest: idx_digest.to_string(),
+            config_digest: arm_img.config_digest.clone(),
+            layers: arm_img.layers.clone(),
+            architecture: "arm64".into(),
+            pulled_at: 1,
+            variants: vec![
+                crate::ImageVariant {
+                    architecture: "arm64".into(),
+                    manifest_digest: arm_img.manifest_digest.clone(),
+                    config_digest: arm_img.config_digest.clone(),
+                    layers: arm_img.layers.clone(),
+                },
+                crate::ImageVariant {
+                    architecture: "amd64".into(),
+                    manifest_digest: amd_img.manifest_digest.clone(),
+                    config_digest: amd_img.config_digest.clone(),
+                    layers: amd_img.layers.clone(),
+                },
+            ],
+        };
+
+        // First push deduplicates the shared layer blob: 1 shared layer + 2 configs = 3 blobs total.
+        let mut manifests_seen = 0usize;
+        let res1 = reg
+            .push_with_auth(&multi, &target, &src_blobs, Some(&creds), |p| {
+                if matches!(p, PushProgress::Manifest { .. }) {
+                    manifests_seen += 1;
+                }
+            })
+            .unwrap();
+        assert_eq!(res1.blobs_pushed, 3);
+        assert_eq!(res1.blobs_skipped, 0);
+        assert_eq!(manifests_seen, 3); // 2 variant manifests + 1 index
+        assert_eq!(res1.digest, idx_digest.to_string());
+
+        // Second push skips all 3 blobs.
+        let res2 = reg.push_with_auth(&multi, &target, &src_blobs, Some(&creds), |_| {}).unwrap();
+        assert_eq!(res2.blobs_pushed, 0);
+        assert_eq!(res2.blobs_skipped, 3);
+
+        // Pulling both architectures from the pushed tag recovers exact manifests & configs.
+        let pulled_arm = reg
+            .pull_with_options(
+                &target,
+                &dst_blobs,
+                PullOptions { auth: Some(&creds), platform: Some("linux/arm64"), allow_amd64_fallback: false },
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(pulled_arm.architecture, "arm64");
+        assert_eq!(dst_blobs.read(&Digest::parse(&pulled_arm.config_digest).unwrap()).unwrap(), arm_cfg);
+
+        let pulled_amd = reg
+            .pull_with_options(
+                &target,
+                &dst_blobs,
+                PullOptions { auth: Some(&creds), platform: Some("linux/amd64"), allow_amd64_fallback: false },
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(pulled_amd.architecture, "amd64");
+        assert_eq!(dst_blobs.read(&Digest::parse(&pulled_amd.config_digest).unwrap()).unwrap(), amd_cfg);
 
         let _ = std::fs::remove_dir_all(&base);
     }

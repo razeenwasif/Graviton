@@ -79,7 +79,7 @@ pub async fn list_containers(
     let summaries = state.backend.store().lock().unwrap().containers().to_vec();
     let mut out = Vec::new();
     for c in summaries {
-        if !all && c.status != ContainerStatus::Running {
+        if !all && !matches!(c.status, ContainerStatus::Running | ContainerStatus::Paused) {
             continue;
         }
         let spec = match &state.backend {
@@ -237,19 +237,22 @@ fn docker_state_str(status: ContainerStatus) -> &'static str {
 }
 
 pub(crate) fn docker_status_human(c: &ContainerSummary, now: u64) -> String {
+    let format_up = |started_at: Option<u64>| {
+        let secs = now.saturating_sub(started_at.unwrap_or(now));
+        if secs < 2 {
+            "Up Less than a second".into()
+        } else if secs < 60 {
+            format!("Up {secs} seconds")
+        } else if secs < 3600 {
+            format!("Up {} minutes", secs / 60)
+        } else {
+            format!("Up {} hours", secs / 3600)
+        }
+    };
     match c.status {
         ContainerStatus::Created => "Created".into(),
         ContainerStatus::Running => {
-            let secs = now.saturating_sub(c.started_at.unwrap_or(now));
-            let base = if secs < 2 {
-                "Up Less than a second".into()
-            } else if secs < 60 {
-                format!("Up {secs} seconds")
-            } else if secs < 3600 {
-                format!("Up {} minutes", secs / 60)
-            } else {
-                format!("Up {} hours", secs / 3600)
-            };
+            let base = format_up(c.started_at);
             match c.health {
                 Some(HealthStatus::Starting) => format!("{base} (health: starting)"),
                 Some(HealthStatus::Healthy) => format!("{base} (healthy)"),
@@ -257,7 +260,7 @@ pub(crate) fn docker_status_human(c: &ContainerSummary, now: u64) -> String {
                 None => base,
             }
         }
-        ContainerStatus::Paused => "Up (Paused)".into(),
+        ContainerStatus::Paused => format!("{} (Paused)", format_up(c.started_at)),
         ContainerStatus::Exited => format!("Exited ({})", c.exit_code.unwrap_or(0)),
     }
 }
@@ -756,7 +759,7 @@ pub async fn inspect_container(
         .unwrap_or_else(|| "0001-01-01T00:00:00Z".into());
     let path = details.command.first().cloned().unwrap_or_default();
     let args: Vec<String> = details.command.iter().skip(1).cloned().collect();
-    let running = c.status == ContainerStatus::Running;
+    let running = matches!(c.status, ContainerStatus::Running | ContainerStatus::Paused);
     let networks = build_networks_map(c, &networks_list);
     let restart_name = details.restart.as_str();
 
@@ -1037,7 +1040,7 @@ pub async fn kill_container(
             return Ok(RouteOutcome::Continue);
         }
     };
-    if status != ContainerStatus::Running {
+    if !matches!(status, ContainerStatus::Running | ContainerStatus::Paused) {
         write_error(write, 409, &format!("container {key} is not running"), head.close_after).await?;
         return Ok(RouteOutcome::Continue);
     }
@@ -1105,6 +1108,106 @@ pub async fn restart_container(
             write_empty(write, 204, &[], head.close_after).await?;
         }
         Err(err) => write_error(write, 500, &format!("{err:#}"), head.close_after).await?,
+    }
+    Ok(RouteOutcome::Continue)
+}
+
+async fn write_demo_lifecycle_result<T>(
+    res: std::result::Result<T, graviton_core::store::StoreError>,
+    key: &str,
+    head: &RequestHead,
+    write: &mut OwnedWriteHalf,
+) -> Result<RouteOutcome> {
+    match res {
+        Ok(_) => write_empty(write, 204, &[], head.close_after).await?,
+        Err(graviton_core::store::StoreError::InvalidState { state: s, .. }) => {
+            write_error(write, 409, &format!("Container {key} is {s}"), head.close_after).await?;
+        }
+        Err(e) => {
+            write_error(write, 404, &e.to_string(), head.close_after).await?;
+        }
+    }
+    Ok(RouteOutcome::Continue)
+}
+
+pub async fn pause_container(
+    state: &Arc<DockerState>,
+    raw_id: &str,
+    head: &RequestHead,
+    reader: &mut BufReader<OwnedReadHalf>,
+    write: &mut OwnedWriteHalf,
+) -> Result<RouteOutcome> {
+    drain_body(reader, write, head).await?;
+    let key = raw_id.trim_start_matches('/').to_string();
+
+    if let Backend::Demo(store) = &state.backend {
+        let res = store.lock().unwrap().pause(&key);
+        return write_demo_lifecycle_result(res, &key, head, write).await;
+    }
+
+    let engine = state.engine().cloned().unwrap();
+    let status_res = engine.store.lock().unwrap().container(&key).map(|c| c.status);
+    let status = match status_res {
+        Ok(s) => s,
+        Err(e) => {
+            write_error(write, 404, &e.to_string(), head.close_after).await?;
+            return Ok(RouteOutcome::Continue);
+        }
+    };
+    if status == ContainerStatus::Paused {
+        write_error(write, 409, &format!("Container {key} is already paused"), head.close_after).await?;
+        return Ok(RouteOutcome::Continue);
+    }
+    if status != ContainerStatus::Running {
+        write_error(write, 409, &format!("Container {key} is not running"), head.close_after).await?;
+        return Ok(RouteOutcome::Continue);
+    }
+    let res = tokio::task::spawn_blocking(move || engine.pause(&key)).await?;
+    match res {
+        Ok(_) => write_empty(write, 204, &[], head.close_after).await?,
+        Err(err) => {
+            let msg = format!("{err:#}");
+            write_error(write, exec_error_status(&msg), &msg, head.close_after).await?;
+        }
+    }
+    Ok(RouteOutcome::Continue)
+}
+
+pub async fn unpause_container(
+    state: &Arc<DockerState>,
+    raw_id: &str,
+    head: &RequestHead,
+    reader: &mut BufReader<OwnedReadHalf>,
+    write: &mut OwnedWriteHalf,
+) -> Result<RouteOutcome> {
+    drain_body(reader, write, head).await?;
+    let key = raw_id.trim_start_matches('/').to_string();
+
+    if let Backend::Demo(store) = &state.backend {
+        let res = store.lock().unwrap().unpause(&key);
+        return write_demo_lifecycle_result(res, &key, head, write).await;
+    }
+
+    let engine = state.engine().cloned().unwrap();
+    let status_res = engine.store.lock().unwrap().container(&key).map(|c| c.status);
+    let status = match status_res {
+        Ok(s) => s,
+        Err(e) => {
+            write_error(write, 404, &e.to_string(), head.close_after).await?;
+            return Ok(RouteOutcome::Continue);
+        }
+    };
+    if status != ContainerStatus::Paused {
+        write_error(write, 409, &format!("Container {key} is not paused"), head.close_after).await?;
+        return Ok(RouteOutcome::Continue);
+    }
+    let res = tokio::task::spawn_blocking(move || engine.unpause(&key)).await?;
+    match res {
+        Ok(_) => write_empty(write, 204, &[], head.close_after).await?,
+        Err(err) => {
+            let msg = format!("{err:#}");
+            write_error(write, exec_error_status(&msg), &msg, head.close_after).await?;
+        }
     }
     Ok(RouteOutcome::Continue)
 }
@@ -2520,7 +2623,7 @@ pub async fn exec_inspect(
 }
 
 pub(super) fn exec_error_status(msg: &str) -> u16 {
-    if msg.contains("isn't running") || msg.contains("not running") {
+    if msg.contains("isn't running") || msg.contains("not running") || msg.contains("is paused") || msg.contains("already paused") {
         409
     } else if msg.contains("no such container") {
         404

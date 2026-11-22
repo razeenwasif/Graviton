@@ -166,6 +166,7 @@ public actor DemoEngine: EngineService {
 
     public func start(id: String) throws -> Container {
         let i = try resolve(id)
+        guard !list[i].isPaused else { throw EngineError.daemon("container \(list[i].name) is paused; unpause it instead") }
         guard !list[i].isRunning else { throw EngineError.daemon("container \(list[i].name) is already running") }
         list[i].status = .running
         list[i].exitCode = nil
@@ -177,7 +178,7 @@ public actor DemoEngine: EngineService {
 
     public func stop(id: String) throws -> Container {
         let i = try resolve(id)
-        guard list[i].isRunning else { throw EngineError.daemon("container \(list[i].name) is already stopped") }
+        guard list[i].isActive else { throw EngineError.daemon("container \(list[i].name) is already stopped") }
         list[i].status = .exited
         list[i].exitCode = 0
         list[i].startedAt = nil
@@ -186,8 +187,24 @@ public actor DemoEngine: EngineService {
         return list[i]
     }
 
+    public func pause(id: String) throws -> Container {
+        let i = try resolve(id)
+        guard list[i].isRunning else { throw EngineError.daemon("container \(list[i].name) is not running") }
+        list[i].status = .paused
+        list[i].cpuPercent = 0
+        return list[i]
+    }
+
+    public func unpause(id: String) throws -> Container {
+        let i = try resolve(id)
+        guard list[i].isPaused else { throw EngineError.daemon("container \(list[i].name) is not paused") }
+        list[i].status = .running
+        list[i].cpuPercent = 2
+        return list[i]
+    }
+
     public func restart(id: String) throws -> Container {
-        if try list[resolve(id)].isRunning { _ = try stop(id: id) }
+        if try list[resolve(id)].isActive { _ = try stop(id: id) }
         return try start(id: id)
     }
 
@@ -234,7 +251,7 @@ public actor DemoEngine: EngineService {
 
     public func remove(id: String) throws -> String {
         let i = try resolve(id)
-        guard !list[i].isRunning else { throw EngineError.daemon("container \(list[i].name) is running; stop it first") }
+        guard !list[i].isActive else { throw EngineError.daemon("container \(list[i].name) is running; stop it first") }
         let removed = list.remove(at: i)
         logLines[removed.id] = nil
         return removed.id

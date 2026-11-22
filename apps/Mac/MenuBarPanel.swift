@@ -254,7 +254,7 @@ private struct ContainerQuickRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            StatusDot(running: container.isRunning, size: 7)
+            StatusDot(status: container.status, size: 7)
             VStack(alignment: .leading, spacing: 1) {
                 Text(container.name).font(.system(size: 12.5, weight: .medium)).foregroundStyle(G.text).lineLimit(1)
                 Text(container.image).font(G.mono(10.5)).foregroundStyle(G.muted).lineLimit(1).truncationMode(.middle)
@@ -282,6 +282,8 @@ private struct ContainerQuickRow: View {
                 Text(Format.percent(container.cpuPercent)).font(G.mono(11)).foregroundStyle(G.textSecondary)
                 Text(container.memoryBytes.map(Format.bytes) ?? container.statusText())
                     .font(G.mono(10.5)).foregroundStyle(G.faint)
+            } else if container.isPaused {
+                Text("Paused").font(.system(size: 11, weight: .medium)).foregroundStyle(G.warning)
             } else {
                 Text(container.statusText()).font(.system(size: 11)).foregroundStyle(G.faint)
             }
@@ -298,6 +300,11 @@ private struct ContainerQuickRow: View {
                     IconButton("safari", help: "Open localhost:\(port.hostPort)") { openInBrowser(port) }
                 }
                 IconButton("terminal", help: "Open a shell") { open(.terminal) }
+                IconButton("pause.fill", help: "Pause") { lifecycle { await store.pause(container) } }
+                IconButton("arrow.counterclockwise", help: "Restart") { lifecycle { await store.restart(container) } }
+                IconButton("stop.fill", help: "Stop", tint: G.danger) { lifecycle { await store.stop(container) } }
+            } else if container.isPaused {
+                IconButton("play.fill", help: "Resume", tint: G.running) { lifecycle { await store.unpause(container) } }
                 IconButton("arrow.counterclockwise", help: "Restart") { lifecycle { await store.restart(container) } }
                 IconButton("stop.fill", help: "Stop", tint: G.danger) { lifecycle { await store.stop(container) } }
             } else {
@@ -308,6 +315,11 @@ private struct ContainerQuickRow: View {
 
     @ViewBuilder private var menu: some View {
         if container.isRunning {
+            Button("Pause") { lifecycle { await store.pause(container) } }
+            Button("Stop") { lifecycle { await store.stop(container) } }
+            Button("Restart") { lifecycle { await store.restart(container) } }
+        } else if container.isPaused {
+            Button("Resume") { lifecycle { await store.unpause(container) } }
             Button("Stop") { lifecycle { await store.stop(container) } }
             Button("Restart") { lifecycle { await store.restart(container) } }
         } else {
