@@ -1013,3 +1013,67 @@ public struct ExecResult: Hashable, Sendable {
         self.truncated = truncated
     }
 }
+
+/// Snapshot a container's filesystem and configuration changes into a local image (`grav commit`).
+public struct CommitSpec: Codable, Hashable, Sendable {
+    public var container: String
+    /// Target image reference (`repo[:tag]`); empty lets the daemon default to `committed:<short_id>`.
+    public var reference: String
+    public var author: String?
+    public var message: String?
+    /// Dockerfile config instructions (`ENV`, `CMD`, `ENTRYPOINT`, `WORKDIR`, `USER`, `EXPOSE`, `LABEL`, `VOLUME`, `STOPSIGNAL`, `HEALTHCHECK`).
+    public var changes: [String]
+
+    public init(container: String, reference: String = "", author: String? = nil, message: String? = nil, changes: [String] = []) {
+        self.container = container
+        self.reference = reference
+        self.author = author
+        self.message = message
+        self.changes = changes
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case container, reference, author, message, changes
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        container = try c.decode(String.self, forKey: .container)
+        reference = try c.decodeIfPresent(String.self, forKey: .reference) ?? ""
+        author = try c.decodeIfPresent(String.self, forKey: .author)
+        message = try c.decodeIfPresent(String.self, forKey: .message)
+        changes = try c.decodeIfPresent([String].self, forKey: .changes) ?? []
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(container, forKey: .container)
+        try c.encode(reference, forKey: .reference)
+        try c.encodeIfPresent(author, forKey: .author)
+        try c.encodeIfPresent(message, forKey: .message)
+        if !changes.isEmpty {
+            try c.encode(changes, forKey: .changes)
+        }
+    }
+}
+
+/// Time-window filter presets for container log views (`All`, `5m`, `15m`, `1h`).
+public enum LogTimeWindow: String, CaseIterable, Identifiable, Sendable, Hashable {
+    case all = "All"
+    case fiveMinutes = "5m"
+    case fifteenMinutes = "15m"
+    case oneHour = "1h"
+
+    public var id: String { rawValue }
+
+    public func sinceMs(now: Date = .now) -> UInt64? {
+        let seconds: TimeInterval
+        switch self {
+        case .all: return nil
+        case .fiveMinutes: seconds = 5 * 60
+        case .fifteenMinutes: seconds = 15 * 60
+        case .oneHour: seconds = 60 * 60
+        }
+        return UInt64(max(0, (now.timeIntervalSince1970 - seconds) * 1000))
+    }
+}

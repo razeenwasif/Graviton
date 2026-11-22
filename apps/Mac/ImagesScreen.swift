@@ -1,5 +1,7 @@
+import AppKit
 import GravitonKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ImagesScreen: View {
     @Environment(EngineStore.self) private var store
@@ -9,6 +11,8 @@ struct ImagesScreen: View {
     @State private var showCleanUp = false
     @State private var runImage: ImageInfo?
     @State private var search = ""
+    @State private var transferring: String?
+    @State private var transferBanner: (tone: GStatusLine.Tone, text: String)?
 
     private var totalSize: UInt64 { store.images.map(\.sizeBytes).reduce(0, +) }
     private var shown: [ImageInfo] {
@@ -29,6 +33,14 @@ struct ImagesScreen: View {
                 .help("Free disk space: the build cache, unused layers, images and stopped containers")
                 .disabled(!store.canManage)
                 Button {
+                    pickAndImport()
+                } label: {
+                    Label("Import…", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(.gSecondary)
+                .help(store.canTransferFiles ? "Import image(s) from a .tar or .tar.gz archive" : "Start gravitond to import images")
+                .disabled(!store.canTransferFiles || transferring != nil)
+                Button {
                     showBuild = true
                 } label: {
                     Label("Build", systemImage: "hammer")
@@ -46,6 +58,18 @@ struct ImagesScreen: View {
                 .help(store.canManage ? "Pull an image from a registry (⌘N)" : "Start gravitond to pull images")
             }
 
+            if let transferring {
+                GStatusLine(.working, transferring)
+                    .padding(.horizontal, 28)
+                    .padding(.top, 6)
+                    .padding(.bottom, 8)
+            } else if let banner = transferBanner {
+                GStatusLine(banner.tone, banner.text)
+                    .padding(.horizontal, 28)
+                    .padding(.top, 6)
+                    .padding(.bottom, 8)
+            }
+
             if store.images.isEmpty {
                 GEmptyState("No images yet", symbol: "square.stack.3d.up",
                             detail: "Pull one from Docker Hub, GHCR or any OCI registry, or build one from a Dockerfile.",
@@ -56,7 +80,13 @@ struct ImagesScreen: View {
                 ScrollView {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 14)], spacing: 14) {
                         ForEach(shown) { image in
-                            ImageCard(image: image, onRun: { runImage = $0 }, onRemove: confirmRemove)
+                            ImageCard(
+                                image: image,
+                                canExport: store.canTransferFiles && transferring == nil,
+                                onRun: { runImage = $0 },
+                                onExport: pickAndExport,
+                                onRemove: confirmRemove
+                            )
                         }
                     }
                     .padding(.horizontal, 28)
@@ -71,6 +101,66 @@ struct ImagesScreen: View {
         .sheet(isPresented: $showCleanUp) { CleanUpSheet() }
         .sheet(item: $runImage) { image in
             RunContainerSheet(initialImage: "\(image.repository):\(image.tag)")
+        }
+    }
+
+    private func pickAndImport() {
+        guard store.canTransferFiles, transferring == nil else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        var types: [UTType] = [.gzip]
+        if let tar = UTType(filenameExtension: "tar") { types.append(tar) }
+        if let tgz = UTType(filenameExtension: "tgz") { types.append(tgz) }
+        panel.allowedContentTypes = types
+        panel.prompt = "Import"
+        panel.message = "Choose a Docker/OCI .tar or .tar.gz image archive to load into \(store.liveName ?? "this Mac")"
+        panel.begin { response in
+            guard response == .OK, let source = panel.url else { return }
+            Task { await importArchive(source) }
+        }
+    }
+
+    private func importArchive(_ url: URL) async {
+        transferBanner = nil
+        transferring = "Importing \(url.lastPathComponent)…"
+        defer { transferring = nil }
+        do {
+            let loaded = try await store.loadImage(from: url)
+            let summary = loaded.map { "\($0.repository):\($0.tag)" }.joined(separator: ", ")
+            let label = loaded.isEmpty ? "Loaded archive \(url.lastPathComponent)." : "Imported \(summary)."
+            transferBanner = (.success, label)
+        } catch {
+            dialogs.alert("Couldn't import image archive", message: error.localizedDescription)
+        }
+    }
+
+    private func pickAndExport(_ image: ImageInfo) {
+        guard store.canTransferFiles, transferring == nil else { return }
+        let panel = NSSavePanel()
+        let safeRepo = image.repository.replacingOccurrences(of: "/", with: "-")
+        let safeTag = image.tag.replacingOccurrences(of: "/", with: "-")
+        panel.nameFieldStringValue = "\(safeRepo)-\(safeTag).tar"
+        panel.canCreateDirectories = true
+        panel.prompt = "Export"
+        panel.message = "Export \(image.repository):\(image.tag) as a .tar image archive"
+        panel.begin { response in
+            guard response == .OK, let destination = panel.url else { return }
+            Task { await exportArchive(image, to: destination) }
+        }
+    }
+
+    private func exportArchive(_ image: ImageInfo, to destination: URL) async {
+        let ref = "\(image.repository):\(image.tag)"
+        transferBanner = nil
+        transferring = "Exporting \(ref)…"
+        defer { transferring = nil }
+        do {
+            try await store.saveImage(references: [ref], to: destination)
+            transferBanner = (.success, "Exported \(ref) → \(destination.lastPathComponent).")
+        } catch {
+            dialogs.alert("Couldn't export \(ref)", message: error.localizedDescription)
         }
     }
 
@@ -89,7 +179,9 @@ struct ImagesScreen: View {
 
 struct ImageCard: View {
     var image: ImageInfo
+    var canExport = false
     var onRun: (ImageInfo) -> Void = { _ in }
+    var onExport: (ImageInfo) -> Void = { _ in }
     var onRemove: (ImageInfo) -> Void = { _ in }
     @State private var hovering = false
 
@@ -110,6 +202,9 @@ struct ImageCard: View {
                     HStack(spacing: 2) {
                         Button { onRun(image) } label: { Image(systemName: "play.fill") }
                             .help("Run a container from it")
+                        Button { onExport(image) } label: { Image(systemName: "square.and.arrow.up") }
+                            .disabled(!canExport)
+                            .help(canExport ? "Export this image as a .tar archive" : "Start gravitond to export images")
                         Button { onRemove(image) } label: { Image(systemName: "trash") }
                             .disabled(image.usedBy > 0)
                             .help(image.usedBy > 0 ? "A container uses it: remove the container first" : "Remove this image")
@@ -138,6 +233,8 @@ struct ImageCard: View {
         .animation(.easeOut(duration: 0.12), value: hovering)
         .contextMenu {
             Button("Run…") { onRun(image) }
+            Button("Export (.tar)…") { onExport(image) }
+                .disabled(!canExport)
             Button("Copy Reference") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(image.reference, forType: .string)

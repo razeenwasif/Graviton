@@ -372,9 +372,56 @@ public actor RemoteEngine: EngineService {
         return info
     }
 
-    public func logs(id: String, tail: Int?) async throws -> [LogLine] {
-        guard case let .logs(lines) = try await call(.logs(id: id, tail: tail)) else { throw EngineError.unexpectedResponse }
+    public func logs(id: String, tail: Int?, sinceMs: UInt64? = nil, untilMs: UInt64? = nil) async throws -> [LogLine] {
+        guard case let .logs(lines) = try await call(.logs(id: id, tail: tail, follow: false, sinceMs: sinceMs, untilMs: untilMs)) else {
+            throw EngineError.unexpectedResponse
+        }
         return lines
+    }
+
+    /// Stream container logs in real time (`follow: true`) over TLS from the paired Mac.
+    public nonisolated func logsStream(id: String, tail: Int? = nil, sinceMs: UInt64? = nil, untilMs: UInt64? = nil) -> AsyncThrowingStream<LogLine, Error> {
+        let host = self.host, token = self.token
+        return AsyncThrowingStream { continuation in
+            let task = Task.detached {
+                do {
+                    let c = try await LineConnection.open(host.endpoints, pin: host.fingerprint)
+                    defer { c.cancel() }
+                    try Task.checkCancellation()
+                    try await withTaskCancellationHandler {
+                        guard case .authenticated = try await c.call(.auth(token: token)) else {
+                            throw EngineError.unexpectedResponse
+                        }
+                        try await c.send(Wire.line(.logs(id: id, tail: tail, follow: true, sinceMs: sinceMs, untilMs: untilMs)))
+                        while true {
+                            try Task.checkCancellation()
+                            switch try Wire.decoder.decode(EngineResponse.self, from: try await c.readLine()) {
+                            case let .log(entry):
+                                continuation.yield(entry)
+                            case .logEnd:
+                                continuation.finish()
+                                return
+                            case let .error(message):
+                                throw EngineError.daemon(message)
+                            default:
+                                throw EngineError.unexpectedResponse
+                            }
+                        }
+                    } onCancel: {
+                        c.cancel()
+                    }
+                } catch is CancellationError {
+                    continuation.finish()
+                } catch {
+                    if Task.isCancelled {
+                        continuation.finish()
+                    } else {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 
     public func start(id: String) async throws -> Container { try await container(.start(id: id)) }
@@ -402,6 +449,26 @@ public actor RemoteEngine: EngineService {
     public func pushImage(reference: String) async throws -> ImagePushResult {
         guard case let .imagePushed(res) = try await separately(.pushImage(reference: reference)) else { throw EngineError.unexpectedResponse }
         return res
+    }
+
+    public func commit(_ spec: CommitSpec) async throws -> ImageInfo {
+        guard case let .image(image) = try await separately(.commit(spec)) else { throw EngineError.unexpectedResponse }
+        return image
+    }
+
+    /// Export one or more images on the paired Mac into a local `.tar` archive at `archiveFile`.
+    public nonisolated func saveImage(references: [String], to archiveFile: URL) async throws {
+        _ = try await receiveArchive(request: .saveImage(references: references), to: archiveFile) { response in
+            guard case .imageArchive = response else { throw EngineError.unexpectedResponse }
+        }
+    }
+
+    /// Upload a local `.tar` or `.tar.gz` archive to load image(s) on the paired Mac.
+    public nonisolated func loadImage(from archiveFile: URL, size: UInt64) async throws -> [ImageInfo] {
+        try await sendArchive(request: .loadImage(size: size), from: archiveFile) { response in
+            guard case let .images(list) = response else { throw EngineError.unexpectedResponse }
+            return list
+        }
     }
 
     /// Pull an image on the paired Mac, streaming per-layer progress before the final image.
@@ -478,33 +545,56 @@ public actor RemoteEngine: EngineService {
 
     /// Download a file or folder from a container on the paired Mac as a tar archive.
     public nonisolated func getArchive(id: String, path: String, to archiveFile: URL) async throws -> (isDir: Bool, name: String) {
-        let c = try await LineConnection.open(host.endpoints, pin: host.fingerprint)
-        defer { c.cancel() }
-        guard case .authenticated = try await c.call(.auth(token: token)) else { throw EngineError.unexpectedResponse }
-        try await c.send(Wire.line(.getArchive(id: id, path: path)))
-        let response = try Wire.decoder.decode(EngineResponse.self, from: try await c.readLine())
-        let meta: (Bool, String)
-        switch response {
-        case let .archive(isDir, name): meta = (isDir, name)
-        case let .error(message): throw EngineError.daemon(message)
-        default: throw EngineError.unexpectedResponse
+        try await receiveArchive(request: .getArchive(id: id, path: path), to: archiveFile) { response in
+            guard case let .archive(isDir, name) = response else { throw EngineError.unexpectedResponse }
+            return (isDir, name)
         }
-        FileManager.default.createFile(atPath: archiveFile.path, contents: nil)
-        let out = try FileHandle(forWritingTo: archiveFile)
-        defer { try? out.close() }
-        while let chunk = try await c.receiveOrEOF() {
-            try Task.checkCancellation()
-            try out.write(contentsOf: chunk)
-        }
-        return meta
     }
 
     /// Upload a tar archive into a container directory on the paired Mac.
     public nonisolated func putArchive(id: String, path: String, archiveFile: URL, size: UInt64) async throws -> UInt64 {
+        try await sendArchive(request: .putArchive(id: id, path: path, size: size), from: archiveFile) { response in
+            guard case let .copied(files) = response else { throw EngineError.unexpectedResponse }
+            return files
+        }
+    }
+
+    private nonisolated func receiveArchive<T: Sendable>(
+        request: EngineRequest,
+        to archiveFile: URL,
+        parseHeader: @Sendable (EngineResponse) throws -> T
+    ) async throws -> T {
         let c = try await LineConnection.open(host.endpoints, pin: host.fingerprint)
         defer { c.cancel() }
         guard case .authenticated = try await c.call(.auth(token: token)) else { throw EngineError.unexpectedResponse }
-        try await c.send(Wire.line(.putArchive(id: id, path: path, size: size)))
+        try await c.send(Wire.line(request))
+        let response = try Wire.decoder.decode(EngineResponse.self, from: try await c.readLine())
+        if case let .error(message) = response { throw EngineError.daemon(message) }
+        let meta = try parseHeader(response)
+        FileManager.default.createFile(atPath: archiveFile.path, contents: nil)
+        do {
+            let out = try FileHandle(forWritingTo: archiveFile)
+            defer { try? out.close() }
+            while let chunk = try await c.receiveOrEOF() {
+                try Task.checkCancellation()
+                try out.write(contentsOf: chunk)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: archiveFile)
+            throw error
+        }
+        return meta
+    }
+
+    private nonisolated func sendArchive<T: Sendable>(
+        request: EngineRequest,
+        from archiveFile: URL,
+        parseResponse: @Sendable (EngineResponse) throws -> T
+    ) async throws -> T {
+        let c = try await LineConnection.open(host.endpoints, pin: host.fingerprint)
+        defer { c.cancel() }
+        guard case .authenticated = try await c.call(.auth(token: token)) else { throw EngineError.unexpectedResponse }
+        try await c.send(Wire.line(request))
 
         let source = try FileHandle(forReadingFrom: archiveFile)
         defer { try? source.close() }
@@ -520,15 +610,11 @@ public actor RemoteEngine: EngineService {
 
         if let line = try? await c.readLine(),
            let response = try? Wire.decoder.decode(EngineResponse.self, from: line) {
-            switch response {
-            case let .copied(files):
-                if let sendError { throw sendError }
-                return files
-            case let .error(message):
+            if case let .error(message) = response {
                 throw EngineError.daemon(message)
-            default:
-                throw EngineError.unexpectedResponse
             }
+            if let sendError { throw sendError }
+            return try parseResponse(response)
         }
         if let sendError { throw sendError }
         throw EngineError.io("the Mac closed the connection")

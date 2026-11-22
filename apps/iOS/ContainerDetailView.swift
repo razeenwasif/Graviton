@@ -4,6 +4,7 @@ import SwiftUI
 struct ContainerDetailView: View {
     @Environment(EngineStore.self) private var store
     var containerID: String
+    @State private var showCommit = false
 
     var body: some View {
         if let c = store.container(containerID) {
@@ -107,6 +108,9 @@ struct ContainerDetailView: View {
             .safeAreaInset(edge: .top, spacing: 0) {
                 MobileHeader("", actions: {
                     Menu {
+                        Button("Commit to Image…", systemImage: "camera.aperture") { showCommit = true }
+                            .disabled(!store.canManage)
+                        Divider()
                         Button("Copy ID", systemImage: "doc.on.doc") { UIPasteboard.general.string = c.id }
                         Button("Copy Image", systemImage: "square.stack.3d.up") { UIPasteboard.general.string = c.image }
                     } label: {
@@ -119,6 +123,9 @@ struct ContainerDetailView: View {
             }
             .refreshable { await store.refresh() }
             .mobileScreen()
+            .sheet(isPresented: $showCommit) {
+                MobileCommitSheet(container: c)
+            }
         } else {
             GEmptyState("Container not found", symbol: "shippingbox", detail: "It may have been removed.")
                 .safeAreaInset(edge: .top, spacing: 0) { MobileHeader("") }

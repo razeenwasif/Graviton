@@ -110,9 +110,9 @@ public enum FairyApprovalPolicy {
     public static let supportedTools: Set<String> = [
         "status", "events", "switch_host", "navigate",
         "containers", "inspect", "logs", "stats",
-        "container_action", "run", "exec", "stack_action", "compose",
+        "container_action", "run", "exec", "commit_container", "stack_action", "compose",
         "list_files", "read_file", "copy_files",
-        "images", "pull", "build", "tag_image", "push_image", "remove_image",
+        "images", "pull", "build", "tag_image", "push_image", "save_image", "load_image", "remove_image",
         "volumes", "volume_action", "network", "disk_and_prune", "snapshots",
     ]
 
@@ -139,7 +139,7 @@ public enum FairyApprovalPolicy {
             return action != "status"
         case "compose":
             return !["config", "ps", "logs", "start", "restart"].contains(action)
-        case "run", "exec", "build", "push_image", "remove_image", "copy_files":
+        case "run", "exec", "commit_container", "build", "push_image", "save_image", "load_image", "remove_image", "copy_files":
             return true
         default:
             return true
@@ -288,6 +288,32 @@ public enum FairyApprovalPolicy {
             title = "Push image \(ref)"
             detail = reasonArg.isEmpty ? ref : "\(ref) — \(reasonArg)"
             macReason = "let Fairy push image \(ref) to its registry\(suffix)"
+        case "commit_container":
+            let target = str("container")
+            let ref = str("reference")
+            let shownRef = ref.isEmpty ? "committed:\(target)" : ref
+            destructive = false
+            title = "Commit \(target) → \(shownRef)"
+            var parts = ["Container: \(target)", "Image: \(shownRef)"]
+            if !reasonArg.isEmpty { parts.append(reasonArg) }
+            detail = parts.joined(separator: "\n")
+            macReason = "let Fairy commit container \(target) to image \(shownRef)\(suffix)"
+        case "save_image":
+            let refs = args["references"]?.stringArrayValue ?? (str("reference").isEmpty ? [] : [str("reference")])
+            let outPath = str("output_path")
+            let refsDisplay = refs.joined(separator: ", ")
+            destructive = false
+            title = "Export image archive"
+            var parts = [refsDisplay.isEmpty ? "Images" : "Images: \(refsDisplay)", "To: \(outPath)"]
+            if !reasonArg.isEmpty { parts.append(reasonArg) }
+            detail = parts.joined(separator: "\n")
+            macReason = "let Fairy export \(refsDisplay.isEmpty ? "image" : refsDisplay) to \(outPath)\(suffix)"
+        case "load_image":
+            let inPath = str("input_path")
+            destructive = false
+            title = "Import image archive"
+            detail = reasonArg.isEmpty ? "From: \(inPath)" : "From: \(inPath)\n\(reasonArg)"
+            macReason = "let Fairy import images from \(inPath)\(suffix)"
         default:
             destructive = requiresTouchID(tool: tool, args: args)
             title = "Run \(tool)"

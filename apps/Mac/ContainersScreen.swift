@@ -14,6 +14,7 @@ struct ContainersScreen: View {
     @State private var selection: Container.ID?
     @State private var route: ContainerRoute?
     @State private var showRun = false
+    @State private var commitContainer: Container?
     @State private var width: CGFloat = 1200
 
     private var rows: [Container] { filter.apply(store.containers, search: search) }
@@ -34,6 +35,9 @@ struct ContainersScreen: View {
                 filter = .all
                 selection = container.id
             }
+        }
+        .sheet(item: $commitContainer) { container in
+            CommitContainerSheet(container: container)
         }
         .onChange(of: router.pending, initial: true) { _, request in
             switch request {
@@ -99,7 +103,7 @@ struct ContainersScreen: View {
                                     detail: search.isEmpty ? "No \(filter.rawValue.lowercased()) containers." : "No container's name or image contains “\(search)”.")
                             .gravitonCard()
                     } else {
-                        ContainerTable(rows: rows, selection: $selection) { id in
+                        ContainerTable(rows: rows, selection: $selection, onCommit: { commitContainer = $0 }) { id in
                             route = ContainerRoute(id: id)
                         }
                     }
@@ -136,6 +140,7 @@ struct ContainerTable: View {
     @Environment(EngineStore.self) private var store
     var rows: [Container]
     @Binding var selection: Container.ID?
+    var onCommit: (Container) -> Void = { _ in }
     var open: (Container.ID) -> Void
     @State private var sort: Column = .name
     @State private var ascending = true
@@ -341,7 +346,7 @@ struct ContainerTable: View {
                 .frame(width: 80, alignment: .trailing)
             Text(c.statusText()).font(.system(size: 12.5)).foregroundStyle(c.isPaused ? G.warning : G.muted).lineLimit(1)
                 .frame(width: 92, alignment: .leading)
-            RowMenu(container: c, open: { open(c.id) }).frame(width: 28)
+            RowMenu(container: c, open: { open(c.id) }, onCommit: { onCommit(c) }).frame(width: 28)
         }
         .padding(.horizontal, 8)
         .frame(height: 50)
@@ -354,6 +359,8 @@ struct ContainerTable: View {
         .contextMenu {
             LifecycleButtons(container: c)
             Divider()
+            Button("Commit to Image…") { onCommit(c) }
+                .disabled(!store.canManage)
             Button("Show Logs") { open(c.id) }
         }
     }
@@ -401,13 +408,17 @@ struct StackLifecycleButtons: View {
 }
 
 struct RowMenu: View {
+    @Environment(EngineStore.self) private var store
     var container: Container
     var open: () -> Void
+    var onCommit: () -> Void
 
     var body: some View {
         Menu {
             LifecycleButtons(container: container)
             Divider()
+            Button("Commit to Image…", action: onCommit)
+                .disabled(!store.canManage)
             Button("Show Logs", action: open)
         } label: {
             Image(systemName: "ellipsis")
@@ -515,11 +526,8 @@ struct Inspector: View {
         }
         .padding(20)
         .gravitonCard(radius: 14)
-        .task(id: container.id) {
-            while !Task.isCancelled {
-                await store.loadLogs(for: container.id, tail: 3)
-                try? await Task.sleep(for: .seconds(2))
-            }
+        .task(id: "\(container.id)|\(container.isActive)|\(store.connection)") {
+            await store.followLogs(for: container.id, tail: 3)
         }
     }
 }

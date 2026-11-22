@@ -157,9 +157,11 @@ public actor DemoEngine: EngineService {
         return info
     }
 
-    public func logs(id: String, tail: Int?) throws -> [LogLine] {
+    public func logs(id: String, tail: Int?, sinceMs: UInt64? = nil, untilMs: UInt64? = nil) throws -> [LogLine] {
         let c = try resolve(id)
-        let lines = logLines[list[c].id] ?? []
+        let lines = (logLines[list[c].id] ?? []).filter { line in
+            (sinceMs == nil || line.timestampMs >= sinceMs!) && (untilMs == nil || line.timestampMs <= untilMs!)
+        }
         guard let tail else { return lines }
         return Array(lines.suffix(tail))
     }
@@ -243,6 +245,10 @@ public actor DemoEngine: EngineService {
 
     public func pushImage(reference: String) throws -> ImagePushResult {
         throw EngineError.daemon("Pushing images needs gravitond. Start it with scripts/dev-gravitond.sh.")
+    }
+
+    public func commit(_ spec: CommitSpec) throws -> ImageInfo {
+        throw EngineError.daemon("Committing containers needs gravitond. Start it with scripts/dev-gravitond.sh.")
     }
 
     public func run(_ spec: RunSpec) throws -> Container {

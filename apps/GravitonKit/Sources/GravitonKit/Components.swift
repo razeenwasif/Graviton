@@ -259,11 +259,13 @@ public struct MetricValue: View {
 public struct LogRow: View {
     public var line: LogLine
     public var showSequence: Bool
+    public var showTimestamp: Bool
     public var compact: Bool
 
-    public init(_ line: LogLine, showSequence: Bool = true, compact: Bool = false) {
+    public init(_ line: LogLine, showSequence: Bool = true, showTimestamp: Bool = true, compact: Bool = false) {
         self.line = line
         self.showSequence = showSequence
+        self.showTimestamp = showTimestamp
         self.compact = compact
     }
 
@@ -280,7 +282,9 @@ public struct LogRow: View {
             if compact {
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(spacing: 8) {
-                        Text(Format.clock(line.date)).foregroundStyle(G.faint)
+                        if showTimestamp {
+                            Text(Format.clock(line.date)).foregroundStyle(G.faint)
+                        }
                         Text(line.level.label).foregroundStyle(G.color(for: line.level))
                     }
                     Text(line.message).foregroundStyle(Color(hex: 0xC9CDD4))
@@ -294,7 +298,9 @@ public struct LogRow: View {
                     if showSequence {
                         Text(String(line.seq)).foregroundStyle(Color(hex: 0x5F6672)).frame(minWidth: 34, alignment: .trailing)
                     }
-                    Text(Format.clock(line.date)).foregroundStyle(G.faint)
+                    if showTimestamp {
+                        Text(Format.clock(line.date)).foregroundStyle(G.faint)
+                    }
                     Text(line.level.label).foregroundStyle(G.color(for: line.level)).frame(width: 44, alignment: .leading)
                     Text(line.message).foregroundStyle(Color(hex: 0xC9CDD4)).textSelection(.enabled)
                     Spacer(minLength: 0)

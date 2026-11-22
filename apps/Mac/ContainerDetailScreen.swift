@@ -12,6 +12,7 @@ struct ContainerDetailScreen: View {
     var containerID: String
     var onBack: () -> Void
     @State private var tab: DetailTab
+    @State private var showCommit = false
 
     init(containerID: String, initialTab: DetailTab = .logs, onBack: @escaping () -> Void) {
         self.containerID = containerID
@@ -33,6 +34,14 @@ struct ContainerDetailScreen: View {
                         }
                         .buttonStyle(.gSecondary)
                         .disabled(!c.isRunning)
+                        Button {
+                            showCommit = true
+                        } label: {
+                            Label("Commit", systemImage: "camera.aperture")
+                        }
+                        .buttonStyle(.gSecondary)
+                        .disabled(!store.canManage)
+                        .help(store.canManage ? "Snapshot this container into a new local image" : "Start gravitond to commit containers")
                         if c.isRunning {
                             Button {
                                 Task { await store.pause(c) }
@@ -98,6 +107,9 @@ struct ContainerDetailScreen: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .background(G.background)
+            .sheet(isPresented: $showCommit) {
+                CommitContainerSheet(container: c)
+            }
         } else {
             VStack(spacing: 0) {
                 ScreenHeader("Not found", back: ("Containers", onBack))
@@ -144,6 +156,31 @@ struct LogsPanel: View {
     @State private var query = ""
     @State private var level: LogLevel?
     @State private var follow = true
+    @State private var showTimestamps = true
+    @State private var window: LogTimeWindow = .all
+    @State private var loadedWindow: LogTimeWindow?
+
+    private struct StreamKey: Equatable {
+        var id: String
+        var follow: Bool
+        var window: LogTimeWindow
+        var active: Bool
+        var connection: EngineStore.Connection
+    }
+
+    private var containerActive: Bool {
+        store.container(containerID)?.isActive ?? false
+    }
+
+    private var streamKey: StreamKey {
+        StreamKey(
+            id: containerID,
+            follow: follow,
+            window: window,
+            active: containerActive,
+            connection: store.connection
+        )
+    }
 
     private var lines: [LogLine] {
         let all = store.logs[containerID] ?? []
@@ -155,8 +192,16 @@ struct LogsPanel: View {
         }
     }
 
+    private var footerLabel: String {
+        let count = store.logs[containerID]?.count ?? 0
+        if !follow {
+            return "Paused · \(count) lines"
+        }
+        return containerActive ? "Live stream · \(count) lines" : "End of logs · \(count) lines"
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
                 GTextField("Filter logs (regex supported)", text: $query)
                     .gravitonField(mono: true, icon: "line.3.horizontal.decrease")
@@ -166,13 +211,19 @@ struct LogsPanel: View {
                 Toggle("Follow", isOn: $follow).toggleStyle(.gSwitch)
             }
 
+            HStack(spacing: 12) {
+                GSegmented(selection: $window, options: LogTimeWindow.allCases.map { ($0, $0.rawValue) })
+                Spacer()
+                Toggle("Timestamps", isOn: $showTimestamps).toggleStyle(.gSwitch)
+            }
+
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(lines) { LogRow($0) }
+                        ForEach(lines) { LogRow($0, showTimestamp: showTimestamps) }
                         HStack(spacing: 8) {
-                            Rectangle().fill(G.accent.opacity(0.8)).frame(width: 7, height: 14)
-                            Text(follow ? "Streaming · \(store.logs[containerID]?.count ?? 0) lines" : "Paused")
+                            Rectangle().fill(follow && containerActive ? G.running : G.accent.opacity(0.8)).frame(width: 7, height: 14)
+                            Text(footerLabel)
                         }
                         .font(G.mono(12))
                         .foregroundStyle(G.faint)
@@ -191,10 +242,121 @@ struct LogsPanel: View {
         }
         .padding(.horizontal, 28)
         .padding(.vertical, 18)
-        .task(id: containerID) {
-            while !Task.isCancelled {
-                if follow || store.logs[containerID] == nil { await store.loadLogs(for: containerID) }
-                try? await Task.sleep(for: .seconds(1))
+        .task(id: streamKey) {
+            if follow {
+                loadedWindow = window
+                await store.followLogs(for: containerID, tail: 500, sinceMs: window.sinceMs())
+            } else if store.logs[containerID] == nil || loadedWindow != window {
+                loadedWindow = window
+                await store.loadLogs(for: containerID, tail: 500, sinceMs: window.sinceMs())
+            }
+        }
+    }
+}
+
+/// Snapshot a container's filesystem and configuration into a new local image (`grav commit`).
+struct CommitContainerSheet: View {
+    @Environment(EngineStore.self) private var store
+    @Environment(\.dismiss) private var dismiss
+    var container: Container
+    @State private var reference = ""
+    @State private var author = ""
+    @State private var message = ""
+    @State private var changesText = ""
+    @State private var phase: Phase = .idle
+    @FocusState private var focused: Bool
+
+    enum Phase: Equatable {
+        case idle
+        case committing
+        case done(ImageInfo)
+        case failed(String)
+    }
+
+    private var committing: Bool { if case .committing = phase { true } else { false } }
+
+    private var parsedChanges: [String] {
+        changesText
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    var body: some View {
+        GSheet("Commit to image",
+               subtitle: "Snapshot \(container.name)’s filesystem and config into a local OCI image.",
+               symbol: "camera.aperture") {
+            GFormRow("Reference", hint: "repo[:tag]. Leave blank to default to committed:\(String(container.id.prefix(12))).") {
+                GTextField("e.g. \(container.name):snapshot", text: $reference)
+                    .focused($focused)
+                    .disabled(committing)
+                    .onSubmit(commit)
+                    .gravitonField(mono: true, height: 36)
+            }
+            HStack(alignment: .top, spacing: 12) {
+                GFormRow("Author") {
+                    GTextField("Optional name or email", text: $author)
+                        .disabled(committing)
+                        .gravitonField()
+                }
+                GFormRow("Message") {
+                    GTextField("Optional commit message", text: $message)
+                        .disabled(committing)
+                        .gravitonField()
+                }
+            }
+            GFormRow("Config changes", hint: "Optional Dockerfile instructions (one per line), e.g. ENV MODE=prod or CMD [\"sh\"].") {
+                TextEditor(text: $changesText)
+                    .scrollContentBackground(.hidden)
+                    .disabled(committing)
+                    .frame(height: 68)
+                    .gravitonField(mono: true, height: nil)
+            }
+
+            switch phase {
+            case .idle:
+                if !store.canManage {
+                    GStatusLine(.warning, "Start gravitond to commit containers.")
+                }
+            case .committing:
+                GStatusLine(.working, "Snapshotting \(container.name)’s overlay filesystem…")
+            case let .done(image):
+                GStatusLine(.success, "Committed \(image.repository):\(image.tag) · \(Format.bytes(image.sizeBytes))")
+            case let .failed(reason):
+                GStatusLine(.failure, reason)
+            }
+        } footer: {
+            Spacer()
+            Button("Close") { dismiss() }
+                .buttonStyle(.gSecondary)
+                .keyboardShortcut(.cancelAction)
+            Button("Commit", action: commit)
+                .buttonStyle(.gPrimary)
+                .keyboardShortcut(.defaultAction)
+                .disabled(committing || !store.canManage)
+        }
+        .onAppear { focused = true }
+    }
+
+    private func commit() {
+        guard !committing, store.canManage else { return }
+        let trimmedRef = reference.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedAuthor = author.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedMsg = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let spec = CommitSpec(
+            container: container.id,
+            reference: trimmedRef,
+            author: trimmedAuthor.isEmpty ? nil : trimmedAuthor,
+            message: trimmedMsg.isEmpty ? nil : trimmedMsg,
+            changes: parsedChanges
+        )
+        phase = .committing
+        Task {
+            do {
+                let image = try await store.commit(spec)
+                phase = .done(image)
+            } catch {
+                phase = .failed(error.localizedDescription)
             }
         }
     }

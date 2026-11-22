@@ -31,7 +31,7 @@ public protocol EngineService: Sendable {
     func createVolume(name: String) async throws -> VolumeInfo
     func removeVolume(name: String) async throws -> UInt64
     func networkInfo() async throws -> NetworkInfo
-    func logs(id: String, tail: Int?) async throws -> [LogLine]
+    func logs(id: String, tail: Int?, sinceMs: UInt64?, untilMs: UInt64?) async throws -> [LogLine]
     func start(id: String) async throws -> Container
     func stop(id: String) async throws -> Container
     func pause(id: String) async throws -> Container
@@ -43,6 +43,8 @@ public protocol EngineService: Sendable {
     func tagImage(source: String, target: String) async throws -> ImageInfo
     /// Push a local image to its registry using Keychain credentials.
     func pushImage(reference: String) async throws -> ImagePushResult
+    /// Snapshot a container's filesystem and configuration into a local image.
+    func commit(_ spec: CommitSpec) async throws -> ImageInfo
     /// Create a container and start it in its own VM; returns once it's running or has failed.
     func run(_ spec: RunSpec) async throws -> Container
     /// Remove a stopped container; returns its id.
@@ -71,6 +73,12 @@ public protocol EngineService: Sendable {
     func snapshotClear() async throws -> SnapshotInfo
     /// Recent events after `since` (oldest first), at most `limit`.
     func events(since: UInt64?, limit: Int?) async throws -> [EngineEvent]
+}
+
+public extension EngineService {
+    func logs(id: String, tail: Int?) async throws -> [LogLine] {
+        try await logs(id: id, tail: tail, sinceMs: nil, untilMs: nil)
+    }
 }
 
 // MARK: - Socket engine
@@ -123,9 +131,119 @@ public final class SocketEngine: EngineService {
         return info
     }
 
-    public func logs(id: String, tail: Int?) async throws -> [LogLine] {
-        guard case let .logs(lines) = try await call(.logs(id: id, tail: tail)) else { throw EngineError.unexpectedResponse }
+    public func logs(id: String, tail: Int?, sinceMs: UInt64? = nil, untilMs: UInt64? = nil) async throws -> [LogLine] {
+        guard case let .logs(lines) = try await call(.logs(id: id, tail: tail, follow: false, sinceMs: sinceMs, untilMs: untilMs)) else {
+            throw EngineError.unexpectedResponse
+        }
         return lines
+    }
+
+    private final class CancelableFD: @unchecked Sendable {
+        private let lock = NSLock()
+        private var fd: Int32?
+        private(set) var isCancelled = false
+
+        func attach(_ fd: Int32) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if isCancelled { return false }
+            self.fd = fd
+            return true
+        }
+
+        func detach() -> Int32? {
+            lock.lock()
+            defer { lock.unlock() }
+            let current = fd
+            fd = nil
+            return current
+        }
+
+        func cancel() {
+            lock.lock()
+            isCancelled = true
+            let current = fd
+            lock.unlock()
+            if let current {
+                _ = Darwin.shutdown(current, SHUT_RDWR)
+            }
+        }
+    }
+
+    /// Stream container logs in real time (`follow: true`), emitting matching history then live lines until exit or cancellation.
+    public func logsStream(id: String, tail: Int? = nil, sinceMs: UInt64? = nil, untilMs: UInt64? = nil) -> AsyncThrowingStream<LogLine, Error> {
+        let path = self.path
+        let box = CancelableFD()
+        return AsyncThrowingStream { continuation in
+            continuation.onTermination = { _ in box.cancel() }
+            let thread = Thread {
+                var ownedFD: Int32?
+                defer {
+                    _ = box.detach()
+                    if let fd = ownedFD { close(fd) }
+                }
+                do {
+                    let fd = try Self.connect(path: path)
+                    ownedFD = fd
+                    guard box.attach(fd) else {
+                        continuation.finish()
+                        return
+                    }
+                    try Self.writeAll(fd, Array(try Wire.line(.logs(id: id, tail: tail, follow: true, sinceMs: sinceMs, untilMs: untilMs))))
+                    var buffer = Data()
+                    var chunk = [UInt8](repeating: 0, count: 64 * 1024)
+                    while true {
+                        if box.isCancelled {
+                            continuation.finish()
+                            return
+                        }
+                        var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                        let pr = Darwin.poll(&pfd, 1, 250)
+                        if pr == 0 { continue }
+                        if pr < 0 {
+                            if errno == EINTR { continue }
+                            if box.isCancelled { continuation.finish(); return }
+                            throw EngineError.io(String(cString: strerror(errno)))
+                        }
+                        let n = read(fd, &chunk, chunk.count)
+                        if n < 0 {
+                            if errno == EINTR || errno == EAGAIN { continue }
+                            if box.isCancelled { continuation.finish(); return }
+                            throw EngineError.io(String(cString: strerror(errno)))
+                        }
+                        if n == 0 {
+                            continuation.finish()
+                            return
+                        }
+                        buffer.append(contentsOf: chunk[0..<n])
+                        while let nl = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                            let line = Data(buffer[buffer.startIndex..<nl])
+                            buffer.removeSubrange(buffer.startIndex...nl)
+                            if line.isEmpty { continue }
+                            switch try Wire.decoder.decode(EngineResponse.self, from: line) {
+                            case let .log(entry):
+                                continuation.yield(entry)
+                            case .logEnd:
+                                continuation.finish()
+                                return
+                            case let .error(message):
+                                throw EngineError.daemon(message)
+                            default:
+                                throw EngineError.unexpectedResponse
+                            }
+                        }
+                    }
+                } catch {
+                    if box.isCancelled {
+                        continuation.finish()
+                    } else {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+            thread.name = "graviton-logs"
+            thread.start()
+        }
     }
 
     public func start(id: String) async throws -> Container { try await lifecycle(.start(id: id)) }
@@ -147,6 +265,26 @@ public final class SocketEngine: EngineService {
     public func pushImage(reference: String) async throws -> ImagePushResult {
         guard case let .imagePushed(res) = try await call(.pushImage(reference: reference), timeout: 1800) else { throw EngineError.unexpectedResponse }
         return res
+    }
+
+    public func commit(_ spec: CommitSpec) async throws -> ImageInfo {
+        guard case let .image(image) = try await call(.commit(spec), timeout: 600) else { throw EngineError.unexpectedResponse }
+        return image
+    }
+
+    /// Export one or more local images into a Docker/OCI `.tar` archive at `archiveFile`.
+    public func saveImage(references: [String], to archiveFile: URL) async throws {
+        _ = try await receiveArchive(request: .saveImage(references: references), to: archiveFile) { response in
+            guard case .imageArchive = response else { throw EngineError.unexpectedResponse }
+        }
+    }
+
+    /// Import one or more images from a `.tar` or `.tar.gz` archive at `archiveFile`.
+    public func loadImage(from archiveFile: URL, size: UInt64) async throws -> [ImageInfo] {
+        try await sendArchive(request: .loadImage(size: size), from: archiveFile) { response in
+            guard case let .images(list) = response else { throw EngineError.unexpectedResponse }
+            return list
+        }
     }
 
     /// Pull an image, streaming per-layer progress before the final image.
@@ -230,11 +368,30 @@ public final class SocketEngine: EngineService {
 
     /// Download a file or folder from a running container as a tar archive written to `archiveFile`.
     public func getArchive(id: String, path remotePath: String, to archiveFile: URL) async throws -> (isDir: Bool, name: String) {
+        try await receiveArchive(request: .getArchive(id: id, path: remotePath), to: archiveFile) { response in
+            guard case let .archive(isDir, name) = response else { throw EngineError.unexpectedResponse }
+            return (isDir, name)
+        }
+    }
+
+    /// Upload a tar archive into directory `remotePath` inside a running container.
+    public func putArchive(id: String, path remotePath: String, archiveFile: URL, size: UInt64) async throws -> UInt64 {
+        try await sendArchive(request: .putArchive(id: id, path: remotePath, size: size), from: archiveFile) { response in
+            guard case let .copied(files) = response else { throw EngineError.unexpectedResponse }
+            return files
+        }
+    }
+
+    private func receiveArchive<T: Sendable>(
+        request: EngineRequest,
+        to archiveFile: URL,
+        parseHeader: @escaping @Sendable (EngineResponse) throws -> T
+    ) async throws -> T {
         let socketPath = self.path
         return try await Task.detached {
             let fd = try Self.connect(path: socketPath)
             defer { close(fd) }
-            try Self.writeAll(fd, Array(try Wire.line(.getArchive(id: id, path: remotePath))))
+            try Self.writeAll(fd, Array(try Wire.line(request)))
 
             var buffer = Data()
             var chunk = [UInt8](repeating: 0, count: 64 * 1024)
@@ -252,36 +409,40 @@ public final class SocketEngine: EngineService {
             }
 
             let response = try Wire.decoder.decode(EngineResponse.self, from: headerLine!)
-            let meta: (Bool, String)
-            switch response {
-            case let .archive(isDir, name): meta = (isDir, name)
-            case let .error(message): throw EngineError.daemon(message)
-            default: throw EngineError.unexpectedResponse
-            }
+            if case let .error(message) = response { throw EngineError.daemon(message) }
+            let meta = try parseHeader(response)
 
             FileManager.default.createFile(atPath: archiveFile.path, contents: nil)
-            let out = try FileHandle(forWritingTo: archiveFile)
-            defer { try? out.close() }
-            if !buffer.isEmpty {
-                try out.write(contentsOf: buffer)
-            }
-            while true {
-                let n = read(fd, &chunk, chunk.count)
-                guard n >= 0 else { throw EngineError.io(String(cString: strerror(errno))) }
-                if n == 0 { break }
-                try out.write(contentsOf: chunk[0..<n])
+            do {
+                let out = try FileHandle(forWritingTo: archiveFile)
+                defer { try? out.close() }
+                if !buffer.isEmpty {
+                    try out.write(contentsOf: buffer)
+                }
+                while true {
+                    let n = read(fd, &chunk, chunk.count)
+                    guard n >= 0 else { throw EngineError.io(String(cString: strerror(errno))) }
+                    if n == 0 { break }
+                    try out.write(contentsOf: chunk[0..<n])
+                }
+            } catch {
+                try? FileManager.default.removeItem(at: archiveFile)
+                throw error
             }
             return meta
         }.value
     }
 
-    /// Upload a tar archive into directory `remotePath` inside a running container.
-    public func putArchive(id: String, path remotePath: String, archiveFile: URL, size: UInt64) async throws -> UInt64 {
+    private func sendArchive<T: Sendable>(
+        request: EngineRequest,
+        from archiveFile: URL,
+        parseResponse: @escaping @Sendable (EngineResponse) throws -> T
+    ) async throws -> T {
         let socketPath = self.path
         return try await Task.detached {
             let fd = try Self.connect(path: socketPath)
             defer { close(fd) }
-            try Self.writeAll(fd, Array(try Wire.line(.putArchive(id: id, path: remotePath, size: size))))
+            try Self.writeAll(fd, Array(try Wire.line(request)))
 
             let source = try FileHandle(forReadingFrom: archiveFile)
             defer { try? source.close() }
@@ -302,15 +463,11 @@ public final class SocketEngine: EngineService {
                 reply.append(contentsOf: buf[0..<n])
             }
             if !reply.isEmpty, let response = try? Wire.decoder.decode(EngineResponse.self, from: reply) {
-                switch response {
-                case let .copied(files):
-                    if let sendError { throw sendError }
-                    return files
-                case let .error(message):
+                if case let .error(message) = response {
                     throw EngineError.daemon(message)
-                default:
-                    throw EngineError.unexpectedResponse
                 }
+                if let sendError { throw sendError }
+                return try parseResponse(response)
             }
             if let sendError { throw sendError }
             throw EngineError.io("gravitond closed the connection")

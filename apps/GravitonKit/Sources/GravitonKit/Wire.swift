@@ -10,7 +10,7 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case createVolume(name: String)
     case removeVolume(name: String)
     case networkInfo
-    case logs(id: String, tail: Int?)
+    case logs(id: String, tail: Int?, follow: Bool = false, sinceMs: UInt64? = nil, untilMs: UInt64? = nil)
     case start(id: String)
     case stop(id: String)
     case pause(id: String)
@@ -19,6 +19,9 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case pull(reference: String, progress: Bool = false, platform: String? = nil)
     case tagImage(source: String, target: String)
     case pushImage(reference: String, progress: Bool = false)
+    case saveImage(references: [String])
+    case loadImage(size: UInt64)
+    case commit(CommitSpec)
     case run(RunSpec)
     case build(BuildSpec)
     case remove(id: String)
@@ -46,7 +49,13 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     private enum Keys: String, CodingKey { case method, params }
     private struct IDParams: Encodable { let id: String }
     private struct NameParams: Encodable { let name: String }
-    private struct LogParams: Encodable { let id: String; let tail: Int? }
+    private struct LogParams: Encodable {
+        let id: String
+        let tail: Int?
+        let follow: Bool?
+        let sinceMs: UInt64?
+        let untilMs: UInt64?
+    }
     private struct PullParams: Encodable {
         let reference: String
         let progress: Bool?
@@ -54,6 +63,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     }
     private struct TagParams: Encodable { let source: String; let target: String }
     private struct PushImageParams: Encodable { let reference: String; let progress: Bool? }
+    private struct SaveImageParams: Encodable { let references: [String] }
+    private struct LoadImageParams: Encodable { let size: UInt64 }
     private struct PairParams: Encodable { let code: String; let device: String }
     private struct AuthParams: Encodable { let token: String }
     private struct PathParams: Encodable { let id: String; let path: String }
@@ -86,6 +97,9 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .pull: "pull"
         case .tagImage: "tag_image"
         case .pushImage: "push_image"
+        case .saveImage: "save_image"
+        case .loadImage: "load_image"
+        case .commit: "commit"
         case .run: "run"
         case .build: "build"
         case .remove: "remove"
@@ -121,7 +135,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case let .revokeDevice(id): try c.encode(IDParams(id: id), forKey: .params)
         case let .pair(code, device): try c.encode(PairParams(code: code, device: device), forKey: .params)
         case let .auth(token): try c.encode(AuthParams(token: token), forKey: .params)
-        case let .logs(id, tail): try c.encode(LogParams(id: id, tail: tail), forKey: .params)
+        case let .logs(id, tail, follow, sinceMs, untilMs):
+            try c.encode(LogParams(id: id, tail: tail, follow: follow ? true : nil, sinceMs: sinceMs, untilMs: untilMs), forKey: .params)
         case .diskUsage: break
         case let .removeImage(reference): try c.encode(PullParams(reference: reference, progress: nil, platform: nil), forKey: .params)
         case let .prune(spec): try c.encode(spec, forKey: .params)
@@ -142,6 +157,12 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
             try c.encode(TagParams(source: source, target: target), forKey: .params)
         case let .pushImage(reference, progress):
             try c.encode(PushImageParams(reference: reference, progress: progress ? true : nil), forKey: .params)
+        case let .saveImage(references):
+            try c.encode(SaveImageParams(references: references), forKey: .params)
+        case let .loadImage(size):
+            try c.encode(LoadImageParams(size: size), forKey: .params)
+        case let .commit(spec):
+            try c.encode(spec, forKey: .params)
         case let .run(spec): try c.encode(spec, forKey: .params)
         case let .build(spec): try c.encode(spec, forKey: .params)
         }
@@ -159,8 +180,11 @@ public enum EngineResponse: Decodable, Sendable {
     case volumeRemoved(name: String, freedBytes: UInt64)
     case network(NetworkInfo)
     case logs([LogLine])
+    case log(LogLine)
+    case logEnd(exitCode: Int32?)
     case container(Container)
     case image(ImageInfo)
+    case imageArchive
     case pullProgress(PullProgress)
     case imagePushed(ImagePushResult)
     case removed(id: String)
@@ -198,6 +222,7 @@ public enum EngineResponse: Decodable, Sendable {
     private struct ArchiveData: Decodable { let isDir: Bool; let name: String }
     private struct CopiedData: Decodable { let files: UInt64 }
     private struct VolumeRemovedData: Decodable { let name: String; let freedBytes: UInt64 }
+    private struct LogEndData: Decodable { let exitCode: Int32? }
     private struct ExecOutputData: Decodable { let stream: String?; let data: [UInt8] }
     private struct ExecExitedData: Decodable { let code: Int32 }
 
@@ -216,8 +241,11 @@ public enum EngineResponse: Decodable, Sendable {
             self = .volumeRemoved(name: r.name, freedBytes: r.freedBytes)
         case "network": self = .network(try c.decode(NetworkInfo.self, forKey: .data))
         case "logs": self = .logs(try c.decode([LogLine].self, forKey: .data))
+        case "log": self = .log(try c.decode(LogLine.self, forKey: .data))
+        case "log_end": self = .logEnd(exitCode: try c.decode(LogEndData.self, forKey: .data).exitCode)
         case "container": self = .container(try c.decode(Container.self, forKey: .data))
         case "image": self = .image(try c.decode(ImageInfo.self, forKey: .data))
+        case "image_archive": self = .imageArchive
         case "pull_progress": self = .pullProgress(try c.decode(PullProgress.self, forKey: .data))
         case "image_pushed": self = .imagePushed(try c.decode(ImagePushResult.self, forKey: .data))
         case "removed": self = .removed(id: try c.decode(Removed.self, forKey: .data).id)

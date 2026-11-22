@@ -713,8 +713,25 @@ final class FairyController {
         case "logs":
             let c = try resolveContainer(try requireString(args, "container"))
             let tail = max(1, min(500, args["tail"]?.intValue ?? 100))
-            await store.loadLogs(for: c.id, tail: tail)
-            var lines = store.logs[c.id] ?? []
+            let sinceMs: UInt64?
+            if let sinceStr = args["since"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !sinceStr.isEmpty {
+                guard let parsed = Format.parseLogTimestamp(sinceStr) else {
+                    throw EngineError.daemon("Couldn't parse `since` timestamp \"\(sinceStr)\". Use e.g. \"10m\", \"2h\", epoch seconds, or RFC 3339.")
+                }
+                sinceMs = parsed
+            } else {
+                sinceMs = nil
+            }
+            let untilMs: UInt64?
+            if let untilStr = args["until"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !untilStr.isEmpty {
+                guard let parsed = Format.parseLogTimestamp(untilStr) else {
+                    throw EngineError.daemon("Couldn't parse `until` timestamp \"\(untilStr)\". Use e.g. \"5m\", epoch seconds, or RFC 3339.")
+                }
+                untilMs = parsed
+            } else {
+                untilMs = nil
+            }
+            var lines = try await store.fetchLogs(for: c.id, tail: tail, sinceMs: sinceMs, untilMs: untilMs)
             if let lvlStr = args["level"]?.stringValue?.lowercased(),
                let minLevel = LogLevel(rawValue: lvlStr) {
                 lines = lines.filter { $0.level >= minLevel }
@@ -917,6 +934,51 @@ final class FairyController {
             let ref = try requireString(args, "reference")
             let pushed = try await store.pushImage(reference: ref)
             return try FairyJSON.fromEncodable(pushed)
+
+        case "commit_container":
+            let c = try resolveContainer(try requireString(args, "container"))
+            let spec = CommitSpec(
+                container: c.id,
+                reference: args["reference"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+                author: args["author"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+                message: args["message"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+                changes: args["changes"]?.stringArrayValue ?? []
+            )
+            let committed = try await store.commit(spec)
+            return try FairyJSON.fromEncodable(committed)
+
+        case "save_image":
+            var refs = args["references"]?.stringArrayValue?.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty } ?? []
+            if refs.isEmpty, let single = args["reference"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !single.isEmpty {
+                refs = [single]
+            }
+            guard !refs.isEmpty else {
+                throw EngineError.daemon("At least one image reference is required (`references`).")
+            }
+            let outPath = expandPath(try requireString(args, "output_path"))
+            let outURL = URL(fileURLWithPath: outPath)
+            let parent = outURL.deletingLastPathComponent()
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+            try await store.saveImage(references: refs, to: outURL)
+            let attrs = try? FileManager.default.attributesOfItem(atPath: outURL.path)
+            let bytes = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+            return .object([
+                "references": .array(refs.map { .string($0) }),
+                "output_path": .string(outURL.path),
+                "size_bytes": .int(bytes),
+            ])
+
+        case "load_image":
+            let inPath = expandPath(try requireString(args, "input_path"))
+            let inURL = URL(fileURLWithPath: inPath)
+            guard FileManager.default.fileExists(atPath: inURL.path) else {
+                throw EngineError.daemon("Archive file \"\(inPath)\" doesn't exist.")
+            }
+            let loaded = try await store.loadImage(from: inURL)
+            return .object([
+                "images": try FairyJSON.fromEncodable(loaded),
+                "count": .int(Int64(loaded.count)),
+            ])
 
         case "volumes":
             await store.loadVolumes()

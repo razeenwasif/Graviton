@@ -89,4 +89,42 @@ public enum Format {
         date.formatted(.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits).second(.twoDigits)) +
             String(format: ".%03d", Int(date.timeIntervalSince1970 * 1000) % 1000)
     }
+
+    /// Parse relative durations (`30s`, `5m`, `2h`, `1d`), Unix epoch seconds/ms, or RFC 3339 / ISO 8601 timestamps into Unix milliseconds.
+    public static func parseLogTimestamp(_ input: String, now: Date = .now) -> UInt64? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        if let unit = trimmed.last?.lowercased().first, "smhd".contains(unit), trimmed.count >= 2 {
+            let numPart = String(trimmed.dropLast())
+            if let value = Double(numPart), value.isFinite, value >= 0 {
+                let multiplier: TimeInterval = switch unit {
+                case "s": 1
+                case "m": 60
+                case "h": 3600
+                case "d": 86_400
+                default: 0
+                }
+                return UInt64(max(0, (now.timeIntervalSince1970 - value * multiplier) * 1000))
+            }
+        }
+
+        if trimmed.allSatisfy(\.isASCII) && trimmed.allSatisfy(\.isNumber) {
+            guard let raw = UInt64(trimmed) else { return nil }
+            if trimmed.count >= 12 { return raw }
+            return raw.multipliedReportingOverflow(by: 1000).partialValue
+        }
+
+        let frac = ISO8601DateFormatter()
+        frac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = frac.date(from: trimmed) {
+            return UInt64(max(0, date.timeIntervalSince1970 * 1000))
+        }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        if let date = plain.date(from: trimmed) {
+            return UInt64(max(0, date.timeIntervalSince1970 * 1000))
+        }
+        return nil
+    }
 }

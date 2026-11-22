@@ -28,8 +28,67 @@ struct LiveEngineTests {
         #expect(messages.contains("hello-from-swift"))
         #expect(messages.contains("hi-env"))
 
+        // Streaming logs over Unix socket replays historical lines then ends when container exited.
+        var streamed: [String] = []
+        for try await line in engine.logsStream(id: container.id, tail: nil) {
+            streamed.append(line.message)
+        }
+        #expect(streamed.contains("hello-from-swift"))
+
         #expect(try await engine.remove(id: container.id) == container.id)
         #expect(try await engine.containers().contains { $0.id == container.id } == false)
+    }
+
+    @Test func streamingLogsCancellationAndCommitSaveLoad() async throws {
+        let engine = SocketEngine()
+        _ = try await engine.pull(reference: "alpine")
+        let name = "swift-commit-\(Int.random(in: 1000...9999))"
+        let committedRef = "swift-committed-\(Int.random(in: 1000...9999)):v1"
+        let container = try await engine.run(RunSpec(
+            image: "alpine",
+            name: name,
+            command: ["sh", "-c", "echo live-line-1; sleep 1; echo live-line-2; sleep 30"],
+            memoryMib: 256
+        ))
+        let tarURL = FileManager.default.temporaryDirectory.appending(path: "swift-save-\(UUID().uuidString).tar")
+        defer { try? FileManager.default.removeItem(at: tarURL) }
+
+        do {
+            // Stream live logs until second line, then break to test mid-stream cancellation without blocking.
+            var got: [String] = []
+            for try await line in engine.logsStream(id: container.id, tail: nil) {
+                got.append(line.message)
+                if got.contains("live-line-2") { break }
+            }
+            #expect(got.contains("live-line-1") && got.contains("live-line-2"))
+
+            // Stop, commit with message + ENV override, export archive, delete image, re-import archive.
+            _ = try await engine.stop(id: container.id)
+            let committed = try await engine.commit(CommitSpec(
+                container: container.id,
+                reference: committedRef,
+                author: "Swift Test",
+                message: "live commit test",
+                changes: ["ENV SWIFT_COMMIT=1"]
+            ))
+            #expect("\(committed.repository):\(committed.tag)" == committedRef)
+
+            try await engine.saveImage(references: [committedRef], to: tarURL)
+            let attrs = try FileManager.default.attributesOfItem(atPath: tarURL.path)
+            let tarSize = try #require((attrs[.size] as? NSNumber)?.uint64Value)
+            #expect(tarSize > 0)
+
+            _ = try await engine.remove(id: container.id)
+            _ = try await engine.removeImage(reference: committedRef)
+            let loaded = try await engine.loadImage(from: tarURL, size: tarSize)
+            #expect(loaded.contains { "\($0.repository):\($0.tag)" == committedRef })
+            _ = try await engine.removeImage(reference: committedRef)
+        } catch {
+            _ = try? await engine.stop(id: container.id)
+            _ = try? await engine.remove(id: container.id)
+            _ = try? await engine.removeImage(reference: committedRef)
+            throw error
+        }
     }
 
     @Test func terminalStatsFilesInspect() async throws {
@@ -119,6 +178,7 @@ struct LiveEngineTests {
         // A bad Dockerfile line comes back as the daemon's error.
         try "FROM alpine\nRUN false\n".write(to: dir.appending(path: "Dockerfile"), atomically: true, encoding: .utf8)
         await #expect(throws: EngineError.self) { for try await _ in engine.build(BuildSpec(context: dir.path, tag: "swift-live-build:bad")) {} }
+        _ = try? await engine.removeImage(reference: "swift-live-build:1")
     }
 
     @Test func reportsDaemonErrors() async throws {
@@ -188,6 +248,16 @@ struct LiveRemoteTests {
             #expect(try await remote.ping() == 2)
             let remoteNet = try await remote.networkInfo()
             #expect(remoteNet.endpoints.contains { $0.containerId == running.id && $0.isRunning })
+
+            // TLS log streaming + immediate cancellation test.
+            let logStreamTask = Task {
+                for try await _ in remote.logsStream(id: running.id, tail: 5) {
+                    break
+                }
+            }
+            try await Task.sleep(for: .milliseconds(150))
+            logStreamTask.cancel()
+            _ = try? await logStreamTask.value
         }
 
         // Volumes over TLS: create, list, remove.
@@ -197,6 +267,47 @@ struct LiveRemoteTests {
         #expect(try await remote.volumes().contains { $0.name == volName })
         _ = try await remote.removeVolume(name: volName)
         #expect(try await remote.volumes().contains { $0.name == volName } == false)
+
+        // Unconditional TLS live streaming logs (+ cancellation), commit, saveImage & loadImage.
+        let tlsName = "swift-tls-stream-\(Int.random(in: 1000...9999))"
+        let tlsRef = "swift-tls-committed-\(Int.random(in: 1000...9999)):v1"
+        let tlsContainer = try await remote.run(RunSpec(
+            image: "alpine",
+            name: tlsName,
+            command: ["sh", "-c", "echo tls-live-1; sleep 1; echo tls-live-2; sleep 30"],
+            memoryMib: 256
+        ))
+        let tlsTar = FileManager.default.temporaryDirectory.appending(path: "swift-tls-save-\(UUID().uuidString).tar")
+        defer { try? FileManager.default.removeItem(at: tlsTar) }
+        do {
+            var seen: [String] = []
+            for try await line in remote.logsStream(id: tlsContainer.id, tail: nil) {
+                seen.append(line.message)
+                if seen.contains("tls-live-2") { break }
+            }
+            #expect(seen.contains("tls-live-1") && seen.contains("tls-live-2"))
+
+            _ = try await remote.stop(id: tlsContainer.id)
+            let committed = try await remote.commit(CommitSpec(container: tlsContainer.id, reference: tlsRef, message: "tls commit"))
+            #expect("\(committed.repository):\(committed.tag)" == tlsRef)
+
+            try await remote.saveImage(references: [tlsRef], to: tlsTar)
+            let attrs = try FileManager.default.attributesOfItem(atPath: tlsTar.path)
+            let tarSize = try #require((attrs[.size] as? NSNumber)?.uint64Value)
+            #expect(tarSize > 0)
+
+            _ = try await remote.remove(id: tlsContainer.id)
+            _ = try await remote.removeImage(reference: tlsRef)
+            let reloaded = try await remote.loadImage(from: tlsTar, size: tarSize)
+            #expect(reloaded.contains { "\($0.repository):\($0.tag)" == tlsRef })
+            _ = try await remote.removeImage(reference: tlsRef)
+        } catch {
+            _ = try? await local.stop(id: tlsContainer.id)
+            _ = try? await local.remove(id: tlsContainer.id)
+            _ = try? await local.removeImage(reference: tlsRef)
+            _ = try? await local.revokeDevice(id: paired.host.deviceID)
+            throw error
+        }
 
         try await local.revokeDevice(id: paired.host.deviceID)
         let revoked = RemoteEngine(host: paired.host, token: paired.token)

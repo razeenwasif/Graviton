@@ -167,3 +167,102 @@ struct MobilePullSheet: View {
         }
     }
 }
+
+/// Snapshot a container's filesystem and configuration into a new image on the paired Mac (`grav commit`).
+struct MobileCommitSheet: View {
+    @Environment(EngineStore.self) private var store
+    @Environment(\.dismiss) private var dismiss
+    var container: Container
+    @State private var reference = ""
+    @State private var author = ""
+    @State private var message = ""
+    @State private var changesText = ""
+    @State private var phase: Phase = .idle
+    @FocusState private var focused: Bool
+
+    enum Phase {
+        case idle
+        case committing
+        case done(ImageInfo)
+        case failed(String)
+    }
+
+    private var busy: Bool { if case .committing = phase { true } else { false } }
+    private var isDone: Bool { if case .done = phase { true } else { false } }
+
+    private var parsedChanges: [String] {
+        changesText
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    var body: some View {
+        MobileSheet("Commit to image",
+                    subtitle: "Snapshot \(container.name) into a local OCI image on \(store.liveName ?? "the Mac").",
+                    cancelTitle: isDone ? "Done" : "Cancel",
+                    actionTitle: "Commit",
+                    actionEnabled: !busy && store.canManage,
+                    action: commit) {
+            GFormRow("Reference", hint: "repo[:tag]. Leave blank for committed:\(String(container.id.prefix(12))).") {
+                MobileField(placeholder: "e.g. \(container.name):snapshot", text: $reference)
+                    .focused($focused)
+                    .disabled(busy)
+                    .submitLabel(.go)
+                    .onSubmit(commit)
+            }
+            GFormRow("Author") {
+                MobileField(placeholder: "Optional name or email", text: $author, mono: false)
+                    .disabled(busy)
+            }
+            GFormRow("Message") {
+                MobileField(placeholder: "Optional commit message", text: $message, mono: false)
+                    .disabled(busy)
+            }
+            GFormRow("Config changes", hint: "Optional Dockerfile lines (one per line), e.g. ENV MODE=prod") {
+                TextEditor(text: $changesText)
+                    .scrollContentBackground(.hidden)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .disabled(busy)
+                    .frame(height: 82)
+                    .gravitonField(mono: true, height: nil, size: 14.5)
+            }
+
+            switch phase {
+            case .idle:
+                EmptyView()
+            case .committing:
+                GStatusLine(.working, "Snapshotting \(container.name)…")
+            case let .done(image):
+                GStatusLine(.success, "Committed \(image.repository):\(image.tag) · \(Format.bytes(image.sizeBytes))")
+            case let .failed(reason):
+                GStatusLine(.failure, reason)
+            }
+        }
+        .onAppear { focused = true }
+    }
+
+    private func commit() {
+        guard !busy, store.canManage else { return }
+        let trimmedRef = reference.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedAuthor = author.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedMsg = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let spec = CommitSpec(
+            container: container.id,
+            reference: trimmedRef,
+            author: trimmedAuthor.isEmpty ? nil : trimmedAuthor,
+            message: trimmedMsg.isEmpty ? nil : trimmedMsg,
+            changes: parsedChanges
+        )
+        phase = .committing
+        Task {
+            do {
+                let image = try await store.commit(spec)
+                phase = .done(image)
+            } catch {
+                phase = .failed(error.localizedDescription)
+            }
+        }
+    }
+}

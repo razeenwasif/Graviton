@@ -562,7 +562,7 @@ import Testing
     }
 
     @Test func approvalPolicyMatchesTieredRules() {
-        #expect(FairyApprovalPolicy.supportedTools.count == 27)
+        #expect(FairyApprovalPolicy.supportedTools.count == 30)
 
         // Auto-run reads & reversible operations
         for readTool in ["status", "events", "containers", "inspect", "logs", "stats",
@@ -594,9 +594,34 @@ import Testing
         for gatedCompose in ["up", "down", "stop", "build"] {
             #expect(FairyApprovalPolicy.requiresTouchID(tool: "compose", args: ["action": .string(gatedCompose)]))
         }
-        for gatedTool in ["run", "exec", "build", "push_image", "remove_image", "copy_files", "unknown_future_tool"] {
+        for gatedTool in ["run", "exec", "commit_container", "build", "push_image", "save_image", "load_image", "remove_image", "copy_files", "unknown_future_tool"] {
             #expect(FairyApprovalPolicy.requiresTouchID(tool: gatedTool, args: [:]), "\(gatedTool) must require Touch ID")
         }
+
+        let commitSummary = FairyApprovalPolicy.summarize(
+            tool: "commit_container",
+            args: ["container": .string("api"), "reference": .string("api:v2"), "reason": .string("snapshot config")],
+            host: "mini"
+        )
+        #expect(commitSummary.title == "Commit api → api:v2")
+        #expect(!commitSummary.isDestructive)
+        #expect(commitSummary.touchIDReason.contains("mini"))
+
+        let saveSummary = FairyApprovalPolicy.summarize(
+            tool: "save_image",
+            args: ["references": .array([.string("alpine:3.22")]), "output_path": .string("/tmp/alpine.tar"), "reason": .string("backup")],
+            host: "mini"
+        )
+        #expect(saveSummary.title == "Export image archive")
+        #expect(saveSummary.detail.contains("/tmp/alpine.tar"))
+
+        let loadSummary = FairyApprovalPolicy.summarize(
+            tool: "load_image",
+            args: ["input_path": .string("/tmp/alpine.tar"), "reason": .string("restore")],
+            host: "mini"
+        )
+        #expect(loadSummary.title == "Import image archive")
+        #expect(loadSummary.detail.contains("/tmp/alpine.tar"))
 
         let tagSummary = FairyApprovalPolicy.summarize(
             tool: "tag_image",
@@ -1095,5 +1120,77 @@ import Testing
         let paused = #"{"enabled":true,"total_slots":1,"in_use":0,"total_bytes":14159872,"max_slots_per_shape":8,"groups":[],"paused_reason":"macOS console session is locked"}"#
         let decodedPaused = try Wire.decoder.decode(SnapshotInfo.self, from: Data(paused.utf8))
         #expect(decodedPaused.pausedReason == "macOS console session is locked")
+    }
+
+    @Test func streamingLogsCommitAndArchivesWireAndHelpers() async throws {
+        let line = { (r: EngineRequest) in String(decoding: try Wire.line(r), as: UTF8.self) }
+
+        // Legacy logs request shape must remain untouched.
+        #expect(try line(.logs(id: "web", tail: 10)) == #"{"method":"logs","params":{"id":"web","tail":10}}"# + "\n")
+
+        // Streaming logs with follow & time window.
+        #expect(
+            try line(.logs(id: "api", tail: 25, follow: true, sinceMs: 1_700_000_000_000, untilMs: 1_700_000_060_000))
+                == #"{"method":"logs","params":{"follow":true,"id":"api","since_ms":1700000000000,"tail":25,"until_ms":1700000060000}}"# + "\n"
+        )
+
+        // Commit, SaveImage, LoadImage request wire format.
+        let commitSpec = CommitSpec(
+            container: "web",
+            reference: "myrepo/web:v2",
+            author: "Jane",
+            message: "snapshot",
+            changes: ["ENV FOO=bar", "CMD [\"sh\"]"]
+        )
+        #expect(
+            try line(.commit(commitSpec))
+                == #"{"method":"commit","params":{"author":"Jane","changes":["ENV FOO=bar","CMD [\"sh\"]"],"container":"web","message":"snapshot","reference":"myrepo/web:v2"}}"# + "\n"
+        )
+        let minCommit = CommitSpec(container: "c1")
+        #expect(try line(.commit(minCommit)) == #"{"method":"commit","params":{"container":"c1","reference":""}}"# + "\n")
+        #expect(try line(.saveImage(references: ["alpine:3.22", "app:1"])) == #"{"method":"save_image","params":{"references":["alpine:3.22","app:1"]}}"# + "\n")
+        #expect(try line(.loadImage(size: 42_000)) == #"{"method":"load_image","params":{"size":42000}}"# + "\n")
+
+        // Responses: log, log_end (with exit code and empty), image_archive.
+        let logJSON = #"{"type":"log","data":{"seq":7,"timestamp_ms":1700000000123,"level":"info","message":"ready"}}"#
+        guard case let .log(entry) = try Wire.decoder.decode(EngineResponse.self, from: Data(logJSON.utf8)) else {
+            Issue.record("expected .log"); return
+        }
+        #expect(entry.seq == 7 && entry.timestampMs == 1_700_000_000_123 && entry.message == "ready")
+
+        guard case let .logEnd(code) = try Wire.decoder.decode(EngineResponse.self, from: Data(#"{"type":"log_end","data":{"exit_code":42}}"#.utf8)) else {
+            Issue.record("expected .logEnd with code"); return
+        }
+        #expect(code == 42)
+
+        guard case let .logEnd(nilCode) = try Wire.decoder.decode(EngineResponse.self, from: Data(#"{"type":"log_end","data":{}}"#.utf8)) else {
+            Issue.record("expected .logEnd without code"); return
+        }
+        #expect(nilCode == nil)
+
+        guard case .imageArchive = try Wire.decoder.decode(EngineResponse.self, from: Data(#"{"type":"image_archive"}"#.utf8)) else {
+            Issue.record("expected .imageArchive"); return
+        }
+
+        // Format.parseLogTimestamp & LogTimeWindow helpers.
+        let fixedNow = Date(timeIntervalSince1970: 1_700_000_600)
+        #expect(Format.parseLogTimestamp("5m", now: fixedNow) == 1_700_000_300_000)
+        #expect(Format.parseLogTimestamp("30s", now: fixedNow) == 1_700_000_570_000)
+        #expect(Format.parseLogTimestamp("1700000100") == 1_700_000_100_000)
+        #expect(Format.parseLogTimestamp("1700000100123") == 1_700_000_100_123)
+        #expect(Format.parseLogTimestamp("2026-11-22T09:00:00Z") != nil)
+        #expect(Format.parseLogTimestamp("not-a-timestamp") == nil)
+        #expect(LogTimeWindow.all.sinceMs(now: fixedNow) == nil)
+        #expect(LogTimeWindow.fiveMinutes.sinceMs(now: fixedNow) == 1_700_000_300_000)
+        #expect(LogTimeWindow.oneHour.sinceMs(now: fixedNow) == 1_699_997_000_000)
+
+        // DemoEngine time window filter & commit rejection.
+        let demo = DemoEngine()
+        let allLogs = try await demo.logs(id: "api-gateway", tail: nil)
+        #expect(allLogs.count > 2)
+        let cutoff = allLogs[allLogs.count - 2].timestampMs
+        let filtered = try await demo.logs(id: "api-gateway", tail: nil, sinceMs: cutoff, untilMs: cutoff)
+        #expect(filtered.allSatisfy { $0.timestampMs == cutoff })
+        await #expect(throws: EngineError.self) { _ = try await demo.commit(CommitSpec(container: "web", reference: "web:snap")) }
     }
 }

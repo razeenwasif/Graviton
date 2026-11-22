@@ -161,11 +161,75 @@ public final class EngineStore {
         if events.count > 500 { events.removeFirst(events.count - 500) }
     }
 
-    public func loadLogs(for id: String, tail: Int? = 500) async {
+    public func loadLogs(for id: String, tail: Int? = 500, sinceMs: UInt64? = nil, untilMs: UInt64? = nil) async {
         do {
-            logs[id] = try await service.logs(id: id, tail: tail)
+            logs[id] = try await service.logs(id: id, tail: tail, sinceMs: sinceMs, untilMs: untilMs)
         } catch {
             lastError = error.localizedDescription
+        }
+    }
+
+    /// Fetch logs for one-off queries (e.g. Fairy) without mutating the UI tab buffer.
+    public func fetchLogs(for id: String, tail: Int? = 500, sinceMs: UInt64? = nil, untilMs: UInt64? = nil) async throws -> [LogLine] {
+        try await service.logs(id: id, tail: tail, sinceMs: sinceMs, untilMs: untilMs)
+    }
+
+    /// Stream container logs in real time over Unix socket / TLS, falling back to polling in demo mode.
+    public func followLogs(for id: String, tail: Int? = 500, sinceMs: UInt64? = nil, untilMs: UInt64? = nil) async {
+        guard connection == .live else {
+            while !Task.isCancelled {
+                await loadLogs(for: id, tail: tail, sinceMs: sinceMs, untilMs: untilMs)
+                try? await Task.sleep(for: .seconds(2))
+            }
+            return
+        }
+
+        let upstream: AsyncThrowingStream<LogLine, Error>
+        switch live {
+        case let local as SocketEngine:
+            upstream = local.logsStream(id: id, tail: tail, sinceMs: sinceMs, untilMs: untilMs)
+        case let remote as RemoteEngine:
+            upstream = remote.logsStream(id: id, tail: tail, sinceMs: sinceMs, untilMs: untilMs)
+        default:
+            while !Task.isCancelled {
+                await loadLogs(for: id, tail: tail, sinceMs: sinceMs, untilMs: untilMs)
+                try? await Task.sleep(for: .seconds(2))
+            }
+            return
+        }
+
+        let hasWindow = sinceMs != nil || untilMs != nil
+        if hasWindow {
+            logs[id] = []
+        }
+        var replaced = hasWindow
+        let maxLines = 5_000
+        do {
+            for try await entry in upstream {
+                try Task.checkCancellation()
+                if !replaced {
+                    logs[id] = [entry]
+                    replaced = true
+                } else {
+                    var current = logs[id] ?? []
+                    if current.last?.seq != entry.seq {
+                        current.append(entry)
+                        if current.count > maxLines {
+                            current.removeFirst(current.count - maxLines)
+                        }
+                        logs[id] = current
+                    }
+                }
+            }
+            if !Task.isCancelled && !replaced {
+                logs[id] = []
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            if !Task.isCancelled {
+                lastError = error.localizedDescription
+            }
         }
     }
 
@@ -202,6 +266,14 @@ public final class EngineStore {
         let result = try await service.pushImage(reference: reference)
         await refresh()
         return result
+    }
+
+    /// Snapshot a container's filesystem and config into a new local image.
+    @discardableResult
+    public func commit(_ spec: CommitSpec) async throws -> ImageInfo {
+        let image = try await service.commit(spec)
+        await refresh()
+        return image
     }
 
     /// Pull an image with streamed per-layer progress. Refreshes the image list when done.
@@ -370,6 +442,44 @@ public final class EngineStore {
         default:
             throw EngineError.daemon("File transfers need gravitond running, here or on a paired Mac.")
         }
+    }
+
+    /// Export one or more local images into a Docker/OCI `.tar` archive at `archiveFile`.
+    public func saveImage(references: [String], to archiveFile: URL) async throws {
+        guard canTransferFiles else {
+            throw EngineError.daemon("Exporting images needs gravitond running, here or on a paired Mac.")
+        }
+        switch live {
+        case let local as SocketEngine:
+            try await local.saveImage(references: references, to: archiveFile)
+        case let remote as RemoteEngine:
+            try await remote.saveImage(references: references, to: archiveFile)
+        default:
+            throw EngineError.daemon("Exporting images needs gravitond running, here or on a paired Mac.")
+        }
+    }
+
+    /// Load one or more images from a `.tar` / `.tar.gz` archive into the active engine.
+    @discardableResult
+    public func loadImage(from archiveFile: URL) async throws -> [ImageInfo] {
+        guard canTransferFiles else {
+            throw EngineError.daemon("Importing images needs gravitond running, here or on a paired Mac.")
+        }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: archiveFile.path)
+        guard let size = (attrs?[.size] as? NSNumber)?.uint64Value, size > 0 else {
+            throw EngineError.daemon("Image archive \(archiveFile.lastPathComponent) is missing or empty.")
+        }
+        let loaded: [ImageInfo]
+        switch live {
+        case let local as SocketEngine:
+            loaded = try await local.loadImage(from: archiveFile, size: size)
+        case let remote as RemoteEngine:
+            loaded = try await remote.loadImage(from: archiveFile, size: size)
+        default:
+            throw EngineError.daemon("Importing images needs gravitond running, here or on a paired Mac.")
+        }
+        await refresh()
+        return loaded
     }
 
     public func start(_ c: Container) async { await lifecycle { try await $0.start(id: c.id) } }
