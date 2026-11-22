@@ -481,6 +481,29 @@ public struct FileContents: Codable, Hashable, Sendable {
     }
 }
 
+/// Saved OCI registry credential entry (`RegistryLoginInfo` in `graviton-proto`).
+public struct RegistryLoginInfo: Codable, Identifiable, Hashable, Sendable {
+    public var id: String { registry }
+    public var registry: String
+    public var username: String
+
+    public init(registry: String, username: String) {
+        self.registry = registry
+        self.username = username
+    }
+}
+
+/// Ephemeral in-memory tmpfs mount inside a container (`TmpfsMount` in `graviton-proto`).
+public struct TmpfsMount: Codable, Hashable, Sendable {
+    public var target: String
+    public var options: String = ""
+
+    public init(target: String, options: String = "") {
+        self.target = target
+        self.options = options
+    }
+}
+
 /// How a container is configured (`ContainerDetails` in `graviton-proto`).
 public struct ContainerDetails: Codable, Hashable, Sendable {
     public var container: Container
@@ -503,6 +526,13 @@ public struct ContainerDetails: Codable, Hashable, Sendable {
     public var labels: [String: String]? = nil
     public var healthcheck: Healthcheck? = nil
     public var health: HealthState? = nil
+    public var readOnly: Bool? = nil
+    public var capAdd: [String]? = nil
+    public var capDrop: [String]? = nil
+    public var tmpfs: [TmpfsMount]? = nil
+    public var `init`: Bool? = nil
+
+    public var usesInit: Bool { self.`init` ?? false }
 }
 
 /// What `grav exec` asks for.

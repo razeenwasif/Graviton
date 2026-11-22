@@ -63,6 +63,25 @@ struct InspectPanel: View {
                     }
                     InspectSection("Mounts") {
                         InspectRow("Volumes", d.container.mounts.isEmpty ? "—" : d.container.mounts.map { "\($0.source) → \($0.target)\($0.readOnly ? " (read-only)" : "")" }.joined(separator: "\n"))
+                        if let tmpfs = d.tmpfs, !tmpfs.isEmpty {
+                            InspectRow("Tmpfs", tmpfs.map { $0.options.isEmpty ? $0.target : "\($0.target) (\($0.options))" }.joined(separator: "\n"))
+                        }
+                    }
+                    if d.readOnly == true || d.usesInit || !(d.capAdd ?? []).isEmpty || !(d.capDrop ?? []).isEmpty {
+                        InspectSection("Security & Runtime") {
+                            if d.readOnly == true {
+                                InspectRow("Root filesystem", "Read-only")
+                            }
+                            if d.usesInit {
+                                InspectRow("Init process", "Enabled (docker-init)")
+                            }
+                            if let add = d.capAdd, !add.isEmpty {
+                                InspectRow("Added capabilities", add.joined(separator: ", "))
+                            }
+                            if let drop = d.capDrop, !drop.isEmpty {
+                                InspectRow("Dropped capabilities", drop.joined(separator: ", "))
+                            }
+                        }
                     }
                     environment(d.env)
                     if let labels = d.labels, !labels.isEmpty {

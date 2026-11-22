@@ -1179,6 +1179,7 @@ fn prepare(b: &mut Builder, container: &str, layers: &[BuiltLayer]) -> Result<()
         container: container.into(),
         layers: layers.iter().map(|l| l.digest.clone()).collect(),
         mounts: vec![],
+        tmpfs: vec![],
         hostname: Some("graviton-build".into()),
         now_secs: None,
     })? {
@@ -1254,6 +1255,10 @@ fn run(
         stdin: stdin.map(|s| s.as_bytes().to_vec()),
         stdin_pipe: false,
         mounts,
+        read_only: false,
+        cap_add: vec![],
+        cap_drop: vec![],
+        init: false,
     }))?;
     let (mut out, mut err) = (LineBuffer::default(), LineBuffer::default());
     loop {

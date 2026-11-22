@@ -8,6 +8,9 @@ public actor DemoEngine: EngineService {
     private var logLines: [String: [LogLine]]
     private var imageList: [ImageInfo]
     private var volumeList: [VolumeInfo]
+    private var loginsList: [RegistryLoginInfo] = [
+        RegistryLoginInfo(registry: "ghcr.io", username: "demo")
+    ]
     /// Pretend build cache, for the Clean Up sheet.
     private var cacheSteps: UInt32 = 23
     private var cacheBytes: UInt64 = 412 << 20
@@ -455,6 +458,44 @@ public actor DemoEngine: EngineService {
         SnapshotInfo(enabled: true, totalSlots: 0, inUse: 0, totalBytes: 0, maxSlotsPerShape: 8, groups: [])
     }
 
+    public func listLogins() -> [RegistryLoginInfo] {
+        loginsList.sorted { $0.registry < $1.registry }
+    }
+
+    public func registryLogin(registry: String, username: String, password: String) throws -> RegistryLoginInfo {
+        let user = username.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !user.isEmpty else { throw EngineError.daemon("username can't be empty") }
+        guard !password.isEmpty else { throw EngineError.daemon("password can't be empty") }
+        var host = registry.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let stripped = host.stripPrefixCaseInsensitive("https://") ?? host.stripPrefixCaseInsensitive("http://") {
+            host = stripped
+        }
+        if let slash = host.firstIndex(of: "/") { host = String(host[..<slash]) }
+        if host.isEmpty || host == "index.docker.io" || host == "registry-1.docker.io" {
+            host = "docker.io"
+        }
+        let info = RegistryLoginInfo(registry: host, username: user)
+        loginsList.removeAll { $0.registry == host }
+        loginsList.append(info)
+        return info
+    }
+
+    public func registryLogout(registry: String) throws -> String {
+        var host = registry.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let stripped = host.stripPrefixCaseInsensitive("https://") ?? host.stripPrefixCaseInsensitive("http://") {
+            host = stripped
+        }
+        if let slash = host.firstIndex(of: "/") { host = String(host[..<slash]) }
+        if host.isEmpty || host == "index.docker.io" || host == "registry-1.docker.io" {
+            host = "docker.io"
+        }
+        guard let idx = loginsList.firstIndex(where: { $0.registry == host }) else {
+            throw EngineError.daemon("not logged in to \(host)")
+        }
+        loginsList.remove(at: idx)
+        return host
+    }
+
     public func events(since: UInt64?, limit: Int?) -> [EngineEvent] {
         let now = UInt64(Date.now.timeIntervalSince1970 * 1000)
         let min: UInt64 = 60_000
@@ -493,5 +534,14 @@ public actor DemoEngine: EngineService {
         lines.append(LogLine(seq: (lines.last?.seq ?? 0) + 1, timestampMs: UInt64(Date.now.timeIntervalSince1970 * 1000),
                              level: pick.0, message: pick.1))
         logLines[id] = Array(lines.suffix(2000))
+    }
+}
+
+private extension String {
+    func stripPrefixCaseInsensitive(_ prefix: String) -> String? {
+        guard count >= prefix.count else { return nil }
+        let idx = index(startIndex, offsetBy: prefix.count)
+        guard self[..<idx].lowercased() == prefix.lowercased() else { return nil }
+        return String(self[idx...])
     }
 }

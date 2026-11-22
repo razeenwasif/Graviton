@@ -21,6 +21,7 @@ public final class EngineStore {
     public private(set) var containers: [Container] = []
     public private(set) var images: [ImageInfo] = []
     public private(set) var volumes: [VolumeInfo] = []
+    public private(set) var registryLogins: [RegistryLoginInfo] = []
     public private(set) var network: NetworkInfo?
     public private(set) var engine: EngineInfo?
     public private(set) var logs: [String: [LogLine]] = [:]
@@ -71,6 +72,7 @@ public final class EngineStore {
         images = []
         volumes = []
         volumesLoaded = false
+        registryLogins = []
         network = nil
         self.engine = nil
         logs = [:]
@@ -391,6 +393,29 @@ public final class EngineStore {
         let freed = try await service.removeVolume(name: volume.name)
         await loadVolumes()
         return freed
+    }
+
+    // Registry logins (usernames on disk; passwords stored in the Mac's Keychain).
+    public func loadRegistryLogins() async {
+        do {
+            registryLogins = try await service.listLogins()
+        } catch {
+            if case EngineError.daemon = error { registryLogins = [] }
+        }
+    }
+
+    @discardableResult
+    public func registryLogin(registry: String, username: String, password: String) async throws -> RegistryLoginInfo {
+        let info = try await service.registryLogin(registry: registry, username: username, password: password)
+        await loadRegistryLogins()
+        return info
+    }
+
+    @discardableResult
+    public func registryLogout(registry: String) async throws -> String {
+        let removed = try await service.registryLogout(registry: registry)
+        await loadRegistryLogins()
+        return removed
     }
 
     // Panels call these directly and show errors in place.

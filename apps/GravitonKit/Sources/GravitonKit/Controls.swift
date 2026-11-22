@@ -330,6 +330,11 @@ public func GTextField(_ placeholder: String, text: Binding<String>) -> TextFiel
     TextField("", text: text, prompt: Text(placeholder).foregroundStyle(G.faint))
 }
 
+/// A `SecureField` whose placeholder is drawn in Graviton's faint grey.
+public func GSecureField(_ placeholder: String, text: Binding<String>) -> SecureField<Text> {
+    SecureField("", text: text, prompt: Text(placeholder).foregroundStyle(G.faint))
+}
+
 /// A label above a field, with an optional hint or error below.
 public struct GFormRow<Content: View>: View {
     var label: String

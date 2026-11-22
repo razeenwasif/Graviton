@@ -246,6 +246,21 @@ enum Command {
         /// Disable any container-specified `HEALTHCHECK`.
         #[arg(long = "no-healthcheck")]
         no_healthcheck: bool,
+        /// Mount the container's root filesystem as read-only.
+        #[arg(long = "read-only")]
+        read_only: bool,
+        /// Add Linux capabilities (`CAP_NET_BIND_SERVICE`, `ALL`, etc.); repeatable.
+        #[arg(long = "cap-add", value_name = "CAP")]
+        cap_add: Vec<String>,
+        /// Drop Linux capabilities (`ALL`, `NET_RAW`, etc.); repeatable.
+        #[arg(long = "cap-drop", value_name = "CAP")]
+        cap_drop: Vec<String>,
+        /// Mount a temporary in-memory filesystem (`/path` or `/path:opts`); repeatable.
+        #[arg(long = "tmpfs", value_name = "PATH[:OPTS]")]
+        tmpfs: Vec<String>,
+        /// Run `docker-init` as container PID 1 for signal forwarding and zombie reaping.
+        #[arg(long)]
+        init: bool,
         image: String,
         /// Command (replaces the image's default command).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -320,8 +335,20 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
-    /// Show a running container's CPU, memory and network use.
-    Stats { container: String },
+    /// Show a live stream of container resource usage statistics.
+    Stats {
+        /// Container names or IDs (default: all running containers).
+        containers: Vec<String>,
+        /// Include stopped containers.
+        #[arg(short, long)]
+        all: bool,
+        /// Disable streaming stats and only print the initial snapshot.
+        #[arg(long = "no-stream")]
+        no_stream: bool,
+        /// Output format: `table` (default) or `json` (NDJSON lines).
+        #[arg(long, default_value = "table", value_parser = ["table", "json"])]
+        format: String,
+    },
     /// List the processes in a running container.
     Top { container: String },
     /// List a folder inside a running container.
@@ -750,6 +777,11 @@ fn run(cli: Cli) -> Result<()> {
             health_start_period,
             health_retries,
             no_healthcheck,
+            read_only,
+            cap_add,
+            cap_drop,
+            tmpfs,
+            init,
             image,
             command,
         } => {
@@ -826,6 +858,18 @@ fn run(cli: Cli) -> Result<()> {
                 let (k, v) = pair.split_once('=').unwrap_or((&pair, ""));
                 labels.insert(k.to_string(), v.to_string());
             }
+            let cap_add = cap_add
+                .iter()
+                .map(|c| graviton_proto::caps::normalize_cap(c).map_err(|e| anyhow::anyhow!(e)))
+                .collect::<Result<Vec<_>>>()?;
+            let cap_drop = cap_drop
+                .iter()
+                .map(|c| graviton_proto::caps::normalize_cap(c).map_err(|e| anyhow::anyhow!(e)))
+                .collect::<Result<Vec<_>>>()?;
+            let tmpfs = tmpfs
+                .iter()
+                .map(|s| graviton_proto::parse_tmpfs_spec(s).map_err(|e| anyhow::anyhow!(e)))
+                .collect::<Result<Vec<_>>>()?;
             let spec = RunSpec {
                 image,
                 name,
@@ -850,6 +894,11 @@ fn run(cli: Cli) -> Result<()> {
                 labels,
                 dns_aliases: vec![],
                 healthcheck,
+                read_only,
+                cap_add,
+                cap_drop,
+                tmpfs,
+                init,
             };
             if tty {
                 let code = run_tty(&target, spec, interactive)?;
@@ -887,26 +936,9 @@ fn run(cli: Cli) -> Result<()> {
             };
             std::process::exit(code);
         }
-        Command::Stats { container } => match client.call(&Request::Stats { id: container })? {
-            Response::Stats(st) => match st.samples.last() {
-                None => println!("No samples yet (they start once the container runs, every {} s).", st.interval_secs),
-                Some(s) => {
-                    let first = &st.samples[0];
-                    let secs = (s.timestamp_ms.saturating_sub(first.timestamp_ms) / 1000).max(1);
-                    println!("CPU       {:.1}%  ({} vCPU; 100% is one busy CPU)", s.cpu_percent, st.cpus);
-                    println!("Memory    {} / {}", bytes(s.memory_bytes), bytes(s.memory_limit_bytes));
-                    println!("Network   ↓ {}  ↑ {}  in total", bytes(s.net_rx_bytes), bytes(s.net_tx_bytes));
-                    if st.samples.len() > 1 {
-                        let (rx_total, tx_total) = network_delta_totals(&st.samples);
-                        let rx = rx_total / secs;
-                        let tx = tx_total / secs;
-                        println!("          ↓ {}/s  ↑ {}/s  over the last {}", bytes(rx), bytes(tx), uptime(secs));
-                    }
-                    println!("Processes {}", st.processes.len());
-                }
-            },
-            other => unexpected(other)?,
-        },
+        Command::Stats { containers, all, no_stream, format } => {
+            cmd_stats(&mut client, containers, all, no_stream, &format)?;
+        }
         Command::Top { container } => match client.call(&Request::Stats { id: container })? {
             Response::Stats(st) => {
                 println!("{:>6} {:>6} {:>5} {:<2} {:>9} {:>9}  COMMAND", "PID", "PPID", "UID", "S", "RSS", "CPU TIME");
@@ -2533,6 +2565,82 @@ fn parse_build_secret(spec: &str) -> Result<BuildSecret> {
     Ok(BuildSecret { id, data })
 }
 
+fn cmd_stats(
+    client: &mut Client,
+    ids: Vec<String>,
+    all: bool,
+    no_stream: bool,
+    format: &str,
+) -> Result<()> {
+    client.send(&Request::StatsStream { ids, all, follow: !no_stream })?;
+    while let Some(resp) = client.recv()? {
+        match resp {
+            Response::StatsSnapshot(rows) => {
+                if let Err(err) = print_stats_snapshot(&rows, format, !no_stream) {
+                    if err.kind() == std::io::ErrorKind::BrokenPipe {
+                        return Ok(());
+                    }
+                    return Err(err.into());
+                }
+                if no_stream {
+                    break;
+                }
+            }
+            other => return unexpected(other),
+        }
+    }
+    Ok(())
+}
+
+fn print_stats_snapshot(
+    rows: &[graviton_proto::ContainerStatRow],
+    format: &str,
+    clear_tty: bool,
+) -> std::io::Result<()> {
+    let mut out = std::io::stdout().lock();
+    if format == "json" {
+        for r in rows {
+            let line = serde_json::to_vec(r).map_err(std::io::Error::other)?;
+            out.write_all(&line)?;
+            out.write_all(b"\n")?;
+        }
+        return out.flush();
+    }
+
+    if clear_tty && out.is_terminal() {
+        out.write_all(b"\x1b[2J\x1b[H")?;
+    }
+    writeln!(
+        out,
+        "{:<13} {:<18} {:>8}  {:<23} {:>7}  {:<21} {:>5}",
+        "CONTAINER", "NAME", "CPU %", "MEM USAGE / LIMIT", "MEM %", "NET I/O", "PIDS"
+    )?;
+    for r in rows {
+        let short_id: String = r.id.chars().take(12).collect();
+        let active = matches!(r.status, ContainerStatus::Running | ContainerStatus::Paused);
+        if active {
+            let cpu = format!("{:.2}%", r.cpu_percent);
+            let mem = format!("{} / {}", bytes(r.memory_bytes), bytes(r.memory_limit_bytes));
+            let mem_pct = if r.memory_limit_bytes > 0 {
+                format!("{:.2}%", r.memory_bytes as f64 / r.memory_limit_bytes as f64 * 100.0)
+            } else {
+                "0.00%".into()
+            };
+            let net = format!("{} / {}", bytes(r.net_rx_bytes), bytes(r.net_tx_bytes));
+            let pids = r.pids.to_string();
+            writeln!(out, "{short_id:<13} {:<18} {cpu:>8}  {mem:<23} {mem_pct:>7}  {net:<21} {pids:>5}", r.name)?;
+        } else {
+            writeln!(
+                out,
+                "{short_id:<13} {:<18} {:>8}  {:<23} {:>7}  {:<21} {:>5}",
+                r.name, "--", "-- / --", "--", "-- / --", "--"
+            )?;
+        }
+    }
+    out.flush()
+}
+
+#[cfg(test)]
 fn network_delta_totals(samples: &[graviton_proto::StatSample]) -> (u64, u64) {
     let mut rx = 0u64;
     let mut tx = 0u64;
@@ -2745,6 +2853,62 @@ mod tests {
                 },
                 ..
             }) if s == "5m" && u == "1m" && services == &["api", "db"]
+        ));
+    }
+
+    #[test]
+    fn parses_security_run_and_stats_stream_flags() {
+        let r = Cli::try_parse_from([
+            "grav",
+            "run",
+            "--read-only",
+            "--init",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "CAP_NET_BIND_SERVICE",
+            "--tmpfs",
+            "/tmp:rw,noexec,size=64m",
+            "alpine",
+            "id",
+        ])
+        .unwrap();
+        assert!(matches!(
+            r.command,
+            Command::Run {
+                read_only: true,
+                init: true,
+                ref cap_drop,
+                ref cap_add,
+                ref tmpfs,
+                ..
+            } if cap_drop == &["ALL"]
+                && cap_add == &["CAP_NET_BIND_SERVICE"]
+                && tmpfs == &["/tmp:rw,noexec,size=64m"]
+        ));
+
+        let st_default = Cli::try_parse_from(["grav", "stats"]).unwrap();
+        assert!(matches!(
+            st_default.command,
+            Command::Stats { ref containers, all: false, no_stream: false, ref format }
+                if containers.is_empty() && format == "table"
+        ));
+
+        let st_opts = Cli::try_parse_from([
+            "grav",
+            "stats",
+            "--no-stream",
+            "-a",
+            "--format",
+            "json",
+            "web",
+            "db",
+        ])
+        .unwrap();
+        assert!(matches!(
+            st_opts.command,
+            Command::Stats { ref containers, all: true, no_stream: true, ref format }
+                if containers == &["web", "db"] && format == "json"
         ));
     }
 }

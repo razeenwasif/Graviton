@@ -43,6 +43,12 @@ public protocol EngineService: Sendable {
     func tagImage(source: String, target: String) async throws -> ImageInfo
     /// Push a local image to its registry using Keychain credentials.
     func pushImage(reference: String) async throws -> ImagePushResult
+    /// Saved OCI registry logins (usernames only; passwords stay in the Mac's Keychain).
+    func listLogins() async throws -> [RegistryLoginInfo]
+    /// Verify and store OCI registry credentials in the Mac's Keychain.
+    func registryLogin(registry: String, username: String, password: String) async throws -> RegistryLoginInfo
+    /// Forget saved OCI registry credentials.
+    func registryLogout(registry: String) async throws -> String
     /// Snapshot a container's filesystem and configuration into a local image.
     func commit(_ spec: CommitSpec) async throws -> ImageInfo
     /// Create a container and start it in its own VM; returns once it's running or has failed.
@@ -550,6 +556,26 @@ public final class SocketEngine: EngineService {
     public func snapshotClear() async throws -> SnapshotInfo {
         guard case let .snapshots(info) = try await call(.snapshotClear, timeout: 30) else { throw EngineError.unexpectedResponse }
         return info
+    }
+
+    public func listLogins() async throws -> [RegistryLoginInfo] {
+        guard case let .logins(list) = try await call(.listLogins, timeout: 10) else { throw EngineError.unexpectedResponse }
+        return list
+    }
+
+    public func registryLogin(registry: String, username: String, password: String) async throws -> RegistryLoginInfo {
+        guard case let .loggedIn(canonical, user) = try await call(
+            .registryLogin(registry: registry, username: username, password: password),
+            timeout: 30
+        ) else { throw EngineError.unexpectedResponse }
+        return RegistryLoginInfo(registry: canonical, username: user)
+    }
+
+    public func registryLogout(registry: String) async throws -> String {
+        guard case let .loggedOut(canonical) = try await call(.registryLogout(registry: registry), timeout: 15) else {
+            throw EngineError.unexpectedResponse
+        }
+        return canonical
     }
 
     /// Build an image from a Dockerfile; the stream carries the log, then the image.

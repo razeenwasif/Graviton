@@ -99,6 +99,11 @@ fn filters_containers_with_label_and_semantics() {
         ]),
         dns_aliases: vec![],
         healthcheck: None,
+        read_only: false,
+        cap_add: vec![],
+        cap_drop: vec![],
+        tmpfs: vec![],
+        init: false,
     };
 
     // Go map filter style (AND across label keys)
@@ -334,6 +339,56 @@ async fn write_empty_sets_content_length_for_200_and_201_not_204_or_304() {
             "status {status}: {text:?}"
         );
     }
+}
+
+#[test]
+fn docker_stats_json_includes_pids_and_sequential_precpu() {
+    use graviton_proto::{ContainerStats, ProcessInfo, StatSample};
+
+    let st = ContainerStats {
+        id: "abc123def456".into(),
+        cpus: 2,
+        interval_secs: 2,
+        samples: vec![StatSample {
+            timestamp_ms: 1_700_000_000_000,
+            cpu_percent: 25.0,
+            memory_bytes: 32 << 20,
+            memory_limit_bytes: 1024 << 20,
+            net_rx_bytes: 100,
+            net_tx_bytes: 200,
+        }],
+        processes: vec![
+            ProcessInfo { pid: 1, ppid: 0, uid: 0, state: "S".into(), command: "init".into(), rss_bytes: 1024, cpu_ms: 10 },
+            ProcessInfo { pid: 2, ppid: 1, uid: 0, state: "R".into(), command: "sleep".into(), rss_bytes: 2048, cpu_ms: 20 },
+        ],
+    };
+
+    let mut prev = None;
+    let first = super::containers::build_docker_stats_json(&st, "web", true, &mut prev);
+    assert_eq!(first["pids_stats"]["current"], 2);
+    assert_eq!(first["cpu_stats"]["cpu_usage"]["total_usage"], 250_000_000);
+    assert_eq!(first["cpu_stats"]["system_cpu_usage"], 4_000_000_000u64);
+    assert_eq!(first["precpu_stats"]["system_cpu_usage"], 2_000_000_000u64);
+
+    let second = super::containers::build_docker_stats_json(&st, "web", true, &mut prev);
+    assert_eq!(second["precpu_stats"]["cpu_usage"]["total_usage"], 250_000_000);
+    assert_eq!(second["cpu_stats"]["cpu_usage"]["total_usage"], 500_000_000);
+    assert_eq!(second["precpu_stats"]["system_cpu_usage"], 4_000_000_000u64);
+    assert_eq!(second["cpu_stats"]["system_cpu_usage"], 6_000_000_000u64);
+
+    let stopped = super::containers::build_docker_stats_json(&st, "web", false, &mut prev);
+    assert_eq!(stopped["pids_stats"]["current"], 0);
+    assert_eq!(stopped["memory_stats"]["usage"], 0);
+
+    let tmp = serde_json::json!({
+        "Type": "tmpfs",
+        "Target": "/cache",
+        "ReadOnly": false,
+        "TmpfsOptions": { "SizeBytes": 67108864u64, "Mode": 0o750u64 }
+    });
+    let parsed = super::containers::normalize_docker_tmpfs_mount(&tmp).unwrap().unwrap();
+    assert_eq!(parsed.target, "/cache");
+    assert_eq!(parsed.options, "size=67108864,mode=750");
 }
 
 async fn read_http_response(stream: &mut UnixStream) -> (u16, std::collections::HashMap<String, String>, Vec<u8>) {

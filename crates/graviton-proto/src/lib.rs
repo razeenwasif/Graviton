@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub mod build;
+pub mod caps;
 pub mod dns;
 
 /// Bumped whenever a breaking change is made to the control API.
@@ -111,6 +112,89 @@ pub struct Mount {
     pub source: String,
     pub target: String,
     pub read_only: bool,
+}
+
+/// An ephemeral in-memory tmpfs mount inside a container (`--tmpfs /path[:opts]`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TmpfsMount {
+    pub target: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub options: String,
+}
+
+/// Parse a CLI/Compose tmpfs spec (`/path` or `/path:opt1,opt2`).
+pub fn parse_tmpfs_spec(raw: &str) -> Result<TmpfsMount, String> {
+    let trimmed = raw.trim();
+    let (target_raw, options_raw) = match trimmed.split_once(':') {
+        Some((t, o)) => (t.trim(), o.trim()),
+        None => (trimmed, ""),
+    };
+    if target_raw.is_empty() || !target_raw.starts_with('/') {
+        return Err(format!("tmpfs target `{raw}` must be an absolute path inside the container"));
+    }
+    if target_raw == "/" {
+        return Err("tmpfs target cannot be `/`".into());
+    }
+    if target_raw.contains('\0') || options_raw.contains('\0') {
+        return Err("tmpfs spec cannot contain NUL bytes".into());
+    }
+    for comp in std::path::Path::new(target_raw).components() {
+        if matches!(comp, std::path::Component::ParentDir | std::path::Component::Prefix(_)) {
+            return Err(format!("tmpfs target `{target_raw}` cannot contain `..`"));
+        }
+    }
+    let cleaned = target_raw.trim_end_matches('/').to_string();
+    if cleaned.is_empty() {
+        return Err("tmpfs target cannot be `/`".into());
+    }
+    Ok(TmpfsMount { target: cleaned, options: options_raw.to_string() })
+}
+
+/// Parse Docker-style tmpfs mount options into `(linux_ms_flags, kernel_data_string)`.
+///
+/// Defaults match Docker: `MS_NOSUID | MS_NODEV | MS_NOEXEC`, plus `mode=1777` unless a `mode=`
+/// option is explicitly given.
+pub fn parse_tmpfs_options(raw: &str) -> (u64, String) {
+    const MS_RDONLY: u64 = 1;
+    const MS_NOSUID: u64 = 2;
+    const MS_NODEV: u64 = 4;
+    const MS_NOEXEC: u64 = 8;
+    const MS_SYNCHRONOUS: u64 = 16;
+    const MS_DIRSYNC: u64 = 128;
+    const MS_NOATIME: u64 = 1024;
+    const MS_RELATIME: u64 = 1 << 21;
+    const MS_STRICTATIME: u64 = 1 << 24;
+
+    let mut flags = MS_NOSUID | MS_NODEV | MS_NOEXEC;
+    let mut data = Vec::new();
+    let mut has_mode = false;
+    for tok in raw.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        match tok {
+            "ro" => flags |= MS_RDONLY,
+            "rw" => flags &= !MS_RDONLY,
+            "noexec" => flags |= MS_NOEXEC,
+            "exec" => flags &= !MS_NOEXEC,
+            "nosuid" => flags |= MS_NOSUID,
+            "suid" => flags &= !MS_NOSUID,
+            "nodev" => flags |= MS_NODEV,
+            "dev" => flags &= !MS_NODEV,
+            "noatime" => flags |= MS_NOATIME,
+            "relatime" => flags |= MS_RELATIME,
+            "strictatime" => flags |= MS_STRICTATIME,
+            "sync" => flags |= MS_SYNCHRONOUS,
+            "dirsync" => flags |= MS_DIRSYNC,
+            other => {
+                if other.starts_with("mode=") {
+                    has_mode = true;
+                }
+                data.push(other.to_string());
+            }
+        }
+    }
+    if !has_mode {
+        data.push("mode=1777".to_string());
+    }
+    (flags, data.join(","))
 }
 
 /// One container's mount of a named volume.
@@ -560,6 +644,21 @@ pub struct RunSpec {
     /// Overrides or disables (`test: ["NONE"]`) the image's `HEALTHCHECK`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<Healthcheck>,
+    /// Mount the container's root filesystem read-only (`--read-only`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+    /// Linux capabilities added to the container (`--cap-add`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_add: Vec<String>,
+    /// Linux capabilities dropped from the container (`--cap-drop`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_drop: Vec<String>,
+    /// Ephemeral tmpfs mounts (`--tmpfs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tmpfs: Vec<TmpfsMount>,
+    /// Run a dedicated `docker-init` zombie reaper as container PID 1 (`--init`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub init: bool,
 }
 
 fn is_zero_u16(n: &u16) -> bool {
@@ -845,6 +944,22 @@ pub struct ContainerStats {
     pub processes: Vec<ProcessInfo>,
 }
 
+/// Live summary row for one container streamed by `Request::StatsStream` (`grav stats`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContainerStatRow {
+    pub id: String,
+    pub name: String,
+    pub status: ContainerStatus,
+    pub cpus: u32,
+    pub cpu_percent: f64,
+    pub memory_bytes: u64,
+    pub memory_limit_bytes: u64,
+    pub net_rx_bytes: u64,
+    pub net_tx_bytes: u64,
+    pub pids: u32,
+    pub timestamp_ms: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileKind {
@@ -927,6 +1042,21 @@ pub struct ContainerDetails {
     /// Live healthcheck status and bounded probe logs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<HealthState>,
+    /// True when the container's root filesystem is mounted read-only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+    /// Linux capabilities added to the container (`--cap-add`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_add: Vec<String>,
+    /// Linux capabilities dropped from the container (`--cap-drop`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_drop: Vec<String>,
+    /// Ephemeral tmpfs mounts (`--tmpfs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tmpfs: Vec<TmpfsMount>,
+    /// True when started with `--init`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub init: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1079,6 +1209,15 @@ pub enum Request {
     Exec(ExecSpec),
     /// Recent resource use and the processes of a running container.
     Stats { id: String },
+    /// Snapshot or live stream (`follow: true`) of resource stats across containers (`grav stats`).
+    StatsStream {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        all: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        follow: bool,
+    },
     /// List a folder inside a running container.
     ListFiles { id: String, path: String },
     /// Read the start of a file inside a running container.
@@ -1158,6 +1297,7 @@ pub enum Response {
     ExecExited { code: i32 },
     Attached,
     Stats(ContainerStats),
+    StatsSnapshot(Vec<ContainerStatRow>),
     Files(DirectoryListing),
     File(FileContents),
     /// Sent before streaming raw tar bytes for `Request::GetArchive`.
@@ -1262,6 +1402,8 @@ pub enum AgentRequest {
         layers: Vec<String>,
         #[serde(default)]
         mounts: Vec<GuestMount>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tmpfs: Vec<TmpfsMount>,
         #[serde(default)]
         hostname: Option<String>,
         /// Host Unix wall-clock time in seconds (used after VM snapshot restore so guest clock matches host UTC).
@@ -1296,6 +1438,18 @@ pub enum AgentRequest {
         /// Ephemeral per-RUN mounts (cache, secret, bind, tmpfs), visible only inside this process's mount namespace.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         mounts: Vec<ExecMount>,
+        /// Mount the container root filesystem read-only after attaching volumes/tmpfs.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        read_only: bool,
+        /// Linux capabilities added to the container (`--cap-add`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cap_add: Vec<String>,
+        /// Linux capabilities dropped from the container (`--cap-drop`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cap_drop: Vec<String>,
+        /// Label PID 1 as `docker-init` (`--init`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        init: bool,
     },
     Signal { pid: i32, signal: i32 },
     Stdin { pid: i32, data: Vec<u8> },
@@ -1603,6 +1757,11 @@ mod tests {
             labels: BTreeMap::from([("com.docker.compose.project".into(), "myapp".into())]),
             dns_aliases: vec!["database".into()],
             healthcheck: None,
+            read_only: false,
+            cap_add: vec![],
+            cap_drop: vec![],
+            tmpfs: vec![],
+            init: false,
         }));
         assert_eq!(decode_line::<Request>(&encode_line(&compose_run)).unwrap(), compose_run);
         assert_eq!("always".parse::<RestartPolicy>().unwrap(), RestartPolicy::Always);
@@ -1710,6 +1869,10 @@ mod tests {
                 read_only: false,
                 mode: Some(0o755),
             }],
+            read_only: false,
+            cap_add: vec![],
+            cap_drop: vec![],
+            init: false,
         };
         let encoded = encode_line(&exec);
         assert_eq!(decode_line::<AgentRequest>(&encoded).unwrap(), exec);
@@ -2074,5 +2237,52 @@ mod tests {
         let end_none = Response::LogEnd { exit_code: None };
         assert_eq!(String::from_utf8(encode_line(&end_none)).unwrap(), "{\"type\":\"log_end\",\"data\":{}}\n");
         assert_eq!(decode_line::<Response>(&encode_line(&end_none)).unwrap(), end_none);
+    }
+
+    #[test]
+    fn tmpfs_security_and_stats_stream_round_trip() {
+        let m = parse_tmpfs_spec("/run/lock:rw,noexec,size=32m").unwrap();
+        assert_eq!(m, TmpfsMount { target: "/run/lock".into(), options: "rw,noexec,size=32m".into() });
+        let m_plain = parse_tmpfs_spec("/tmp/").unwrap();
+        assert_eq!(m_plain, TmpfsMount { target: "/tmp".into(), options: String::new() });
+        assert!(parse_tmpfs_spec("/").is_err());
+        assert!(parse_tmpfs_spec("relative").is_err());
+        assert!(parse_tmpfs_spec("/a/../b").is_err());
+
+        let (flags_default, data_default) = parse_tmpfs_options("");
+        assert_eq!(flags_default, 2 | 4 | 8);
+        assert_eq!(data_default, "mode=1777");
+
+        let (flags_custom, data_custom) = parse_tmpfs_options("ro,exec,size=64m,mode=0700");
+        assert_eq!(flags_custom, 1 | 2 | 4);
+        assert_eq!(data_custom, "size=64m,mode=0700");
+
+        let req = Request::StatsStream { ids: vec!["web".into()], all: true, follow: true };
+        assert_eq!(decode_line::<Request>(&encode_line(&req)).unwrap(), req);
+
+        let snap = Response::StatsSnapshot(vec![ContainerStatRow {
+            id: "abc123def456".into(),
+            name: "web".into(),
+            status: ContainerStatus::Running,
+            cpus: 2,
+            cpu_percent: 12.5,
+            memory_bytes: 16 << 20,
+            memory_limit_bytes: 1024 << 20,
+            net_rx_bytes: 100,
+            net_tx_bytes: 200,
+            pids: 3,
+            timestamp_ms: 1_700_000_000_000,
+        }]);
+        assert_eq!(decode_line::<Response>(&encode_line(&snap)).unwrap(), snap);
+
+        let min_details: ContainerDetails = serde_json::from_str(
+            r#"{"container":{"id":"abc","name":"web","image":"nginx","status":"running","exit_code":null,"ports":[],"mounts":[],"ip_address":null,"cpu_percent":null,"memory_bytes":null,"memory_limit_bytes":null,"created_at":1,"started_at":2},"image_reference":"nginx","image_digest":"sha256:aa","command":["nginx"],"env":[],"working_dir":"/","user":null,"hostname":"web","cpus":2,"memory_mib":512,"kernel":"6.12","vm_dir":"/tmp"}"#,
+        )
+        .unwrap();
+        assert!(!min_details.read_only);
+        assert!(min_details.cap_add.is_empty());
+        assert!(min_details.cap_drop.is_empty());
+        assert!(min_details.tmpfs.is_empty());
+        assert!(!min_details.init);
     }
 }

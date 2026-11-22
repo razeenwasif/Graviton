@@ -338,6 +338,12 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
             }
             continue;
         }
+        if let Request::StatsStream { ids, all, follow } = &request {
+            if !stats_stream(&backend, ids.clone(), *all, *follow, lines.get_mut(), &mut write).await? {
+                return Ok(());
+            }
+            continue;
+        }
         let response = handle(request, &backend).await;
         write.write_all(&encode_line(&response)).await?;
     }
@@ -959,6 +965,145 @@ where
     }
 }
 
+fn demo_stats_rows(store: &Store, ids: &[String], all: bool) -> Result<Vec<graviton_proto::ContainerStatRow>> {
+    let selected: Vec<graviton_proto::ContainerSummary> = if !ids.is_empty() {
+        ids.iter()
+            .map(|k| store.container(k).cloned().map_err(anyhow::Error::from))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        store
+            .containers()
+            .iter()
+            .filter(|c| all || matches!(c.status, graviton_proto::ContainerStatus::Running | graviton_proto::ContainerStatus::Paused))
+            .cloned()
+            .collect()
+    };
+    let now = runtime::now_ms();
+    Ok(selected
+        .into_iter()
+        .map(|c| {
+            let active = matches!(c.status, graviton_proto::ContainerStatus::Running | graviton_proto::ContainerStatus::Paused);
+            graviton_proto::ContainerStatRow {
+                id: c.id,
+                name: c.name,
+                status: c.status,
+                cpus: 2,
+                cpu_percent: if active { c.cpu_percent.unwrap_or(0.0) } else { 0.0 },
+                memory_bytes: if active { c.memory_bytes.unwrap_or(0) } else { 0 },
+                memory_limit_bytes: c.memory_limit_bytes.unwrap_or(1024 << 20),
+                net_rx_bytes: 0,
+                net_tx_bytes: 0,
+                pids: if active { 2 } else { 0 },
+                timestamp_ms: now,
+            }
+        })
+        .collect())
+}
+
+/// Stream resource stats snapshots (`Response::StatsSnapshot`) across one or more containers.
+/// Returns `Ok(true)` when finished cleanly so the caller may reuse the connection.
+pub(crate) async fn stats_stream<R, W>(
+    backend: &Backend,
+    ids: Vec<String>,
+    all: bool,
+    follow: bool,
+    read: &mut BufReader<R>,
+    write: &mut W,
+) -> Result<bool>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use crate::runtime::StatsEvent;
+    use tokio::io::AsyncBufReadExt;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let (mut rx, initial_res) = match backend {
+        Backend::Demo(store) => {
+            let s = store.lock().unwrap();
+            (None, demo_stats_rows(&s, &ids, all))
+        }
+        Backend::Engine(engine) => {
+            let rx = engine.subscribe_stats();
+            let res = engine.stats_rows(&ids, all);
+            (Some(rx), res)
+        }
+    };
+
+    let initial_rows = match initial_res {
+        Ok(rows) => rows,
+        Err(err) => {
+            if write.write_all(&encode_line(&Response::Error { message: err.to_string() })).await.is_err()
+                || write.flush().await.is_err()
+            {
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+    };
+    if write.write_all(&encode_line(&Response::StatsSnapshot(initial_rows))).await.is_err()
+        || write.flush().await.is_err()
+    {
+        return Ok(false);
+    }
+
+    let (Backend::Engine(engine), Some(rx)) = (backend, &mut rx) else {
+        return Ok(true);
+    };
+    if !follow {
+        return Ok(true);
+    }
+
+    let tracked: Option<std::collections::HashSet<String>> = (!ids.is_empty()).then(|| {
+        let store = engine.store.lock().unwrap();
+        ids.iter()
+            .filter_map(|k| store.container(k).ok().map(|c| c.id.clone()))
+            .collect()
+    });
+    let matches_event = |cid: &str| tracked.as_ref().is_none_or(|set| set.contains(cid));
+
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
+
+    loop {
+        let check_eof = read.buffer().is_empty();
+        let should_emit = tokio::select! {
+            res = read.fill_buf(), if check_eof => match res {
+                Ok([]) | Err(_) => return Ok(false),
+                Ok(_) => false,
+            },
+            ev = rx.recv() => match ev {
+                Ok(StatsEvent::Sample { container_id, .. }) | Ok(StatsEvent::Stopped { container_id }) => {
+                    let hit = matches_event(&container_id);
+                    let mut extra_hit = false;
+                    while let Ok(more) = rx.try_recv() {
+                        match more {
+                            StatsEvent::Sample { container_id, .. } | StatsEvent::Stopped { container_id } => {
+                                extra_hit |= matches_event(&container_id);
+                            }
+                        }
+                    }
+                    hit || extra_hit
+                }
+                Err(RecvError::Lagged(_)) => true,
+                Err(RecvError::Closed) => return Ok(true),
+            },
+            _ = ticker.tick() => true,
+        };
+        if should_emit {
+            let Ok(rows) = engine.stats_rows(&ids, all) else {
+                continue;
+            };
+            if write.write_all(&encode_line(&Response::StatsSnapshot(rows))).await.is_err()
+                || write.flush().await.is_err()
+            {
+                return Ok(false);
+            }
+        }
+    }
+}
+
 pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
     // Reads answer straight from the store.
     {
@@ -1043,7 +1188,8 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                     | Request::GetArchive { .. }
                     | Request::PutArchive { .. }
                     | Request::SaveImage { .. }
-                    | Request::LoadImage { .. } => {
+                    | Request::LoadImage { .. }
+                    | Request::StatsStream { .. } => {
                         unreachable!("handled by serve()")
                     }
                     Request::Build(_) => Response::Error { message: "builds run on the Mac itself: use grav build there".into() },
@@ -1198,5 +1344,27 @@ mod tests {
         assert!(matches!(decoded[0], Response::Log(_)));
         assert!(matches!(decoded[1], Response::Log(_)));
         assert_eq!(decoded[2], Response::LogEnd { exit_code: None });
+    }
+
+    #[tokio::test]
+    async fn stats_stream_on_demo_backend() {
+        let backend = Backend::Demo(Arc::new(Mutex::new(Store::demo())));
+        let mut reader = BufReader::new(tokio::io::empty());
+        let mut out = Vec::new();
+        let reusable = stats_stream(&backend, vec![], false, true, &mut reader, &mut out)
+            .await
+            .unwrap();
+        assert!(reusable);
+        let decoded: Vec<Response> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| decode_line::<Response>(l.as_bytes()).unwrap())
+            .collect();
+        assert_eq!(decoded.len(), 1);
+        let Response::StatsSnapshot(rows) = &decoded[0] else {
+            panic!("expected StatsSnapshot, got {:?}", decoded[0]);
+        };
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|r| r.pids > 0));
     }
 }

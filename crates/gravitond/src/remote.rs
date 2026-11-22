@@ -385,6 +385,11 @@ impl Remote {
                         return Ok(());
                     }
                 }
+                (Request::StatsStream { ids, all, follow }, _) => {
+                    if !crate::stats_stream(&backend, ids.clone(), *all, *follow, lines.get_mut(), &mut write).await? {
+                        return Ok(());
+                    }
+                }
                 _ => {
                     let response = crate::handle(request, &backend).await;
                     write.write_all(&encode_line(&response)).await?;

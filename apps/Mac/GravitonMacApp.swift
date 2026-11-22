@@ -56,6 +56,10 @@ struct GravitonMacApp: App {
                 .keyboardShortcut("i", modifiers: [.command, .option])
                 Toggle("Show in Menu Bar", isOn: $showsMenuBarExtra)
             }
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") { router.pending = .settings }
+                    .keyboardShortcut(",", modifiers: .command)
+            }
             HostCommands(store: store, hosts: hosts, shells: shells, router: router)
         }
 
@@ -72,7 +76,7 @@ struct GravitonMacApp: App {
 }
 
 enum Section: String, Hashable, CaseIterable, Identifiable {
-    case containers = "Containers", images = "Images", volumes = "Volumes", networks = "Networks"
+    case containers = "Containers", images = "Images", volumes = "Volumes", networks = "Networks", settings = "Settings"
     var id: String { rawValue }
 
     var symbol: String {
@@ -81,6 +85,7 @@ enum Section: String, Hashable, CaseIterable, Identifiable {
         case .images: "square.stack.3d.up"
         case .volumes: "cylinder.split.1x2"
         case .networks: "point.3.connected.trianglepath.dotted"
+        case .settings: "gearshape"
         }
     }
 }
@@ -107,6 +112,7 @@ struct RootView: View {
                 case .images: ImagesScreen()
                 case .volumes: VolumesScreen()
                 case .networks: NetworksScreen()
+                case .settings: SettingsScreen()
                 }
             }
             .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
@@ -140,6 +146,9 @@ struct RootView: View {
                 router.pending = nil
             case .networks:
                 section = .networks
+                router.pending = nil
+            case .settings:
+                section = .settings
                 router.pending = nil
             case .runContainer, .container:
                 section = .containers // ContainersScreen handles the rest.
@@ -207,6 +216,7 @@ struct Sidebar: View {
         case .images: store.images.count
         case .volumes: store.volumes.count
         case .networks: store.runningCount
+        case .settings: nil
         }
     }
 }

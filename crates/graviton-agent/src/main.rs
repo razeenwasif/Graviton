@@ -138,7 +138,7 @@ pub(crate) mod linux {
                 continue;
             }
             match decode_line::<AgentRequest>(line.as_bytes()) {
-                Ok(AgentRequest::Prepare { container, layers, mounts, hostname, now_secs }) => {
+                Ok(AgentRequest::Prepare { container, layers, mounts, tmpfs, hostname, now_secs }) => {
                     let t0 = std::time::Instant::now();
                     if let Some(secs) = now_secs {
                         set_wall_clock(secs);
@@ -147,7 +147,7 @@ pub(crate) mod linux {
                     crate::net::start();
                     let result = crate::container::prepare(&container, &layers).and_then(|(files, reused)| {
                         let ip = crate::net::wait(std::time::Duration::from_secs(8));
-                        let dns = crate::container::finish(&container, &mounts, hostname.as_deref().unwrap_or(&container), ip.as_deref())?;
+                        let dns = crate::container::finish(&container, &mounts, &tmpfs, hostname.as_deref().unwrap_or(&container), ip.as_deref())?;
                         Ok((files, reused, ip, dns))
                     });
                     match result {
@@ -157,10 +157,34 @@ pub(crate) mod linux {
                         Err(err) => send(&writer, &AgentEvent::Error { message: format!("preparing {container}: {err}") }),
                     }
                 }
-                Ok(AgentRequest::Exec { argv, env, cwd, tty, container, user, hostname, rows, cols, stdin, stdin_pipe, mounts }) => {
+                Ok(AgentRequest::Exec {
+                    argv,
+                    env,
+                    cwd,
+                    tty,
+                    container,
+                    user,
+                    hostname,
+                    rows,
+                    cols,
+                    stdin,
+                    stdin_pipe,
+                    mounts,
+                    read_only,
+                    cap_add,
+                    cap_drop,
+                    init,
+                }) => {
                     let has_term = env.iter().any(|e| e.starts_with("TERM="));
                     let program = argv.first().cloned().unwrap_or_default();
                     if let Some(id) = &container {
+                        let cap_mask = match graviton_proto::caps::resolve_cap_mask(&cap_add, &cap_drop) {
+                            Ok(m) => m,
+                            Err(msg) => {
+                                send(&writer, &AgentEvent::Error { message: msg });
+                                continue;
+                            }
+                        };
                         let (pm, cleanup) = if mounts.is_empty() {
                             (Vec::new(), None)
                         } else {
@@ -188,6 +212,9 @@ pub(crate) mod linux {
                             hostname.as_deref().unwrap_or(id),
                             tty,
                             pm,
+                            read_only,
+                            cap_mask,
+                            init,
                         ) {
                             Ok(launch) if tty => {
                                 drop(cleanup);

@@ -834,6 +834,25 @@ public actor RemoteEngine: EngineService {
         return info
     }
 
+    public func listLogins() async throws -> [RegistryLoginInfo] {
+        guard case let .logins(list) = try await call(.listLogins) else { throw EngineError.unexpectedResponse }
+        return list
+    }
+
+    public func registryLogin(registry: String, username: String, password: String) async throws -> RegistryLoginInfo {
+        guard case let .loggedIn(canonical, user) = try await separately(
+            .registryLogin(registry: registry, username: username, password: password)
+        ) else { throw EngineError.unexpectedResponse }
+        return RegistryLoginInfo(registry: canonical, username: user)
+    }
+
+    public func registryLogout(registry: String) async throws -> String {
+        guard case let .loggedOut(canonical) = try await call(.registryLogout(registry: registry)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return canonical
+    }
+
     private func container(_ request: EngineRequest) async throws -> Container {
         guard case let .container(c) = try await call(request) else { throw EngineError.unexpectedResponse }
         return c

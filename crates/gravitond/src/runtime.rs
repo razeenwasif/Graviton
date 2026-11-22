@@ -32,11 +32,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use graviton_core::{ImageReference, Store, paths};
 use graviton_image::{BlobStore, Credentials, HealthcheckConfig, ImageError, ImageIndex, LocalImage, Progress, PullOptions, PushProgress, Registry};
 use graviton_proto::{
-    AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ContainerDetails, ContainerStats, ContainerStatus, ContainerSummary,
-    DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats, HealthLog, HealthState, HealthStatus,
-    Healthcheck, HostEntry, ImageSummary, LogLevel, LogLine, LogStream, Mount, NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION,
-    PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy, RunSpec, SnapshotInfo, StatSample, VolumeMountRef,
-    VolumeSummary, decode_line, encode_line,
+    AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ContainerDetails, ContainerStatRow, ContainerStats, ContainerStatus,
+    ContainerSummary, DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats, HealthLog, HealthState,
+    HealthStatus, Healthcheck, HostEntry, ImageSummary, LogLevel, LogLine, LogStream, Mount, NetworkEndpoint, NetworkInfo,
+    PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy, RunSpec, SnapshotInfo, StatSample,
+    TmpfsMount, VolumeMountRef, VolumeSummary, caps, decode_line, encode_line, parse_tmpfs_spec,
 };
 use graviton_vmm::apple::{AppleHypervisor, AppleVm};
 use graviton_vmm::{NetworkMode, SharedDirectory, VmConfig, VmHandle};
@@ -107,6 +107,16 @@ pub(crate) struct ContainerSpec {
     /// Container `HEALTHCHECK` configuration (defaults/image merged at creation time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) healthcheck: Option<Healthcheck>,
+    #[serde(default)]
+    pub(crate) read_only: bool,
+    #[serde(default)]
+    pub(crate) cap_add: Vec<String>,
+    #[serde(default)]
+    pub(crate) cap_drop: Vec<String>,
+    #[serde(default)]
+    pub(crate) tmpfs: Vec<TmpfsMount>,
+    #[serde(default)]
+    pub(crate) init: bool,
 }
 
 /// Interactive `grav run -it` handle returned to the control connection.
@@ -176,6 +186,13 @@ pub enum LogEvent {
     Ended { container_id: String, exit_code: Option<i32> },
 }
 
+/// Real-time stats update broadcast to streaming `grav stats` and Docker `/stats` clients.
+#[derive(Debug, Clone)]
+pub enum StatsEvent {
+    Sample { container_id: String },
+    Stopped { container_id: String },
+}
+
 pub struct Engine {
     pub store: Arc<Mutex<Store>>,
     pub(crate) blobs: BlobStore,
@@ -187,6 +204,7 @@ pub struct Engine {
     health: Mutex<HashMap<String, HealthState>>,
     log_io: Mutex<()>,
     log_tx: tokio::sync::broadcast::Sender<LogEvent>,
+    stats_tx: tokio::sync::broadcast::Sender<StatsEvent>,
     switch: crate::switch::Switch,
     /// Serialises guest DNS table broadcasts so concurrent starts/stops never reorder.
     hosts_sync: Mutex<()>,
@@ -214,6 +232,7 @@ impl Engine {
         fs::create_dir_all(blobs.root().join("sha256")).context("creating the blob store")?;
         let index = ImageIndex::load(paths::support_dir().join("images.json"))?;
         let (log_tx, _) = tokio::sync::broadcast::channel(1024);
+        let (stats_tx, _) = tokio::sync::broadcast::channel(256);
         let engine = Arc::new(Self {
             store: Arc::new(Mutex::new(Store::new())),
             blobs,
@@ -225,6 +244,7 @@ impl Engine {
             health: Mutex::new(HashMap::new()),
             log_io: Mutex::new(()),
             log_tx,
+            stats_tx,
             switch: crate::switch::Switch::new(),
             hosts_sync: Mutex::new(()),
             hosts_gen: AtomicU64::new(0),
@@ -706,6 +726,25 @@ impl Engine {
     fn create_with_image(&self, spec: RunSpec, image: LocalImage) -> Result<String> {
         let ports = spec.ports.iter().map(|p| parse_port(p)).collect::<Result<Vec<_>>>()?;
         let volumes = spec.volumes.iter().map(|v| parse_volume(v)).collect::<Result<Vec<_>>>()?;
+        let cap_add = spec
+            .cap_add
+            .iter()
+            .map(|c| caps::normalize_cap(c).map_err(|e| anyhow!(e)))
+            .collect::<Result<Vec<_>>>()?;
+        let cap_drop = spec
+            .cap_drop
+            .iter()
+            .map(|c| caps::normalize_cap(c).map_err(|e| anyhow!(e)))
+            .collect::<Result<Vec<_>>>()?;
+        let _ = caps::resolve_cap_mask(&cap_add, &cap_drop).map_err(|e| anyhow!(e))?;
+        let tmpfs = spec
+            .tmpfs
+            .iter()
+            .map(|t| {
+                let combined = if t.options.is_empty() { t.target.clone() } else { format!("{}:{}", t.target, t.options) };
+                parse_tmpfs_spec(&combined).map_err(|e| anyhow!(e))
+            })
+            .collect::<Result<Vec<_>>>()?;
         if let Some(name) = &spec.name {
             if self.store.lock().unwrap().name_taken(name) {
                 bail!("the name {name} is already in use");
@@ -761,6 +800,11 @@ impl Engine {
             labels: spec.labels,
             dns_aliases: spec.dns_aliases,
             healthcheck,
+            read_only: spec.read_only,
+            cap_add,
+            cap_drop,
+            tmpfs,
+            init: spec.init,
         };
 
         let id = new_id();
@@ -1393,6 +1437,7 @@ impl Engine {
             container: id.into(),
             layers: spec.image.layers.iter().map(|l| l.digest.clone()).collect(),
             mounts,
+            tmpfs: spec.tmpfs.clone(),
             hostname: Some(host_name.clone()),
             now_secs: from_snapshot.then(now_secs),
         })?;
@@ -1478,6 +1523,10 @@ impl Engine {
                 stdin: None,
                 stdin_pipe: false,
                 mounts: vec![],
+                read_only: spec.read_only,
+                cap_add: spec.cap_add.clone(),
+                cap_drop: spec.cap_drop.clone(),
+                init: spec.init,
             }))?;
             let pid = match read_event_unbuffered(&mut tty_conn)? {
                 AgentEvent::Started { pid } => pid,
@@ -1517,6 +1566,10 @@ impl Engine {
             stdin: None,
             stdin_pipe: false,
             mounts: vec![],
+            read_only: spec.read_only,
+            cap_add: spec.cap_add.clone(),
+            cap_drop: spec.cap_drop.clone(),
+            init: spec.init,
         })?;
 
         let mut out = LineBuffer::default();
@@ -1750,27 +1803,31 @@ impl Engine {
                     break;
                 }
                 let Ok(AgentEvent::Stats(now)) = events.next() else { break };
-                if let Some(prev) = &previous {
-                    let sample = sample_between(prev, &now, limit);
-                    engine.store.lock().unwrap().update(&id, |c| {
-                        c.cpu_percent = Some(sample.cpu_percent);
-                        c.memory_bytes = Some(sample.memory_bytes);
-                    });
-                    {
-                        let mut stats = engine.stats.lock().unwrap();
-                        let history = stats.entry(id.clone()).or_default();
-                        history.cpus = now.cpus;
-                        history.samples.push_back(sample.clone());
-                        while history.samples.len() > STATS_KEPT {
-                            history.samples.pop_front();
-                        }
-                        history.processes = now.processes.clone();
+                let sample = match &previous {
+                    Some(prev) => sample_between(prev, &now, limit),
+                    None => initial_sample(&now, limit),
+                };
+                let cpus = now.cpus;
+                engine.store.lock().unwrap().update(&id, |c| {
+                    c.cpu_percent = Some(sample.cpu_percent);
+                    c.memory_bytes = Some(sample.memory_bytes);
+                });
+                {
+                    let mut stats = engine.stats.lock().unwrap();
+                    let history = stats.entry(id.clone()).or_default();
+                    history.cpus = cpus;
+                    history.samples.push_back(sample.clone());
+                    while history.samples.len() > STATS_KEPT {
+                        history.samples.pop_front();
                     }
-                    crate::persistence::append_stat_sample(&stats_path(&id), &sample, STATS_KEPT);
+                    history.processes = now.processes.clone();
                 }
+                crate::persistence::append_stat_sample(&stats_path(&id), &sample, STATS_KEPT);
+                let _ = engine.stats_tx.send(StatsEvent::Sample { container_id: id.clone() });
                 previous = Some(now);
                 std::thread::sleep(STATS_INTERVAL);
             }
+            let _ = engine.stats_tx.send(StatsEvent::Stopped { container_id: id });
         });
     }
 
@@ -1970,6 +2027,73 @@ impl Engine {
         })
     }
 
+    pub fn stats_rows(&self, ids: &[String], all: bool) -> Result<Vec<ContainerStatRow>> {
+        let store = self.store.lock().unwrap();
+        let selected: Vec<ContainerSummary> = if !ids.is_empty() {
+            ids.iter()
+                .map(|key| store.container(key).cloned().map_err(anyhow::Error::from))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            store
+                .containers()
+                .iter()
+                .filter(|c| all || matches!(c.status, ContainerStatus::Running | ContainerStatus::Paused))
+                .cloned()
+                .collect()
+        };
+        drop(store);
+
+        let running = self.running.lock().unwrap();
+        let stats = self.stats.lock().unwrap();
+        let specs = self.specs.lock().unwrap();
+        let now = now_ms();
+        Ok(selected
+            .into_iter()
+            .map(|c| {
+                let active = running.contains_key(&c.id) && matches!(c.status, ContainerStatus::Running | ContainerStatus::Paused);
+                let spec = specs.get(&c.id);
+                let history = stats.get(&c.id);
+                let spec_cpus = spec.map_or(DEFAULT_CPUS, |s| s.cpus);
+                let cpus = history.and_then(|h| (h.cpus > 0).then_some(h.cpus)).unwrap_or(spec_cpus).max(1);
+                let spec_limit = spec.map_or(0, |s| s.memory_mib << 20);
+                let last = history.and_then(|h| h.samples.back());
+                if active {
+                    ContainerStatRow {
+                        id: c.id,
+                        name: c.name,
+                        status: c.status,
+                        cpus,
+                        cpu_percent: last.map_or(c.cpu_percent.unwrap_or(0.0), |s| s.cpu_percent),
+                        memory_bytes: last.map_or(c.memory_bytes.unwrap_or(0), |s| s.memory_bytes),
+                        memory_limit_bytes: last
+                            .map(|s| s.memory_limit_bytes)
+                            .filter(|&l| l > 0)
+                            .or(c.memory_limit_bytes)
+                            .unwrap_or(spec_limit),
+                        net_rx_bytes: last.map_or(0, |s| s.net_rx_bytes),
+                        net_tx_bytes: last.map_or(0, |s| s.net_tx_bytes),
+                        pids: history.map_or(0, |h| h.processes.len() as u32),
+                        timestamp_ms: last.map_or(now, |s| s.timestamp_ms),
+                    }
+                } else {
+                    ContainerStatRow {
+                        id: c.id,
+                        name: c.name,
+                        status: c.status,
+                        cpus,
+                        cpu_percent: 0.0,
+                        memory_bytes: 0,
+                        memory_limit_bytes: c.memory_limit_bytes.unwrap_or(spec_limit),
+                        net_rx_bytes: 0,
+                        net_tx_bytes: 0,
+                        pids: 0,
+                        timestamp_ms: now,
+                    }
+                }
+            })
+            .collect())
+    }
+
     // -- Files and details --------------------------------------------------
 
     /// Return a cloned VM handle only when container `id` is live and unpaused.
@@ -2069,6 +2193,11 @@ impl Engine {
             labels: spec.labels,
             healthcheck: spec.healthcheck,
             health,
+            read_only: spec.read_only,
+            cap_add: spec.cap_add,
+            cap_drop: spec.cap_drop,
+            tmpfs: spec.tmpfs,
+            init: spec.init,
             container,
         })
     }
@@ -2294,6 +2423,10 @@ impl Engine {
             stdin: None,
             stdin_pipe,
             mounts: vec![],
+            read_only: false,
+            cap_add: cs.cap_add,
+            cap_drop: cs.cap_drop,
+            init: false,
         }))?;
         match read_event_unbuffered(&mut conn)? {
             AgentEvent::Started { pid } => Ok((pid, conn)),
@@ -2336,6 +2469,10 @@ impl Engine {
 
     pub fn subscribe_logs(&self) -> tokio::sync::broadcast::Receiver<LogEvent> {
         self.log_tx.subscribe()
+    }
+
+    pub fn subscribe_stats(&self) -> tokio::sync::broadcast::Receiver<StatsEvent> {
+        self.stats_tx.subscribe()
     }
 
     fn log(&self, id: &str, level: LogLevel, stream: LogStream, message: String) {
@@ -2651,6 +2788,19 @@ impl LineBuffer {
     }
 }
 
+/// Turn the very first reading into an initial sample (0.0% CPU until the next tick, with real memory & net totals).
+fn initial_sample(now: &GuestStats, limit: u64) -> StatSample {
+    let memory_limit_bytes = if limit > 0 { limit } else { now.memory_total_bytes };
+    StatSample {
+        timestamp_ms: now_ms(),
+        cpu_percent: 0.0,
+        memory_bytes: now.memory_total_bytes.saturating_sub(now.memory_available_bytes),
+        memory_limit_bytes,
+        net_rx_bytes: now.net_rx_bytes,
+        net_tx_bytes: now.net_tx_bytes,
+    }
+}
+
 /// Turn two readings of the guest's counters into one sample.
 fn sample_between(prev: &GuestStats, now: &GuestStats, limit: u64) -> StatSample {
     let total = now.cpu_total.saturating_sub(prev.cpu_total);
@@ -2953,6 +3103,10 @@ fn exec_probe_on_vm(
         stdin: None,
         stdin_pipe: false,
         mounts: vec![],
+        read_only: false,
+        cap_add: cs.cap_add.clone(),
+        cap_drop: cs.cap_drop.clone(),
+        init: false,
     }))?;
     match read_event_unbuffered(&mut conn)? {
         AgentEvent::Started { pid } => Ok((pid, conn)),

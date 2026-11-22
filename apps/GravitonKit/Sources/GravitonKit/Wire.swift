@@ -19,6 +19,9 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case pull(reference: String, progress: Bool = false, platform: String? = nil)
     case tagImage(source: String, target: String)
     case pushImage(reference: String, progress: Bool = false)
+    case listLogins
+    case registryLogin(registry: String, username: String, password: String)
+    case registryLogout(registry: String)
     case saveImage(references: [String])
     case loadImage(size: UInt64)
     case commit(CommitSpec)
@@ -63,6 +66,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     }
     private struct TagParams: Encodable { let source: String; let target: String }
     private struct PushImageParams: Encodable { let reference: String; let progress: Bool? }
+    private struct RegistryLoginParams: Encodable { let registry: String; let username: String; let password: String }
+    private struct RegistryParams: Encodable { let registry: String }
     private struct SaveImageParams: Encodable { let references: [String] }
     private struct LoadImageParams: Encodable { let size: UInt64 }
     private struct PairParams: Encodable { let code: String; let device: String }
@@ -97,6 +102,9 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .pull: "pull"
         case .tagImage: "tag_image"
         case .pushImage: "push_image"
+        case .listLogins: "list_logins"
+        case .registryLogin: "registry_login"
+        case .registryLogout: "registry_logout"
         case .saveImage: "save_image"
         case .loadImage: "load_image"
         case .commit: "commit"
@@ -130,7 +138,11 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         var c = encoder.container(keyedBy: Keys.self)
         try c.encode(method, forKey: .method)
         switch self {
-        case .ping, .engineInfo, .listContainers, .listImages, .listVolumes, .networkInfo, .pairBegin, .listDevices, .snapshotStatus, .snapshotClear: break
+        case .ping, .engineInfo, .listContainers, .listImages, .listVolumes, .networkInfo, .listLogins, .pairBegin, .listDevices, .snapshotStatus, .snapshotClear: break
+        case let .registryLogin(registry, username, password):
+            try c.encode(RegistryLoginParams(registry: registry, username: username, password: password), forKey: .params)
+        case let .registryLogout(registry):
+            try c.encode(RegistryParams(registry: registry), forKey: .params)
         case let .createVolume(name), let .removeVolume(name): try c.encode(NameParams(name: name), forKey: .params)
         case let .revokeDevice(id): try c.encode(IDParams(id: id), forKey: .params)
         case let .pair(code, device): try c.encode(PairParams(code: code, device: device), forKey: .params)
@@ -187,6 +199,9 @@ public enum EngineResponse: Decodable, Sendable {
     case imageArchive
     case pullProgress(PullProgress)
     case imagePushed(ImagePushResult)
+    case logins([RegistryLoginInfo])
+    case loggedIn(registry: String, username: String)
+    case loggedOut(registry: String)
     case removed(id: String)
     case diskUsage(DiskUsage)
     case imageRemoved(reference: String, freedBytes: UInt64, keptBytes: UInt64)
@@ -225,6 +240,8 @@ public enum EngineResponse: Decodable, Sendable {
     private struct LogEndData: Decodable { let exitCode: Int32? }
     private struct ExecOutputData: Decodable { let stream: String?; let data: [UInt8] }
     private struct ExecExitedData: Decodable { let code: Int32 }
+    private struct LoggedInData: Decodable { let registry: String; let username: String }
+    private struct LoggedOutData: Decodable { let registry: String }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
@@ -248,6 +265,13 @@ public enum EngineResponse: Decodable, Sendable {
         case "image_archive": self = .imageArchive
         case "pull_progress": self = .pullProgress(try c.decode(PullProgress.self, forKey: .data))
         case "image_pushed": self = .imagePushed(try c.decode(ImagePushResult.self, forKey: .data))
+        case "logins": self = .logins(try c.decode([RegistryLoginInfo].self, forKey: .data))
+        case "logged_in":
+            let r = try c.decode(LoggedInData.self, forKey: .data)
+            self = .loggedIn(registry: r.registry, username: r.username)
+        case "logged_out":
+            let r = try c.decode(LoggedOutData.self, forKey: .data)
+            self = .loggedOut(registry: r.registry)
         case "removed": self = .removed(id: try c.decode(Removed.self, forKey: .data).id)
         case "disk_usage": self = .diskUsage(try c.decode(DiskUsage.self, forKey: .data))
         case "image_removed":

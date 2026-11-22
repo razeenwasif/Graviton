@@ -174,9 +174,15 @@ pub fn prepare(id: &str, layers: &[String]) -> io::Result<(u64, bool)> {
     Ok((files, false))
 }
 
-/// Mount the container's volumes and write its network files. Returns whether
+/// Mount the container's volumes, tmpfs mounts, and write its network files. Returns whether
 /// the guest's container DNS resolver (`127.0.0.11:53`) is active.
-pub fn finish(id: &str, mounts: &[graviton_proto::GuestMount], hostname: &str, ip: Option<&str>) -> io::Result<bool> {
+pub fn finish(
+    id: &str,
+    mounts: &[graviton_proto::GuestMount],
+    tmpfs: &[graviton_proto::TmpfsMount],
+    hostname: &str,
+    ip: Option<&str>,
+) -> io::Result<bool> {
     let root = rootfs(id)?;
     for m in mounts {
         let rel = clean(Path::new(&m.target)).ok_or_else(|| io::Error::other(format!("bad mount target `{}`", m.target)))?;
@@ -200,6 +206,21 @@ pub fn finish(id: &str, mounts: &[graviton_proto::GuestMount], hostname: &str, i
             crate::linux::mount_with(&m.tag, &target.to_string_lossy(), "virtiofs", flags, None)
                 .map_err(|e| io::Error::other(format!("mounting {} at {}: {e}", m.tag, m.target)))?;
         }
+    }
+
+    for t in tmpfs {
+        let rel = clean(Path::new(&t.target)).ok_or_else(|| io::Error::other(format!("bad tmpfs target `{}`", t.target)))?;
+        let target = root.join(rel);
+        fs::create_dir_all(&target)?;
+        let (flags, data) = graviton_proto::parse_tmpfs_options(&t.options);
+        crate::linux::mount_with(
+            "tmpfs",
+            &target.to_string_lossy(),
+            "tmpfs",
+            flags as libc::c_ulong,
+            (!data.is_empty()).then_some(data.as_str()),
+        )
+        .map_err(|e| io::Error::other(format!("mounting tmpfs at {}: {e}", t.target)))?;
     }
 
     let etc = root.join("etc");
@@ -441,6 +462,9 @@ pub fn prepare_launch(
     hostname: &str,
     tty: bool,
     mounts: Vec<PreparedMount>,
+    read_only: bool,
+    cap_mask: u64,
+    init: bool,
 ) -> io::Result<crate::ns::PreparedLaunch> {
     let root = rootfs(id)?;
     if !root.join("proc").is_dir() {
@@ -478,6 +502,8 @@ pub fn prepare_launch(
                 dev_dst: root.join("dev").to_string_lossy().into_owned(),
                 hostname: hostname.to_string(),
                 mounts: Vec::new(),
+                read_only,
+                init,
             };
             (mode, true)
         }
@@ -496,10 +522,12 @@ pub fn prepare_launch(
             dev_dst: root.join("dev").to_string_lossy().into_owned(),
             hostname: hostname.to_string(),
             mounts: mount_specs,
+            read_only,
+            init,
         };
         (mode, false)
     };
 
     let workdir = if cwd.is_empty() { "/" } else { cwd };
-    crate::ns::PreparedLaunch::build(id, mode, argv, &merged_env, workdir, uid, gid, tty, register)
+    crate::ns::PreparedLaunch::build(id, mode, argv, &merged_env, workdir, uid, gid, tty, cap_mask, register)
 }

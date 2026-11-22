@@ -1244,4 +1244,63 @@ import Testing
         #expect(filtered.allSatisfy { $0.timestampMs == cutoff })
         await #expect(throws: EngineError.self) { _ = try await demo.commit(CommitSpec(container: "web", reference: "web:snap")) }
     }
+
+    @Test func registryLoginsAndSecurityDetailsWireAndDemo() async throws {
+        let line = { (r: EngineRequest) in String(decoding: try Wire.line(r), as: UTF8.self) }
+        #expect(try line(.listLogins) == #"{"method":"list_logins"}"# + "\n")
+        #expect(
+            try line(.registryLogin(registry: "ghcr.io", username: "octocat", password: "secret"))
+                == #"{"method":"registry_login","params":{"password":"secret","registry":"ghcr.io","username":"octocat"}}"# + "\n"
+        )
+        #expect(
+            try line(.registryLogout(registry: "ghcr.io"))
+                == #"{"method":"registry_logout","params":{"registry":"ghcr.io"}}"# + "\n"
+        )
+
+        guard case let .logins(list) = try Wire.decoder.decode(
+            EngineResponse.self,
+            from: Data(#"{"type":"logins","data":[{"registry":"docker.io","username":"alice"}]}"#.utf8)
+        ) else {
+            Issue.record("expected .logins"); return
+        }
+        #expect(list == [RegistryLoginInfo(registry: "docker.io", username: "alice")])
+
+        guard case let .loggedIn(reg, user) = try Wire.decoder.decode(
+            EngineResponse.self,
+            from: Data(#"{"type":"logged_in","data":{"registry":"docker.io","username":"alice"}}"#.utf8)
+        ) else {
+            Issue.record("expected .loggedIn"); return
+        }
+        #expect(reg == "docker.io" && user == "alice")
+
+        guard case let .loggedOut(outReg) = try Wire.decoder.decode(
+            EngineResponse.self,
+            from: Data(#"{"type":"logged_out","data":{"registry":"docker.io"}}"#.utf8)
+        ) else {
+            Issue.record("expected .loggedOut"); return
+        }
+        #expect(outReg == "docker.io")
+
+        // ContainerDetails with security fields + backwards compatibility when omitted.
+        let secJSON = #"{"container":{"id":"abc","name":"web","image":"alpine","status":"running","exit_code":null,"ports":[],"mounts":[],"ip_address":null,"cpu_percent":null,"memory_bytes":null,"memory_limit_bytes":null,"created_at":1,"started_at":2},"image_reference":"alpine","image_digest":"sha256:aa","command":["sh"],"env":[],"working_dir":"/","user":null,"hostname":"web","cpus":2,"memory_mib":512,"kernel":"6.12","vm_dir":"/tmp","read_only":true,"cap_add":["NET_BIND_SERVICE"],"cap_drop":["ALL"],"tmpfs":[{"target":"/tmp","options":"size=64m"}],"init":true}"#
+        let decoded = try Wire.decoder.decode(ContainerDetails.self, from: Data(secJSON.utf8))
+        #expect(decoded.readOnly == true)
+        #expect(decoded.capAdd == ["NET_BIND_SERVICE"])
+        #expect(decoded.capDrop == ["ALL"])
+        #expect(decoded.tmpfs == [TmpfsMount(target: "/tmp", options: "size=64m")])
+        #expect(decoded.usesInit)
+
+        let plainJSON = #"{"container":{"id":"abc","name":"web","image":"alpine","status":"running","exit_code":null,"ports":[],"mounts":[],"ip_address":null,"cpu_percent":null,"memory_bytes":null,"memory_limit_bytes":null,"created_at":1,"started_at":2},"image_reference":"alpine","image_digest":"sha256:aa","command":["sh"],"env":[],"working_dir":"/","user":null,"hostname":"web","cpus":2,"memory_mib":512,"kernel":"6.12","vm_dir":"/tmp"}"#
+        let decodedPlain = try Wire.decoder.decode(ContainerDetails.self, from: Data(plainJSON.utf8))
+        #expect(decodedPlain.readOnly == nil && !decodedPlain.usesInit)
+
+        // DemoEngine login/logout lifecycle.
+        let demo = DemoEngine()
+        #expect(await demo.listLogins().contains { $0.registry == "ghcr.io" })
+        let added = try await demo.registryLogin(registry: "https://index.docker.io/v1/", username: "alice", password: "pw")
+        #expect(added == RegistryLoginInfo(registry: "docker.io", username: "alice"))
+        #expect(await demo.listLogins().contains { $0.registry == "docker.io" })
+        #expect(try await demo.registryLogout(registry: "docker.io") == "docker.io")
+        await #expect(throws: EngineError.self) { _ = try await demo.registryLogout(registry: "docker.io") }
+    }
 }

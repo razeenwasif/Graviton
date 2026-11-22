@@ -13,6 +13,7 @@ final class AppRouter {
         case images
         case volumes
         case networks
+        case settings
         /// Open the Pair a Mac sheet.
         case pairMac
     }

@@ -695,6 +695,11 @@ fn service_to_run_spec(proj: &ComposeProject, svc: &ComposeService) -> RunSpec {
         labels: svc.labels.clone(),
         dns_aliases: svc.dns_aliases.clone(),
         healthcheck: svc.healthcheck.clone(),
+        read_only: svc.read_only,
+        cap_add: svc.cap_add.clone(),
+        cap_drop: svc.cap_drop.clone(),
+        tmpfs: svc.tmpfs.clone(),
+        init: svc.init,
     }
 }
 

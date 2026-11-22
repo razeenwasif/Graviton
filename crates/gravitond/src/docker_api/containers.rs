@@ -9,8 +9,9 @@ use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use graviton_proto::{
     AgentEvent, AgentRequest, ContainerStatus, ContainerSummary, ExecSpec, FileKind, HealthStatus, Healthcheck, LogLevel,
-    LogStream, PruneSpec, RestartPolicy, RunSpec, decode_line, encode_line,
+    LogStream, PruneSpec, RestartPolicy, RunSpec, TmpfsMount, decode_line, encode_line,
     frame::{Decoder, Frame},
+    parse_tmpfs_spec,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -19,7 +20,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::cleanup;
-use crate::runtime::{ContainerSpec, Engine, LogEvent, new_id, now_ms, now_secs};
+use crate::runtime::{ContainerSpec, Engine, LogEvent, StatsEvent, new_id, now_ms, now_secs};
 use crate::{Backend, upload};
 
 use super::http::{
@@ -437,8 +438,19 @@ pub async fn create_container(
 
     let hc = &payload["HostConfig"];
     let auto_remove = hc["AutoRemove"].as_bool().unwrap_or(false);
+    let read_only = hc["ReadonlyRootfs"].as_bool().unwrap_or(false);
+    let init = hc["Init"].as_bool().unwrap_or(false);
+    let cap_add: Vec<String> = hc["CapAdd"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let cap_drop: Vec<String> = hc["CapDrop"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
 
     let mut volumes = Vec::new();
+    let mut tmpfs = Vec::new();
     if let Some(binds) = hc["Binds"].as_array() {
         for b in binds {
             if let Some(raw) = b.as_str() {
@@ -448,9 +460,31 @@ pub async fn create_container(
             }
         }
     }
+    if let Some(tmpfs_map) = hc["Tmpfs"].as_object() {
+        for (target, opts) in tmpfs_map {
+            let opt_str = opts.as_str().unwrap_or("").trim();
+            let raw = if opt_str.is_empty() { target.clone() } else { format!("{target}:{opt_str}") };
+            match parse_tmpfs_spec(&raw) {
+                Ok(parsed) => tmpfs.push(parsed),
+                Err(msg) => {
+                    write_error(write, 400, &msg, head.close_after).await?;
+                    return Ok(RouteOutcome::Continue);
+                }
+            }
+        }
+    }
     if let Some(mounts) = hc["Mounts"].as_array() {
         for m in mounts {
-            if let Some(mapped) = normalize_docker_mount(m) {
+            if m["Type"].as_str() == Some("tmpfs") {
+                match normalize_docker_tmpfs_mount(m) {
+                    Ok(Some(t)) => tmpfs.push(t),
+                    Ok(None) => {}
+                    Err(msg) => {
+                        write_error(write, 400, &msg, head.close_after).await?;
+                        return Ok(RouteOutcome::Continue);
+                    }
+                }
+            } else if let Some(mapped) = normalize_docker_mount(m) {
                 volumes.push(mapped);
             }
         }
@@ -538,6 +572,11 @@ pub async fn create_container(
         labels,
         dns_aliases,
         healthcheck,
+        read_only,
+        cap_add,
+        cap_drop,
+        tmpfs,
+        init,
     };
 
     let res = tokio::task::spawn_blocking(move || engine.create_container_local(spec)).await?;
@@ -615,9 +654,28 @@ pub(crate) fn normalize_docker_mount(m: &Value) -> Option<String> {
                 .unwrap_or_else(|| format!("vol-{}", new_id()));
             Some(format!("{source}:{target}{suffix}"))
         }
-        // `tmpfs` mounts aren't virtiofs shares on macOS; skip gracefully rather than failing create.
         _ => None,
     }
+}
+
+pub(crate) fn normalize_docker_tmpfs_mount(m: &Value) -> std::result::Result<Option<TmpfsMount>, String> {
+    let Some(target) = m["Target"].as_str().filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    let mut opts = Vec::new();
+    if m["ReadOnly"].as_bool().unwrap_or(false) {
+        opts.push("ro".to_string());
+    }
+    if let Some(to) = m["TmpfsOptions"].as_object() {
+        if let Some(size) = to.get("SizeBytes").and_then(|v| v.as_u64()).filter(|&n| n > 0) {
+            opts.push(format!("size={size}"));
+        }
+        if let Some(mode) = to.get("Mode").and_then(|v| v.as_u64()) {
+            opts.push(format!("mode={:o}", mode & 0o7777));
+        }
+    }
+    let raw = if opts.is_empty() { target.to_string() } else { format!("{target}:{}", opts.join(",")) };
+    parse_tmpfs_spec(&raw).map(Some)
 }
 
 fn parse_port_bindings(v: &Value) -> Vec<String> {
@@ -763,6 +821,24 @@ pub async fn inspect_container(
     let networks = build_networks_map(c, &networks_list);
     let restart_name = details.restart.as_str();
 
+    let mut mounts_json = docker_mounts_list(c);
+    for t in &details.tmpfs {
+        let ro = t.options.split(',').any(|o| o.trim() == "ro");
+        mounts_json.push(json!({
+            "Type": "tmpfs",
+            "Source": "",
+            "Destination": t.target,
+            "Mode": t.options,
+            "RW": !ro,
+            "Propagation": ""
+        }));
+    }
+    let tmpfs_map: serde_json::Map<String, Value> = details
+        .tmpfs
+        .iter()
+        .map(|t| (t.target.clone(), Value::String(t.options.clone())))
+        .collect();
+
     let mut inspect_json = json!({
         "Id": c.id,
         "Created": created,
@@ -804,6 +880,11 @@ pub async fn inspect_container(
             "AutoRemove": auto_remove,
             "Memory": details.memory_mib << 20,
             "NanoCpus": u64::from(details.cpus) * 1_000_000_000,
+            "ReadonlyRootfs": details.read_only,
+            "Init": details.init,
+            "CapAdd": if details.cap_add.is_empty() { Value::Null } else { json!(details.cap_add) },
+            "CapDrop": if details.cap_drop.is_empty() { Value::Null } else { json!(details.cap_drop) },
+            "Tmpfs": Value::Object(tmpfs_map),
         },
         "Config": {
             "Hostname": details.hostname,
@@ -824,7 +905,7 @@ pub async fn inspect_container(
             "Entrypoint": Value::Null,
             "Labels": details.labels,
         },
-        "Mounts": docker_mounts_list(c),
+        "Mounts": mounts_json,
         "NetworkSettings": {
             "Bridge": "",
             "Gateway": c.ip_address.as_deref().map(|_| "192.168.64.1").unwrap_or(""),
@@ -1954,6 +2035,80 @@ pub async fn container_top(
     Ok(RouteOutcome::Continue)
 }
 
+pub(crate) struct DockerCpuReading {
+    read: String,
+    total_usage: u64,
+    system_cpu_usage: u64,
+    online_cpus: u32,
+}
+
+impl DockerCpuReading {
+    pub(crate) fn advance(&self, cpu_percent: f64, cpus: u32, now: &str) -> Self {
+        let online_cpus = cpus.max(1);
+        let step_system = 1_000_000_000u64 * u64::from(online_cpus);
+        let delta_cpu = (cpu_percent.max(0.0) * 10_000_000.0) as u64;
+        Self {
+            read: now.to_string(),
+            total_usage: self.total_usage.saturating_add(delta_cpu),
+            system_cpu_usage: self.system_cpu_usage.saturating_add(step_system),
+            online_cpus,
+        }
+    }
+}
+
+pub(crate) fn build_docker_stats_json(
+    st: &graviton_proto::ContainerStats,
+    name: &str,
+    active: bool,
+    prev_cpu: &mut Option<DockerCpuReading>,
+) -> Value {
+    let now = crate::build::rfc3339(now_secs());
+    let online_cpus = st.cpus.max(1);
+    let step_system = 1_000_000_000u64 * u64::from(online_cpus);
+    let initial_prev = prev_cpu.take().unwrap_or_else(|| DockerCpuReading {
+        read: now.clone(),
+        total_usage: 0,
+        system_cpu_usage: step_system,
+        online_cpus,
+    });
+    let (mem, limit, rx, tx, pids, cpu_percent) = if active {
+        let last = st.samples.last();
+        (
+            last.map_or(0, |s| s.memory_bytes),
+            last.map_or(0, |s| s.memory_limit_bytes),
+            last.map_or(0, |s| s.net_rx_bytes),
+            last.map_or(0, |s| s.net_tx_bytes),
+            st.processes.len() as u64,
+            last.map_or(0.0, |s| s.cpu_percent),
+        )
+    } else {
+        (0, st.samples.last().map_or(0, |s| s.memory_limit_bytes), 0, 0, 0, 0.0)
+    };
+    let next_cpu = initial_prev.advance(cpu_percent, online_cpus, &now);
+    let out = json!({
+        "read": now,
+        "preread": initial_prev.read,
+        "id": st.id,
+        "name": format!("/{name}"),
+        "pids_stats": { "current": pids },
+        "blkio_stats": { "io_service_bytes_recursive": [] },
+        "cpu_stats": {
+            "cpu_usage": { "total_usage": next_cpu.total_usage },
+            "system_cpu_usage": next_cpu.system_cpu_usage,
+            "online_cpus": next_cpu.online_cpus,
+        },
+        "precpu_stats": {
+            "cpu_usage": { "total_usage": initial_prev.total_usage },
+            "system_cpu_usage": initial_prev.system_cpu_usage,
+            "online_cpus": initial_prev.online_cpus,
+        },
+        "memory_stats": { "usage": mem, "limit": limit },
+        "networks": { "eth0": { "rx_bytes": rx, "tx_bytes": tx } }
+    });
+    *prev_cpu = Some(next_cpu);
+    out
+}
+
 pub async fn container_stats(
     state: &Arc<DockerState>,
     raw_id: &str,
@@ -1961,6 +2116,8 @@ pub async fn container_stats(
     reader: &mut BufReader<OwnedReadHalf>,
     write: &mut OwnedWriteHalf,
 ) -> Result<RouteOutcome> {
+    use tokio::sync::broadcast::error::RecvError;
+
     drain_body(reader, write, head).await?;
     let key = raw_id.trim_start_matches('/').to_string();
     let stream = head.query_bool("stream", true);
@@ -1971,65 +2128,124 @@ pub async fn container_stats(
         return Ok(RouteOutcome::Continue);
     };
 
-    let build_stats_json = |st: &graviton_proto::ContainerStats, name: &str| {
-        let last = st.samples.last();
-        let mem = last.map_or(0, |s| s.memory_bytes);
-        let limit = last.map_or(0, |s| s.memory_limit_bytes);
-        let rx = last.map_or(0, |s| s.net_rx_bytes);
-        let tx = last.map_or(0, |s| s.net_tx_bytes);
-        let cpu_ns = last.map_or(0u64, |s| (s.cpu_percent * 10_000_000.0) as u64);
-        json!({
-            "read": crate::build::rfc3339(now_secs()),
-            "id": st.id,
-            "name": format!("/{name}"),
-            "cpu_stats": {
-                "cpu_usage": { "total_usage": cpu_ns },
-                "system_cpu_usage": 1_000_000_000u64 * u64::from(st.cpus.max(1)),
-                "online_cpus": st.cpus.max(1),
-            },
-            "precpu_stats": {
-                "cpu_usage": { "total_usage": 0 },
-                "system_cpu_usage": 0,
-                "online_cpus": st.cpus.max(1),
-            },
-            "memory_stats": { "usage": mem, "limit": limit },
-            "networks": { "eth0": { "rx_bytes": rx, "tx_bytes": tx } }
-        })
-    };
-
+    let mut stats_rx = engine.subscribe_stats();
     let resolved = {
         let store = engine.store.lock().unwrap();
-        store.container(&key).map(|c| c.name.clone()).map_err(|e| e.to_string())
+        store
+            .container(&key)
+            .map(|c| (c.id.clone(), c.name.clone(), matches!(c.status, ContainerStatus::Running | ContainerStatus::Paused)))
+            .map_err(|e| e.to_string())
     };
-    let cname = match resolved {
-        Ok(n) => n,
+    let (cid, cname, mut active) = match resolved {
+        Ok(triple) => triple,
         Err(msg) => {
             write_error(write, 404, &msg, head.close_after).await?;
             return Ok(RouteOutcome::Continue);
         }
     };
 
-    if !stream || oneshot {
-        let k = key.clone();
+    let mut st = {
+        let k = cid.clone();
         let e = Arc::clone(&engine);
-        let st = tokio::task::spawn_blocking(move || e.stats(&k)).await??;
-        write_json(write, 200, &build_stats_json(&st, &cname), head.close_after).await?;
+        tokio::task::spawn_blocking(move || e.stats(&k)).await??
+    };
+    if active && st.samples.is_empty() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if rem.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(rem, stats_rx.recv()).await {
+                Ok(Ok(StatsEvent::Sample { container_id, .. })) if container_id == cid => {
+                    let k = cid.clone();
+                    let e = Arc::clone(&engine);
+                    if let Ok(fresh) = tokio::task::spawn_blocking(move || e.stats(&k)).await? {
+                        st = fresh;
+                    }
+                    break;
+                }
+                Ok(Ok(StatsEvent::Stopped { container_id })) if container_id == cid => {
+                    active = false;
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(RecvError::Lagged(_))) => {
+                    let k = cid.clone();
+                    let e = Arc::clone(&engine);
+                    if let Ok(fresh) = tokio::task::spawn_blocking(move || e.stats(&k)).await? {
+                        st = fresh;
+                        if !st.samples.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                Ok(Err(RecvError::Closed)) | Err(_) => break,
+            }
+        }
+    }
+
+    let mut prev_cpu: Option<DockerCpuReading> = None;
+    if !stream || oneshot {
+        write_json(write, 200, &build_docker_stats_json(&st, &cname, active, &mut prev_cpu), head.close_after).await?;
         return Ok(RouteOutcome::Continue);
     }
 
     write_chunked_head(write, 200, "application/json", &[]).await?;
+    let mut initial_line = serde_json::to_vec(&build_docker_stats_json(&st, &cname, active, &mut prev_cpu))?;
+    initial_line.push(b'\n');
+    if write_chunk(write, &initial_line).await.is_err() || !active {
+        let _ = finish_chunked(write).await;
+        return Ok(RouteOutcome::Done);
+    }
+
+    let mut fallback = tokio::time::interval(Duration::from_secs(2));
+    fallback.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    fallback.tick().await;
+
     loop {
-        let k = key.clone();
+        let emit_next = tokio::select! {
+            res = reader.fill_buf() => match res {
+                Ok([]) | Err(_) => false,
+                Ok(_) => continue,
+            },
+            ev = stats_rx.recv() => match ev {
+                Ok(StatsEvent::Sample { container_id, .. }) if container_id == cid => true,
+                Ok(StatsEvent::Stopped { container_id }) if container_id == cid => {
+                    let k = cid.clone();
+                    let e = Arc::clone(&engine);
+                    if let Ok(Ok(fresh)) = tokio::task::spawn_blocking(move || e.stats(&k)).await {
+                        let mut line = serde_json::to_vec(&build_docker_stats_json(&fresh, &cname, false, &mut prev_cpu))?;
+                        line.push(b'\n');
+                        let _ = write_chunk(write, &line).await;
+                    }
+                    false
+                }
+                Ok(_) => continue,
+                Err(RecvError::Lagged(_)) => true,
+                Err(RecvError::Closed) => false,
+            },
+            _ = fallback.tick() => true,
+        };
+        if !emit_next {
+            break;
+        }
+        let still_active = engine
+            .store
+            .lock()
+            .unwrap()
+            .container(&cid)
+            .is_ok_and(|c| matches!(c.status, ContainerStatus::Running | ContainerStatus::Paused));
+        let k = cid.clone();
         let e = Arc::clone(&engine);
         let Ok(Ok(st)) = tokio::task::spawn_blocking(move || e.stats(&k)).await else {
             break;
         };
-        let mut line = serde_json::to_vec(&build_stats_json(&st, &cname))?;
+        let mut line = serde_json::to_vec(&build_docker_stats_json(&st, &cname, still_active, &mut prev_cpu))?;
         line.push(b'\n');
-        if write_chunk(write, &line).await.is_err() {
+        if write_chunk(write, &line).await.is_err() || !still_active {
             break;
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
     }
     let _ = finish_chunked(write).await;
     Ok(RouteOutcome::Done)

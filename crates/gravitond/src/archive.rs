@@ -569,6 +569,7 @@ fn commit_stopped_container(blobs: &BlobStore, id: &str, base_img: &LocalImage, 
             container: id.to_string(),
             layers: base_img.layers.iter().map(|l| l.digest.clone()).collect(),
             mounts: vec![],
+            tmpfs: vec![],
             hostname: Some("commit".into()),
             now_secs: None,
         }))?;

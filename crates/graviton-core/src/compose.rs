@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use graviton_proto::{Healthcheck, RestartPolicy, parse_duration_secs};
+use graviton_proto::{Healthcheck, RestartPolicy, TmpfsMount, caps, parse_duration_secs, parse_tmpfs_spec};
 use serde::Serialize;
 use thiserror::Error;
 use yaml_rust2::{Yaml, YamlLoader, yaml::Hash as YamlHash};
@@ -108,6 +108,11 @@ pub struct ComposeService {
     pub dns_aliases: Vec<String>,
     pub profiles: Vec<String>,
     pub healthcheck: Option<Healthcheck>,
+    pub read_only: bool,
+    pub cap_add: Vec<String>,
+    pub cap_drop: Vec<String>,
+    pub tmpfs: Vec<TmpfsMount>,
+    pub init: bool,
 }
 
 /// Options for loading a Compose project from disk.
@@ -786,6 +791,11 @@ fn parse_service(
         Some(v) => Some(parse_healthcheck(name, v)?),
         None => None,
     };
+    let read_only = parse_bool_field(name, h, "read_only")?;
+    let init = parse_bool_field(name, h, "init")?;
+    let cap_add = parse_caps_field(name, h, "cap_add")?;
+    let cap_drop = parse_caps_field(name, h, "cap_drop")?;
+    let tmpfs = parse_tmpfs_field(name, h)?;
 
     Ok(ComposeService {
         name: name.to_string(),
@@ -809,7 +819,66 @@ fn parse_service(
         dns_aliases,
         profiles,
         healthcheck,
+        read_only,
+        cap_add,
+        cap_drop,
+        tmpfs,
+        init,
     })
+}
+
+fn parse_bool_field(service: &str, h: &YamlHash, field: &str) -> Result<bool> {
+    match yaml_get(h, field) {
+        None | Some(Yaml::Null) => Ok(false),
+        Some(Yaml::Boolean(b)) => Ok(*b),
+        Some(Yaml::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(ComposeError::Spec(format!("service `{service}`: `{field}` must be a boolean"))),
+        },
+        _ => Err(ComposeError::Spec(format!("service `{service}`: `{field}` must be a boolean"))),
+    }
+}
+
+fn parse_caps_field(service: &str, h: &YamlHash, field: &str) -> Result<Vec<String>> {
+    let Some(val) = yaml_get(h, field).filter(|y| !matches!(y, Yaml::Null)) else {
+        return Ok(Vec::new());
+    };
+    let Yaml::Array(arr) = val else {
+        return Err(ComposeError::Spec(format!("service `{service}`: `{field}` must be a list")));
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let raw = yaml_scalar_to_string(item).ok_or_else(|| {
+            ComposeError::Spec(format!("service `{service}`: `{field}` items must be strings"))
+        })?;
+        let norm = caps::normalize_cap(&raw)
+            .map_err(|e| ComposeError::Spec(format!("service `{service}`: invalid `{field}`: {e}")))?;
+        out.push(norm);
+    }
+    Ok(out)
+}
+
+fn parse_tmpfs_field(service: &str, h: &YamlHash) -> Result<Vec<TmpfsMount>> {
+    match yaml_get(h, "tmpfs") {
+        None | Some(Yaml::Null) => Ok(Vec::new()),
+        Some(Yaml::String(s)) => {
+            let m = parse_tmpfs_spec(s)
+                .map_err(|e| ComposeError::Spec(format!("service `{service}`: invalid `tmpfs`: {e}")))?;
+            Ok(vec![m])
+        }
+        Some(Yaml::Array(arr)) => arr
+            .iter()
+            .map(|item| {
+                let raw = yaml_scalar_to_string(item).ok_or_else(|| {
+                    ComposeError::Spec(format!("service `{service}`: `tmpfs` items must be strings"))
+                })?;
+                parse_tmpfs_spec(&raw)
+                    .map_err(|e| ComposeError::Spec(format!("service `{service}`: invalid `tmpfs`: {e}")))
+            })
+            .collect(),
+        _ => Err(ComposeError::Spec(format!("service `{service}`: `tmpfs` must be a string or list"))),
+    }
 }
 
 fn parse_healthcheck(service: &str, v: &Yaml) -> Result<Healthcheck> {
@@ -1612,6 +1681,58 @@ services:
         .unwrap();
         let proj = ComposeProject::load_with_env(&dir, &LoadOptions::default(), &BTreeMap::new()).unwrap();
         assert!(matches!(proj.startup_order(&[], &[]), Err(ComposeError::Cycle(_))));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_security_runtime_fields() {
+        let dir = std::env::temp_dir().join(format!("graviton-compose-sec-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("compose.yaml"),
+            r#"
+services:
+  single:
+    image: alpine:3.22
+    read_only: true
+    init: true
+    cap_drop: [all]
+    cap_add: [cap_net_bind_service]
+    tmpfs: /run
+  multi:
+    image: alpine:3.22
+    tmpfs:
+      - /tmp:rw,noexec,size=64m
+      - /var/run
+"#,
+        )
+        .unwrap();
+        let proj = ComposeProject::load_with_env(&dir, &LoadOptions::default(), &BTreeMap::new()).unwrap();
+        let s = &proj.services["single"];
+        assert!(s.read_only);
+        assert!(s.init);
+        assert_eq!(s.cap_drop, vec!["ALL"]);
+        assert_eq!(s.cap_add, vec!["NET_BIND_SERVICE"]);
+        assert_eq!(s.tmpfs, vec![TmpfsMount { target: "/run".into(), options: String::new() }]);
+
+        let m = &proj.services["multi"];
+        assert!(!m.read_only);
+        assert!(!m.init);
+        assert_eq!(
+            m.tmpfs,
+            vec![
+                TmpfsMount { target: "/tmp".into(), options: "rw,noexec,size=64m".into() },
+                TmpfsMount { target: "/var/run".into(), options: String::new() },
+            ]
+        );
+
+        fs::write(
+            dir.join("compose.yaml"),
+            "services:\n  bad:\n    image: alpine\n    cap_add: [NOT_A_CAP]\n",
+        )
+        .unwrap();
+        assert!(ComposeProject::load_with_env(&dir, &LoadOptions::default(), &BTreeMap::new()).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 }

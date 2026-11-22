@@ -36,6 +36,8 @@ pub enum LaunchMode {
         dev_dst: String,
         hostname: String,
         mounts: Vec<MountSpec>,
+        read_only: bool,
+        init: bool,
     },
     Enter {
         init_pid: i32,
@@ -52,6 +54,7 @@ pub struct LaunchSpec {
     pub uid: u32,
     pub gid: u32,
     pub tty: bool,
+    pub cap_mask: u64,
     pub status_fd: i32,
 }
 
@@ -160,6 +163,7 @@ mod imp {
             uid: u32,
             gid: u32,
             tty: bool,
+            cap_mask: u64,
             register: bool,
         ) -> io::Result<Self> {
             let mut pipe_fds = [-1i32; 2];
@@ -181,6 +185,7 @@ mod imp {
                 uid,
                 gid,
                 tty,
+                cap_mask,
                 status_fd: status_w_fd,
             };
             let json = serde_json::to_vec(&spec).map_err(io::Error::other)?;
@@ -283,7 +288,9 @@ mod imp {
         let _ = set_cloexec(spec.status_fd);
 
         match &spec.mode {
-            LaunchMode::Init { root, dev_dst, hostname, mounts } => run_init(&spec, root, dev_dst, hostname, mounts),
+            LaunchMode::Init { root, dev_dst, hostname, mounts, read_only, init } => {
+                run_init(&spec, root, dev_dst, hostname, mounts, *read_only, *init)
+            }
             LaunchMode::Enter { init_pid } => run_enter(&spec, *init_pid),
         }
     }
@@ -380,6 +387,78 @@ mod imp {
         }
     }
 
+    #[repr(C)]
+    struct CapUserHeader {
+        version: u32,
+        pid: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapUserData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    fn last_linux_cap() -> u32 {
+        fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map(|c| c.min(63))
+            .unwrap_or(40)
+    }
+
+    fn apply_capabilities_and_identity(cap_mask: u64, uid: u32, gid: u32) -> Result<(), String> {
+        const PR_CAP_AMBIENT: libc::c_int = 47;
+        const PR_CAP_AMBIENT_CLEAR_ALL: libc::c_ulong = 4;
+        const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+        // 1. Drop bounding caps before touching UID/CAP_SETPCAP.
+        let last_cap = last_linux_cap();
+        for cap in 0..=last_cap {
+            if (cap_mask & (1u64 << cap)) == 0 {
+                // SAFETY: valid PR_CAPBSET_DROP capability number on Linux.
+                if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) } != 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EINVAL) {
+                        return Err(format!("prctl PR_CAPBSET_DROP({cap}): {err}"));
+                    }
+                }
+            }
+        }
+
+        // 2. Drop supplementary groups and transition to target gid/uid.
+        // SAFETY: clearing supplementary groups then dropping gid/uid inside forked child.
+        unsafe {
+            if libc::setgroups(0, std::ptr::null()) != 0 {
+                return Err(format!("setgroups: {}", io::Error::last_os_error()));
+            }
+            if libc::setgid(gid) != 0 {
+                return Err(format!("setgid: {}", io::Error::last_os_error()));
+            }
+            if libc::setuid(uid) != 0 {
+                return Err(format!("setuid: {}", io::Error::last_os_error()));
+            }
+            let _ = libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+        }
+
+        // 3. Restrict effective/permitted/inheritable capability sets.
+        let eff_prm = if uid == 0 { cap_mask } else { 0 };
+        let lo = (eff_prm & 0xffff_ffff) as u32;
+        let hi = (eff_prm >> 32) as u32;
+        let mut hdr = CapUserHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
+        let mut data = [
+            CapUserData { effective: lo, permitted: lo, inheritable: 0 },
+            CapUserData { effective: hi, permitted: hi, inheritable: 0 },
+        ];
+        // SAFETY: capset(2) with Linux v3 header and 2-word CapUserData array for calling thread.
+        if unsafe { libc::syscall(libc::SYS_capset, &raw mut hdr, data.as_mut_ptr()) } != 0 {
+            return Err(format!("capset: {}", io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
     fn exec_child(spec: &LaunchSpec, err_w: i32) -> ! {
         let fail = |msg: &str| -> ! {
             write_all_fd(err_w, msg.as_bytes());
@@ -413,17 +492,12 @@ mod imp {
             Err(_) => fail("invalid working directory"),
         };
 
-        // SAFETY: dropping supplementary groups, gid, uid, then chdir inside the container root.
+        if let Err(msg) = apply_capabilities_and_identity(spec.cap_mask, spec.uid, spec.gid) {
+            fail(&msg);
+        }
+
+        // SAFETY: chdir inside the container root after capability and UID drop.
         unsafe {
-            if libc::setgroups(0, std::ptr::null()) != 0 {
-                fail(&format!("setgroups: {}", io::Error::last_os_error()));
-            }
-            if libc::setgid(spec.gid) != 0 {
-                fail(&format!("setgid: {}", io::Error::last_os_error()));
-            }
-            if libc::setuid(spec.uid) != 0 {
-                fail(&format!("setuid: {}", io::Error::last_os_error()));
-            }
             if libc::chdir(cwd_c.as_ptr()) != 0 {
                 fail(&format!("chdir {}: {}", spec.cwd, io::Error::last_os_error()));
             }
@@ -503,7 +577,34 @@ mod imp {
         }
     }
 
-    fn run_init(spec: &LaunchSpec, root: &str, dev_dst: &str, hostname: &str, mounts: &[MountSpec]) -> ! {
+    fn remount_root_readonly() -> Result<(), String> {
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        let mut flags = libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY;
+        if unsafe { libc::statvfs(c"/".as_ptr(), &raw mut st) } == 0 {
+            if (st.f_flag & libc::ST_NOSUID) != 0 {
+                flags |= libc::MS_NOSUID;
+            }
+            if (st.f_flag & libc::ST_NODEV) != 0 {
+                flags |= libc::MS_NODEV;
+            }
+            if (st.f_flag & libc::ST_NOEXEC) != 0 {
+                flags |= libc::MS_NOEXEC;
+            }
+            if (st.f_flag & libc::ST_NOATIME) != 0 {
+                flags |= libc::MS_NOATIME;
+            }
+            if (st.f_flag & libc::ST_NODIRATIME) != 0 {
+                flags |= libc::MS_NODIRATIME;
+            }
+        }
+        // SAFETY: remounting the container's private `/` mountpoint read-only while leaving submounts untouched.
+        if unsafe { libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), flags, std::ptr::null()) } != 0 {
+            return Err(format!("remount / read-only: {}", io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    fn run_init(spec: &LaunchSpec, root: &str, dev_dst: &str, hostname: &str, mounts: &[MountSpec], read_only: bool, init: bool) -> ! {
         let check = |rc: libc::c_int, what: &str| -> Result<(), String> {
             if rc == 0 { Ok(()) } else { Err(format!("{what}: {}", io::Error::last_os_error())) }
         };
@@ -583,7 +684,8 @@ mod imp {
                     write_all_fd(err_w, b"prctl PDEATHSIG failed");
                     libc::_exit(126);
                 }
-                let _ = libc::prctl(libc::PR_SET_NAME, c"init".as_ptr());
+                let init_name = if init { c"docker-init" } else { c"init" };
+                let _ = libc::prctl(libc::PR_SET_NAME, init_name.as_ptr());
 
                 if libc::mount(
                     c"proc".as_ptr(),
@@ -604,6 +706,12 @@ mod imp {
                     libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
                     std::ptr::null(),
                 );
+                if read_only {
+                    if let Err(msg) = remount_root_readonly() {
+                        write_all_fd(err_w, msg.as_bytes());
+                        libc::_exit(126);
+                    }
+                }
             }
 
             let child_pid = unsafe { libc::fork() };
@@ -754,6 +862,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             tty: false,
+            cap_mask: graviton_proto::caps::DEFAULT_CAP_MASK,
             status_fd: 5,
         };
         let encoded = serde_json::to_vec(&spec).unwrap();

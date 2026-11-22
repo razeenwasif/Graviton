@@ -186,6 +186,11 @@ struct LiveEngineTests {
             try await SocketEngine().remove(id: "definitely-not-here")
         }
     }
+
+    @Test func listsRegistryLoginsReadOnly() async throws {
+        let logins = try await SocketEngine().listLogins()
+        #expect(logins.allSatisfy { !$0.registry.isEmpty })
+    }
 }
 
 /// Pairs with a real gravitond running `--remote`, then uses the remote engine.
