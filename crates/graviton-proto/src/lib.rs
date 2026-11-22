@@ -952,6 +952,9 @@ pub struct SnapshotInfo {
     pub total_bytes: u64,
     pub max_slots_per_shape: u32,
     pub groups: Vec<SnapshotGroup>,
+    /// Populated when snapshot restore/warm is paused (e.g., host macOS screen locked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1576,8 +1579,22 @@ mod tests {
             total_bytes: 256 << 20,
             max_slots_per_shape: 8,
             groups: vec![SnapshotGroup { cpus: 2, memory_mib: 1024, rosetta: false, slots: 2, in_use: 1, size_bytes: 256 << 20 }],
+            paused_reason: None,
         });
-        assert_eq!(decode_line::<Response>(&encode_line(&snap_resp)).unwrap(), snap_resp);
+        let snap_json = encode_line(&snap_resp);
+        assert!(!String::from_utf8_lossy(&snap_json).contains("paused_reason"));
+        assert_eq!(decode_line::<Response>(&snap_json).unwrap(), snap_resp);
+
+        let paused_snap_resp = Response::Snapshots(SnapshotInfo {
+            enabled: true,
+            total_slots: 1,
+            in_use: 0,
+            total_bytes: 13 << 20,
+            max_slots_per_shape: 8,
+            groups: vec![],
+            paused_reason: Some("macOS console session is locked".into()),
+        });
+        assert_eq!(decode_line::<Response>(&encode_line(&paused_snap_resp)).unwrap(), paused_snap_resp);
     }
 
     #[test]

@@ -970,15 +970,17 @@ public struct SnapshotInfo: Codable, Hashable, Sendable {
     public var totalBytes: UInt64
     public var maxSlotsPerShape: UInt32
     public var groups: [SnapshotGroup]
+    public var pausedReason: String?
 
     public init(enabled: Bool = true, totalSlots: UInt32 = 0, inUse: UInt32 = 0, totalBytes: UInt64 = 0,
-                maxSlotsPerShape: UInt32 = 8, groups: [SnapshotGroup] = []) {
+                maxSlotsPerShape: UInt32 = 8, groups: [SnapshotGroup] = [], pausedReason: String? = nil) {
         self.enabled = enabled
         self.totalSlots = totalSlots
         self.inUse = inUse
         self.totalBytes = totalBytes
         self.maxSlotsPerShape = maxSlotsPerShape
         self.groups = groups
+        self.pausedReason = pausedReason
     }
 }
 

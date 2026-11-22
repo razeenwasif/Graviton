@@ -29,6 +29,8 @@ pub enum VmmError {
     Framework(String),
     #[error("hypervisor unavailable: {0}")]
     Unavailable(String),
+    #[error("{0}")]
+    SnapshotLocked(String),
     #[error("timed out {0}")]
     Timeout(&'static str),
     #[error("not implemented yet: {0}")]

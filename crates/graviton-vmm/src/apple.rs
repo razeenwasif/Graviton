@@ -18,6 +18,7 @@
 //! below hops onto that queue with `exec_sync` and waits for completion
 //! handlers on a channel *outside* the queue.
 
+use std::ffi::c_void;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -27,7 +28,7 @@ use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::AllocAnyThread;
-use objc2_foundation::{NSArray, NSData, NSDictionary, NSError, NSFileHandle, NSString, NSURL};
+use objc2_foundation::{NSArray, NSData, NSDictionary, NSError, NSFileHandle, NSNumber, NSString, NSUnderlyingErrorKey, NSURL};
 use objc2_virtualization::{
     VZBootLoader, VZDirectorySharingDeviceConfiguration, VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment,
     VZDiskImageSynchronizationMode, VZEntropyDeviceConfiguration, VZFileHandleNetworkDeviceAttachment, VZFileSerialPortAttachment,
@@ -72,6 +73,25 @@ impl AppleHypervisor {
         unsafe { VZGenericMachineIdentifier::new().dataRepresentation().to_vec() }
     }
 
+    /// Whether the macOS console login session is active and unlocked so SEP-backed
+    /// `.vzsave` decryption (`kSecAttrAccessibleWhenUnlocked`) can succeed.
+    pub fn session_unlocked() -> bool {
+        // SAFETY: CoreGraphics returns an owned CFDictionary (or NULL) that we release below.
+        let dict = unsafe { CGSessionCopyCurrentDictionary() };
+        if dict.is_null() {
+            return false;
+        }
+        let screen_locked = cf_dict_bool(dict, "CGSSessionScreenIsLocked");
+        let on_console = cf_dict_bool(dict, "kCGSSessionOnConsoleKey");
+        let login_done = cf_dict_bool(dict, "kCGSessionLoginDoneKey");
+        // SAFETY: `dict` is a non-null +1 CF object returned by `CGSessionCopyCurrentDictionary`.
+        unsafe { CFRelease(dict) };
+        if screen_locked == Some(true) || on_console == Some(false) || login_done != Some(true) {
+            return false;
+        }
+        true
+    }
+
     /// Boot and return the concrete handle (gives access to the console log path).
     pub fn boot_vm(&self, config: &VmConfig) -> Result<AppleVm, VmmError> {
         self.boot_vm_inner(config, false)
@@ -106,12 +126,13 @@ impl AppleHypervisor {
         let state_url = Sendable(file_url(state_path));
         let (tx, rx) = mpsc::channel();
         let done = Sendable(RcBlock::new(move |err: *mut NSError| {
-            let _ = tx.send(error_text(err));
+            let _ = tx.send(restore_error_info(err));
         }));
         vm.on_queue(|machine| unsafe { machine.restoreMachineStateFromURL_completionHandler(state_url.get(), done.get()) });
         match rx.recv_timeout(START_TIMEOUT) {
             Ok(None) => {}
-            Ok(Some(message)) => return Err(VmmError::Framework(format!("restoring VM snapshot: {message}"))),
+            Ok(Some((message, true))) => return Err(VmmError::SnapshotLocked(format!("restoring VM snapshot: {message}"))),
+            Ok(Some((message, false))) => return Err(VmmError::Framework(format!("restoring VM snapshot: {message}"))),
             Err(_) => return Err(VmmError::Timeout("waiting for the VM snapshot to restore")),
         }
         vm.resume()?;
@@ -524,5 +545,138 @@ fn error_text(err: *mut NSError) -> Option<String> {
     } else {
         // SAFETY: the framework passes a valid NSError (or nil) to completion handlers.
         Some(unsafe { &*err }.localizedDescription().to_string())
+    }
+}
+
+fn is_locked_restore_error(domain: &str, code: isize, description: &str) -> bool {
+    (domain == "NSOSStatusErrorDomain" && code == -25308)
+        || code == -536_870_174
+        || description.to_ascii_lowercase().contains("permission denied")
+}
+
+fn error_chain_locked(err: &NSError, depth: usize) -> bool {
+    if depth >= 4 {
+        return false;
+    }
+    let domain = err.domain().to_string();
+    let code = err.code();
+    let desc = err.localizedDescription().to_string();
+    if is_locked_restore_error(&domain, code, &desc) {
+        return true;
+    }
+    let info = err.userInfo();
+    let aks_key = NSString::from_str("AKSError");
+    if let Some(aks_obj) = info.objectForKey(&aks_key) {
+        if let Ok(num) = aks_obj.downcast::<NSNumber>() {
+            if num.integerValue() == -536_870_174 {
+                return true;
+            }
+        }
+    }
+    // SAFETY: `NSUnderlyingErrorKey` is a static Foundation constant key.
+    let underlying_key = unsafe { NSUnderlyingErrorKey };
+    if let Some(next_obj) = info.objectForKey(underlying_key) {
+        if let Ok(next_err) = next_obj.downcast::<NSError>() {
+            return error_chain_locked(&next_err, depth + 1);
+        }
+    }
+    false
+}
+
+fn restore_error_info(err: *mut NSError) -> Option<(String, bool)> {
+    if err.is_null() {
+        None
+    } else {
+        // SAFETY: the framework passes a valid NSError (or nil) to completion handlers.
+        let err_ref = unsafe { &*err };
+        Some((err_ref.localizedDescription().to_string(), error_chain_locked(err_ref, 0)))
+    }
+}
+
+type CFTypeID = usize;
+type CFIndex = isize;
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGSessionCopyCurrentDictionary() -> *const c_void;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFStringCreateWithBytes(
+        alloc: *const c_void,
+        bytes: *const u8,
+        num_bytes: CFIndex,
+        encoding: u32,
+        is_external_representation: bool,
+    ) -> *const c_void;
+    fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+    fn CFGetTypeID(cf: *const c_void) -> CFTypeID;
+    fn CFBooleanGetTypeID() -> CFTypeID;
+    fn CFBooleanGetValue(boolean: *const c_void) -> bool;
+    fn CFNumberGetTypeID() -> CFTypeID;
+    fn CFNumberGetValue(number: *const c_void, the_type: CFIndex, value_ptr: *mut c_void) -> bool;
+    fn CFRelease(cf: *const c_void);
+}
+
+fn cf_dict_bool(dict: *const c_void, key: &str) -> Option<bool> {
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    const K_CF_NUMBER_SINT32_TYPE: CFIndex = 3;
+    // SAFETY: `dict` is a valid CFDictionaryRef for the duration of this call and `cf_key` is released before returning.
+    unsafe {
+        let cf_key = CFStringCreateWithBytes(
+            std::ptr::null(),
+            key.as_ptr(),
+            key.len() as CFIndex,
+            K_CF_STRING_ENCODING_UTF8,
+            false,
+        );
+        if cf_key.is_null() {
+            return None;
+        }
+        let val = CFDictionaryGetValue(dict, cf_key);
+        CFRelease(cf_key);
+        if val.is_null() {
+            return None;
+        }
+        let tid = CFGetTypeID(val);
+        if tid == CFBooleanGetTypeID() {
+            Some(CFBooleanGetValue(val))
+        } else if tid == CFNumberGetTypeID() {
+            let mut n: i32 = 0;
+            if CFNumberGetValue(val, K_CF_NUMBER_SINT32_TYPE, (&raw mut n).cast()) {
+                Some(n != 0)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppleHypervisor, is_locked_restore_error};
+
+    #[test]
+    fn session_unlocked_probe_does_not_crash() {
+        let _ = AppleHypervisor::session_unlocked();
+    }
+
+    #[test]
+    fn classifies_locked_restore_errors() {
+        assert!(is_locked_restore_error("NSOSStatusErrorDomain", -25308, "sec error"));
+        assert!(is_locked_restore_error("AKSError", -536_870_174, "aks error"));
+        assert!(is_locked_restore_error(
+            "VZErrorDomain",
+            12,
+            "The virtual machine failed to restore with error “permission denied”."
+        ));
+        assert!(!is_locked_restore_error(
+            "VZErrorDomain",
+            12,
+            "The virtual machine configuration is incompatible with the saved state."
+        ));
     }
 }

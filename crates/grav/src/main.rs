@@ -915,9 +915,15 @@ fn run(cli: Cli) -> Result<()> {
             };
             match client.call(&req)? {
                 Response::Snapshots(info) => {
+                    let state = if !info.enabled {
+                        "disabled".to_string()
+                    } else if let Some(reason) = &info.paused_reason {
+                        format!("paused — {reason}")
+                    } else {
+                        "enabled".to_string()
+                    };
                     println!(
-                        "Snapshots: {} ({} slot{}, {} in use, {} on disk; max {}/shape)",
-                        if info.enabled { "enabled" } else { "disabled" },
+                        "Snapshots: {state} ({} slot{}, {} in use, {} on disk; max {}/shape)",
                         info.total_slots,
                         if info.total_slots == 1 { "" } else { "s" },
                         info.in_use,

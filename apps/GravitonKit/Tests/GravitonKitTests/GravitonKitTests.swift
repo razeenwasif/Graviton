@@ -1061,4 +1061,14 @@ import Testing
         let stopped = try await engine.stop(id: "web")
         #expect(stopped.status == .exited)
     }
+
+    @Test func snapshotInfoDecodesPausedReasonBackCompat() throws {
+        let plain = #"{"enabled":true,"total_slots":1,"in_use":0,"total_bytes":14159872,"max_slots_per_shape":8,"groups":[]}"#
+        let decodedPlain = try Wire.decoder.decode(SnapshotInfo.self, from: Data(plain.utf8))
+        #expect(decodedPlain.pausedReason == nil)
+
+        let paused = #"{"enabled":true,"total_slots":1,"in_use":0,"total_bytes":14159872,"max_slots_per_shape":8,"groups":[],"paused_reason":"macOS console session is locked"}"#
+        let decodedPaused = try Wire.decoder.decode(SnapshotInfo.self, from: Data(paused.utf8))
+        #expect(decodedPaused.pausedReason == "macOS console session is locked")
+    }
 }

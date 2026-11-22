@@ -38,6 +38,9 @@ pub const MAX_SLOTS_PER_SHAPE: usize = 8;
 /// defers DHCP and disk/volume mounting until `AgentRequest::Prepare` runs on restore).
 pub const SNAPSHOT_CMDLINE: &str = "console=hvc0 panic=-1 quiet graviton.snapshot=1";
 
+const LOCKED_REASON: &str = "macOS console session is locked (unlock screen to restore .vzsave snapshots)";
+const LOCKED_BACKOFF: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Shape {
     pub cpus: u32,
@@ -116,6 +119,8 @@ pub struct SnapshotPool {
     root: PathBuf,
     state: Arc<Mutex<PoolState>>,
     bg_warming: Arc<AtomicBool>,
+    logged_locked: AtomicBool,
+    last_locked_at: Mutex<Option<Instant>>,
 }
 
 impl SnapshotPool {
@@ -125,6 +130,8 @@ impl SnapshotPool {
             root,
             state: Arc::new(Mutex::new(PoolState::default())),
             bg_warming: Arc::new(AtomicBool::new(false)),
+            logged_locked: AtomicBool::new(false),
+            last_locked_at: Mutex::new(None),
         };
         if let Ok(fp) = guest_fingerprint(&paths::guest_dir()) {
             pool.prune_stale_fingerprints(&fp);
@@ -135,6 +142,20 @@ impl SnapshotPool {
     /// Snapshots are enabled unless explicitly disabled via `GRAVITON_NO_SNAPSHOTS=1`.
     pub fn enabled(&self) -> bool {
         std::env::var("GRAVITON_NO_SNAPSHOTS").as_deref() != Ok("1")
+    }
+
+    /// Non-empty reason when snapshots are temporarily paused (for example while the
+    /// macOS console session is locked and SEP keys cannot decrypt `.vzsave` files).
+    pub fn pause_reason(&self) -> Option<String> {
+        if !self.enabled() {
+            return None;
+        }
+        if !AppleHypervisor::session_unlocked()
+            || self.last_locked_at.lock().unwrap().is_some_and(|t| t.elapsed() < LOCKED_BACKOFF)
+        {
+            return Some(LOCKED_REASON.into());
+        }
+        None
     }
 
     fn slot_dir(&self, shape: &Shape, slot: usize) -> PathBuf {
@@ -150,6 +171,15 @@ impl SnapshotPool {
     pub fn try_restore(&self, config: &VmConfig) -> Result<Option<(AppleVm, SnapshotLease)>> {
         if !self.enabled() {
             return Ok(None);
+        }
+        if let Some(reason) = self.pause_reason() {
+            if !self.logged_locked.swap(true, Ordering::Relaxed) {
+                eprintln!("snapshots paused: {reason}; using cold boot until unlocked");
+            }
+            return Ok(None);
+        }
+        if self.logged_locked.swap(false, Ordering::Relaxed) {
+            eprintln!("snapshots resumed: macOS console session unlocked");
         }
         let guest_dir = config.kernel.parent().unwrap_or_else(|| Path::new("."));
         let Ok(fingerprint) = guest_fingerprint(guest_dir) else {
@@ -199,6 +229,14 @@ impl SnapshotPool {
         let state_path = dir.join("state.vzsave");
         match AppleHypervisor::new().restore_vm(&restore_cfg, &state_path) {
             Ok(vm) => Ok(Some((vm, lease))),
+            Err(graviton_vmm::VmmError::SnapshotLocked(msg)) => {
+                *self.last_locked_at.lock().unwrap() = Some(Instant::now());
+                if !self.logged_locked.swap(true, Ordering::Relaxed) {
+                    eprintln!("snapshots paused ({msg}); keeping cached .vzsave slots until console unlocks");
+                }
+                drop(lease);
+                Ok(None)
+            }
             Err(err) => {
                 eprintln!("snapshot restore ({shape_key}/slot-{slot}) failed: {err}; discarding stale snapshot");
                 let _ = fs::remove_file(&state_path);
@@ -211,7 +249,7 @@ impl SnapshotPool {
     /// Warm one new snapshot slot in the background if this shape isn't full yet
     /// and no other background warm is already in progress.
     pub fn maybe_warm_background(self: &Arc<Self>, blobs_dir: PathBuf, cpus: u32, memory_mib: u64, rosetta: bool) {
-        if !self.enabled() {
+        if !self.enabled() || self.pause_reason().is_some() {
             return;
         }
         if self.bg_warming.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
@@ -232,10 +270,18 @@ impl SnapshotPool {
     /// for `(cpus, memory_mib, rosetta)`, warming any missing slots synchronously.
     /// When `incremental` is handled via `warm_slots(..., 1)` from background warming,
     /// warms up to `count` *additional* empty slots.
-    pub fn warm_slots(&self, blobs_dir: &Path, cpus: u32, memory_mib: u64, rosetta: bool, add_count: usize) -> Result<usize> {
+    fn check_warm_allowed(&self) -> Result<()> {
         if !self.enabled() {
             bail!("VM snapshots are disabled (GRAVITON_NO_SNAPSHOTS=1)");
         }
+        if let Some(reason) = self.pause_reason() {
+            bail!("cannot warm snapshots: {reason}");
+        }
+        Ok(())
+    }
+
+    pub fn warm_slots(&self, blobs_dir: &Path, cpus: u32, memory_mib: u64, rosetta: bool, add_count: usize) -> Result<usize> {
+        self.check_warm_allowed()?;
         if rosetta && !AppleHypervisor::rosetta_available() {
             bail!("Rosetta for Linux isn't available on this Mac (run `softwareupdate --install-rosetta`)");
         }
@@ -275,6 +321,7 @@ impl SnapshotPool {
 
     /// Ensure at least `desired` total slots exist for `(cpus, memory_mib, rosetta)`.
     pub fn ensure_slots(&self, blobs_dir: &Path, cpus: u32, memory_mib: u64, rosetta: bool, desired: usize) -> Result<usize> {
+        self.check_warm_allowed()?;
         let guest = paths::guest_dir();
         let fingerprint = guest_fingerprint(&guest)?;
         let shape = Shape { cpus, memory_mib, rosetta, fingerprint };
@@ -379,6 +426,7 @@ impl SnapshotPool {
         let mut in_use = 0u32;
         let mut total_bytes = 0u64;
 
+        let paused_reason = self.pause_reason();
         let Ok(shape_dirs) = fs::read_dir(&self.root) else {
             return SnapshotInfo {
                 enabled: self.enabled(),
@@ -387,6 +435,7 @@ impl SnapshotPool {
                 total_bytes: 0,
                 max_slots_per_shape: MAX_SLOTS_PER_SHAPE as u32,
                 groups: vec![],
+                paused_reason,
             };
         };
 
@@ -437,6 +486,7 @@ impl SnapshotPool {
             total_bytes,
             max_slots_per_shape: MAX_SLOTS_PER_SHAPE as u32,
             groups: groups.into_values().collect(),
+            paused_reason,
         }
     }
 
