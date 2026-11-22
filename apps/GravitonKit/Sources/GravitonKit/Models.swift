@@ -630,11 +630,13 @@ public struct NetworkRate: Identifiable, Sendable {
 
     public static func series(_ samples: [StatSample]) -> [NetworkRate] {
         zip(samples, samples.dropFirst()).compactMap { a, b in
+            guard b.timestampMs > a.timestampMs else { return nil }
             let secs = Double(b.timestampMs - a.timestampMs) / 1000
-            guard secs > 0 else { return nil }
+            let rx = b.netRxBytes >= a.netRxBytes ? b.netRxBytes - a.netRxBytes : b.netRxBytes
+            let tx = b.netTxBytes >= a.netTxBytes ? b.netTxBytes - a.netTxBytes : b.netTxBytes
             return NetworkRate(date: b.date,
-                               received: Double(b.netRxBytes.subtractingReportingOverflow(a.netRxBytes).partialValue) / secs,
-                               sent: Double(b.netTxBytes.subtractingReportingOverflow(a.netTxBytes).partialValue) / secs)
+                               received: Double(rx) / secs,
+                               sent: Double(tx) / secs)
         }
     }
 }

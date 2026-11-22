@@ -18,7 +18,7 @@
 //! `~/Library/Application Support/Graviton`, so they survive a restart.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::hash::{BuildHasher, RandomState};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
@@ -33,7 +33,7 @@ use graviton_core::{ImageReference, Store, paths};
 use graviton_image::{BlobStore, Credentials, ImageError, ImageIndex, LocalImage, Progress, PullOptions, PushProgress, Registry};
 use graviton_proto::{
     AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ContainerDetails, ContainerStats, ContainerStatus, ContainerSummary,
-    DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats, HostEntry, ImageSummary, LogLevel, LogLine, LogStream,
+    DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats, HostEntry, ImageSummary, LogLevel, LogStream,
     Mount, NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy, RunSpec,
     SnapshotInfo, StatSample, VolumeMountRef, VolumeSummary, decode_line, encode_line,
 };
@@ -171,6 +171,7 @@ pub struct Engine {
     pub(crate) snapshots: Arc<crate::snapshot::SnapshotPool>,
     running: Mutex<HashMap<String, Running>>,
     stats: Mutex<HashMap<String, StatsHistory>>,
+    log_io: Mutex<()>,
     switch: crate::switch::Switch,
     /// Serialises guest DNS table broadcasts so concurrent starts/stops never reorder.
     hosts_sync: Mutex<()>,
@@ -205,6 +206,7 @@ impl Engine {
             snapshots: Arc::new(crate::snapshot::SnapshotPool::open()),
             running: Mutex::new(HashMap::new()),
             stats: Mutex::new(HashMap::new()),
+            log_io: Mutex::new(()),
             switch: crate::switch::Switch::new(),
             hosts_sync: Mutex::new(()),
             hosts_gen: AtomicU64::new(0),
@@ -316,7 +318,7 @@ impl Engine {
                 c.memory_bytes = None;
                 let id = c.id.clone();
                 if store.insert(c).is_ok() {
-                    store.set_logs(&id, read_log(&log_path(&id)));
+                    store.set_logs(&id, crate::persistence::read_logs_tail(&log_path(&id), graviton_core::store::LOG_LIMIT));
                 }
             }
         }
@@ -332,6 +334,17 @@ impl Engine {
                 stopped_logs.push(id.clone());
             }
         }
+        let mut restored_stats = HashMap::new();
+        for (id, spec) in &specs {
+            let samples = crate::persistence::read_stats_tail(&stats_path(id), STATS_KEPT);
+            if !samples.is_empty() {
+                restored_stats.insert(
+                    id.clone(),
+                    StatsHistory { cpus: spec.cpus, samples, processes: Vec::new() },
+                );
+            }
+        }
+        *self.stats.lock().unwrap() = restored_stats;
         *self.specs.lock().unwrap() = specs;
         for id in stopped_logs {
             self.log(&id, LogLevel::Warn, LogStream::System, "gravitond restarted while this container was running; its VM stopped".into());
@@ -1500,7 +1513,12 @@ impl Engine {
     fn start_monitor(self: &Arc<Self>, id: &str, vm: Arc<AppleVm>) {
         let engine = Arc::clone(self);
         let id = id.to_string();
-        let limit = self.specs.lock().unwrap().get(&id).map_or(0, |s| s.memory_mib << 20);
+        let (spec_cpus, limit) = self
+            .specs
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map_or((DEFAULT_CPUS, 0), |s| (s.cpus, s.memory_mib << 20));
         let _ = std::thread::Builder::new().name(format!("stats-{id}")).spawn(move || {
             let Ok(fd) = vm.connect(AGENT_VSOCK_PORT) else { return };
             let mut conn = File::from(fd);
@@ -1511,7 +1529,14 @@ impl Engine {
                 Ok(c) => c,
                 Err(_) => return,
             }));
-            engine.stats.lock().unwrap().insert(id.clone(), StatsHistory::default());
+            {
+                let mut stats = engine.stats.lock().unwrap();
+                let history = stats.entry(id.clone()).or_default();
+                if history.cpus == 0 {
+                    history.cpus = spec_cpus;
+                }
+                history.processes.clear();
+            }
             let mut previous: Option<GuestStats> = None;
             loop {
                 let still_running = engine.running.lock().unwrap().get(&id).is_some_and(|r| Arc::ptr_eq(&r.vm, &vm));
@@ -1525,14 +1550,17 @@ impl Engine {
                         c.cpu_percent = Some(sample.cpu_percent);
                         c.memory_bytes = Some(sample.memory_bytes);
                     });
-                    let mut stats = engine.stats.lock().unwrap();
-                    let history = stats.entry(id.clone()).or_default();
-                    history.cpus = now.cpus;
-                    history.samples.push_back(sample);
-                    while history.samples.len() > STATS_KEPT {
-                        history.samples.pop_front();
+                    {
+                        let mut stats = engine.stats.lock().unwrap();
+                        let history = stats.entry(id.clone()).or_default();
+                        history.cpus = now.cpus;
+                        history.samples.push_back(sample.clone());
+                        while history.samples.len() > STATS_KEPT {
+                            history.samples.pop_front();
+                        }
+                        history.processes = now.processes.clone();
                     }
-                    history.processes = now.processes.clone();
+                    crate::persistence::append_stat_sample(&stats_path(&id), &sample, STATS_KEPT);
                 }
                 previous = Some(now);
                 std::thread::sleep(STATS_INTERVAL);
@@ -1548,7 +1576,7 @@ impl Engine {
         let history = stats.get(&id);
         Ok(ContainerStats {
             id,
-            cpus: history.map_or(cpus, |h| h.cpus.max(1)),
+            cpus: history.and_then(|h| (h.cpus > 0).then_some(h.cpus)).unwrap_or(cpus).max(1),
             interval_secs: STATS_INTERVAL.as_secs() as u32,
             samples: history.map(|h| h.samples.iter().cloned().collect()).unwrap_or_default(),
             processes: if running { history.map(|h| h.processes.clone()).unwrap_or_default() } else { vec![] },
@@ -1906,7 +1934,8 @@ impl Engine {
 
     fn log(&self, id: &str, level: LogLevel, stream: LogStream, message: String) {
         let line = self.store.lock().unwrap().push_log(id, level, stream, message);
-        append_log(&log_path(id), &line);
+        let _guard = self.log_io.lock().unwrap();
+        crate::persistence::append_log(&log_path(id), &line);
     }
 
     fn generated_name(&self, image: &str) -> String {
@@ -2148,18 +2177,8 @@ fn log_path(id: &str) -> PathBuf {
     paths::vms_dir().join(id).join("log.jsonl")
 }
 
-fn append_log(path: &Path, line: &LogLine) {
-    if let Some(dir) = path.parent() {
-        let _ = fs::create_dir_all(dir);
-    }
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = f.write_all(&encode_line(line));
-    }
-}
-
-fn read_log(path: &Path) -> Vec<LogLine> {
-    let Ok(f) = File::open(path) else { return vec![] };
-    BufReader::new(f).lines().map_while(Result::ok).filter_map(|l| decode_line(l.as_bytes()).ok()).collect()
+fn stats_path(id: &str) -> PathBuf {
+    paths::vms_dir().join(id).join("stats.jsonl")
 }
 
 /// Read one JSON line byte by byte, so nothing after it is consumed.

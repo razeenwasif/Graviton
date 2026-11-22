@@ -682,13 +682,14 @@ fn run(cli: Cli) -> Result<()> {
                 None => println!("No samples yet (they start once the container runs, every {} s).", st.interval_secs),
                 Some(s) => {
                     let first = &st.samples[0];
-                    let secs = ((s.timestamp_ms - first.timestamp_ms) / 1000).max(1);
+                    let secs = (s.timestamp_ms.saturating_sub(first.timestamp_ms) / 1000).max(1);
                     println!("CPU       {:.1}%  ({} vCPU; 100% is one busy CPU)", s.cpu_percent, st.cpus);
                     println!("Memory    {} / {}", bytes(s.memory_bytes), bytes(s.memory_limit_bytes));
                     println!("Network   ↓ {}  ↑ {}  in total", bytes(s.net_rx_bytes), bytes(s.net_tx_bytes));
                     if st.samples.len() > 1 {
-                        let rx = (s.net_rx_bytes - first.net_rx_bytes) / secs;
-                        let tx = (s.net_tx_bytes - first.net_tx_bytes) / secs;
+                        let (rx_total, tx_total) = network_delta_totals(&st.samples);
+                        let rx = rx_total / secs;
+                        let tx = tx_total / secs;
                         println!("          ↓ {}/s  ↑ {}/s  over the last {}", bytes(rx), bytes(tx), uptime(secs));
                     }
                     println!("Processes {}", st.processes.len());
@@ -2060,6 +2061,17 @@ fn parse_build_secret(spec: &str) -> Result<BuildSecret> {
     Ok(BuildSecret { id, data })
 }
 
+fn network_delta_totals(samples: &[graviton_proto::StatSample]) -> (u64, u64) {
+    let mut rx = 0u64;
+    let mut tx = 0u64;
+    for pair in samples.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        rx += if b.net_rx_bytes >= a.net_rx_bytes { b.net_rx_bytes - a.net_rx_bytes } else { b.net_rx_bytes };
+        tx += if b.net_tx_bytes >= a.net_tx_bytes { b.net_tx_bytes - a.net_tx_bytes } else { b.net_tx_bytes };
+    }
+    (rx, tx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2140,5 +2152,27 @@ mod tests {
             setup.command,
             Command::Push { action: Some(PushAction::Setup { .. }), image: None }
         ));
+    }
+
+    #[test]
+    fn computes_reboot_safe_network_deltas() {
+        let mk = |ts, rx, tx| graviton_proto::StatSample {
+            timestamp_ms: ts,
+            cpu_percent: 1.0,
+            memory_bytes: 100,
+            memory_limit_bytes: 1000,
+            net_rx_bytes: rx,
+            net_tx_bytes: tx,
+        };
+        let samples = vec![
+            mk(1_000, 1_000, 500),
+            mk(3_000, 1_600, 800),
+            // VM restart resets NIC counters to 0 -> 200/100 in next tick.
+            mk(5_000, 200, 100),
+            mk(7_000, 350, 180),
+        ];
+        // Delta = (600 + 200 + 150, 300 + 100 + 80) = (950, 480)
+        assert_eq!(network_delta_totals(&samples), (950, 480));
+        assert_eq!(network_delta_totals(&[]), (0, 0));
     }
 }

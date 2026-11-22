@@ -255,7 +255,10 @@ scripts/dev-gravitond.sh boot-check --cpus 4 --memory 1024 -- /bin/sh -c 'nproc;
 
 Virtualization.framework requires the `com.apple.security.virtualization`
 entitlement, so gravitond must be signed (the script does it ad hoc). The guest
-console is written to `~/Library/Application Support/Graviton/vms/boot-check/console.log`.
+console is written to `~/Library/Application Support/Graviton/vms/boot-check/console.log`,
+and running containers persist bounded logs (`vms/<id>/log.jsonl` + `log.1.jsonl`,
+10 MiB rotation cap) and resource samples (`vms/<id>/stats.jsonl`, compacted to 150
+recent samples) across `gravitond` restarts.
 
 Socket: `$GRAVITON_SOCKET`, else `~/Library/Application Support/Graviton/gravitond.sock`
 (and `$GRAVITON_DOCKER_SOCKET`, else `docker.sock` alongside it).

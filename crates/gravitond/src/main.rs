@@ -11,6 +11,7 @@ mod build;
 mod cleanup;
 mod docker_api;
 mod events;
+mod persistence;
 mod push;
 mod remote;
 mod runtime;

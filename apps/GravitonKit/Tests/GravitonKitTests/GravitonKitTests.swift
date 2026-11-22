@@ -922,4 +922,21 @@ import Testing
         #expect(recap?.contains("Fairy [1 tool steps]: First reply") == true)
         #expect(recap?.contains("Transient error") == false)
     }
+
+    @Test func networkRateSeriesHandlesVmCounterReset() {
+        let samples = [
+            StatSample(timestampMs: 1_000, cpuPercent: 1, memoryBytes: 100, memoryLimitBytes: 1000, netRxBytes: 1_000, netTxBytes: 500),
+            StatSample(timestampMs: 3_000, cpuPercent: 2, memoryBytes: 100, memoryLimitBytes: 1000, netRxBytes: 1_600, netTxBytes: 800),
+            // Non-increasing timestamp should be skipped cleanly.
+            StatSample(timestampMs: 3_000, cpuPercent: 2, memoryBytes: 100, memoryLimitBytes: 1000, netRxBytes: 1_700, netTxBytes: 900),
+            // Simulated VM restart resetting RX/TX counters below previous total.
+            StatSample(timestampMs: 5_000, cpuPercent: 3, memoryBytes: 100, memoryLimitBytes: 1000, netRxBytes: 200, netTxBytes: 100),
+        ]
+        let rates = NetworkRate.series(samples)
+        #expect(rates.count == 2)
+        #expect(rates[0].received == 300)
+        #expect(rates[0].sent == 150)
+        #expect(rates[1].received == 100)
+        #expect(rates[1].sent == 50)
+    }
 }
