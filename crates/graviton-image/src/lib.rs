@@ -13,7 +13,7 @@ mod registry;
 
 pub use blobs::{BlobStore, Digest};
 pub use dockerfile::Dockerfile;
-pub use config::{ImageConfig, RuntimeConfig};
+pub use config::{HealthcheckConfig, ImageConfig, RuntimeConfig};
 pub use index::{ImageIndex, LocalImage, Layer};
 pub use registry::{
     Credentials, Progress, PullOptions, PushProgress, PushResult, Registry, fetch_url, normalize_platform, normalize_registry,

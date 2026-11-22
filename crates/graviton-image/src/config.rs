@@ -32,6 +32,32 @@ pub struct RuntimeConfig {
     pub labels: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub exposed_ports: Option<BTreeMap<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<HealthcheckConfig>,
+}
+
+/// OCI `config.Healthcheck` specification (durations in nanoseconds).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct HealthcheckConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub interval: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub timeout: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub start_period: i64,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retries: u32,
+}
+
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 impl RuntimeConfig {
@@ -94,5 +120,15 @@ mod tests {
             Some("[{\"remoteUser\":\"vscode\"}]")
         );
         assert!(with_labels.config.exposed_ports.as_ref().is_some_and(|p| p.contains_key("8000/tcp")));
+
+        let with_hc: ImageConfig = serde_json::from_str(
+            r#"{"config":{"Healthcheck":{"Test":["CMD-SHELL","curl -f http://localhost/"],"Interval":10000000000,"Timeout":2000000000,"StartPeriod":5000000000,"Retries":3}}}"#,
+        )
+        .unwrap();
+        let hc = with_hc.config.healthcheck.as_ref().unwrap();
+        assert_eq!(hc.test, vec!["CMD-SHELL", "curl -f http://localhost/"]);
+        assert_eq!((hc.interval, hc.timeout, hc.start_period, hc.retries), (10_000_000_000, 2_000_000_000, 5_000_000_000, 3));
+        let partial_hc: ImageConfig = serde_json::from_str(r#"{"config":{"Healthcheck":{"Test":["NONE"]}}}"#).unwrap();
+        assert_eq!(partial_hc.config.healthcheck.unwrap().test, vec!["NONE"]);
     }
 }

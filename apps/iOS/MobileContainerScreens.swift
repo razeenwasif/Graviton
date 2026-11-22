@@ -401,6 +401,34 @@ struct MobileInspectView: View {
                             }
                         }
                     }
+                    if d.healthcheck != nil || d.health != nil {
+                        section("Healthcheck") {
+                            if let h = d.health {
+                                HStack {
+                                    Text("Status").font(.system(size: 12)).foregroundStyle(G.muted)
+                                    Spacer()
+                                    HealthBadge(h.status)
+                                }
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 11)
+                                row("Failures", "\(h.failingStreak)")
+                            }
+                            if let hc = d.healthcheck {
+                                row("Command", hc.commandDisplay)
+                                row("Schedule", "every \(hc.intervalSecs)s · timeout \(hc.timeoutSecs)s · retries \(hc.retries)")
+                                if hc.startPeriodSecs > 0 {
+                                    row("Start period", "\(hc.startPeriodSecs)s")
+                                }
+                            }
+                            if let logs = d.health?.log, !logs.isEmpty {
+                                ForEach(Array(logs.reversed().prefix(3).enumerated()), id: \.offset) { _, entry in
+                                    let out = entry.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    let ts = Date(timeIntervalSince1970: Double(entry.end)).formatted(date: .omitted, time: .standard)
+                                    row("Exit \(entry.exitCode) · \(ts)", out.isEmpty ? "—" : out)
+                                }
+                            }
+                        }
+                    }
                     section("Lifecycle") {
                         row("ID", d.container.id)
                         row("Status", d.container.statusText())

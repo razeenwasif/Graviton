@@ -171,6 +171,7 @@ struct State {
     labels: BTreeMap<String, String>,
     volumes: BTreeSet<String>,
     stop_signal: Option<String>,
+    healthcheck: Option<graviton_image::HealthcheckConfig>,
     history: Vec<Value>,
     key: String,
     /// The stage's ARGs in scope, with their values.
@@ -837,6 +838,7 @@ fn base_state(engine: &Engine, base: &str, platform: Option<&str>, log: &mut dyn
         labels: BTreeMap::new(),
         volumes: BTreeSet::new(),
         stop_signal: None,
+        healthcheck: None,
         history: vec![],
         key: hash(&["scratch", &target_arch]),
         args: BTreeMap::new(),
@@ -866,6 +868,9 @@ fn base_state(engine: &Engine, base: &str, platform: Option<&str>, log: &mut dyn
     }
     let c = &config["config"];
     let strings = |v: &Value| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>());
+    let healthcheck = (!c["Healthcheck"].is_null())
+        .then(|| serde_json::from_value(c["Healthcheck"].clone()).ok())
+        .flatten();
     Ok(State {
         architecture: image.architecture.clone(),
         layers: image
@@ -884,6 +889,7 @@ fn base_state(engine: &Engine, base: &str, platform: Option<&str>, log: &mut dyn
         labels: c["Labels"].as_object().map(|o| o.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect()).unwrap_or_default(),
         volumes: c["Volumes"].as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default(),
         stop_signal: c["StopSignal"].as_str().map(String::from),
+        healthcheck,
         history: config["history"].as_array().cloned().unwrap_or_default(),
         key: hash(&["image", &image.manifest_digest, &image.architecture]),
         base_config: config,
@@ -935,6 +941,21 @@ fn apply_config(s: &mut State, kind: &Kind, vars: &BTreeMap<String, String>, bui
         }
         Kind::Volume(v) => s.volumes.extend(v.iter().map(|p| expand(p, vars))),
         Kind::StopSignal(sig) => s.stop_signal = Some(expand(sig, vars)),
+        Kind::Healthcheck(hc) => {
+            s.healthcheck = Some(match hc {
+                None => graviton_image::HealthcheckConfig {
+                    test: vec!["NONE".into()],
+                    ..Default::default()
+                },
+                Some(spec) => graviton_image::HealthcheckConfig {
+                    test: spec.test.clone(),
+                    interval: (spec.interval_secs as i64).saturating_mul(1_000_000_000),
+                    timeout: (spec.timeout_secs as i64).saturating_mul(1_000_000_000),
+                    start_period: (spec.start_period_secs as i64).saturating_mul(1_000_000_000),
+                    retries: spec.retries,
+                },
+            });
+        }
         Kind::Run { .. } | Kind::Copy { .. } | Kind::Workdir(_) => unreachable!(),
     }
     Ok(())
@@ -1157,6 +1178,9 @@ fn write_image(engine: &Engine, reference: &str, s: &State) -> Result<LocalImage
     if let Some(sig) = &s.stop_signal {
         rc.insert("StopSignal".into(), json!(sig));
     }
+    if let Some(hc) = &s.healthcheck {
+        rc.insert("Healthcheck".into(), serde_json::to_value(hc)?);
+    }
     // The newest step's time; with nothing but config changes, the base image's.
     let created = match s.created {
         Some(t) => rfc3339(t),
@@ -1274,6 +1298,26 @@ mod tests {
         let v = s.vars();
         apply_config(&mut s, &Kind::Expose(vec!["80".into(), "53/udp".into()]), &v, &BTreeMap::new()).unwrap();
         assert_eq!(s.exposed.iter().cloned().collect::<Vec<_>>(), ["53/udp", "80/tcp"]);
+        let hc = graviton_proto::Healthcheck {
+            test: vec!["CMD-SHELL".into(), "curl -f http://localhost/".into()],
+            interval_secs: 5,
+            timeout_secs: 2,
+            start_period_secs: 1,
+            retries: 3,
+        };
+        apply_config(&mut s, &Kind::Healthcheck(Some(hc)), &v, &BTreeMap::new()).unwrap();
+        assert_eq!(
+            s.healthcheck,
+            Some(graviton_image::HealthcheckConfig {
+                test: vec!["CMD-SHELL".into(), "curl -f http://localhost/".into()],
+                interval: 5_000_000_000,
+                timeout: 2_000_000_000,
+                start_period: 1_000_000_000,
+                retries: 3,
+            })
+        );
+        apply_config(&mut s, &Kind::Healthcheck(None), &v, &BTreeMap::new()).unwrap();
+        assert_eq!(s.healthcheck.as_ref().map(|h| h.test.as_slice()), Some(&["NONE".to_string()][..]));
     }
 
     fn base_state_for_test() -> State {
@@ -1291,6 +1335,7 @@ mod tests {
             labels: BTreeMap::new(),
             volumes: BTreeSet::new(),
             stop_signal: None,
+            healthcheck: None,
             history: vec![],
             key: String::new(),
             args: BTreeMap::new(),

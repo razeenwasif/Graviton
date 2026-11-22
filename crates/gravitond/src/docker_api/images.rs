@@ -210,6 +210,8 @@ pub async fn events(
                 let (ev_type, action, id, name) = match ev.kind {
                     EventKind::Started => ("container", "start", ev.container_id.as_deref().unwrap_or(""), ev.container.as_deref().unwrap_or("")),
                     EventKind::Stopped | EventKind::Failed => ("container", "die", ev.container_id.as_deref().unwrap_or(""), ev.container.as_deref().unwrap_or("")),
+                    EventKind::Healthy => ("container", "health_status: healthy", ev.container_id.as_deref().unwrap_or(""), ev.container.as_deref().unwrap_or("")),
+                    EventKind::Unhealthy => ("container", "health_status: unhealthy", ev.container_id.as_deref().unwrap_or(""), ev.container.as_deref().unwrap_or("")),
                     EventKind::Removed => ("container", "destroy", ev.container_id.as_deref().unwrap_or(""), ev.container.as_deref().unwrap_or("")),
                     EventKind::Pulled => ("image", "pull", ev.image.as_deref().unwrap_or(""), ev.image.as_deref().unwrap_or("")),
                     EventKind::Pushed => ("image", "push", ev.image.as_deref().unwrap_or(""), ev.image.as_deref().unwrap_or("")),

@@ -19,11 +19,11 @@ public actor DemoEngine: EngineService {
         func tcp(_ h: UInt16, _ c: UInt16) -> PortMapping { PortMapping(hostPort: h, containerPort: c, protocol: .tcp) }
         func make(_ id: String, _ name: String, _ image: String, up: (UInt64, Double, UInt64)?, exit: Int32? = nil,
                   ports: [PortMapping] = [], mounts: [Mount] = [], ip: String? = nil,
-                  project: String? = nil, service: String? = nil) -> Container {
+                  project: String? = nil, service: String? = nil, health: HealthStatus? = nil) -> Container {
             Container(id: id, name: name, image: image, status: up == nil ? .exited : .running, exitCode: exit,
                       ports: ports, mounts: mounts, ipAddress: ip, cpuPercent: up?.1, memoryBytes: up.map { $0.2 * mib },
                       memoryLimitBytes: 1024 * mib, createdAt: now - 4 * 3600, startedAt: up.map { now - $0.0 },
-                      project: project, service: service)
+                      project: project, service: service, health: health)
         }
         list = [
             make("a3f9c2e81b07", "api-gateway", "storefront/api:0.4.2", up: (11_520, 12.4, 412), ports: [tcp(8080, 80)],
@@ -31,7 +31,7 @@ public actor DemoEngine: EngineService {
                  project: "storefront", service: "api"),
             make("5d10e7b3c4aa", "postgres", "postgres:17-alpine", up: (11_520, 3.1, 286), ports: [tcp(5432, 5432)],
                  mounts: [Mount(source: "pgdata", target: "/var/lib/postgresql/data", readOnly: false)], ip: "192.168.64.2",
-                 project: "storefront", service: "postgres"),
+                 project: "storefront", service: "postgres", health: .healthy),
             make("9be2041f6d33", "redis-cache", "redis:7.4", up: (11_520, 0.6, 24), ports: [tcp(6379, 6379)], ip: "192.168.64.3",
                  project: "storefront", service: "redis"),
             make("c71a88e09f12", "web", "node:22-slim", up: (2_460, 7.8, 538), ports: [tcp(3000, 3000)],
@@ -389,12 +389,20 @@ public actor DemoEngine: EngineService {
         var labels: [String: String] = [:]
         if let project = c.project { labels["com.docker.compose.project"] = project }
         if let service = c.service { labels["com.docker.compose.service"] = service }
+        let now = UInt64(Date.now.timeIntervalSince1970)
+        let (hc, healthState): (Healthcheck?, HealthState?) = c.name == "postgres"
+            ? (
+                Healthcheck(test: ["CMD-SHELL", "pg_isready -U postgres"], intervalSecs: 10, timeoutSecs: 5, startPeriodSecs: 5, retries: 3),
+                HealthState(status: .healthy, failingStreak: 0, log: [HealthLog(start: now - 8, end: now - 8, exitCode: 0, output: "/var/run/postgresql:5432 - accepting connections")])
+            )
+            : (nil, nil)
         return ContainerDetails(container: c, imageReference: image?.reference ?? c.image, imageDigest: image?.digest ?? "sha256:…",
                                 command: command, env: ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "APP_ENV=development", "LOG_LEVEL=info"],
                                 workingDir: c.name == "web" ? "/srv" : "/app", user: c.name == "postgres" ? "postgres" : nil,
                                 hostname: c.name, cpus: 2, memoryMib: (c.memoryLimitBytes ?? 1 << 30) >> 20,
                                 kernel: "Linux 6.12 (demo)", vmDir: "~/Library/Application Support/Graviton/vms/\(c.id)", restart: restart,
-                                project: c.project, service: c.service, labels: labels.isEmpty ? nil : labels)
+                                project: c.project, service: c.service, labels: labels.isEmpty ? nil : labels,
+                                healthcheck: hc, health: healthState)
     }
 
     public func openTerminal(_ spec: ExecSpec) throws -> any TerminalSession {

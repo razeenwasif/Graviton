@@ -528,6 +528,7 @@ dependencies = [
  "graviton-proto",
  "libc",
  "ruzstd",
+ "serde",
  "serde_json",
  "sha2",
  "tar",

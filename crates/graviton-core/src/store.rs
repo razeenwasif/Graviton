@@ -216,6 +216,7 @@ impl Store {
                 started_at: running.map(|r| now - r.0),
                 project: project.map(Into::into),
                 service: service.map(Into::into),
+                health: None,
             });
         };
         add("a3f9c2e81b07", "api-gateway", "storefront/api:0.4.2", Some((11_520, 12.4, 412)), None, vec![tcp(8080, 80)],

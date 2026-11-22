@@ -15,6 +15,7 @@
 //!
 //! Build it for the guest with `scripts/build-guest.sh`.
 
+mod ns;
 mod zstd_stream;
 
 #[cfg(target_os = "linux")]
@@ -61,6 +62,9 @@ pub(crate) mod linux {
     type Writer = Arc<Mutex<File>>;
 
     pub fn main() {
+        if let Ok(fd_str) = std::env::var(crate::ns::LAUNCH_FD_ENV) {
+            crate::ns::run_launcher(&fd_str);
+        }
         let pid1 = std::process::id() == 1;
         if pid1 {
             if let Err(err) = setup_system() {
@@ -155,33 +159,87 @@ pub(crate) mod linux {
                 }
                 Ok(AgentRequest::Exec { argv, env, cwd, tty, container, user, hostname, rows, cols, stdin, stdin_pipe, mounts }) => {
                     let has_term = env.iter().any(|e| e.starts_with("TERM="));
-                    let prepared: io::Result<(Command, Option<crate::build::MountCleanup>)> = match &container {
-                        Some(id) => {
-                            let (pm, cleanup) = if mounts.is_empty() {
-                                (Vec::new(), None)
-                            } else {
-                                match crate::build::prepare_exec_mounts(id, &mounts) {
-                                    Ok((pm, cl)) => (pm, Some(cl)),
+                    let program = argv.first().cloned().unwrap_or_default();
+                    if let Some(id) = &container {
+                        let (pm, cleanup) = if mounts.is_empty() {
+                            (Vec::new(), None)
+                        } else {
+                            match crate::build::prepare_exec_mounts(id, &mounts) {
+                                Ok((pm, cl)) => (pm, Some(cl)),
+                                Err(err) => {
+                                    send(&writer, &AgentEvent::Error { message: format!("exec mounts: {err}") });
+                                    continue;
+                                }
+                            }
+                        };
+                        let launch_env = if tty && !has_term {
+                            let mut e = env.clone();
+                            e.push("TERM=xterm-256color".into());
+                            e
+                        } else {
+                            env.clone()
+                        };
+                        match crate::container::prepare_launch(
+                            id,
+                            &argv,
+                            &launch_env,
+                            &cwd,
+                            user.as_deref(),
+                            hostname.as_deref().unwrap_or(id),
+                            tty,
+                            pm,
+                        ) {
+                            Ok(launch) if tty => {
+                                drop(cleanup);
+                                let pending = reader.buffer().to_vec();
+                                drop(writer);
+                                return crate::tty::run_container(launch, reader.into_inner(), pending, rows, cols);
+                            }
+                            Ok(mut launch) => {
+                                let stdin_stdio = match open_stdin_stdio(stdin, stdin_pipe) {
+                                    Ok(s) => s,
                                     Err(err) => {
-                                        send(&writer, &AgentEvent::Error { message: format!("exec mounts: {err}") });
+                                        drop(cleanup);
+                                        send(&writer, &AgentEvent::Error { message: format!("preparing stdin for {program}: {err}") });
                                         continue;
                                     }
+                                };
+                                launch.cmd.stdin(stdin_stdio).stdout(Stdio::piped()).stderr(Stdio::piped());
+                                match launch.spawn_and_wait_start() {
+                                    Ok((child, guard)) => {
+                                        finish_exec(child, cleanup, guard, &mut stdins, Arc::clone(&writer));
+                                    }
+                                    Err(err) => {
+                                        drop(cleanup);
+                                        send(&writer, &AgentEvent::Error { message: format!("{err}") });
+                                    }
                                 }
-                            };
-                            crate::container::command(id, &argv, &env, &cwd, user.as_deref(), hostname.as_deref().unwrap_or(id), pm)
-                                .map(|cmd| (cmd, cleanup))
+                            }
+                            Err(err) => send(&writer, &AgentEvent::Error { message: format!("exec: {err}") }),
                         }
-                        None => plain_command(&argv, &env, &cwd).map(|cmd| (cmd, None)),
-                    };
-                    match prepared {
-                        Ok((cmd, _cleanup)) if tty => {
-                            // The connection now belongs to the terminal session.
-                            let pending = reader.buffer().to_vec();
-                            drop(writer);
-                            return crate::tty::run(cmd, reader.into_inner(), pending, rows, cols, has_term);
+                    } else {
+                        match plain_command(&argv, &env, &cwd) {
+                            Ok(cmd) if tty => {
+                                let pending = reader.buffer().to_vec();
+                                drop(writer);
+                                return crate::tty::run(cmd, reader.into_inner(), pending, rows, cols, has_term);
+                            }
+                            Ok(mut cmd) => {
+                                let stdin_stdio = match open_stdin_stdio(stdin, stdin_pipe) {
+                                    Ok(s) => s,
+                                    Err(err) => {
+                                        send(&writer, &AgentEvent::Error { message: format!("preparing stdin for {program}: {err}") });
+                                        continue;
+                                    }
+                                };
+                                cmd.stdin(stdin_stdio).stdout(Stdio::piped()).stderr(Stdio::piped());
+                                match crate::reap::spawn(&mut cmd) {
+                                    Ok(child) => finish_exec(child, None, None, &mut stdins, Arc::clone(&writer)),
+                                    Err(err) => send(&writer, &AgentEvent::Error { message: format!("exec {program}: {err}") }),
+                                }
+                            }
+                            Err(err) => send(&writer, &AgentEvent::Error { message: format!("exec: {err}") }),
                         }
-                        Ok((cmd, cleanup)) => exec(cmd, argv.first().cloned().unwrap_or_default(), stdin, stdin_pipe, &mut stdins, cleanup, Arc::clone(&writer)),
-                        Err(err) => send(&writer, &AgentEvent::Error { message: format!("exec: {err}") }),
                     }
                 }
                 Ok(AgentRequest::Signal { pid, signal }) => {
@@ -286,39 +344,23 @@ pub(crate) mod linux {
         Ok(cmd)
     }
 
-    fn exec(
-        mut cmd: Command,
-        program: String,
-        stdin_bytes: Option<Vec<u8>>,
-        stdin_pipe: bool,
-        stdins: &mut HashMap<i32, ChildStdin>,
+    fn open_stdin_stdio(stdin_bytes: Option<Vec<u8>>, stdin_pipe: bool) -> io::Result<Stdio> {
+        if stdin_pipe {
+            Ok(Stdio::piped())
+        } else if let Some(bytes) = stdin_bytes {
+            Ok(Stdio::from(make_stdin_file(&bytes)?))
+        } else {
+            Ok(Stdio::null())
+        }
+    }
+
+    fn finish_exec(
+        mut child: std::process::Child,
         cleanup: Option<crate::build::MountCleanup>,
+        init_guard: Option<crate::ns::InitGuard>,
+        stdins: &mut HashMap<i32, ChildStdin>,
         writer: Writer,
     ) {
-        let stdin_stdio = if stdin_pipe {
-            Stdio::piped()
-        } else {
-            match stdin_bytes {
-                Some(bytes) => match make_stdin_file(&bytes) {
-                    Ok(file) => Stdio::from(file),
-                    Err(err) => {
-                        drop(cleanup);
-                        send(&writer, &AgentEvent::Error { message: format!("preparing stdin for {program}: {err}") });
-                        return;
-                    }
-                },
-                None => Stdio::null(),
-            }
-        };
-        cmd.stdin(stdin_stdio).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = match crate::reap::spawn(&mut cmd) {
-            Ok(child) => child,
-            Err(err) => {
-                drop(cleanup);
-                send(&writer, &AgentEvent::Error { message: format!("exec {program}: {err}") });
-                return;
-            }
-        };
         let pid = child.id() as i32;
         if let Some(pipe) = child.stdin.take() {
             stdins.insert(pid, pipe);
@@ -330,6 +372,7 @@ pub(crate) mod linux {
         thread::spawn(move || {
             let status = child.wait();
             crate::reap::release(pid);
+            drop(init_guard);
             // Drain output and remove ephemeral secret/bind mountpoints BEFORE
             // announcing Exited so a following Commit never sees them.
             for t in [out, err].into_iter().flatten() {

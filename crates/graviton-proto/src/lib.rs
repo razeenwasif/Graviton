@@ -164,6 +164,215 @@ pub struct NetworkInfo {
     pub endpoints: Vec<NetworkEndpoint>,
 }
 
+/// Default seconds between `HEALTHCHECK` probes when omitted or `0`.
+pub const DEFAULT_HEALTH_INTERVAL_SECS: u64 = 30;
+/// Default seconds before an individual `HEALTHCHECK` probe times out when omitted or `0`.
+pub const DEFAULT_HEALTH_TIMEOUT_SECS: u64 = 30;
+/// Default consecutive failed probes before becoming `unhealthy` when omitted or `0`.
+pub const DEFAULT_HEALTH_RETRIES: u32 = 3;
+
+fn default_health_interval_secs() -> u64 {
+    DEFAULT_HEALTH_INTERVAL_SECS
+}
+
+fn default_health_timeout_secs() -> u64 {
+    DEFAULT_HEALTH_TIMEOUT_SECS
+}
+
+fn default_health_retries() -> u32 {
+    DEFAULT_HEALTH_RETRIES
+}
+
+/// Container health state reported while a `HEALTHCHECK` is active.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthStatus {
+    #[default]
+    Starting,
+    Healthy,
+    Unhealthy,
+}
+
+impl HealthStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HealthStatus::Starting => "starting",
+            HealthStatus::Healthy => "healthy",
+            HealthStatus::Unhealthy => "unhealthy",
+        }
+    }
+}
+
+impl std::fmt::Display for HealthStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Container `HEALTHCHECK` configuration shared across Dockerfiles, Compose, CLI flags and the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Healthcheck {
+    /// Probe command (`["NONE"]`, `["CMD", prog, args...]`, or `["CMD-SHELL", script]`).
+    #[serde(default)]
+    pub test: Vec<String>,
+    /// Seconds between probes (`0` selects the 30s default).
+    #[serde(default = "default_health_interval_secs")]
+    pub interval_secs: u64,
+    /// Seconds before an individual probe times out (`0` selects the 30s default).
+    #[serde(default = "default_health_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Startup grace period in seconds while failing probes do not count toward `retries`.
+    #[serde(default)]
+    pub start_period_secs: u64,
+    /// Consecutive failures needed to transition to `unhealthy` (`0` selects the default 3).
+    #[serde(default = "default_health_retries")]
+    pub retries: u32,
+}
+
+impl Default for Healthcheck {
+    fn default() -> Self {
+        Self {
+            test: Vec::new(),
+            interval_secs: DEFAULT_HEALTH_INTERVAL_SECS,
+            timeout_secs: DEFAULT_HEALTH_TIMEOUT_SECS,
+            start_period_secs: 0,
+            retries: DEFAULT_HEALTH_RETRIES,
+        }
+    }
+}
+
+impl Healthcheck {
+    /// Sentinel value (`test: ["NONE"]`) that disables an image's built-in `HEALTHCHECK`.
+    pub fn disabled() -> Self {
+        Self {
+            test: vec!["NONE".into()],
+            interval_secs: 0,
+            timeout_secs: 0,
+            start_period_secs: 0,
+            retries: 0,
+        }
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        self.test.first().is_some_and(|s| s.eq_ignore_ascii_case("NONE"))
+    }
+
+    /// Fill zeroed timing/retry fields with standard Docker defaults (`30s / 30s / 3`).
+    pub fn normalized(&self) -> Self {
+        Self {
+            test: self.test.clone(),
+            interval_secs: if self.interval_secs == 0 { DEFAULT_HEALTH_INTERVAL_SECS } else { self.interval_secs },
+            timeout_secs: if self.timeout_secs == 0 { DEFAULT_HEALTH_TIMEOUT_SECS } else { self.timeout_secs },
+            start_period_secs: self.start_period_secs,
+            retries: if self.retries == 0 { DEFAULT_HEALTH_RETRIES } else { self.retries },
+        }
+    }
+
+    /// Resolve `test` into the container `argv` executed by the probe runner.
+    pub fn exec_command(&self) -> Option<Vec<String>> {
+        if self.test.is_empty() || self.is_disabled() {
+            return None;
+        }
+        match self.test[0].as_str() {
+            "CMD" => Some(self.test[1..].to_vec()).filter(|v| !v.is_empty()),
+            "CMD-SHELL" => self.test.get(1).map(|cmd| vec!["/bin/sh".into(), "-c".into(), cmd.clone()]),
+            _ => Some(self.test.clone()),
+        }
+    }
+}
+
+/// Output of one completed `HEALTHCHECK` probe invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthLog {
+    /// Unix seconds when the probe started.
+    pub start: u64,
+    /// Unix seconds when the probe completed.
+    pub end: u64,
+    pub exit_code: i32,
+    #[serde(default)]
+    pub output: String,
+}
+
+/// Live healthcheck status and bounded history of the most recent probes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthState {
+    pub status: HealthStatus,
+    #[serde(default)]
+    pub failing_streak: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log: Vec<HealthLog>,
+}
+
+/// Parse a Go/Docker-style duration string (e.g. `500ms`, `10s`, `1m30s`, `2m`, `1h`, or bare
+/// non-negative seconds like `15`) into integer seconds, rounding positive sub-second durations
+/// up to `1s` while preserving explicit `0`.
+pub fn parse_duration_secs(raw: &str) -> Result<u64, String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err("duration cannot be empty".into());
+    }
+    if s.starts_with('-') {
+        return Err(format!("duration `{raw}` cannot be negative"));
+    }
+    if s.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        let secs: f64 = s.parse().map_err(|_| format!("invalid duration `{raw}`"))?;
+        if !secs.is_finite() || secs < 0.0 {
+            return Err(format!("invalid duration `{raw}`"));
+        }
+        if secs == 0.0 {
+            return Ok(0);
+        }
+        return Ok((secs * 1000.0).ceil() as u64).map(|ms| ms.div_ceil(1000));
+    }
+
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut total_ms: u128 = 0;
+    while i < bytes.len() {
+        let num_start = i;
+        let mut saw_digit = false;
+        let mut saw_dot = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b.is_ascii_digit() {
+                saw_digit = true;
+                i += 1;
+            } else if b == b'.' && !saw_dot {
+                saw_dot = true;
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if !saw_digit {
+            return Err(format!("invalid duration `{raw}`"));
+        }
+        let num: f64 = s[num_start..i].parse().map_err(|_| format!("invalid duration `{raw}`"))?;
+        let unit_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+        let unit = &s[unit_start..i];
+        let mult_ms: f64 = match unit {
+            "ms" => 1.0,
+            "s" => 1000.0,
+            "m" => 60_000.0,
+            "h" => 3_600_000.0,
+            "" => return Err(format!("missing duration unit in `{raw}` (use ms, s, m, or h)")),
+            other => return Err(format!("unsupported duration unit `{other}` in `{raw}`")),
+        };
+        let ms = num * mult_ms;
+        if !ms.is_finite() || ms < 0.0 {
+            return Err(format!("invalid duration `{raw}`"));
+        }
+        total_ms = total_ms.saturating_add(ms.round() as u128);
+    }
+    if total_ms == 0 {
+        return Ok(0);
+    }
+    Ok(u64::try_from(total_ms.div_ceil(1000)).unwrap_or(u64::MAX))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContainerSummary {
     pub id: String,
@@ -187,6 +396,9 @@ pub struct ContainerSummary {
     /// Compose service name within `project`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<String>,
+    /// Current healthcheck status, when a healthcheck is configured and the container is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<HealthStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -345,6 +557,9 @@ pub struct RunSpec {
     /// Additional project-scoped DNS aliases (Compose `networks.<net>.aliases`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns_aliases: Vec<String>,
+    /// Overrides or disables (`test: ["NONE"]`) the image's `HEALTHCHECK`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<Healthcheck>,
 }
 
 fn is_zero_u16(n: &u16) -> bool {
@@ -422,6 +637,8 @@ pub enum EventKind {
     Stopped,
     /// Exited on its own with a non-zero code, or couldn't start.
     Failed,
+    Healthy,
+    Unhealthy,
     Pulled,
     Pushed,
     Built,
@@ -432,7 +649,7 @@ pub enum EventKind {
 impl EventKind {
     /// Worth interrupting someone for (a push alert).
     pub fn is_alert(self) -> bool {
-        matches!(self, EventKind::Failed | EventKind::Built | EventKind::BuildFailed)
+        matches!(self, EventKind::Failed | EventKind::Unhealthy | EventKind::Built | EventKind::BuildFailed)
     }
 }
 
@@ -686,6 +903,12 @@ pub struct ContainerDetails {
     /// Container labels.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// Configured container `HEALTHCHECK`, if enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<Healthcheck>,
+    /// Live healthcheck status and bounded probe logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<HealthState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -786,7 +1009,7 @@ pub enum Request {
     /// lines as it goes, then `Image` (or `Error`).
     Build(BuildSpec),
     /// Create a container and start it in its own VM; answers `Container` once started.
-    Run(RunSpec),
+    Run(Box<RunSpec>),
     /// Remove a stopped container.
     Remove { id: String },
     /// Where the disk space goes.
@@ -1298,7 +1521,7 @@ mod tests {
         assert_eq!(spec.project, None);
         assert!(spec.labels.is_empty());
 
-        let compose_run = Request::Run(RunSpec {
+        let compose_run = Request::Run(Box::new(RunSpec {
             image: "postgres:17-alpine".into(),
             name: Some("myapp-db-1".into()),
             command: None,
@@ -1321,7 +1544,8 @@ mod tests {
             service: Some("db".into()),
             labels: BTreeMap::from([("com.docker.compose.project".into(), "myapp".into())]),
             dns_aliases: vec!["database".into()],
-        });
+            healthcheck: None,
+        }));
         assert_eq!(decode_line::<Request>(&encode_line(&compose_run)).unwrap(), compose_run);
         assert_eq!("always".parse::<RestartPolicy>().unwrap(), RestartPolicy::Always);
         assert_eq!("on-failure".parse::<RestartPolicy>().unwrap(), RestartPolicy::OnFailure);
@@ -1615,5 +1839,84 @@ mod tests {
             blobs_skipped: 1,
         });
         assert_eq!(decode_line::<Response>(&encode_line(&res)).unwrap(), res);
+    }
+
+    #[test]
+    fn healthcheck_duration_and_event_round_trip() {
+        assert_eq!(parse_duration_secs("30s").unwrap(), 30);
+        assert_eq!(parse_duration_secs("1m30s").unwrap(), 90);
+        assert_eq!(parse_duration_secs("1h2m3s").unwrap(), 3723);
+        assert_eq!(parse_duration_secs("500ms").unwrap(), 1);
+        assert_eq!(parse_duration_secs("1.5s").unwrap(), 2);
+        assert_eq!(parse_duration_secs("0s").unwrap(), 0);
+        assert_eq!(parse_duration_secs("0").unwrap(), 0);
+        assert_eq!(parse_duration_secs("15").unwrap(), 15);
+        for bad in ["", "-5s", "10x", "abc"] {
+            assert!(parse_duration_secs(bad).is_err(), "expected err for `{bad}`");
+        }
+
+        let hc = Healthcheck {
+            test: vec!["CMD-SHELL".into(), "curl -f http://localhost/".into()],
+            interval_secs: 0,
+            timeout_secs: 0,
+            start_period_secs: 5,
+            retries: 0,
+        };
+        assert!(!hc.is_disabled());
+        let norm = hc.normalized();
+        assert_eq!((norm.interval_secs, norm.timeout_secs, norm.start_period_secs, norm.retries), (30, 30, 5, 3));
+        assert_eq!(
+            norm.exec_command().as_deref(),
+            Some(&["/bin/sh".to_string(), "-c".into(), "curl -f http://localhost/".into()][..])
+        );
+
+        let cmd_hc = Healthcheck {
+            test: vec!["CMD".into(), "/bin/check".into(), "--fast".into()],
+            ..Default::default()
+        };
+        assert_eq!(cmd_hc.exec_command().as_deref(), Some(&["/bin/check".to_string(), "--fast".into()][..]));
+
+        let disabled = Healthcheck::disabled();
+        assert!(disabled.is_disabled());
+        assert_eq!(disabled.exec_command(), None);
+        assert_eq!(Healthcheck::default().exec_command(), None);
+
+        let state = HealthState {
+            status: HealthStatus::Healthy,
+            failing_streak: 0,
+            log: vec![HealthLog { start: 10, end: 11, exit_code: 0, output: "ok".into() }],
+        };
+        let encoded_state = serde_json::to_vec(&state).unwrap();
+        assert_eq!(serde_json::from_slice::<HealthState>(&encoded_state).unwrap(), state);
+
+        assert!(!EventKind::Healthy.is_alert());
+        assert!(EventKind::Unhealthy.is_alert());
+        let healthy_ev = EngineEvent {
+            seq: 1,
+            timestamp_ms: 1000,
+            kind: EventKind::Healthy,
+            container_id: Some("abc".into()),
+            container: Some("web".into()),
+            image: Some("nginx".into()),
+            message: "web is healthy".into(),
+        };
+        assert_eq!(
+            decode_line::<Response>(&encode_line(&Response::Events(vec![healthy_ev.clone()]))).unwrap(),
+            Response::Events(vec![healthy_ev])
+        );
+
+        // Legacy ContainerSummary and ContainerDetails without health fields still decode cleanly.
+        let legacy_summary: ContainerSummary = serde_json::from_str(
+            r#"{"id":"abc","name":"web","image":"nginx","status":"running","exit_code":null,"ports":[],"mounts":[],"ip_address":null,"cpu_percent":null,"memory_bytes":null,"memory_limit_bytes":null,"created_at":1,"started_at":2}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy_summary.health, None);
+
+        let legacy_details: ContainerDetails = serde_json::from_str(
+            r#"{"container":{"id":"abc","name":"web","image":"nginx","status":"running","exit_code":null,"ports":[],"mounts":[],"ip_address":null,"cpu_percent":null,"memory_bytes":null,"memory_limit_bytes":null,"created_at":1,"started_at":2},"image_reference":"nginx","image_digest":"sha256:aa","command":["nginx"],"env":[],"working_dir":"/","user":null,"hostname":"web","cpus":2,"memory_mib":512,"kernel":"6.12","vm_dir":"/tmp"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy_details.healthcheck, None);
+        assert_eq!(legacy_details.health, None);
     }
 }

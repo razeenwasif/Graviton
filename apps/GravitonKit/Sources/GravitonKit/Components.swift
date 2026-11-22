@@ -22,6 +22,34 @@ public struct StatusDot: View {
     }
 }
 
+public struct HealthBadge: View {
+    public var status: HealthStatus
+
+    public init(_ status: HealthStatus) {
+        self.status = status
+    }
+
+    private var tint: Color {
+        switch status {
+        case .healthy: G.running
+        case .starting: G.warning
+        case .unhealthy: G.danger
+        }
+    }
+
+    public var body: some View {
+        HStack(spacing: 5) {
+            Circle().fill(tint).frame(width: 6, height: 6)
+            Text(status.label)
+        }
+        .font(.system(size: 11, weight: .medium))
+        .foregroundStyle(tint)
+        .padding(.horizontal, 8)
+        .frame(height: 20)
+        .background(tint.opacity(0.12), in: Capsule())
+    }
+}
+
 public struct StatusPill: View {
     public var container: Container
     public var showUptime: Bool
@@ -33,10 +61,17 @@ public struct StatusPill: View {
 
     public var body: some View {
         let running = container.isRunning
-        let tint = running ? G.running : G.muted
+        let tint: Color = switch (running, container.health) {
+        case (true, .unhealthy): G.danger
+        case (true, .starting): G.warning
+        case (true, _): G.running
+        case (false, _): G.muted
+        }
+        let suffix = running ? (container.health.map { " · \($0.label)" } ?? "") : ""
+        let label = running ? (showUptime ? "Running · \(container.statusText())\(suffix)" : "Running\(suffix)") : container.statusText()
         HStack(spacing: 6) {
             Circle().fill(tint).frame(width: 6, height: 6)
-            Text(running ? (showUptime ? "Running · \(container.statusText())" : "Running") : container.statusText())
+            Text(label)
         }
         .font(.system(size: 12, weight: .medium))
         .foregroundStyle(tint)

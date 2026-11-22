@@ -30,12 +30,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use graviton_core::{ImageReference, Store, paths};
-use graviton_image::{BlobStore, Credentials, ImageError, ImageIndex, LocalImage, Progress, PullOptions, PushProgress, Registry};
+use graviton_image::{BlobStore, Credentials, HealthcheckConfig, ImageError, ImageIndex, LocalImage, Progress, PullOptions, PushProgress, Registry};
 use graviton_proto::{
     AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ContainerDetails, ContainerStats, ContainerStatus, ContainerSummary,
-    DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats, HostEntry, ImageSummary, LogLevel, LogStream,
-    Mount, NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy, RunSpec,
-    SnapshotInfo, StatSample, VolumeMountRef, VolumeSummary, decode_line, encode_line,
+    DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats, HealthLog, HealthState, HealthStatus,
+    Healthcheck, HostEntry, ImageSummary, LogLevel, LogStream, Mount, NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION,
+    PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy, RunSpec, SnapshotInfo, StatSample, VolumeMountRef,
+    VolumeSummary, decode_line, encode_line,
 };
 use graviton_vmm::apple::{AppleHypervisor, AppleVm};
 use graviton_vmm::{NetworkMode, SharedDirectory, VmConfig, VmHandle};
@@ -103,6 +104,9 @@ pub(crate) struct ContainerSpec {
     /// Additional project-scoped DNS aliases.
     #[serde(default)]
     pub(crate) dns_aliases: Vec<String>,
+    /// Container `HEALTHCHECK` configuration (defaults/image merged at creation time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) healthcheck: Option<Healthcheck>,
 }
 
 /// Interactive `grav run -it` handle returned to the control connection.
@@ -150,6 +154,7 @@ struct Running {
     /// Whether the guest runs the embedded DNS resolver (`SetHosts`).
     dns: bool,
     forwards: Vec<tokio::task::JoinHandle<()>>,
+    healthcheck: Option<tokio::task::JoinHandle<()>>,
     /// The VM's port on the container network; unplugged when this is dropped (after the VM stops).
     _port: Option<crate::switch::Port>,
     /// Exclusive lease on the snapshot slot this VM restored from; released after the VM stops.
@@ -171,6 +176,7 @@ pub struct Engine {
     pub(crate) snapshots: Arc<crate::snapshot::SnapshotPool>,
     running: Mutex<HashMap<String, Running>>,
     stats: Mutex<HashMap<String, StatsHistory>>,
+    health: Mutex<HashMap<String, HealthState>>,
     log_io: Mutex<()>,
     switch: crate::switch::Switch,
     /// Serialises guest DNS table broadcasts so concurrent starts/stops never reorder.
@@ -206,6 +212,7 @@ impl Engine {
             snapshots: Arc::new(crate::snapshot::SnapshotPool::open()),
             running: Mutex::new(HashMap::new()),
             stats: Mutex::new(HashMap::new()),
+            health: Mutex::new(HashMap::new()),
             log_io: Mutex::new(()),
             switch: crate::switch::Switch::new(),
             hosts_sync: Mutex::new(()),
@@ -243,6 +250,9 @@ impl Engine {
         for r in &running {
             for f in &r.forwards {
                 f.abort();
+            }
+            if let Some(h) = &r.healthcheck {
+                h.abort();
             }
             let _ = r.agent.lock().unwrap().write_all(&encode_line(&AgentRequest::Shutdown));
         }
@@ -316,6 +326,7 @@ impl Engine {
                 c.ip_address = None;
                 c.cpu_percent = None;
                 c.memory_bytes = None;
+                c.health = None;
                 let id = c.id.clone();
                 if store.insert(c).is_ok() {
                     store.set_logs(&id, crate::persistence::read_logs_tail(&log_path(&id), graviton_core::store::LOG_LIMIT));
@@ -707,6 +718,7 @@ impl Engine {
             .clone()
             .filter(|u| !u.is_empty())
             .or_else(|| config.user.clone().filter(|u| !u.is_empty()));
+        let healthcheck = resolve_healthcheck(config.healthcheck.as_ref(), spec.healthcheck);
         let cs = ContainerSpec {
             argv,
             env: config.env(&spec.env),
@@ -725,6 +737,7 @@ impl Engine {
             service: spec.service.filter(|s| !s.is_empty()),
             labels: spec.labels,
             dns_aliases: spec.dns_aliases,
+            healthcheck,
         };
 
         let id = new_id();
@@ -752,6 +765,7 @@ impl Engine {
             started_at: None,
             project: cs.project.clone(),
             service: cs.service.clone(),
+            health: None,
         };
         self.store.lock().unwrap().insert(summary)?;
         self.specs.lock().unwrap().insert(id.clone(), cs);
@@ -932,6 +946,7 @@ impl Engine {
             self.cancel_restart(&removed.id);
         }
         self.stats.lock().unwrap().remove(&removed.id);
+        self.health.lock().unwrap().remove(&removed.id);
         let _ = fs::remove_dir_all(paths::vms_dir().join(&removed.id));
         self.save();
         self.refresh_images();
@@ -1115,11 +1130,15 @@ impl Engine {
             for f in &r.forwards {
                 f.abort();
             }
+            if let Some(h) = &r.healthcheck {
+                h.abort();
+            }
             let _ = r.agent.lock().unwrap().write_all(&encode_line(&AgentRequest::Shutdown));
             if r.vm.wait_stopped(Duration::from_secs(5)).is_err() {
                 let _ = r.vm.kill();
             }
         }
+        self.health.lock().unwrap().remove(id);
         let (restart_policy, auto_remove) = {
             let mut specs = self.specs.lock().unwrap();
             if let Some(spec) = specs.get_mut(id) {
@@ -1139,6 +1158,7 @@ impl Engine {
             c.ip_address = None;
             c.cpu_percent = None;
             c.memory_bytes = None;
+            c.health = None;
         });
         self.save();
         let (name, image) = self.store.lock().unwrap().container(id).map(|c| (c.name.clone(), c.image.clone())).unwrap_or_default();
@@ -1240,6 +1260,7 @@ impl Engine {
                 ip: None,
                 dns: false,
                 forwards: vec![],
+                healthcheck: None,
                 _port: Some(port),
                 _snapshot: snapshot_lease,
             },
@@ -1345,6 +1366,9 @@ impl Engine {
             });
             self.save();
             self.start_monitor(id, Arc::clone(&vm));
+            if let Some(hc) = spec.healthcheck.clone() {
+                self.start_healthcheck(id, Arc::clone(&vm), hc);
+            }
             let (cname, image) = self.store.lock().unwrap().container(id).map(|c| (c.name.clone(), c.image.clone())).unwrap_or_default();
             self.events.record(graviton_proto::EventKind::Started, Some((id, &cname)), Some(&image), format!("{cname} started"));
             let _ = ready_tx.send(Ok(OwnedFd::from(tty_conn)));
@@ -1382,6 +1406,9 @@ impl Engine {
                     });
                     self.save();
                     self.start_monitor(id, Arc::clone(&vm));
+                    if let Some(hc) = spec.healthcheck.clone() {
+                        self.start_healthcheck(id, Arc::clone(&vm), hc);
+                    }
                     let (cname, image) = self.store.lock().unwrap().container(id).map(|c| (c.name.clone(), c.image.clone())).unwrap_or_default();
                     self.events.record(graviton_proto::EventKind::Started, Some((id, &cname)), Some(&image), format!("{cname} started"));
                 }
@@ -1568,6 +1595,172 @@ impl Engine {
         });
     }
 
+    fn start_healthcheck(self: &Arc<Self>, id: &str, vm: Arc<AppleVm>, hc: Healthcheck) {
+        let Some(argv) = hc.exec_command() else { return };
+        let Some(cs) = self.specs.lock().unwrap().get(id).cloned() else { return };
+        let engine = Arc::clone(self);
+        let id_owned = id.to_string();
+        {
+            self.health.lock().unwrap().insert(id_owned.clone(), HealthState::default());
+            self.store.lock().unwrap().update(&id_owned, |c| {
+                if c.status == ContainerStatus::Running {
+                    c.health = Some(HealthStatus::Starting);
+                }
+            });
+        }
+        let started_wall = Instant::now();
+        let interval = Duration::from_secs(hc.interval_secs.max(1));
+        let timeout_dur = Duration::from_secs(hc.timeout_secs.max(1));
+        let start_period = Duration::from_secs(hc.start_period_secs);
+        let vm_for_task = Arc::clone(&vm);
+        let handle = self.rt.spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let (agent, cname, image, hostname) = {
+                    let running = engine.running.lock().unwrap();
+                    let Some(r) = running.get(&id_owned).filter(|r| Arc::ptr_eq(&r.vm, &vm_for_task)) else {
+                        break;
+                    };
+                    let (cname, image) = engine
+                        .store
+                        .lock()
+                        .unwrap()
+                        .container(&id_owned)
+                        .map(|c| (c.name.clone(), c.image.clone()))
+                        .unwrap_or_default();
+                    let hostname = cs.hostname.clone().unwrap_or_else(|| r.name.clone());
+                    (Arc::clone(&r.agent), cname, image, hostname)
+                };
+
+                let probe_pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
+                let pid_ref = Arc::clone(&probe_pid);
+                let vm_for_probe = Arc::clone(&vm_for_task);
+                let id_for_probe = id_owned.clone();
+                let cs_for_probe = cs.clone();
+                let argv_for_probe = argv.clone();
+                let start = now_secs();
+
+                let fut = tokio::task::spawn_blocking(move || -> Result<(i32, String)> {
+                    let (pid, conn) = exec_probe_on_vm(&vm_for_probe, &id_for_probe, &cs_for_probe, &hostname, &argv_for_probe)?;
+                    pid_ref.store(pid, Ordering::Release);
+                    let mut events = Events::new(BufReader::new(conn));
+                    let mut output = Vec::new();
+                    loop {
+                        match events.next()? {
+                            AgentEvent::Stdout { data, .. } | AgentEvent::Stderr { data, .. } => {
+                                if output.len() < 4096 {
+                                    let take = data.len().min(4096 - output.len());
+                                    output.extend_from_slice(&data[..take]);
+                                }
+                            }
+                            AgentEvent::Exited { code, .. } => {
+                                return Ok((code, truncate_health_output(&output)));
+                            }
+                            AgentEvent::Error { message } => bail!("{message}"),
+                            _ => {}
+                        }
+                    }
+                });
+
+                let (exit_code, output) = match tokio::time::timeout(timeout_dur, fut).await {
+                    Ok(Ok(Ok(res))) => res,
+                    Ok(Ok(Err(err))) => {
+                        let still_running = engine
+                            .running
+                            .lock()
+                            .unwrap()
+                            .get(&id_owned)
+                            .is_some_and(|r| Arc::ptr_eq(&r.vm, &vm_for_task));
+                        if !still_running {
+                            break;
+                        }
+                        (-1, format!("healthcheck error: {err:#}"))
+                    }
+                    Ok(Err(err)) => {
+                        let still_running = engine
+                            .running
+                            .lock()
+                            .unwrap()
+                            .get(&id_owned)
+                            .is_some_and(|r| Arc::ptr_eq(&r.vm, &vm_for_task));
+                        if !still_running {
+                            break;
+                        }
+                        (-1, format!("healthcheck task panicked: {err}"))
+                    }
+                    Err(_elapsed) => {
+                        let pid = probe_pid.load(Ordering::Acquire);
+                        if pid > 0 {
+                            let _ = agent.lock().unwrap().write_all(&encode_line(&AgentRequest::Signal {
+                                pid,
+                                signal: libc::SIGKILL,
+                            }));
+                        }
+                        (-1, format!("healthcheck timed out after {}s", hc.timeout_secs.max(1)))
+                    }
+                };
+
+                let end = now_secs().max(start);
+                let still_running = engine
+                    .running
+                    .lock()
+                    .unwrap()
+                    .get(&id_owned)
+                    .is_some_and(|r| Arc::ptr_eq(&r.vm, &vm_for_task));
+                if !still_running {
+                    break;
+                }
+
+                let in_start_period = !start_period.is_zero() && started_wall.elapsed() < start_period;
+                let entry = HealthLog { start, end, exit_code, output };
+                let (transition, new_status, streak) = {
+                    let mut map = engine.health.lock().unwrap();
+                    let state = map.entry(id_owned.clone()).or_default();
+                    let transition = apply_health_probe(state, &hc, in_start_period, entry);
+                    (transition, state.status, state.failing_streak)
+                };
+                engine.store.lock().unwrap().update(&id_owned, |c| {
+                    if c.status == ContainerStatus::Running {
+                        c.health = Some(new_status);
+                    }
+                });
+                match transition {
+                    Some(HealthStatus::Healthy) => {
+                        engine.log(&id_owned, LogLevel::Info, LogStream::System, "container is healthy".into());
+                        engine.events.record(
+                            graviton_proto::EventKind::Healthy,
+                            Some((&id_owned, &cname)),
+                            Some(&image),
+                            format!("{cname} is healthy"),
+                        );
+                    }
+                    Some(HealthStatus::Unhealthy) => {
+                        engine.log(
+                            &id_owned,
+                            LogLevel::Warn,
+                            LogStream::System,
+                            format!("container is unhealthy ({streak} consecutive failures)"),
+                        );
+                        engine.events.record(
+                            graviton_proto::EventKind::Unhealthy,
+                            Some((&id_owned, &cname)),
+                            Some(&image),
+                            format!("{cname} is unhealthy"),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        });
+        if let Some(r) = self.running.lock().unwrap().get_mut(id) {
+            if Arc::ptr_eq(&r.vm, &vm) {
+                r.healthcheck = Some(handle);
+                return;
+            }
+        }
+        handle.abort();
+    }
+
     pub fn stats(&self, key: &str) -> Result<ContainerStats> {
         let id = self.store.lock().unwrap().container(key)?.id.clone();
         let cpus = self.specs.lock().unwrap().get(&id).map_or(0, |s| s.cpus);
@@ -1649,6 +1842,7 @@ impl Engine {
     pub fn inspect(&self, key: &str) -> Result<ContainerDetails> {
         let container = self.store.lock().unwrap().container(key)?.clone();
         let spec = self.specs.lock().unwrap().get(&container.id).cloned().ok_or_else(|| anyhow!("container {key} has no saved settings"))?;
+        let health = self.health.lock().unwrap().get(&container.id).cloned();
         Ok(ContainerDetails {
             image_reference: spec.image.reference.clone(),
             image_digest: spec.image.manifest_digest.clone(),
@@ -1667,6 +1861,8 @@ impl Engine {
             project: spec.project,
             service: spec.service,
             labels: spec.labels,
+            healthcheck: spec.healthcheck,
+            health,
             container,
         })
     }
@@ -2417,6 +2613,123 @@ fn remove_orphan_disks(known: &HashSet<String>) {
     }
 }
 
+fn ns_to_secs(ns: i64) -> u64 {
+    if ns <= 0 { 0 } else { (ns as u64).div_ceil(1_000_000_000) }
+}
+
+fn resolve_healthcheck(
+    image_hc: Option<&HealthcheckConfig>,
+    override_hc: Option<Healthcheck>,
+) -> Option<Healthcheck> {
+    let from_image = image_hc.and_then(|cfg| {
+        if cfg.test.is_empty() || cfg.test.first().is_some_and(|s| s.eq_ignore_ascii_case("NONE")) {
+            None
+        } else {
+            Some(
+                Healthcheck {
+                    test: cfg.test.clone(),
+                    interval_secs: ns_to_secs(cfg.interval),
+                    timeout_secs: ns_to_secs(cfg.timeout),
+                    start_period_secs: ns_to_secs(cfg.start_period),
+                    retries: cfg.retries,
+                }
+                .normalized(),
+            )
+        }
+    });
+    let resolved = match override_hc {
+        None => from_image,
+        Some(ov) if ov.is_disabled() => None,
+        Some(ov) if !ov.test.is_empty() => Some(ov.normalized()),
+        Some(ov) => from_image.map(|mut base| {
+            if ov.interval_secs > 0 {
+                base.interval_secs = ov.interval_secs;
+            }
+            if ov.timeout_secs > 0 {
+                base.timeout_secs = ov.timeout_secs;
+            }
+            if ov.start_period_secs > 0 {
+                base.start_period_secs = ov.start_period_secs;
+            }
+            if ov.retries > 0 {
+                base.retries = ov.retries;
+            }
+            base.normalized()
+        }),
+    };
+    resolved.filter(|hc| hc.exec_command().is_some())
+}
+
+fn apply_health_probe(
+    state: &mut HealthState,
+    hc: &Healthcheck,
+    in_start_period: bool,
+    log: HealthLog,
+) -> Option<HealthStatus> {
+    state.log.push(log);
+    if state.log.len() > 5 {
+        let excess = state.log.len() - 5;
+        state.log.drain(..excess);
+    }
+    let prev = state.status;
+    let code = state.log.last().map_or(-1, |l| l.exit_code);
+    if code == 0 {
+        state.failing_streak = 0;
+        state.status = HealthStatus::Healthy;
+    } else if in_start_period && state.status == HealthStatus::Starting {
+        // Startup grace period: probe failures do not increment `failing_streak`.
+    } else {
+        state.failing_streak = state.failing_streak.saturating_add(1);
+        if state.failing_streak >= hc.retries.max(1) {
+            state.status = HealthStatus::Unhealthy;
+        }
+    }
+    if state.status != prev && matches!(state.status, HealthStatus::Healthy | HealthStatus::Unhealthy) {
+        Some(state.status)
+    } else {
+        None
+    }
+}
+
+fn truncate_health_output(buf: &[u8]) -> String {
+    let slice = &buf[..buf.len().min(4096)];
+    String::from_utf8_lossy(slice).into_owned()
+}
+
+fn exec_probe_on_vm(
+    vm: &AppleVm,
+    id: &str,
+    cs: &ContainerSpec,
+    hostname: &str,
+    argv: &[String],
+) -> Result<(i32, File)> {
+    let fd: OwnedFd = vm.connect(AGENT_VSOCK_PORT)?;
+    let mut conn = File::from(fd);
+    match read_event_unbuffered(&mut conn)? {
+        AgentEvent::Ready { .. } => {}
+        other => bail!("expected ready from the agent, got {other:?}"),
+    }
+    conn.write_all(&encode_line(&AgentRequest::Exec {
+        argv: argv.to_vec(),
+        env: cs.env.clone(),
+        cwd: cs.cwd.clone(),
+        tty: false,
+        container: Some(id.to_string()),
+        user: cs.user.clone(),
+        hostname: Some(hostname.to_string()),
+        rows: 0,
+        cols: 0,
+        stdin: None,
+        stdin_pipe: false,
+        mounts: vec![],
+    }))?;
+    match read_event_unbuffered(&mut conn)? {
+        AgentEvent::Started { pid } => Ok((pid, conn)),
+        AgentEvent::Error { message } => bail!("{message}"),
+        other => bail!("expected started from the agent, got {other:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2604,5 +2917,59 @@ mod tests {
         let used = host_memory_used().expect("macOS host_statistics64 should succeed");
         assert!(total > 0);
         assert!(used > 0 && used <= total, "used={used}, total={total}");
+    }
+
+    #[test]
+    fn resolves_healthcheck_merges_and_disables() {
+        let img = HealthcheckConfig {
+            test: vec!["CMD-SHELL".into(), "true".into()],
+            interval: 10_000_000_000,
+            timeout: 2_000_000_000,
+            start_period: 0,
+            retries: 0,
+        };
+        let inherited = resolve_healthcheck(Some(&img), None).unwrap();
+        assert_eq!((inherited.interval_secs, inherited.timeout_secs, inherited.retries), (10, 2, 3));
+
+        // Disabled via RunSpec override.
+        assert_eq!(resolve_healthcheck(Some(&img), Some(Healthcheck::disabled())), None);
+        // Image NONE returns None.
+        let img_none = HealthcheckConfig { test: vec!["NONE".into()], ..Default::default() };
+        assert_eq!(resolve_healthcheck(Some(&img_none), None), None);
+
+        // Timing-only override applies onto image test.
+        let timing_only = Healthcheck { test: vec![], interval_secs: 5, timeout_secs: 0, start_period_secs: 7, retries: 0 };
+        let merged = resolve_healthcheck(Some(&img), Some(timing_only)).unwrap();
+        assert_eq!((merged.interval_secs, merged.timeout_secs, merged.start_period_secs, merged.retries), (5, 2, 7, 3));
+        assert_eq!(merged.test, vec!["CMD-SHELL", "true"]);
+    }
+
+    #[test]
+    fn healthcheck_state_machine_and_log_cap() {
+        let hc = Healthcheck { test: vec!["CMD".into(), "true".into()], interval_secs: 1, timeout_secs: 1, start_period_secs: 5, retries: 2 };
+        let mut st = HealthState::default();
+        let entry = |code| HealthLog { start: 1, end: 2, exit_code: code, output: format!("code={code}") };
+
+        // Failures during start_period do not count toward streak.
+        assert_eq!(apply_health_probe(&mut st, &hc, true, entry(1)), None);
+        assert_eq!((st.status, st.failing_streak), (HealthStatus::Starting, 0));
+
+        // After start_period: 1 failure increments streak but stays Starting (< retries=2).
+        assert_eq!(apply_health_probe(&mut st, &hc, false, entry(1)), None);
+        assert_eq!((st.status, st.failing_streak), (HealthStatus::Starting, 1));
+
+        // Second failure crosses retries=2 -> transitions to Unhealthy.
+        assert_eq!(apply_health_probe(&mut st, &hc, false, entry(1)), Some(HealthStatus::Unhealthy));
+        assert_eq!((st.status, st.failing_streak), (HealthStatus::Unhealthy, 2));
+        // Third failure stays Unhealthy without duplicate transition.
+        assert_eq!(apply_health_probe(&mut st, &hc, false, entry(1)), None);
+
+        // First success resets streak and recovers immediately to Healthy.
+        assert_eq!(apply_health_probe(&mut st, &hc, false, entry(0)), Some(HealthStatus::Healthy));
+        assert_eq!((st.status, st.failing_streak), (HealthStatus::Healthy, 0));
+
+        // 5-entry log cap preserved even across more probes.
+        assert_eq!(apply_health_probe(&mut st, &hc, false, entry(0)), None);
+        assert_eq!(st.log.len(), 5);
     }
 }

@@ -305,7 +305,7 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
         if let (Request::Run(spec), Backend::Engine(engine)) = (&request, &backend) {
             if spec.tty {
                 let reader = lines.into_inner();
-                return run_tty(Arc::clone(engine), spec.clone(), reader, write).await;
+                return run_tty(Arc::clone(engine), spec.as_ref().clone(), reader, write).await;
             }
         }
         if let (Request::GetArchive { id, path }, Backend::Engine(engine)) = (&request, &backend) {
@@ -695,7 +695,7 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                         Response::LoggedOut { registry }
                     }
                     Request::ListLogins => Response::Logins(engine.auth.list()),
-                    Request::Run(spec) => Response::Container(engine.run(spec)?),
+                    Request::Run(spec) => Response::Container(engine.run(*spec)?),
                     Request::Start { id } => Response::Container(engine.start(&id)?),
                     Request::Stop { id } => Response::Container(engine.stop(&id)?),
                     Request::Restart { id } => Response::Container(engine.restart(&id)?),

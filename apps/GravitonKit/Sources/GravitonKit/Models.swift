@@ -57,6 +57,60 @@ public struct Mount: Codable, Hashable, Sendable {
     public var readOnly: Bool
 }
 
+public enum HealthStatus: String, Codable, Hashable, Sendable {
+    case starting
+    case healthy
+    case unhealthy
+
+    public var label: String {
+        switch self {
+        case .starting: "Starting"
+        case .healthy: "Healthy"
+        case .unhealthy: "Unhealthy"
+        }
+    }
+}
+
+public struct Healthcheck: Codable, Hashable, Sendable {
+    public var test: [String]
+    public var intervalSecs: UInt64
+    public var timeoutSecs: UInt64
+    public var startPeriodSecs: UInt64
+    public var retries: UInt32
+
+    public init(test: [String], intervalSecs: UInt64 = 30, timeoutSecs: UInt64 = 30,
+                startPeriodSecs: UInt64 = 0, retries: UInt32 = 3) {
+        self.test = test
+        self.intervalSecs = intervalSecs
+        self.timeoutSecs = timeoutSecs
+        self.startPeriodSecs = startPeriodSecs
+        self.retries = retries
+    }
+
+    public var commandDisplay: String {
+        if test.first == "CMD-SHELL", test.count >= 2 {
+            return test.dropFirst().joined(separator: " ")
+        }
+        if test.first == "CMD" {
+            return test.dropFirst().joined(separator: " ")
+        }
+        return test.joined(separator: " ")
+    }
+}
+
+public struct HealthLog: Codable, Hashable, Sendable {
+    public var start: UInt64
+    public var end: UInt64
+    public var exitCode: Int32
+    public var output: String
+}
+
+public struct HealthState: Codable, Hashable, Sendable {
+    public var status: HealthStatus
+    public var failingStreak: UInt32
+    public var log: [HealthLog] = []
+}
+
 public struct Container: Codable, Identifiable, Hashable, Sendable {
     public var id: String
     public var name: String
@@ -77,6 +131,8 @@ public struct Container: Codable, Identifiable, Hashable, Sendable {
     public var project: String? = nil
     /// Service name inside `project`.
     public var service: String? = nil
+    /// Container health status when running with an active `HEALTHCHECK`.
+    public var health: HealthStatus? = nil
 
     public var isRunning: Bool { status == .running }
 
@@ -244,12 +300,14 @@ public struct RunSpec: Codable, Hashable, Sendable {
     public var labels: [String: String]?
     /// Extra project-scoped DNS aliases.
     public var dnsAliases: [String]?
+    /// Healthcheck configuration overrides.
+    public var healthcheck: Healthcheck? = nil
 
     public init(image: String, name: String? = nil, command: [String]? = nil, env: [String] = [], cpus: UInt32? = nil,
                 memoryMib: UInt64? = nil, ports: [String] = [], volumes: [String] = [], restart: RestartPolicy? = nil,
                 platform: String? = nil, entrypoint: [String]? = nil, workingDir: String? = nil, user: String? = nil,
                 hostname: String? = nil, project: String? = nil, service: String? = nil, labels: [String: String]? = nil,
-                dnsAliases: [String]? = nil) {
+                dnsAliases: [String]? = nil, healthcheck: Healthcheck? = nil) {
         self.image = image
         self.name = name
         self.command = command
@@ -268,6 +326,7 @@ public struct RunSpec: Codable, Hashable, Sendable {
         self.service = service
         self.labels = labels
         self.dnsAliases = dnsAliases
+        self.healthcheck = healthcheck
     }
 
     /// Split a list typed as "8080:80, 5432" or one per line.
@@ -440,6 +499,8 @@ public struct ContainerDetails: Codable, Hashable, Sendable {
     public var project: String? = nil
     public var service: String? = nil
     public var labels: [String: String]? = nil
+    public var healthcheck: Healthcheck? = nil
+    public var health: HealthState? = nil
 }
 
 /// What `grav exec` asks for.
@@ -644,7 +705,7 @@ public struct NetworkRate: Identifiable, Sendable {
 /// Something that happened on the engine (`EngineEvent` in `graviton-proto`).
 public struct EngineEvent: Codable, Identifiable, Hashable, Sendable {
     public enum Kind: String, Codable, Sendable {
-        case started, stopped, failed, pulled, pushed, built, buildFailed = "build_failed", removed
+        case started, stopped, failed, healthy, unhealthy, pulled, pushed, built, buildFailed = "build_failed", removed
     }
 
     public var seq: UInt64
@@ -657,7 +718,7 @@ public struct EngineEvent: Codable, Identifiable, Hashable, Sendable {
 
     public var id: UInt64 { seq }
     public var date: Date { Date(timeIntervalSince1970: Double(timestampMs) / 1000) }
-    public var isProblem: Bool { kind == .failed || kind == .buildFailed }
+    public var isProblem: Bool { kind == .failed || kind == .unhealthy || kind == .buildFailed }
 
     public init(seq: UInt64, timestampMs: UInt64, kind: Kind, containerId: String? = nil, container: String? = nil, image: String? = nil, message: String) {
         self.seq = seq

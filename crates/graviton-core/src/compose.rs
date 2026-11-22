@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use graviton_proto::RestartPolicy;
+use graviton_proto::{Healthcheck, RestartPolicy, parse_duration_secs};
 use serde::Serialize;
 use thiserror::Error;
 use yaml_rust2::{Yaml, YamlLoader, yaml::Hash as YamlHash};
@@ -107,6 +107,7 @@ pub struct ComposeService {
     pub labels: BTreeMap<String, String>,
     pub dns_aliases: Vec<String>,
     pub profiles: Vec<String>,
+    pub healthcheck: Option<Healthcheck>,
 }
 
 /// Options for loading a Compose project from disk.
@@ -781,6 +782,10 @@ fn parse_service(
     let (cpus, memory_mib) = parse_resources(name, h)?;
     let dns_aliases = parse_network_aliases(h);
     let profiles = parse_string_list(yaml_get(h, "profiles"));
+    let healthcheck = match yaml_get(h, "healthcheck").filter(|y| !matches!(y, Yaml::Null)) {
+        Some(v) => Some(parse_healthcheck(name, v)?),
+        None => None,
+    };
 
     Ok(ComposeService {
         name: name.to_string(),
@@ -803,7 +808,111 @@ fn parse_service(
         labels,
         dns_aliases,
         profiles,
+        healthcheck,
     })
+}
+
+fn parse_healthcheck(service: &str, v: &Yaml) -> Result<Healthcheck> {
+    let Some(h) = v.as_hash() else {
+        return Err(ComposeError::Spec(format!("service `{service}`: `healthcheck` must be a mapping")));
+    };
+    let disabled = yaml_get(h, "disable")
+        .and_then(yaml_scalar_to_string)
+        .is_some_and(|s| s.eq_ignore_ascii_case("true"));
+    if disabled {
+        return Ok(Healthcheck::disabled());
+    }
+
+    let test = match yaml_get(h, "test") {
+        None | Some(Yaml::Null) => Vec::new(),
+        Some(Yaml::String(s)) => {
+            if s.trim().eq_ignore_ascii_case("NONE") {
+                return Ok(Healthcheck::disabled());
+            }
+            vec!["CMD-SHELL".into(), s.clone()]
+        }
+        Some(Yaml::Array(arr)) => {
+            let mut items = Vec::with_capacity(arr.len());
+            for item in arr {
+                let s = yaml_scalar_to_string(item).ok_or_else(|| {
+                    ComposeError::Spec(format!("service `{service}`: `healthcheck.test` items must be strings"))
+                })?;
+                items.push(s);
+            }
+            if items.is_empty() {
+                return Err(ComposeError::Spec(format!("service `{service}`: `healthcheck.test` cannot be empty")));
+            }
+            if items[0].eq_ignore_ascii_case("NONE") {
+                return Ok(Healthcheck::disabled());
+            }
+            if items[0] != "CMD" && items[0] != "CMD-SHELL" {
+                items.insert(0, "CMD".into());
+            }
+            items
+        }
+        _ => {
+            return Err(ComposeError::Spec(format!(
+                "service `{service}`: `healthcheck.test` must be a string or list"
+            )));
+        }
+    };
+
+    let mut hc = Healthcheck {
+        test,
+        interval_secs: 0,
+        timeout_secs: 0,
+        start_period_secs: 0,
+        retries: 0,
+    };
+
+    let parse_dur = |field: &str, allow_zero: bool| -> Result<Option<u64>> {
+        let Some(val) = yaml_get(h, field).filter(|y| !matches!(y, Yaml::Null)) else {
+            return Ok(None);
+        };
+        let raw = yaml_scalar_to_string(val).ok_or_else(|| {
+            ComposeError::Spec(format!("service `{service}`: invalid `healthcheck.{field}`"))
+        })?;
+        let secs = parse_duration_secs(&raw).map_err(|e| {
+            ComposeError::Spec(format!("service `{service}`: invalid `healthcheck.{field}`: {e}"))
+        })?;
+        if !allow_zero && secs == 0 {
+            return Err(ComposeError::Spec(format!(
+                "service `{service}`: `healthcheck.{field}` must be greater than 0s"
+            )));
+        }
+        Ok(Some(secs))
+    };
+
+    if let Some(v) = parse_dur("interval", false)? {
+        hc.interval_secs = v;
+    }
+    if let Some(v) = parse_dur("timeout", false)? {
+        hc.timeout_secs = v;
+    }
+    if let Some(v) = parse_dur("start_period", true)? {
+        hc.start_period_secs = v;
+    }
+    let _ = parse_dur("start_interval", false)?;
+    if let Some(val) = yaml_get(h, "retries").filter(|y| !matches!(y, Yaml::Null)) {
+        let raw = yaml_scalar_to_string(val).ok_or_else(|| {
+            ComposeError::Spec(format!("service `{service}`: invalid `healthcheck.retries`"))
+        })?;
+        let n: u32 = raw.trim().parse().map_err(|_| {
+            ComposeError::Spec(format!("service `{service}`: invalid `healthcheck.retries` value `{raw}`"))
+        })?;
+        if n == 0 {
+            return Err(ComposeError::Spec(format!(
+                "service `{service}`: `healthcheck.retries` must be at least 1"
+            )));
+        }
+        hc.retries = n;
+    }
+
+    if !hc.test.is_empty() {
+        Ok(hc.normalized())
+    } else {
+        Ok(hc)
+    }
 }
 
 fn parse_build(service: &str, v: &Yaml, project_dir: &Path, vars: &BTreeMap<String, String>) -> Result<ComposeBuild> {
@@ -1268,6 +1377,83 @@ mod tests {
         assert_eq!(parse_memory_mib("64m"), Some(128)); // clamped to MIN_MEMORY_MIB
         assert_eq!(split_shell_words("sh -c 'echo \"hi there\"'"), vec!["sh", "-c", "echo \"hi there\""]);
         assert_eq!(sanitize_project_name("My App_2!"), "myapp_2");
+    }
+
+    #[test]
+    fn parses_compose_healthcheck_variants() {
+        let dir = std::env::temp_dir().join(format!("graviton-compose-hc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("compose.yaml"),
+            r#"
+services:
+  db:
+    image: postgres:17-alpine
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 4
+  api:
+    image: alpine
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: "wget -qO- http://localhost:8080/health || exit 1"
+  worker:
+    image: alpine
+    healthcheck:
+      disable: true
+  tuner:
+    image: alpine
+    healthcheck:
+      interval: 2s
+"#,
+        )
+        .unwrap();
+
+        let proj = ComposeProject::load_with_env(&dir, &LoadOptions::default(), &BTreeMap::new()).unwrap();
+        let db = &proj.services["db"];
+        assert_eq!(
+            db.healthcheck,
+            Some(Healthcheck {
+                test: vec!["CMD-SHELL".into(), "pg_isready -U postgres".into()],
+                interval_secs: 5,
+                timeout_secs: 3,
+                start_period_secs: 10,
+                retries: 4,
+            })
+        );
+        let api = &proj.services["api"];
+        assert_eq!(
+            api.healthcheck,
+            Some(Healthcheck {
+                test: vec!["CMD-SHELL".into(), "wget -qO- http://localhost:8080/health || exit 1".into()],
+                interval_secs: 30,
+                timeout_secs: 30,
+                start_period_secs: 0,
+                retries: 3,
+            })
+        );
+        assert_eq!(api.depends_on["db"], DependsCondition::ServiceHealthy);
+        assert_eq!(proj.services["worker"].healthcheck, Some(Healthcheck::disabled()));
+        // Timing-only override keeps unset fields as 0 so daemon merges image test cleanly.
+        assert_eq!(
+            proj.services["tuner"].healthcheck,
+            Some(Healthcheck { test: vec![], interval_secs: 2, timeout_secs: 0, start_period_secs: 0, retries: 0 })
+        );
+
+        for bad in [
+            "services:\n  a:\n    image: alpine\n    healthcheck:\n      interval: 0s\n",
+            "services:\n  a:\n    image: alpine\n    healthcheck:\n      retries: 0\n",
+        ] {
+            fs::write(dir.join("compose.yaml"), bad).unwrap();
+            assert!(ComposeProject::load_with_env(&dir, &LoadOptions::default(), &BTreeMap::new()).is_err());
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

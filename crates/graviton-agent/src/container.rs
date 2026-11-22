@@ -17,7 +17,6 @@
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
-use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -427,93 +426,80 @@ pub struct PreparedMount {
     pub read_only: bool,
 }
 
-/// A `Command` that runs `argv` inside container `id`.
-pub fn command(
+/// Build a namespace-isolated launcher for `argv` inside container `id`.
+///
+/// Enters the container's existing PID/mount/UTS/IPC namespaces when `id`
+/// already has a live PID-1 init process and no per-exec `mounts` are requested;
+/// otherwise starts a fresh PID+mount+UTS+IPC namespace tree.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_launch(
     id: &str,
     argv: &[String],
     env: &[String],
     cwd: &str,
     user: Option<&str>,
     hostname: &str,
+    tty: bool,
     mounts: Vec<PreparedMount>,
-) -> io::Result<Command> {
+) -> io::Result<crate::ns::PreparedLaunch> {
     let root = rootfs(id)?;
     if !root.join("proc").is_dir() {
         return Err(io::Error::other(format!("container {id} has no root filesystem (prepare it first)")));
     }
     let (uid, gid, home) = resolve_user(&root, user)?;
-    let (program, args) = argv.split_first().ok_or_else(|| io::Error::other("empty command"))?;
+    if argv.is_empty() {
+        return Err(io::Error::other("empty command"));
+    }
 
-    let mut cmd = Command::new(program);
-    cmd.args(args).env_clear();
+    let mut merged_env = Vec::with_capacity(env.len() + 2);
     let mut has_home = false;
+    let mut has_path = false;
     for pair in env {
-        if let Some((k, v)) = pair.split_once('=') {
+        if let Some((k, _)) = pair.split_once('=') {
             has_home |= k == "HOME";
-            cmd.env(k, v);
+            has_path |= k == "PATH";
+            merged_env.push(pair.clone());
         }
     }
     if !has_home {
-        cmd.env("HOME", &home);
+        merged_env.push(format!("HOME={home}"));
+    }
+    if !has_path {
+        merged_env.push("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
     }
 
-    let c = |s: &str| CString::new(s).map_err(io::Error::other);
-    let root_c = c(&root.to_string_lossy())?;
-    let dev_dst = c(&root.join("dev").to_string_lossy())?;
-    let cwd_c = c(if cwd.is_empty() { "/" } else { cwd })?;
-    let host = hostname.as_bytes().to_vec();
-
-    // SAFETY: the closure runs in the forked child before exec and only makes
-    // raw syscalls on data prepared above (no allocation, no locks).
-    unsafe {
-        cmd.pre_exec(move || enter(&root_c, &dev_dst, &cwd_c, &host, uid, gid, &mounts));
-    }
-    Ok(cmd)
-}
-
-fn enter(root: &CString, dev_dst: &CString, cwd: &CString, hostname: &[u8], uid: u32, gid: u32, mounts: &[PreparedMount]) -> io::Result<()> {
-    fn check(rc: libc::c_int) -> io::Result<()> {
-        if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
-    }
-    let null = std::ptr::null::<libc::c_char>();
-    // SAFETY: plain syscalls with valid NUL-terminated strings owned by the caller.
-    unsafe {
-        check(libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC))?;
-        check(libc::mount(null, c"/".as_ptr(), null, libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()))?;
-        check(libc::mount(c"/dev".as_ptr(), dev_dst.as_ptr(), null, libc::MS_BIND | libc::MS_REC, std::ptr::null()))?;
-        for m in mounts {
-            if m.is_tmpfs {
-                let mut flags = libc::MS_NOSUID | libc::MS_NODEV;
-                if m.read_only {
-                    flags |= libc::MS_RDONLY;
-                }
-                check(libc::mount(c"tmpfs".as_ptr(), m.dst.as_ptr(), c"tmpfs".as_ptr(), flags, std::ptr::null()))?;
-            } else {
-                check(libc::mount(m.src.as_ptr(), m.dst.as_ptr(), null, libc::MS_BIND, std::ptr::null()))?;
-                if m.read_only {
-                    check(libc::mount(
-                        null,
-                        m.dst.as_ptr(),
-                        null,
-                        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
-                        std::ptr::null(),
-                    ))?;
-                }
-            }
+    let can_enter = mounts.is_empty();
+    let (mode, register) = if can_enter {
+        if let Some(init_pid) = crate::ns::lookup_init(id) {
+            (crate::ns::LaunchMode::Enter { init_pid }, false)
+        } else {
+            let mode = crate::ns::LaunchMode::Init {
+                root: root.to_string_lossy().into_owned(),
+                dev_dst: root.join("dev").to_string_lossy().into_owned(),
+                hostname: hostname.to_string(),
+                mounts: Vec::new(),
+            };
+            (mode, true)
         }
-        check(libc::chdir(root.as_ptr()))?;
-        check(libc::mount(root.as_ptr(), c"/".as_ptr(), null, libc::MS_MOVE, std::ptr::null()))?;
-        check(libc::chroot(c".".as_ptr()))?;
-        check(libc::chdir(c"/".as_ptr()))?;
-        check(libc::mount(c"proc".as_ptr(), c"/proc".as_ptr(), c"proc".as_ptr(), libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, std::ptr::null()))?;
-        let _ = libc::mount(c"sysfs".as_ptr(), c"/sys".as_ptr(), c"sysfs".as_ptr(), libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, std::ptr::null());
-        if !hostname.is_empty() {
-            check(libc::sethostname(hostname.as_ptr().cast(), hostname.len()))?;
-        }
-        check(libc::setgroups(0, std::ptr::null()))?;
-        check(libc::setgid(gid))?;
-        check(libc::setuid(uid))?;
-        check(libc::chdir(cwd.as_ptr()))?;
-    }
-    Ok(())
+    } else {
+        let mount_specs = mounts
+            .into_iter()
+            .map(|m| crate::ns::MountSpec {
+                src: m.src.to_string_lossy().into_owned(),
+                dst: m.dst.to_string_lossy().into_owned(),
+                is_tmpfs: m.is_tmpfs,
+                read_only: m.read_only,
+            })
+            .collect();
+        let mode = crate::ns::LaunchMode::Init {
+            root: root.to_string_lossy().into_owned(),
+            dev_dst: root.join("dev").to_string_lossy().into_owned(),
+            hostname: hostname.to_string(),
+            mounts: mount_specs,
+        };
+        (mode, false)
+    };
+
+    let workdir = if cwd.is_empty() { "/" } else { cwd };
+    crate::ns::PreparedLaunch::build(id, mode, argv, &merged_env, workdir, uid, gid, tty, register)
 }

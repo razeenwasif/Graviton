@@ -12,7 +12,8 @@ use crate::Backend;
 use crate::runtime::ContainerSpec;
 
 use super::containers::{
-    exec_error_status, matches_container_filters, normalize_docker_bind, normalize_docker_mount, parse_filters,
+    docker_status_human, exec_error_status, matches_container_filters, normalize_docker_bind,
+    normalize_docker_mount, parse_filters,
 };
 use super::http::{encode_mux_frame, read_request_head, strip_api_version, write_empty};
 use super::{DockerState, serve_connection};
@@ -64,6 +65,7 @@ fn filters_containers_with_label_and_semantics() {
         started_at: Some(101),
         project: None,
         service: None,
+        health: None,
     };
     let spec = ContainerSpec {
         image: LocalImage {
@@ -93,6 +95,7 @@ fn filters_containers_with_label_and_semantics() {
             ("devcontainer.config_file".into(), "/Users/me/proj/.devcontainer/devcontainer.json".into()),
         ]),
         dns_aliases: vec![],
+        healthcheck: None,
     };
 
     // Go map filter style (AND across label keys)
@@ -112,6 +115,24 @@ fn filters_containers_with_label_and_semantics() {
     // Name, id prefix, ancestor, volume filters
     let f2 = parse_filters(r#"{"name":["dev-"],"id":["a1b2"],"ancestor":["ubuntu"],"volume":["/workspace"]}"#).unwrap();
     assert!(matches_container_filters(&c, Some(&spec), &f2));
+
+    // Health filters (`none`, `starting`, `healthy`, `unhealthy`) and status suffix
+    let f_none = parse_filters(r#"{"health":["none"]}"#).unwrap();
+    assert!(matches_container_filters(&c, Some(&spec), &f_none));
+    assert!(!docker_status_human(&c, 120).contains("health"));
+
+    let mut healthy = c.clone();
+    healthy.health = Some(graviton_proto::HealthStatus::Healthy);
+    let f_healthy = parse_filters(r#"{"health":["healthy"]}"#).unwrap();
+    assert!(matches_container_filters(&healthy, Some(&spec), &f_healthy));
+    assert!(!matches_container_filters(&healthy, Some(&spec), &f_none));
+    assert!(docker_status_human(&healthy, 120).ends_with(" (healthy)"));
+
+    healthy.health = Some(graviton_proto::HealthStatus::Starting);
+    assert!(docker_status_human(&healthy, 120).ends_with(" (health: starting)"));
+
+    healthy.health = Some(graviton_proto::HealthStatus::Unhealthy);
+    assert!(docker_status_human(&healthy, 120).ends_with(" (unhealthy)"));
 
     // Ensure unused imports BlobStore/ImageIndex aren't flagged even if future tests use them
     let _ = (std::mem::size_of::<BlobStore>(), std::mem::size_of::<ImageIndex>());

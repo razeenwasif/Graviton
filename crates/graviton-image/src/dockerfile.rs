@@ -83,6 +83,7 @@ pub enum Kind {
     Label(Vec<(String, String)>),
     Volume(Vec<String>),
     StopSignal(String),
+    Healthcheck(Option<graviton_proto::Healthcheck>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,7 +259,7 @@ impl Dockerfile {
                 "VOLUME" => Kind::Volume(json_array(rest).unwrap_or_else(|| split_words(rest))),
                 "STOPSIGNAL" => Kind::StopSignal(rest.to_string()),
                 "MAINTAINER" => Kind::Label(vec![("maintainer".into(), rest.to_string())]),
-                "HEALTHCHECK" => continue, // not run by Graviton yet
+                "HEALTHCHECK" => Kind::Healthcheck(parse_healthcheck(rest).map_err(err)?),
                 "ONBUILD" => return Err(err("ONBUILD isn't supported".into())),
                 other => return Err(err(format!("unknown instruction `{other}`"))),
             };
@@ -307,6 +308,87 @@ fn build_run_command(rest: &str, heredocs: &[RawHeredoc]) -> (Command, Option<St
         script.push('\n');
     }
     (Command::Shell(script), None)
+}
+
+fn parse_healthcheck(raw: &str) -> Result<Option<graviton_proto::Healthcheck>, String> {
+    let mut rest = raw.trim();
+    if rest.is_empty() {
+        return Err("HEALTHCHECK needs NONE or [OPTIONS] CMD <command>".into());
+    }
+    if rest.eq_ignore_ascii_case("NONE") {
+        return Ok(None);
+    }
+
+    let mut hc = graviton_proto::Healthcheck::default();
+    let mut saw_flags = false;
+    while rest.starts_with("--") {
+        let (flag, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let Some((opt, raw_val)) = flag.split_once('=') else {
+            return Err(format!("HEALTHCHECK option `{flag}` requires a `=value`"));
+        };
+        let val = unquote(raw_val);
+        match opt.to_ascii_lowercase().as_str() {
+            "--interval" => {
+                let secs = graviton_proto::parse_duration_secs(&val)
+                    .map_err(|e| format!("invalid HEALTHCHECK --interval: {e}"))?;
+                if secs == 0 {
+                    return Err("HEALTHCHECK --interval must be greater than 0s".into());
+                }
+                hc.interval_secs = secs;
+            }
+            "--timeout" => {
+                let secs = graviton_proto::parse_duration_secs(&val)
+                    .map_err(|e| format!("invalid HEALTHCHECK --timeout: {e}"))?;
+                if secs == 0 {
+                    return Err("HEALTHCHECK --timeout must be greater than 0s".into());
+                }
+                hc.timeout_secs = secs;
+            }
+            "--start-period" => {
+                hc.start_period_secs = graviton_proto::parse_duration_secs(&val)
+                    .map_err(|e| format!("invalid HEALTHCHECK --start-period: {e}"))?;
+            }
+            "--start-interval" => {
+                graviton_proto::parse_duration_secs(&val)
+                    .map_err(|e| format!("invalid HEALTHCHECK --start-interval: {e}"))?;
+            }
+            "--retries" => {
+                let n: u32 = val.trim().parse().map_err(|_| format!("invalid HEALTHCHECK --retries `{val}`"))?;
+                if n == 0 {
+                    return Err("HEALTHCHECK --retries must be at least 1".into());
+                }
+                hc.retries = n;
+            }
+            _ => return Err(format!("unsupported HEALTHCHECK option `{flag}`")),
+        }
+        saw_flags = true;
+        rest = after.trim_start();
+    }
+
+    let (kw, cmd_rest) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    if kw.eq_ignore_ascii_case("NONE") {
+        if saw_flags || !cmd_rest.trim().is_empty() {
+            return Err("HEALTHCHECK NONE takes no options or arguments".into());
+        }
+        return Ok(None);
+    }
+    if !kw.eq_ignore_ascii_case("CMD") {
+        return Err(format!("HEALTHCHECK expected CMD or NONE, got `{rest}`"));
+    }
+    let cmd_rest = cmd_rest.trim();
+    if cmd_rest.is_empty() {
+        return Err("HEALTHCHECK CMD needs a command".into());
+    }
+    hc.test = match json_array(cmd_rest) {
+        Some(v) => {
+            if v.is_empty() {
+                return Err("HEALTHCHECK CMD [] cannot be empty".into());
+            }
+            std::iter::once("CMD".to_string()).chain(v).collect()
+        }
+        None => vec!["CMD-SHELL".into(), cmd_rest.to_string()],
+    };
+    Ok(Some(hc))
 }
 
 fn parse_run_mount(spec: &str) -> Result<RunMount, String> {
@@ -781,6 +863,47 @@ pub fn expand(s: &str, vars: &BTreeMap<String, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_healthcheck_variants_and_rejects_bad_flags() {
+        let shell = Dockerfile::parse("FROM alpine\nHEALTHCHECK --interval=5s --timeout=2s --start-period=10s --retries=4 CMD curl -f http://localhost/ || exit 1\n").unwrap();
+        assert_eq!(
+            shell.stages[0].instructions[0].kind,
+            Kind::Healthcheck(Some(graviton_proto::Healthcheck {
+                test: vec!["CMD-SHELL".into(), "curl -f http://localhost/ || exit 1".into()],
+                interval_secs: 5,
+                timeout_secs: 2,
+                start_period_secs: 10,
+                retries: 4,
+            }))
+        );
+
+        let exec = Dockerfile::parse("FROM alpine\nHEALTHCHECK --start-interval=1s CMD [\"/bin/true\"]\n").unwrap();
+        assert_eq!(
+            exec.stages[0].instructions[0].kind,
+            Kind::Healthcheck(Some(graviton_proto::Healthcheck {
+                test: vec!["CMD".into(), "/bin/true".into()],
+                interval_secs: 30,
+                timeout_secs: 30,
+                start_period_secs: 0,
+                retries: 3,
+            }))
+        );
+
+        let disabled = Dockerfile::parse("FROM alpine\nHEALTHCHECK NONE\n").unwrap();
+        assert_eq!(disabled.stages[0].instructions[0].kind, Kind::Healthcheck(None));
+
+        for bad in [
+            "FROM alpine\nHEALTHCHECK",
+            "FROM alpine\nHEALTHCHECK --retries=0 CMD true",
+            "FROM alpine\nHEALTHCHECK --interval=0s CMD true",
+            "FROM alpine\nHEALTHCHECK --unknown=1 CMD true",
+            "FROM alpine\nHEALTHCHECK --interval=5s NONE",
+            "FROM alpine\nHEALTHCHECK CMD []",
+        ] {
+            assert!(Dockerfile::parse(bad).is_err(), "expected error for: {bad}");
+        }
+    }
 
     const SAMPLE: &str = r#"
 # syntax=docker/dockerfile:1

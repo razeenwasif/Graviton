@@ -14,10 +14,50 @@ use std::thread;
 use graviton_proto::frame::{self, Decoder, Frame};
 use graviton_proto::{AgentEvent, encode_line};
 
-pub fn run(cmd: Command, mut conn: File, pending: Vec<u8>, rows: u16, cols: u16, has_term: bool) -> io::Result<()> {
-    let result = session(cmd, &mut conn, pending, rows, cols, has_term);
+pub fn run(mut cmd: Command, mut conn: File, pending: Vec<u8>, rows: u16, cols: u16, has_term: bool) -> io::Result<()> {
+    let result = session(
+        |slave_in, slave_out, slave_err| {
+            cmd.stdin(slave_in).stdout(slave_out).stderr(slave_err);
+            if !has_term {
+                cmd.env("TERM", "xterm-256color");
+            }
+            // SAFETY: runs in the forked child after its stdio is the terminal: become a
+            // session leader with the terminal as its controlling tty.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            Ok((crate::reap::spawn(&mut cmd)?, None))
+        },
+        true,
+        &mut conn,
+        pending,
+        rows,
+        cols,
+    );
     if let Err(err) = &result {
-        // Before `started` the client is still reading JSON lines; tell it what failed.
+        let _ = conn.write_all(&encode_line(&AgentEvent::Error { message: format!("terminal: {err}") }));
+    }
+    result
+}
+
+pub fn run_container(mut launch: crate::ns::PreparedLaunch, mut conn: File, pending: Vec<u8>, rows: u16, cols: u16) -> io::Result<()> {
+    let result = session(
+        |slave_in, slave_out, slave_err| {
+            launch.cmd.stdin(slave_in).stdout(slave_out).stderr(slave_err);
+            launch.spawn_and_wait_start()
+        },
+        false,
+        &mut conn,
+        pending,
+        rows,
+        cols,
+    );
+    if let Err(err) = &result {
         let _ = conn.write_all(&encode_line(&AgentEvent::Error { message: format!("terminal: {err}") }));
     }
     result
@@ -27,7 +67,14 @@ fn winsize(rows: u16, cols: u16) -> libc::winsize {
     libc::winsize { ws_row: if rows == 0 { 24 } else { rows }, ws_col: if cols == 0 { 80 } else { cols }, ws_xpixel: 0, ws_ypixel: 0 }
 }
 
-fn session(mut cmd: Command, conn: &mut File, pending: Vec<u8>, rows: u16, cols: u16, has_term: bool) -> io::Result<()> {
+fn session(
+    spawn: impl FnOnce(Stdio, Stdio, Stdio) -> io::Result<(std::process::Child, Option<crate::ns::InitGuard>)>,
+    hangup_group: bool,
+    conn: &mut File,
+    pending: Vec<u8>,
+    rows: u16,
+    cols: u16,
+) -> io::Result<()> {
     let size = winsize(rows, cols);
     let (mut master_fd, mut slave_fd) = (-1, -1);
     // SAFETY: openpty fills two descriptors; the name and termios pointers may be null.
@@ -39,29 +86,19 @@ fn session(mut cmd: Command, conn: &mut File, pending: Vec<u8>, rows: u16, cols:
     // SAFETY: fcntl on a descriptor we own; the child mustn't inherit the master.
     unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
 
-    cmd.stdin(Stdio::from(slave.try_clone()?)).stdout(Stdio::from(slave.try_clone()?)).stderr(Stdio::from(slave));
-    if !has_term {
-        cmd.env("TERM", "xterm-256color");
-    }
-    // SAFETY: runs in the child after its stdio is the terminal: become a
-    // session leader with the terminal as its controlling tty.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = match crate::reap::spawn(&mut cmd) {
-        Ok(child) => child,
+    let (mut child, _init_guard) = match spawn(
+        Stdio::from(slave.try_clone()?),
+        Stdio::from(slave.try_clone()?),
+        Stdio::from(slave),
+    ) {
+        Ok(res) => res,
         Err(err) => {
             let _ = conn.write_all(&encode_line(&AgentEvent::Error { message: format!("exec: {err}") }));
             return Ok(());
         }
     };
-    drop(cmd); // closes our copies of the terminal's slave side
     let pid = child.id() as i32;
+    let hangup_target = if hangup_group { -pid } else { pid };
     conn.write_all(&encode_line(&AgentEvent::Started { pid }))?;
 
     // Client frames → terminal.
@@ -97,9 +134,9 @@ fn session(mut cmd: Command, conn: &mut File, pending: Vec<u8>, rows: u16, cols:
                 Ok(n) => decoder.push(&buf[..n]),
             }
         }
-        // The client hung up: so does the terminal.
-        // SAFETY: signals the session's process group; harmless if it's gone.
-        unsafe { libc::kill(-pid, libc::SIGHUP) };
+        // The client hung up: signal the container launcher/process group.
+        // SAFETY: sending SIGHUP to live child pid / process group.
+        unsafe { libc::kill(hangup_target, libc::SIGHUP) };
     });
 
     // Terminal → client, until the program (and everything on the terminal) exits.
@@ -113,7 +150,7 @@ fn session(mut cmd: Command, conn: &mut File, pending: Vec<u8>, rows: u16, cols:
                 if conn.write_all(&frame::data_frame(frame::DATA, &buf[..n])).is_err() {
                     client_gone = true;
                     // SAFETY: as above.
-                    unsafe { libc::kill(-pid, libc::SIGHUP) };
+                    unsafe { libc::kill(hangup_target, libc::SIGHUP) };
                     break;
                 }
             }
@@ -121,6 +158,7 @@ fn session(mut cmd: Command, conn: &mut File, pending: Vec<u8>, rows: u16, cols:
     }
     let waited = child.wait();
     crate::reap::release(pid);
+    drop(_init_guard);
     let code = match waited {
         Ok(s) => s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0)),
         Err(_) => -1,

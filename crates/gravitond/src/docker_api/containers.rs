@@ -8,8 +8,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use graviton_proto::{
-    AgentEvent, AgentRequest, ContainerStatus, ContainerSummary, ExecSpec, FileKind, LogLevel, LogStream, PruneSpec, RestartPolicy,
-    RunSpec, decode_line, encode_line,
+    AgentEvent, AgentRequest, ContainerStatus, ContainerSummary, ExecSpec, FileKind, HealthStatus, Healthcheck, LogLevel,
+    LogStream, PruneSpec, RestartPolicy, RunSpec, decode_line, encode_line,
     frame::{Decoder, Frame},
 };
 use serde_json::{Value, json};
@@ -217,6 +217,13 @@ pub(crate) fn matches_container_filters(
         }
     }
 
+    if let Some(want_health) = filters.get("health") {
+        let actual = c.health.map_or("none", HealthStatus::as_str);
+        if !want_health.iter().any(|want| want.eq_ignore_ascii_case(actual)) {
+            return false;
+        }
+    }
+
     true
 }
 
@@ -229,12 +236,12 @@ fn docker_state_str(status: ContainerStatus) -> &'static str {
     }
 }
 
-fn docker_status_human(c: &ContainerSummary, now: u64) -> String {
+pub(crate) fn docker_status_human(c: &ContainerSummary, now: u64) -> String {
     match c.status {
         ContainerStatus::Created => "Created".into(),
         ContainerStatus::Running => {
             let secs = now.saturating_sub(c.started_at.unwrap_or(now));
-            if secs < 2 {
+            let base = if secs < 2 {
                 "Up Less than a second".into()
             } else if secs < 60 {
                 format!("Up {secs} seconds")
@@ -242,6 +249,12 @@ fn docker_status_human(c: &ContainerSummary, now: u64) -> String {
                 format!("Up {} minutes", secs / 60)
             } else {
                 format!("Up {} hours", secs / 3600)
+            };
+            match c.health {
+                Some(HealthStatus::Starting) => format!("{base} (health: starting)"),
+                Some(HealthStatus::Healthy) => format!("{base} (healthy)"),
+                Some(HealthStatus::Unhealthy) => format!("{base} (unhealthy)"),
+                None => base,
             }
         }
         ContainerStatus::Paused => "Up (Paused)".into(),
@@ -479,6 +492,25 @@ pub async fn create_container(
         }
     }
 
+    let healthcheck = payload.get("Healthcheck").and_then(|v| v.as_object()).map(|hc| {
+        let test: Vec<String> = hc
+            .get("Test")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let ns_to_secs = |k: &str| -> u64 {
+            let ns = hc.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+            if ns <= 0 { 0 } else { (ns as u64).div_ceil(1_000_000_000) }
+        };
+        Healthcheck {
+            test,
+            interval_secs: ns_to_secs("Interval"),
+            timeout_secs: ns_to_secs("Timeout"),
+            start_period_secs: ns_to_secs("StartPeriod"),
+            retries: hc.get("Retries").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        }
+    });
+
     let spec = RunSpec {
         image: image.clone(),
         name,
@@ -502,6 +534,7 @@ pub async fn create_container(
         service,
         labels,
         dns_aliases,
+        healthcheck,
     };
 
     let res = tokio::task::spawn_blocking(move || engine.create_container_local(spec)).await?;
@@ -727,7 +760,7 @@ pub async fn inspect_container(
     let networks = build_networks_map(c, &networks_list);
     let restart_name = details.restart.as_str();
 
-    let inspect_json = json!({
+    let mut inspect_json = json!({
         "Id": c.id,
         "Created": created,
         "Path": path,
@@ -798,6 +831,34 @@ pub async fn inspect_container(
             "Networks": networks,
         }
     });
+    if let Some(h) = &details.health {
+        let log: Vec<Value> = h
+            .log
+            .iter()
+            .map(|entry| {
+                json!({
+                    "Start": crate::build::rfc3339(entry.start),
+                    "End": crate::build::rfc3339(entry.end),
+                    "ExitCode": entry.exit_code,
+                    "Output": entry.output,
+                })
+            })
+            .collect();
+        inspect_json["State"]["Health"] = json!({
+            "Status": h.status.as_str(),
+            "FailingStreak": h.failing_streak,
+            "Log": log,
+        });
+    }
+    if let Some(hc) = &details.healthcheck {
+        inspect_json["Config"]["Healthcheck"] = json!({
+            "Test": hc.test,
+            "Interval": i64::try_from(hc.interval_secs.saturating_mul(1_000_000_000)).unwrap_or(i64::MAX),
+            "Timeout": i64::try_from(hc.timeout_secs.saturating_mul(1_000_000_000)).unwrap_or(i64::MAX),
+            "StartPeriod": i64::try_from(hc.start_period_secs.saturating_mul(1_000_000_000)).unwrap_or(i64::MAX),
+            "Retries": hc.retries,
+        });
+    }
 
     write_json(write, 200, &inspect_json, head.close_after).await?;
     Ok(RouteOutcome::Continue)

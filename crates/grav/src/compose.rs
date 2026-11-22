@@ -265,12 +265,20 @@ fn up(
         return Ok(());
     }
 
-    // Services that another service waits on with `condition: service_completed_successfully`.
+    // Services that another service waits on with `condition: service_completed_successfully`
+    // or `condition: service_healthy`.
     let mut wait_complete: HashSet<&str> = HashSet::new();
+    let mut wait_healthy: HashSet<&str> = HashSet::new();
     for svc in &ordered {
         for (dep, cond) in &svc.depends_on {
-            if *cond == DependsCondition::ServiceCompletedSuccessfully {
-                wait_complete.insert(dep.as_str());
+            match cond {
+                DependsCondition::ServiceCompletedSuccessfully => {
+                    wait_complete.insert(dep.as_str());
+                }
+                DependsCondition::ServiceHealthy => {
+                    wait_healthy.insert(dep.as_str());
+                }
+                DependsCondition::ServiceStarted => {}
             }
         }
     }
@@ -339,7 +347,7 @@ fn up(
             }
             None => {
                 let spec = service_to_run_spec(proj, svc);
-                match client.call(&Request::Run(spec))? {
+                match client.call(&Request::Run(Box::new(spec)))? {
                     Response::Container(created) => {
                         let ip = created.ip_address.as_deref().unwrap_or("starting");
                         eprintln!("  ▶ {:<16} {} ({ip})", svc.name, created.name);
@@ -359,6 +367,11 @@ fn up(
                 bail!("service `{}` exited with code {code} (dependent services not started)", svc.name);
             }
             eprintln!("  ✓ {:<16} completed (exit 0)", svc.name);
+        }
+        if wait_healthy.contains(svc.name.as_str()) {
+            eprintln!("  … waiting for {} to become healthy…", svc.name);
+            wait_for_healthy(client, &container.id, &svc.name)?;
+            eprintln!("  ✓ {:<16} healthy", svc.name);
         }
     }
 
@@ -647,6 +660,7 @@ fn service_to_run_spec(proj: &ComposeProject, svc: &ComposeService) -> RunSpec {
         service: Some(svc.name.clone()),
         labels: svc.labels.clone(),
         dns_aliases: svc.dns_aliases.clone(),
+        healthcheck: svc.healthcheck.clone(),
     }
 }
 
@@ -677,6 +691,37 @@ fn wait_for_exit(client: &mut Client, id: &str) -> Result<i32> {
             Some(c) if c.status == ContainerStatus::Exited => return Ok(c.exit_code.unwrap_or(0)),
             Some(_) => std::thread::sleep(Duration::from_millis(120)),
             None => bail!("container {id} disappeared"),
+        }
+    }
+}
+
+fn wait_for_healthy(client: &mut Client, id: &str, service: &str) -> Result<()> {
+    let mut checked_inspect = false;
+    loop {
+        let list = list_containers(client)?;
+        match list.into_iter().find(|c| c.id == id) {
+            Some(c) if c.health == Some(graviton_proto::HealthStatus::Healthy) => return Ok(()),
+            Some(c) if c.health == Some(graviton_proto::HealthStatus::Unhealthy) => {
+                bail!("service `{service}` became unhealthy (dependent services not started)");
+            }
+            Some(c) if c.status == ContainerStatus::Exited => {
+                bail!(
+                    "service `{service}` exited with code {} before becoming healthy (dependent services not started)",
+                    c.exit_code.unwrap_or(0)
+                );
+            }
+            Some(c) => {
+                if c.status == ContainerStatus::Running && c.health.is_none() && !checked_inspect {
+                    if let Response::Details(d) = client.call(&Request::Inspect { id: id.to_string() })? {
+                        if d.healthcheck.is_none() {
+                            bail!("service `{service}` has `condition: service_healthy` but no `healthcheck` configured");
+                        }
+                    }
+                    checked_inspect = true;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            None => bail!("service `{service}` ({id}) disappeared"),
         }
     }
 }

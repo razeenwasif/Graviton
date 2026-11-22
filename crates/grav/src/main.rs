@@ -38,6 +38,7 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Check that the daemon is reachable.
     Ping,
@@ -150,6 +151,24 @@ enum Command {
         /// Set container label (`KEY=value`); repeatable.
         #[arg(short = 'l', long = "label")]
         label: Vec<String>,
+        /// Command to run to check health (shell form).
+        #[arg(long = "health-cmd", value_name = "CMD")]
+        health_cmd: Option<String>,
+        /// Time between running the check (e.g. `5s`, `1m`).
+        #[arg(long = "health-interval", value_name = "DURATION")]
+        health_interval: Option<String>,
+        /// Maximum time to allow one check to run (`5s`, `30s`).
+        #[arg(long = "health-timeout", value_name = "DURATION")]
+        health_timeout: Option<String>,
+        /// Start period before failures count toward retries (`10s`).
+        #[arg(long = "health-start-period", value_name = "DURATION")]
+        health_start_period: Option<String>,
+        /// Consecutive failures needed to report unhealthy.
+        #[arg(long = "health-retries", value_name = "N")]
+        health_retries: Option<u32>,
+        /// Disable any container-specified `HEALTHCHECK`.
+        #[arg(long = "no-healthcheck")]
+        no_healthcheck: bool,
         image: String,
         /// Command (replaces the image's default command).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -603,6 +622,12 @@ fn run(cli: Cli) -> Result<()> {
             user,
             hostname,
             label,
+            health_cmd,
+            health_interval,
+            health_timeout,
+            health_start_period,
+            health_retries,
+            no_healthcheck,
             image,
             command,
         } => {
@@ -612,6 +637,68 @@ fn run(cli: Cli) -> Result<()> {
             if detach && rm {
                 bail!("can't combine -d/--detach with --rm");
             }
+            let has_health_override = health_cmd.is_some()
+                || health_interval.is_some()
+                || health_timeout.is_some()
+                || health_start_period.is_some()
+                || health_retries.is_some();
+            if no_healthcheck && has_health_override {
+                bail!("can't combine --no-healthcheck with --health-* flags");
+            }
+            let healthcheck = if no_healthcheck {
+                Some(graviton_proto::Healthcheck::disabled())
+            } else if has_health_override {
+                let interval_secs = match health_interval {
+                    Some(s) => {
+                        let v = graviton_proto::parse_duration_secs(&s)
+                            .map_err(|e| anyhow::anyhow!("--health-interval: {e}"))?;
+                        if v == 0 {
+                            bail!("--health-interval must be greater than 0s");
+                        }
+                        v
+                    }
+                    None => 0,
+                };
+                let timeout_secs = match health_timeout {
+                    Some(s) => {
+                        let v = graviton_proto::parse_duration_secs(&s)
+                            .map_err(|e| anyhow::anyhow!("--health-timeout: {e}"))?;
+                        if v == 0 {
+                            bail!("--health-timeout must be greater than 0s");
+                        }
+                        v
+                    }
+                    None => 0,
+                };
+                let start_period_secs = match health_start_period {
+                    Some(s) => graviton_proto::parse_duration_secs(&s)
+                        .map_err(|e| anyhow::anyhow!("--health-start-period: {e}"))?,
+                    None => 0,
+                };
+                let retries = match health_retries {
+                    Some(0) => bail!("--health-retries must be at least 1"),
+                    Some(n) => n,
+                    None => 0,
+                };
+                let test = match health_cmd {
+                    Some(cmd) => {
+                        if cmd.trim().is_empty() {
+                            bail!("--health-cmd cannot be empty");
+                        }
+                        vec!["CMD-SHELL".into(), cmd]
+                    }
+                    None => Vec::new(),
+                };
+                Some(graviton_proto::Healthcheck {
+                    test,
+                    interval_secs,
+                    timeout_secs,
+                    start_period_secs,
+                    retries,
+                })
+            } else {
+                None
+            };
             let mut labels = BTreeMap::new();
             for pair in label {
                 let (k, v) = pair.split_once('=').unwrap_or((&pair, ""));
@@ -640,12 +727,13 @@ fn run(cli: Cli) -> Result<()> {
                 service: None,
                 labels,
                 dns_aliases: vec![],
+                healthcheck,
             };
             if tty {
                 let code = run_tty(&target, spec, interactive)?;
                 std::process::exit(code);
             }
-            let container = match client.call(&Request::Run(spec))? {
+            let container = match client.call(&Request::Run(Box::new(spec)))? {
                 Response::Container(c) => c,
                 other => return unexpected(other),
             };
@@ -881,8 +969,11 @@ fn run(cli: Cli) -> Result<()> {
                     Response::Events(list) => {
                         for e in &list {
                             let marker = match e.kind {
-                                graviton_proto::EventKind::Failed | graviton_proto::EventKind::BuildFailed => "✗",
+                                graviton_proto::EventKind::Failed
+                                | graviton_proto::EventKind::Unhealthy
+                                | graviton_proto::EventKind::BuildFailed => "✗",
                                 graviton_proto::EventKind::Started
+                                | graviton_proto::EventKind::Healthy
                                 | graviton_proto::EventKind::Built
                                 | graviton_proto::EventKind::Pulled
                                 | graviton_proto::EventKind::Pushed => "✓",
@@ -1273,7 +1364,7 @@ fn run_tty(target: &Target, mut spec: RunSpec, interactive: bool) -> Result<i32>
         (spec.rows, spec.cols) = (rows, cols);
     }
     let mut stream = target.connect()?;
-    stream.write_all(&encode_line(&Request::Run(spec)))?;
+    stream.write_all(&encode_line(&Request::Run(Box::new(spec))))?;
     attach_tty(stream, interactive)
 }
 
@@ -1957,11 +2048,19 @@ pub(crate) fn unexpected(response: Response) -> Result<()> {
 }
 
 fn print_containers<'a>(list: impl Iterator<Item = &'a ContainerSummary>) {
-    println!("{:<13} {:<14} {:<26} {:<14} {:>6} {:>9}  PORTS", "ID", "NAME", "IMAGE", "STATUS", "CPU", "MEM");
+    println!("{:<13} {:<14} {:<26} {:<24} {:>6} {:>9}  PORTS", "ID", "NAME", "IMAGE", "STATUS", "CPU", "MEM");
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     for c in list {
         let status = match (c.status, c.started_at, c.exit_code) {
-            (ContainerStatus::Running, Some(t), _) => format!("Up {}", uptime(now.saturating_sub(t))),
+            (ContainerStatus::Running, Some(t), _) => {
+                let up = format!("Up {}", uptime(now.saturating_sub(t)));
+                match c.health {
+                    Some(graviton_proto::HealthStatus::Starting) => format!("{up} (health: starting)"),
+                    Some(graviton_proto::HealthStatus::Healthy) => format!("{up} (healthy)"),
+                    Some(graviton_proto::HealthStatus::Unhealthy) => format!("{up} (unhealthy)"),
+                    None => up,
+                }
+            }
             (ContainerStatus::Exited, _, Some(code)) => format!("Exited ({code})"),
             (s, _, _) => format!("{s:?}"),
         };
@@ -1983,7 +2082,7 @@ fn print_containers<'a>(list: impl Iterator<Item = &'a ContainerSummary>) {
             .collect::<Vec<_>>()
             .join(", ");
         println!(
-            "{:<13} {:<14} {:<26} {:<14} {:>6} {:>9}  {}",
+            "{:<13} {:<14} {:<26} {:<24} {:>6} {:>9}  {}",
             c.id,
             c.name,
             c.image,

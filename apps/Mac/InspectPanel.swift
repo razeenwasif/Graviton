@@ -72,6 +72,37 @@ struct InspectPanel: View {
                             }
                         }
                     }
+                    if d.healthcheck != nil || d.health != nil {
+                        InspectSection("Healthcheck") {
+                            if let h = d.health {
+                                GridRow(alignment: .center) {
+                                    Text("Status").foregroundStyle(G.muted).frame(width: 150, alignment: .leading)
+                                    HStack(spacing: 10) {
+                                        HealthBadge(h.status)
+                                        if h.failingStreak > 0 {
+                                            Text("\(h.failingStreak) consecutive failure\(h.failingStreak == 1 ? "" : "s")")
+                                                .font(G.mono(11)).foregroundStyle(G.muted)
+                                        }
+                                    }
+                                }
+                            }
+                            if let hc = d.healthcheck {
+                                InspectRow("Command", hc.commandDisplay)
+                                InspectRow("Schedule", "every \(hc.intervalSecs)s · timeout \(hc.timeoutSecs)s · retries \(hc.retries)")
+                                if hc.startPeriodSecs > 0 {
+                                    InspectRow("Start period", "\(hc.startPeriodSecs)s")
+                                }
+                            }
+                            if let logs = d.health?.log, !logs.isEmpty {
+                                ForEach(Array(logs.reversed().prefix(3).enumerated()), id: \.offset) { _, entry in
+                                    let out = entry.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    let ts = Date(timeIntervalSince1970: Double(entry.end)).formatted(date: .omitted, time: .standard)
+                                    InspectRow("Exit \(entry.exitCode) · \(ts)", out.isEmpty ? "—" : out)
+                                }
+                            }
+                        }
+                    }
+
                     InspectSection("Lifecycle") {
                         InspectRow("ID", d.container.id)
                         InspectRow("Created", Date(timeIntervalSince1970: Double(d.container.createdAt)).formatted(date: .abbreviated, time: .standard))

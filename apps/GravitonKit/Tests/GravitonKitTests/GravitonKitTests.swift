@@ -972,3 +972,58 @@ import Testing
         #expect(rates[1].sent == 50)
     }
 }
+
+@Suite struct HealthcheckTests {
+    @Test func wireDecodesHealthcheckDetailsAndEvents() throws {
+        let json = #"""
+        {"type":"containers","data":[{"id":"abc123def456","name":"db","image":"postgres:17",
+        "status":"running","exit_code":null,"ports":[],"mounts":[],"ip_address":"192.168.64.2",
+        "cpu_percent":1.5,"memory_bytes":67108864,"memory_limit_bytes":1073741824,
+        "created_at":1700000000,"started_at":1700000005,"health":"healthy"}]}
+        """#
+        guard case let .containers(list) = try Wire.decoder.decode(EngineResponse.self, from: Data(json.utf8)) else {
+            Issue.record("expected containers"); return
+        }
+        #expect(list.first?.health == .healthy)
+
+        let detailsJSON = #"""
+        {"type":"details","data":{"container":{"id":"abc123def456","name":"db","image":"postgres:17",
+        "status":"running","exit_code":null,"ports":[],"mounts":[],"ip_address":"192.168.64.2",
+        "cpu_percent":1.5,"memory_bytes":67108864,"memory_limit_bytes":1073741824,
+        "created_at":1700000000,"started_at":1700000005,"health":"unhealthy"},
+        "image_reference":"docker.io/library/postgres:17","image_digest":"sha256:abc","command":["postgres"],
+        "env":[],"working_dir":"/","user":"postgres","hostname":"db","cpus":2,"memory_mib":1024,
+        "kernel":"Linux 6.12","vm_dir":"/tmp/vm","restart":"no",
+        "healthcheck":{"test":["CMD-SHELL","pg_isready"],"interval_secs":5,"timeout_secs":2,"start_period_secs":10,"retries":3},
+        "health":{"status":"unhealthy","failing_streak":3,"log":[{"start":10,"end":11,"exit_code":1,"output":"refused"}]}}}
+        """#
+        guard case let .details(d) = try Wire.decoder.decode(EngineResponse.self, from: Data(detailsJSON.utf8)) else {
+            Issue.record("expected details"); return
+        }
+        #expect(d.healthcheck?.commandDisplay == "pg_isready")
+        #expect(d.healthcheck?.intervalSecs == 5)
+        #expect(d.health?.status == .unhealthy)
+        #expect(d.health?.failingStreak == 3)
+        #expect(d.health?.log.first?.output == "refused")
+
+        let evJSON = #"""
+        {"type":"events","data":[
+            {"seq":1,"timestamp_ms":1000,"kind":"healthy","container_id":"abc","container":"db","message":"db is healthy"},
+            {"seq":2,"timestamp_ms":2000,"kind":"unhealthy","container_id":"abc","container":"db","message":"db is unhealthy"}
+        ]}
+        """#
+        guard case let .events(evs) = try Wire.decoder.decode(EngineResponse.self, from: Data(evJSON.utf8)) else {
+            Issue.record("expected events"); return
+        }
+        #expect(evs.map(\.kind) == [.healthy, .unhealthy])
+        #expect(evs[0].isProblem == false && evs[1].isProblem == true)
+
+        let spec = RunSpec(
+            image: "alpine:3.22",
+            healthcheck: Healthcheck(test: ["CMD-SHELL", "test -f /tmp/ok"], intervalSecs: 2, timeoutSecs: 1, startPeriodSecs: 0, retries: 2)
+        )
+        let encoded = String(decoding: try Wire.line(.run(spec)), as: UTF8.self)
+        #expect(encoded.contains(#""interval_secs":2"#))
+        #expect(encoded.contains(#""CMD-SHELL""#))
+    }
+}
