@@ -68,7 +68,8 @@ struct InspectPanel: View {
                             InspectRow("Tmpfs", tmpfs.map { $0.options.isEmpty ? $0.target : "\($0.target) (\($0.options))" }.joined(separator: "\n"))
                         }
                     }
-                    if d.readOnly == true || d.usesInit || !(d.capAdd ?? []).isEmpty || !(d.capDrop ?? []).isEmpty {
+                    if d.readOnly == true || d.usesInit || !(d.capAdd ?? []).isEmpty || !(d.capDrop ?? []).isEmpty
+                        || d.shmSizeBytes != nil || !(d.ulimits ?? []).isEmpty {
                         InspectSection("Security & Runtime") {
                             if d.readOnly == true {
                                 InspectRow("Root filesystem", "Read-only")
@@ -81,6 +82,12 @@ struct InspectPanel: View {
                             }
                             if let drop = d.capDrop, !drop.isEmpty {
                                 InspectRow("Dropped capabilities", drop.joined(separator: ", "))
+                            }
+                            if let shm = d.shmSizeBytes {
+                                InspectRow("Shared memory (/dev/shm)", Format.bytes(shm))
+                            }
+                            if let ulimits = d.ulimits, !ulimits.isEmpty {
+                                InspectRow("Ulimits", ulimits.map(\.displayLabel).joined(separator: ", "))
                             }
                         }
                     }

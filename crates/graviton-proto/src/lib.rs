@@ -197,6 +197,105 @@ pub fn parse_tmpfs_options(raw: &str) -> (u64, String) {
     (flags, data.join(","))
 }
 
+/// Default `/dev/shm` tmpfs size (`64 MiB`), matching Docker.
+pub const DEFAULT_SHM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Sentinel value representing `RLIM_INFINITY` in serialized [`UlimitSpec`] values.
+pub const ULIMIT_UNLIMITED: i64 = -1;
+
+/// One POSIX resource limit (`--ulimit name=soft[:hard]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UlimitSpec {
+    pub name: String,
+    pub soft: i64,
+    pub hard: i64,
+}
+
+const VALID_ULIMIT_NAMES: &[&str] = &[
+    "as", "core", "cpu", "data", "fsize", "locks", "memlock", "msgqueue", "nice", "nofile", "nproc", "rss", "rtprio",
+    "rttime", "sigpending", "stack",
+];
+
+/// Parse a human byte size such as `64m`, `128mb`, `1g`, or `67108864`.
+pub fn parse_byte_size(raw: &str) -> Result<u64, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("byte size cannot be empty".into());
+    }
+    let split = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    if split == 0 {
+        return Err(format!("invalid byte size `{raw}`"));
+    }
+    let (num_str, unit_raw) = trimmed.split_at(split);
+    let n: u64 = num_str.parse().map_err(|_| format!("invalid byte size `{raw}`"))?;
+    let unit = unit_raw.trim().to_ascii_lowercase();
+    let mult: u64 = match unit.as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        _ => return Err(format!("unsupported size suffix `{unit_raw}` in `{raw}` (use b, k, m, or g)")),
+    };
+    let bytes = n.checked_mul(mult).ok_or_else(|| format!("byte size `{raw}` overflows"))?;
+    if bytes == 0 {
+        return Err("byte size must be greater than 0".into());
+    }
+    Ok(bytes)
+}
+
+fn parse_ulimit_val(raw: &str) -> Result<i64, String> {
+    let t = raw.trim();
+    if t.eq_ignore_ascii_case("unlimited") {
+        return Ok(ULIMIT_UNLIMITED);
+    }
+    let v: i64 = t.parse().map_err(|_| format!("invalid ulimit value `{raw}`"))?;
+    if v < ULIMIT_UNLIMITED {
+        return Err(format!("ulimit value `{raw}` must be >= -1 or `unlimited`"));
+    }
+    Ok(v)
+}
+
+/// Normalize and validate a [`UlimitSpec`].
+pub fn validate_ulimit(u: &UlimitSpec) -> Result<UlimitSpec, String> {
+    let name = u.name.trim().to_ascii_lowercase();
+    if !VALID_ULIMIT_NAMES.contains(&name.as_str()) {
+        return Err(format!("unsupported ulimit name `{}`", u.name));
+    }
+    if u.soft < ULIMIT_UNLIMITED || u.hard < ULIMIT_UNLIMITED {
+        return Err(format!("ulimit `{name}` values must be >= -1"));
+    }
+    if (u.soft == ULIMIT_UNLIMITED && u.hard != ULIMIT_UNLIMITED)
+        || (u.soft != ULIMIT_UNLIMITED && u.hard != ULIMIT_UNLIMITED && u.soft > u.hard)
+    {
+        return Err(format!("ulimit `{name}` soft limit ({}) exceeds hard limit ({})", u.soft, u.hard));
+    }
+    Ok(UlimitSpec { name, soft: u.soft, hard: u.hard })
+}
+
+/// Parse a CLI `--ulimit name=soft[:hard]` string.
+pub fn parse_ulimit_spec(raw: &str) -> Result<UlimitSpec, String> {
+    let trimmed = raw.trim();
+    let Some((name_raw, val_raw)) = trimmed.split_once('=') else {
+        return Err(format!("invalid ulimit `{raw}`: expected NAME=SOFT[:HARD]"));
+    };
+    let (soft_raw, hard_raw) = match val_raw.split_once(':') {
+        Some((s, h)) => (s, Some(h)),
+        None => (val_raw, None),
+    };
+    let soft = parse_ulimit_val(soft_raw)?;
+    let hard = match hard_raw {
+        Some(h) => parse_ulimit_val(h)?,
+        None => soft,
+    };
+    validate_ulimit(&UlimitSpec {
+        name: name_raw.to_string(),
+        soft,
+        hard,
+    })
+}
+
 /// One container's mount of a named volume.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeMountRef {
@@ -687,6 +786,12 @@ pub struct RunSpec {
     /// Named networks to attach to (empty defaults to `["graviton"]`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub networks: Vec<String>,
+    /// Size of `/dev/shm` tmpfs mount in bytes (`--shm-size`). `None` defaults to `DEFAULT_SHM_SIZE_BYTES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shm_size_bytes: Option<u64>,
+    /// POSIX resource limits applied inside the container (`--ulimit`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ulimits: Vec<UlimitSpec>,
 }
 
 fn is_zero_u16(n: &u16) -> bool {
@@ -1088,6 +1193,12 @@ pub struct ContainerDetails {
     /// Attached networks for this container.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub networks: Vec<String>,
+    /// Size of `/dev/shm` tmpfs mount in bytes (`--shm-size`). `None` defaults to `DEFAULT_SHM_SIZE_BYTES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shm_size_bytes: Option<u64>,
+    /// POSIX resource limits applied inside the container (`--ulimit`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ulimits: Vec<UlimitSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1501,6 +1612,12 @@ pub enum AgentRequest {
         /// Label PID 1 as `docker-init` (`--init`).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         init: bool,
+        /// Custom `/dev/shm` tmpfs size in bytes (`--shm-size`); `None` uses `DEFAULT_SHM_SIZE_BYTES` when initializing the container.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shm_size_bytes: Option<u64>,
+        /// POSIX resource limits (`--ulimit`) applied in the child before privilege/capability drop.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ulimits: Vec<UlimitSpec>,
     },
     Signal { pid: i32, signal: i32 },
     Stdin { pid: i32, data: Vec<u8> },
@@ -1814,6 +1931,8 @@ mod tests {
             tmpfs: vec![],
             init: false,
             networks: vec![],
+            shm_size_bytes: None,
+            ulimits: vec![],
         }));
         assert_eq!(decode_line::<Request>(&encode_line(&compose_run)).unwrap(), compose_run);
         assert_eq!("always".parse::<RestartPolicy>().unwrap(), RestartPolicy::Always);
@@ -1925,6 +2044,8 @@ mod tests {
             cap_add: vec![],
             cap_drop: vec![],
             init: false,
+            shm_size_bytes: None,
+            ulimits: vec![],
         };
         let encoded = encode_line(&exec);
         assert_eq!(decode_line::<AgentRequest>(&encoded).unwrap(), exec);
@@ -2385,5 +2506,69 @@ mod tests {
         ] {
             assert_eq!(decode_line::<Response>(&encode_line(&resp)).unwrap(), resp);
         }
+    }
+
+    #[test]
+    fn shm_size_and_ulimit_parsing_and_round_trip() {
+        assert_eq!(parse_byte_size("64m").unwrap(), 64 * 1024 * 1024);
+        assert_eq!(parse_byte_size("128MB").unwrap(), 128 * 1024 * 1024);
+        assert_eq!(parse_byte_size("2G").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_byte_size("4096").unwrap(), 4096);
+        assert_eq!(parse_byte_size("512kib").unwrap(), 512 * 1024);
+        assert!(parse_byte_size("0m").is_err());
+        assert!(parse_byte_size("").is_err());
+        assert!(parse_byte_size("10tb").is_err());
+
+        assert_eq!(
+            parse_ulimit_spec("NOFILE=1024:4096").unwrap(),
+            UlimitSpec { name: "nofile".into(), soft: 1024, hard: 4096 }
+        );
+        assert_eq!(
+            parse_ulimit_spec("core=unlimited").unwrap(),
+            UlimitSpec { name: "core".into(), soft: ULIMIT_UNLIMITED, hard: ULIMIT_UNLIMITED }
+        );
+        assert_eq!(
+            parse_ulimit_spec("nproc=512:-1").unwrap(),
+            UlimitSpec { name: "nproc".into(), soft: 512, hard: ULIMIT_UNLIMITED }
+        );
+        assert!(parse_ulimit_spec("nofile=4096:1024").is_err());
+        assert!(parse_ulimit_spec("nofile=unlimited:1024").is_err());
+        assert!(parse_ulimit_spec("bogus=10").is_err());
+        assert!(parse_ulimit_spec("nofile").is_err());
+
+        let run = Request::Run(Box::new(RunSpec {
+            image: "alpine:latest".into(),
+            name: None,
+            command: None,
+            env: vec![],
+            cpus: None,
+            memory_mib: None,
+            ports: vec![],
+            volumes: vec![],
+            restart: None,
+            tty: false,
+            rows: 0,
+            cols: 0,
+            auto_remove: false,
+            platform: None,
+            entrypoint: None,
+            working_dir: None,
+            user: None,
+            hostname: None,
+            project: None,
+            service: None,
+            labels: BTreeMap::new(),
+            dns_aliases: vec![],
+            healthcheck: None,
+            read_only: false,
+            cap_add: vec![],
+            cap_drop: vec![],
+            tmpfs: vec![],
+            init: false,
+            networks: vec![],
+            shm_size_bytes: Some(128 * 1024 * 1024),
+            ulimits: vec![UlimitSpec { name: "nofile".into(), soft: 2048, hard: 4096 }],
+        }));
+        assert_eq!(decode_line::<Request>(&encode_line(&run)).unwrap(), run);
     }
 }

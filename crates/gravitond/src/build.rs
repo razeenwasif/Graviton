@@ -172,6 +172,7 @@ pub(crate) struct State {
     pub(crate) volumes: BTreeSet<String>,
     pub(crate) stop_signal: Option<String>,
     pub(crate) healthcheck: Option<graviton_image::HealthcheckConfig>,
+    pub(crate) onbuild: Vec<String>,
     pub(crate) history: Vec<Value>,
     pub(crate) key: String,
     /// The stage's ARGs in scope, with their values.
@@ -490,9 +491,27 @@ fn build_one_platform(
             let mut live = false; // the container holds `state.layers`
             let mut use_cache = !spec.no_cache;
 
-            for ins in &stage.instructions {
-                step += 1;
-                log(format!("Step {step}/{steps} : {}", ins.text));
+            for (ins, is_onbuild) in {
+                let triggers = std::mem::take(&mut state.onbuild);
+                let mut parsed_triggers = Vec::with_capacity(triggers.len());
+                for raw in triggers {
+                    parsed_triggers.push(
+                        Dockerfile::parse_onbuild_trigger(&raw, stage.line)
+                            .with_context(|| format!("invalid ONBUILD trigger `{raw}` inherited from {base}"))?,
+                    );
+                }
+                parsed_triggers
+                    .into_iter()
+                    .map(|ins| (ins, true))
+                    .chain(stage.instructions.iter().cloned().map(|ins| (ins, false)))
+                    .collect::<Vec<_>>()
+            } {
+                if is_onbuild {
+                    log(format!(" ---> [ONBUILD] {}", ins.text));
+                } else {
+                    step += 1;
+                    log(format!("Step {step}/{steps} : {}", ins.text));
+                }
                 let vars = state.vars();
                 let mut prepared_copy: Option<PreparedCopy> = None;
 
@@ -962,6 +981,7 @@ fn base_state(engine: &Engine, base: &str, platform: Option<&str>, log: &mut dyn
         volumes: BTreeSet::new(),
         stop_signal: None,
         healthcheck: None,
+        onbuild: vec![],
         history: vec![],
         key: hash(&["scratch", &target_arch]),
         args: BTreeMap::new(),
@@ -1023,6 +1043,7 @@ pub(crate) fn state_from_base(image: &LocalImage, config: Value) -> Result<State
         volumes: c["Volumes"].as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default(),
         stop_signal: c["StopSignal"].as_str().map(String::from),
         healthcheck,
+        onbuild: strings(&c["OnBuild"]).unwrap_or_default(),
         history: config["history"].as_array().cloned().unwrap_or_default(),
         key: hash(&["image", &image.manifest_digest, &image.architecture]),
         author: config["author"].as_str().map(String::from),
@@ -1090,6 +1111,7 @@ pub(crate) fn apply_config(s: &mut State, kind: &Kind, vars: &BTreeMap<String, S
                 },
             });
         }
+        Kind::OnBuild(trigger) => s.onbuild.push(trigger.clone()),
         Kind::Run { .. } | Kind::Copy { .. } | Kind::Workdir(_) => unreachable!(),
     }
     Ok(())
@@ -1259,6 +1281,8 @@ fn run(
         cap_add: vec![],
         cap_drop: vec![],
         init: false,
+        shm_size_bytes: None,
+        ulimits: vec![],
     }))?;
     let (mut out, mut err) = (LineBuffer::default(), LineBuffer::default());
     loop {
@@ -1324,6 +1348,9 @@ pub(crate) fn write_image_with_creator(engine: &Engine, reference: &str, s: &Sta
     }
     if let Some(hc) = &s.healthcheck {
         rc.insert("Healthcheck".into(), serde_json::to_value(hc)?);
+    }
+    if !s.onbuild.is_empty() {
+        rc.insert("OnBuild".into(), json!(s.onbuild));
     }
     // The newest step's time; with nothing but config changes, the base image's.
     let created = match s.created {
@@ -1510,6 +1537,21 @@ mod tests {
         );
         apply_config(&mut s, &Kind::Healthcheck(None), &v, &BTreeMap::new()).unwrap();
         assert_eq!(s.healthcheck.as_ref().map(|h| h.test.as_slice()), Some(&["NONE".to_string()][..]));
+        apply_config(&mut s, &Kind::OnBuild("ENV ONBUILD_X=1".into()), &v, &BTreeMap::new()).unwrap();
+        assert_eq!(s.onbuild, vec!["ENV ONBUILD_X=1"]);
+
+        let base_img = LocalImage {
+            reference: "example/base:1".into(),
+            manifest_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
+            config_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
+            layers: vec![],
+            architecture: "arm64".into(),
+            pulled_at: 0,
+            variants: vec![],
+        };
+        let cfg_json = json!({"config": {"OnBuild": ["COPY a b", "RUN echo ok"]}, "rootfs": {"diff_ids": []}});
+        let loaded = state_from_base(&base_img, cfg_json).unwrap();
+        assert_eq!(loaded.onbuild, vec!["COPY a b", "RUN echo ok"]);
     }
 
     #[test]
@@ -1538,6 +1580,7 @@ mod tests {
             volumes: BTreeSet::new(),
             stop_signal: None,
             healthcheck: None,
+            onbuild: vec![],
             history: vec![],
             key: String::new(),
             args: BTreeMap::new(),

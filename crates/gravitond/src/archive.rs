@@ -1042,6 +1042,7 @@ mod tests {
             volumes: Default::default(),
             stop_signal: None,
             healthcheck: None,
+            onbuild: vec![],
             history: vec![],
             key: String::new(),
             args: Default::default(),

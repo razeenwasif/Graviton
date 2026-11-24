@@ -386,7 +386,8 @@ struct MobileInspectView: View {
                             }
                         }
                     }
-                    if d.readOnly == true || d.usesInit || !(d.capAdd ?? []).isEmpty || !(d.capDrop ?? []).isEmpty {
+                    if d.readOnly == true || d.usesInit || !(d.capAdd ?? []).isEmpty || !(d.capDrop ?? []).isEmpty
+                        || d.shmSizeBytes != nil || !(d.ulimits ?? []).isEmpty {
                         section("Security & Runtime") {
                             if d.readOnly == true {
                                 row("Root filesystem", "Read-only")
@@ -399,6 +400,12 @@ struct MobileInspectView: View {
                             }
                             if let drop = d.capDrop, !drop.isEmpty {
                                 row("Dropped capabilities", drop.joined(separator: ", "))
+                            }
+                            if let shm = d.shmSizeBytes {
+                                row("Shared memory (/dev/shm)", Format.bytes(shm))
+                            }
+                            if let ulimits = d.ulimits, !ulimits.isEmpty {
+                                row("Ulimits", ulimits.map(\.displayLabel).joined(separator: ", "))
                             }
                         }
                     }

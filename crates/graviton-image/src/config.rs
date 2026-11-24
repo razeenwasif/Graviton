@@ -34,6 +34,8 @@ pub struct RuntimeConfig {
     pub exposed_ports: Option<BTreeMap<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<HealthcheckConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_build: Option<Vec<String>>,
 }
 
 /// OCI `config.Healthcheck` specification (durations in nanoseconds).
@@ -130,5 +132,9 @@ mod tests {
         assert_eq!((hc.interval, hc.timeout, hc.start_period, hc.retries), (10_000_000_000, 2_000_000_000, 5_000_000_000, 3));
         let partial_hc: ImageConfig = serde_json::from_str(r#"{"config":{"Healthcheck":{"Test":["NONE"]}}}"#).unwrap();
         assert_eq!(partial_hc.config.healthcheck.unwrap().test, vec!["NONE"]);
+
+        let with_onbuild: ImageConfig =
+            serde_json::from_str(r#"{"config":{"OnBuild":["COPY . /app","RUN make"]}}"#).unwrap();
+        assert_eq!(with_onbuild.config.on_build, Some(vec!["COPY . /app".into(), "RUN make".into()]));
     }
 }

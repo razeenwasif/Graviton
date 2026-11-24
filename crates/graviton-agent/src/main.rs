@@ -174,6 +174,8 @@ pub(crate) mod linux {
                     cap_add,
                     cap_drop,
                     init,
+                    shm_size_bytes,
+                    ulimits,
                 }) => {
                     let has_term = env.iter().any(|e| e.starts_with("TERM="));
                     let program = argv.first().cloned().unwrap_or_default();
@@ -215,6 +217,8 @@ pub(crate) mod linux {
                             read_only,
                             cap_mask,
                             init,
+                            shm_size_bytes,
+                            &ulimits,
                         ) {
                             Ok(launch) if tty => {
                                 drop(cleanup);

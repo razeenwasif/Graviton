@@ -1566,4 +1566,28 @@ import Testing
         #expect(removed == "qa-net")
         #expect(await demo.networks().contains { $0.name == "qa-net" } == false)
     }
+
+    @Test func shmSizeAndUlimitWireRoundTrip() throws {
+        let plainLine = String(decoding: try Wire.line(.run(RunSpec(image: "alpine:latest"))), as: UTF8.self)
+        #expect(!plainLine.contains("shm_size_bytes") && !plainLine.contains("ulimits"))
+
+        let spec = RunSpec(
+            image: "alpine:latest",
+            shmSizeBytes: 134_217_728,
+            ulimits: [
+                UlimitSpec(name: "nofile", soft: 2048, hard: 4096),
+                UlimitSpec(name: "core", soft: -1, hard: -1),
+            ]
+        )
+        let encoded = String(decoding: try Wire.line(.run(spec)), as: UTF8.self)
+        #expect(encoded.contains(#""shm_size_bytes":134217728"#))
+        #expect(encoded.contains(#""hard":4096,"name":"nofile","soft":2048"#))
+        #expect(UlimitSpec(name: "nofile", soft: 2048, hard: 4096).displayLabel == "nofile=2048:4096")
+        #expect(UlimitSpec(name: "core", soft: -1, hard: -1).displayLabel == "core=unlimited")
+
+        let detailsJson = #"{"container":{"id":"c1","name":"web","image":"alpine","status":"running","ports":[],"mounts":[],"created_at":1700000000},"image_reference":"alpine:latest","image_digest":"sha256:aaa","command":["sh"],"env":[],"working_dir":"/","hostname":"web","cpus":2,"memory_mib":1024,"kernel":"Linux","vm_dir":"/tmp/vm","shm_size_bytes":134217728,"ulimits":[{"name":"nofile","soft":2048,"hard":4096}]}"#
+        let details = try Wire.decoder.decode(ContainerDetails.self, from: Data(detailsJson.utf8))
+        #expect(details.shmSizeBytes == 134_217_728)
+        #expect(details.ulimits == [UlimitSpec(name: "nofile", soft: 2048, hard: 4096)])
+    }
 }

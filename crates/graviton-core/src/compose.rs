@@ -19,7 +19,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use graviton_proto::{Healthcheck, RestartPolicy, TmpfsMount, caps, parse_duration_secs, parse_tmpfs_spec};
+use graviton_proto::{
+    Healthcheck, RestartPolicy, TmpfsMount, UlimitSpec, caps, parse_byte_size, parse_duration_secs, parse_tmpfs_spec,
+    validate_ulimit,
+};
 use serde::Serialize;
 use thiserror::Error;
 use yaml_rust2::{Yaml, YamlLoader, yaml::Hash as YamlHash};
@@ -123,6 +126,8 @@ pub struct ComposeService {
     pub cap_drop: Vec<String>,
     pub tmpfs: Vec<TmpfsMount>,
     pub init: bool,
+    pub shm_size_bytes: Option<u64>,
+    pub ulimits: Vec<UlimitSpec>,
 }
 
 /// Options for loading a Compose project from disk.
@@ -847,6 +852,8 @@ fn parse_service(
     let cap_add = parse_caps_field(name, h, "cap_add")?;
     let cap_drop = parse_caps_field(name, h, "cap_drop")?;
     let tmpfs = parse_tmpfs_field(name, h)?;
+    let shm_size_bytes = parse_shm_size_field(name, h)?;
+    let ulimits = parse_ulimits_field(name, h)?;
 
     Ok(ComposeService {
         name: name.to_string(),
@@ -876,7 +883,84 @@ fn parse_service(
         cap_drop,
         tmpfs,
         init,
+        shm_size_bytes,
+        ulimits,
     })
+}
+
+fn parse_shm_size_field(service: &str, h: &YamlHash) -> Result<Option<u64>> {
+    match yaml_get(h, "shm_size") {
+        None | Some(Yaml::Null) => Ok(None),
+        Some(Yaml::Integer(i)) => {
+            if *i <= 0 {
+                return Err(ComposeError::Spec(format!("service `{service}`: `shm_size` must be greater than 0")));
+            }
+            Ok(Some(*i as u64))
+        }
+        Some(v) => {
+            let raw = yaml_scalar_to_string(v).ok_or_else(|| {
+                ComposeError::Spec(format!("service `{service}`: `shm_size` must be a size string or integer"))
+            })?;
+            parse_byte_size(&raw)
+                .map(Some)
+                .map_err(|e| ComposeError::Spec(format!("service `{service}`: invalid `shm_size`: {e}")))
+        }
+    }
+}
+
+fn parse_compose_ulimit_scalar(service: &str, ulim_name: &str, v: &Yaml) -> Result<i64> {
+    match v {
+        Yaml::Integer(i) => Ok(*i),
+        _ => {
+            let raw = yaml_scalar_to_string(v).ok_or_else(|| {
+                ComposeError::Spec(format!("service `{service}`: invalid ulimit value for `{ulim_name}`"))
+            })?;
+            let t = raw.trim();
+            if t.eq_ignore_ascii_case("unlimited") {
+                return Ok(graviton_proto::ULIMIT_UNLIMITED);
+            }
+            t.parse::<i64>().map_err(|_| {
+                ComposeError::Spec(format!("service `{service}`: invalid ulimit `{raw}` for `{ulim_name}`"))
+            })
+        }
+    }
+}
+
+fn parse_ulimits_field(service: &str, h: &YamlHash) -> Result<Vec<UlimitSpec>> {
+    let Some(val) = yaml_get(h, "ulimits").filter(|y| !matches!(y, Yaml::Null)) else {
+        return Ok(Vec::new());
+    };
+    let Yaml::Hash(map) = val else {
+        return Err(ComposeError::Spec(format!("service `{service}`: `ulimits` must be a mapping")));
+    };
+    let mut out = Vec::with_capacity(map.len());
+    for (k, v) in map {
+        let Some(name_raw) = k.as_str() else {
+            return Err(ComposeError::Spec(format!("service `{service}`: `ulimits` keys must be strings")));
+        };
+        let (soft, hard) = if let Some(sub) = v.as_hash() {
+            let Some(sv) = yaml_get(sub, "soft") else {
+                return Err(ComposeError::Spec(format!("service `{service}`: ulimit `{name_raw}` missing `soft`")));
+            };
+            let soft = parse_compose_ulimit_scalar(service, name_raw, sv)?;
+            let hard = match yaml_get(sub, "hard").filter(|y| !matches!(y, Yaml::Null)) {
+                Some(hv) => parse_compose_ulimit_scalar(service, name_raw, hv)?,
+                None => soft,
+            };
+            (soft, hard)
+        } else {
+            let val = parse_compose_ulimit_scalar(service, name_raw, v)?;
+            (val, val)
+        };
+        let spec = validate_ulimit(&UlimitSpec {
+            name: name_raw.to_string(),
+            soft,
+            hard,
+        })
+        .map_err(|e| ComposeError::Spec(format!("service `{service}`: invalid `ulimits`: {e}")))?;
+        out.push(spec);
+    }
+    Ok(out)
 }
 
 fn parse_bool_field(service: &str, h: &YamlHash, field: &str) -> Result<bool> {
@@ -1795,6 +1879,12 @@ services:
     cap_drop: [all]
     cap_add: [cap_net_bind_service]
     tmpfs: /run
+    shm_size: 128m
+    ulimits:
+      nofile:
+        soft: 2048
+        hard: 4096
+      core: unlimited
   multi:
     image: alpine:3.22
     tmpfs:
@@ -1810,6 +1900,13 @@ services:
         assert_eq!(s.cap_drop, vec!["ALL"]);
         assert_eq!(s.cap_add, vec!["NET_BIND_SERVICE"]);
         assert_eq!(s.tmpfs, vec![TmpfsMount { target: "/run".into(), options: String::new() }]);
+        assert_eq!(s.shm_size_bytes, Some(128 * 1024 * 1024));
+        assert!(s.ulimits.contains(&UlimitSpec { name: "nofile".into(), soft: 2048, hard: 4096 }));
+        assert!(s.ulimits.contains(&UlimitSpec {
+            name: "core".into(),
+            soft: graviton_proto::ULIMIT_UNLIMITED,
+            hard: graviton_proto::ULIMIT_UNLIMITED,
+        }));
 
         let m = &proj.services["multi"];
         assert!(!m.read_only);

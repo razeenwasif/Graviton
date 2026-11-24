@@ -38,6 +38,8 @@ pub enum LaunchMode {
         mounts: Vec<MountSpec>,
         read_only: bool,
         init: bool,
+        #[serde(default)]
+        shm_size_bytes: Option<u64>,
     },
     Enter {
         init_pid: i32,
@@ -55,6 +57,8 @@ pub struct LaunchSpec {
     pub gid: u32,
     pub tty: bool,
     pub cap_mask: u64,
+    #[serde(default)]
+    pub ulimits: Vec<graviton_proto::UlimitSpec>,
     pub status_fd: i32,
 }
 
@@ -164,6 +168,7 @@ mod imp {
             gid: u32,
             tty: bool,
             cap_mask: u64,
+            ulimits: &[graviton_proto::UlimitSpec],
             register: bool,
         ) -> io::Result<Self> {
             let mut pipe_fds = [-1i32; 2];
@@ -186,6 +191,7 @@ mod imp {
                 gid,
                 tty,
                 cap_mask,
+                ulimits: ulimits.to_vec(),
                 status_fd: status_w_fd,
             };
             let json = serde_json::to_vec(&spec).map_err(io::Error::other)?;
@@ -288,8 +294,8 @@ mod imp {
         let _ = set_cloexec(spec.status_fd);
 
         match &spec.mode {
-            LaunchMode::Init { root, dev_dst, hostname, mounts, read_only, init } => {
-                run_init(&spec, root, dev_dst, hostname, mounts, *read_only, *init)
+            LaunchMode::Init { root, dev_dst, hostname, mounts, read_only, init, shm_size_bytes } => {
+                run_init(&spec, root, dev_dst, hostname, mounts, *read_only, *init, *shm_size_bytes)
             }
             LaunchMode::Enter { init_pid } => run_enter(&spec, *init_pid),
         }
@@ -459,6 +465,47 @@ mod imp {
         Ok(())
     }
 
+    fn apply_ulimits(ulimits: &[graviton_proto::UlimitSpec]) -> Result<(), String> {
+        for u in ulimits {
+            let norm = graviton_proto::validate_ulimit(u)?;
+            let resource: libc::c_int = match norm.name.as_str() {
+                "as" => libc::RLIMIT_AS as _,
+                "core" => libc::RLIMIT_CORE as _,
+                "cpu" => libc::RLIMIT_CPU as _,
+                "data" => libc::RLIMIT_DATA as _,
+                "fsize" => libc::RLIMIT_FSIZE as _,
+                "locks" => libc::RLIMIT_LOCKS as _,
+                "memlock" => libc::RLIMIT_MEMLOCK as _,
+                "msgqueue" => libc::RLIMIT_MSGQUEUE as _,
+                "nice" => libc::RLIMIT_NICE as _,
+                "nofile" => libc::RLIMIT_NOFILE as _,
+                "nproc" => libc::RLIMIT_NPROC as _,
+                "rss" => libc::RLIMIT_RSS as _,
+                "rtprio" => libc::RLIMIT_RTPRIO as _,
+                "rttime" => libc::RLIMIT_RTTIME as _,
+                "sigpending" => libc::RLIMIT_SIGPENDING as _,
+                "stack" => libc::RLIMIT_STACK as _,
+                other => return Err(format!("unsupported ulimit `{other}`")),
+            };
+            let to_rlim = |val: i64| -> libc::rlim_t {
+                if val == graviton_proto::ULIMIT_UNLIMITED {
+                    libc::RLIM_INFINITY
+                } else {
+                    val as libc::rlim_t
+                }
+            };
+            let rlim = libc::rlimit {
+                rlim_cur: to_rlim(norm.soft),
+                rlim_max: to_rlim(norm.hard),
+            };
+            // SAFETY: setting resource limits on the forked child before dropping capabilities/UID.
+            if unsafe { libc::setrlimit(resource as _, &raw const rlim) } != 0 {
+                return Err(format!("setrlimit({}): {}", norm.name, io::Error::last_os_error()));
+            }
+        }
+        Ok(())
+    }
+
     fn exec_child(spec: &LaunchSpec, err_w: i32) -> ! {
         let fail = |msg: &str| -> ! {
             write_all_fd(err_w, msg.as_bytes());
@@ -492,6 +539,9 @@ mod imp {
             Err(_) => fail("invalid working directory"),
         };
 
+        if let Err(msg) = apply_ulimits(&spec.ulimits) {
+            fail(&msg);
+        }
         if let Err(msg) = apply_capabilities_and_identity(spec.cap_mask, spec.uid, spec.gid) {
             fail(&msg);
         }
@@ -604,7 +654,17 @@ mod imp {
         Ok(())
     }
 
-    fn run_init(spec: &LaunchSpec, root: &str, dev_dst: &str, hostname: &str, mounts: &[MountSpec], read_only: bool, init: bool) -> ! {
+    #[allow(clippy::too_many_arguments)]
+    fn run_init(
+        spec: &LaunchSpec,
+        root: &str,
+        dev_dst: &str,
+        hostname: &str,
+        mounts: &[MountSpec],
+        read_only: bool,
+        init: bool,
+        shm_size_bytes: Option<u64>,
+    ) -> ! {
         let check = |rc: libc::c_int, what: &str| -> Result<(), String> {
             if rc == 0 { Ok(()) } else { Err(format!("{what}: {}", io::Error::last_os_error())) }
         };
@@ -706,6 +766,23 @@ mod imp {
                     libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
                     std::ptr::null(),
                 );
+                // Mount private /dev/shm inside the container's chroot + mount namespace before read-only rootfs remount.
+                let _ = fs::create_dir_all("/dev/shm");
+                let shm_bytes = shm_size_bytes.unwrap_or(graviton_proto::DEFAULT_SHM_SIZE_BYTES);
+                if let Ok(shm_opts) = CString::new(format!("mode=1777,size={shm_bytes}")) {
+                    if libc::mount(
+                        c"tmpfs".as_ptr(),
+                        c"/dev/shm".as_ptr(),
+                        c"tmpfs".as_ptr(),
+                        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                        shm_opts.as_ptr().cast(),
+                    ) != 0
+                    {
+                        let msg = format!("mount /dev/shm: {}", io::Error::last_os_error());
+                        write_all_fd(err_w, msg.as_bytes());
+                        libc::_exit(126);
+                    }
+                }
                 if read_only {
                     if let Err(msg) = remount_root_readonly() {
                         write_all_fd(err_w, msg.as_bytes());
@@ -863,6 +940,7 @@ mod tests {
             gid: 1000,
             tty: false,
             cap_mask: graviton_proto::caps::DEFAULT_CAP_MASK,
+            ulimits: vec![],
             status_fd: 5,
         };
         let encoded = serde_json::to_vec(&spec).unwrap();

@@ -157,6 +157,8 @@ fn talk_to_agent(vm: &dyn VmHandle, command: Vec<String>, t0: Instant) -> Result
         cap_add: vec![],
         cap_drop: vec![],
         init: false,
+        shm_size_bytes: None,
+        ulimits: vec![],
     }))?;
     let code = loop {
         match next_event(&mut reader)? {

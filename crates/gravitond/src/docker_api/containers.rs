@@ -9,9 +9,8 @@ use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use graviton_proto::{
     AgentEvent, AgentRequest, ContainerStatus, ContainerSummary, ExecSpec, FileKind, HealthStatus, Healthcheck, LogLevel,
-    LogStream, PruneSpec, RestartPolicy, RunSpec, TmpfsMount, decode_line, encode_line,
-    frame::{Decoder, Frame},
-    parse_tmpfs_spec,
+    LogStream, PruneSpec, RestartPolicy, RunSpec, TmpfsMount, UlimitSpec, decode_line, encode_line, frame::{Decoder, Frame},
+    parse_tmpfs_spec, validate_ulimit,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -450,6 +449,23 @@ pub async fn create_container(
     let auto_remove = hc["AutoRemove"].as_bool().unwrap_or(false);
     let read_only = hc["ReadonlyRootfs"].as_bool().unwrap_or(false);
     let init = hc["Init"].as_bool().unwrap_or(false);
+    let shm_size_bytes = match hc.get("ShmSize") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            if v.as_i64().is_some_and(|n| n < 0) {
+                write_error(write, 400, "HostConfig.ShmSize cannot be negative", head.close_after).await?;
+                return Ok(RouteOutcome::Continue);
+            }
+            v.as_u64().filter(|&n| n > 0)
+        }
+    };
+    let ulimits = match normalize_docker_ulimits(&hc["Ulimits"]) {
+        Ok(u) => u,
+        Err(msg) => {
+            write_error(write, 400, &msg, head.close_after).await?;
+            return Ok(RouteOutcome::Continue);
+        }
+    };
     let cap_add: Vec<String> = hc["CapAdd"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
@@ -588,6 +604,8 @@ pub async fn create_container(
         tmpfs,
         init,
         networks: networks.clone(),
+        shm_size_bytes,
+        ulimits,
     };
 
     let res = tokio::task::spawn_blocking(move || engine.create_container_local(spec)).await?;
@@ -687,6 +705,31 @@ pub(crate) fn normalize_docker_tmpfs_mount(m: &Value) -> std::result::Result<Opt
     }
     let raw = if opts.is_empty() { target.to_string() } else { format!("{target}:{}", opts.join(",")) };
     parse_tmpfs_spec(&raw).map(Some)
+}
+
+pub(crate) fn normalize_docker_ulimits(v: &Value) -> std::result::Result<Vec<UlimitSpec>, String> {
+    if v.is_null() {
+        return Ok(Vec::new());
+    }
+    let Some(arr) = v.as_array() else {
+        return Err("HostConfig.Ulimits must be an array".into());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let Some(name) = entry["Name"].as_str() else {
+            return Err("HostConfig.Ulimits entry missing string `Name`".into());
+        };
+        let Some(soft) = entry["Soft"].as_i64() else {
+            return Err(format!("HostConfig.Ulimits[{name}] missing integer `Soft`"));
+        };
+        let hard = entry["Hard"].as_i64().unwrap_or(soft);
+        out.push(validate_ulimit(&UlimitSpec {
+            name: name.to_string(),
+            soft,
+            hard,
+        })?);
+    }
+    Ok(out)
 }
 
 fn parse_port_bindings(v: &Value) -> Vec<String> {
@@ -900,6 +943,12 @@ pub async fn inspect_container(
             "CapAdd": if details.cap_add.is_empty() { Value::Null } else { json!(details.cap_add) },
             "CapDrop": if details.cap_drop.is_empty() { Value::Null } else { json!(details.cap_drop) },
             "Tmpfs": Value::Object(tmpfs_map),
+            "ShmSize": details.shm_size_bytes.unwrap_or(graviton_proto::DEFAULT_SHM_SIZE_BYTES),
+            "Ulimits": if details.ulimits.is_empty() {
+                Value::Null
+            } else {
+                json!(details.ulimits.iter().map(|u| json!({"Name": u.name, "Soft": u.soft, "Hard": u.hard})).collect::<Vec<_>>())
+            },
         },
         "Config": {
             "Hostname": details.hostname,

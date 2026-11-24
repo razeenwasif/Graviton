@@ -723,6 +723,8 @@ fn service_to_run_spec(proj: &ComposeProject, svc: &ComposeService) -> RunSpec {
         tmpfs: svc.tmpfs.clone(),
         init: svc.init,
         networks: svc.networks.clone(),
+        shm_size_bytes: svc.shm_size_bytes,
+        ulimits: svc.ulimits.clone(),
     }
 }
 

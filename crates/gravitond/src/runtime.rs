@@ -36,8 +36,8 @@ use graviton_proto::{
     ContainerSummary, DEFAULT_NETWORK_NAME, DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats,
     HealthLog, HealthState, HealthStatus, Healthcheck, HostEntry, ImageSummary, LogLevel, LogLine, LogStream, Mount,
     NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy,
-    RunSpec, SnapshotInfo, StatSample, TmpfsMount, UserNetwork, VolumeMountRef, VolumeSummary, caps, decode_line,
-    encode_line, parse_tmpfs_spec,
+    RunSpec, SnapshotInfo, StatSample, TmpfsMount, UlimitSpec, UserNetwork, VolumeMountRef, VolumeSummary, caps,
+    decode_line, encode_line, parse_tmpfs_spec, validate_ulimit,
 };
 use graviton_vmm::apple::{AppleHypervisor, AppleVm};
 use graviton_vmm::{NetworkMode, SharedDirectory, VmConfig, VmHandle};
@@ -120,6 +120,10 @@ pub(crate) struct ContainerSpec {
     pub(crate) init: bool,
     #[serde(default)]
     pub(crate) networks: Vec<String>,
+    #[serde(default)]
+    pub(crate) shm_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub(crate) ulimits: Vec<UlimitSpec>,
 }
 
 /// Interactive `grav run -it` handle returned to the control connection.
@@ -777,6 +781,14 @@ impl Engine {
                 parse_tmpfs_spec(&combined).map_err(|e| anyhow!(e))
             })
             .collect::<Result<Vec<_>>>()?;
+        if spec.shm_size_bytes == Some(0) {
+            bail!("--shm-size must be greater than 0");
+        }
+        let ulimits = spec
+            .ulimits
+            .iter()
+            .map(|u| validate_ulimit(u).map_err(|e| anyhow!(e)))
+            .collect::<Result<Vec<_>>>()?;
         if let Some(name) = &spec.name {
             if self.store.lock().unwrap().name_taken(name) {
                 bail!("the name {name} is already in use");
@@ -847,6 +859,8 @@ impl Engine {
             tmpfs,
             init: spec.init,
             networks,
+            shm_size_bytes: spec.shm_size_bytes,
+            ulimits,
         };
 
         let id = new_id();
@@ -1570,6 +1584,8 @@ impl Engine {
                 cap_add: spec.cap_add.clone(),
                 cap_drop: spec.cap_drop.clone(),
                 init: spec.init,
+                shm_size_bytes: spec.shm_size_bytes,
+                ulimits: spec.ulimits.clone(),
             }))?;
             let pid = match read_event_unbuffered(&mut tty_conn)? {
                 AgentEvent::Started { pid } => pid,
@@ -1613,6 +1629,8 @@ impl Engine {
             cap_add: spec.cap_add.clone(),
             cap_drop: spec.cap_drop.clone(),
             init: spec.init,
+            shm_size_bytes: spec.shm_size_bytes,
+            ulimits: spec.ulimits.clone(),
         })?;
 
         let mut out = LineBuffer::default();
@@ -2254,6 +2272,8 @@ impl Engine {
             tmpfs: spec.tmpfs,
             init: spec.init,
             networks: spec.networks,
+            shm_size_bytes: spec.shm_size_bytes,
+            ulimits: spec.ulimits,
             container,
         })
     }
@@ -2696,6 +2716,8 @@ impl Engine {
             cap_add: cs.cap_add,
             cap_drop: cs.cap_drop,
             init: false,
+            shm_size_bytes: None,
+            ulimits: cs.ulimits,
         }))?;
         match read_event_unbuffered(&mut conn)? {
             AgentEvent::Started { pid } => Ok((pid, conn)),
@@ -3376,6 +3398,8 @@ fn exec_probe_on_vm(
         cap_add: cs.cap_add.clone(),
         cap_drop: cs.cap_drop.clone(),
         init: false,
+        shm_size_bytes: None,
+        ulimits: cs.ulimits.clone(),
     }))?;
     match read_event_unbuffered(&mut conn)? {
         AgentEvent::Started { pid } => Ok((pid, conn)),
@@ -3771,6 +3795,8 @@ mod tests {
             tmpfs: vec![],
             init: false,
             networks: vec![DEFAULT_NETWORK_NAME.into()],
+            shm_size_bytes: None,
+            ulimits: vec![],
         });
 
         engine.connect_network("frontend", "web").unwrap();

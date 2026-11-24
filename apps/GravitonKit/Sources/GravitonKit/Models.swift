@@ -316,6 +316,10 @@ public struct RunSpec: Codable, Hashable, Sendable {
     public var `init`: Bool? = nil
     /// Named networks to attach to (empty/nil defaults to `["graviton"]`).
     public var networks: [String]? = nil
+    /// Size of `/dev/shm` tmpfs mount in bytes (`--shm-size`).
+    public var shmSizeBytes: UInt64? = nil
+    /// POSIX resource limits (`--ulimit`).
+    public var ulimits: [UlimitSpec]? = nil
 
     public init(image: String, name: String? = nil, command: [String]? = nil, env: [String] = [], cpus: UInt32? = nil,
                 memoryMib: UInt64? = nil, ports: [String] = [], volumes: [String] = [], restart: RestartPolicy? = nil,
@@ -323,7 +327,8 @@ public struct RunSpec: Codable, Hashable, Sendable {
                 hostname: String? = nil, project: String? = nil, service: String? = nil, labels: [String: String]? = nil,
                 dnsAliases: [String]? = nil, healthcheck: Healthcheck? = nil,
                 readOnly: Bool? = nil, capAdd: [String]? = nil, capDrop: [String]? = nil,
-                tmpfs: [TmpfsMount]? = nil, initProcess: Bool? = nil, networks: [String]? = nil) {
+                tmpfs: [TmpfsMount]? = nil, initProcess: Bool? = nil, networks: [String]? = nil,
+                shmSizeBytes: UInt64? = nil, ulimits: [UlimitSpec]? = nil) {
         self.image = image
         self.name = name
         self.command = command
@@ -349,6 +354,8 @@ public struct RunSpec: Codable, Hashable, Sendable {
         self.tmpfs = tmpfs
         self.`init` = initProcess
         self.networks = networks
+        self.shmSizeBytes = shmSizeBytes
+        self.ulimits = ulimits
     }
 
     /// Split a list typed as "8080:80, 5432" or one per line.
@@ -557,6 +564,27 @@ public struct TmpfsMount: Codable, Hashable, Sendable {
     }
 }
 
+/// One POSIX resource limit (`UlimitSpec` in `graviton-proto`).
+public struct UlimitSpec: Codable, Hashable, Sendable {
+    public var name: String
+    public var soft: Int64
+    public var hard: Int64
+
+    public init(name: String, soft: Int64, hard: Int64? = nil) {
+        self.name = name
+        self.soft = soft
+        self.hard = hard ?? soft
+    }
+
+    public var displayLabel: String {
+        let fmt: (Int64) -> String = { $0 == -1 ? "unlimited" : "\($0)" }
+        if soft == hard {
+            return "\(name)=\(fmt(soft))"
+        }
+        return "\(name)=\(fmt(soft)):\(fmt(hard))"
+    }
+}
+
 /// How a container is configured (`ContainerDetails` in `graviton-proto`).
 public struct ContainerDetails: Codable, Hashable, Sendable {
     public var container: Container
@@ -585,6 +613,8 @@ public struct ContainerDetails: Codable, Hashable, Sendable {
     public var tmpfs: [TmpfsMount]? = nil
     public var `init`: Bool? = nil
     public var networks: [String]? = nil
+    public var shmSizeBytes: UInt64? = nil
+    public var ulimits: [UlimitSpec]? = nil
 
     public var usesInit: Bool { self.`init` ?? false }
     public var attachedNetworks: [String] { (networks?.isEmpty == false) ? networks! : ["graviton"] }

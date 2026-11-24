@@ -465,6 +465,8 @@ pub fn prepare_launch(
     read_only: bool,
     cap_mask: u64,
     init: bool,
+    shm_size_bytes: Option<u64>,
+    ulimits: &[graviton_proto::UlimitSpec],
 ) -> io::Result<crate::ns::PreparedLaunch> {
     let root = rootfs(id)?;
     if !root.join("proc").is_dir() {
@@ -504,6 +506,7 @@ pub fn prepare_launch(
                 mounts: Vec::new(),
                 read_only,
                 init,
+                shm_size_bytes,
             };
             (mode, true)
         }
@@ -524,10 +527,11 @@ pub fn prepare_launch(
             mounts: mount_specs,
             read_only,
             init,
+            shm_size_bytes,
         };
         (mode, false)
     };
 
     let workdir = if cwd.is_empty() { "/" } else { cwd };
-    crate::ns::PreparedLaunch::build(id, mode, argv, &merged_env, workdir, uid, gid, tty, cap_mask, register)
+    crate::ns::PreparedLaunch::build(id, mode, argv, &merged_env, workdir, uid, gid, tty, cap_mask, ulimits, register)
 }

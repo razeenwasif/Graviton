@@ -5,7 +5,7 @@
 //! ENTRYPOINT and SHELL in shell or JSON form, COPY and ADD (local files,
 //! `ADD <http(s)://url>`, heredocs, `--from`, `--chown`, `--chmod`,
 //! `--checksum`), ENV, ARG, WORKDIR, USER, EXPOSE, LABEL, VOLUME, STOPSIGNAL,
-//! and line continuations.
+//! HEALTHCHECK, ONBUILD, and line continuations.
 
 use std::collections::BTreeMap;
 
@@ -84,6 +84,7 @@ pub enum Kind {
     Volume(Vec<String>),
     StopSignal(String),
     Healthcheck(Option<graviton_proto::Healthcheck>),
+    OnBuild(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,117 +155,25 @@ impl Dockerfile {
                 df.stages.push(Stage { line, base, name, instructions: vec![] });
                 continue;
             }
-            let kind = match instr.as_str() {
-                "RUN" => {
-                    let mut rest = rest;
-                    let mut mounts = Vec::new();
-                    while let Some(flag) = rest.strip_prefix("--") {
-                        let (f, after) = flag.split_once(char::is_whitespace).unwrap_or((flag, ""));
-                        if let Some(spec) = f.strip_prefix("mount=") {
-                            mounts.push(parse_run_mount(spec).map_err(err)?);
-                        } else if !f.starts_with("network=") && !f.starts_with("security=") {
-                            return Err(err(format!("RUN --{f} isn't supported")));
-                        }
-                        rest = after.trim_start();
-                    }
-                    let (cmd, stdin) = build_run_command(rest, &heredocs);
-                    Kind::Run { command: cmd, mounts, stdin }
-                }
-                "CMD" => Kind::Cmd(command(rest)),
-                "ENTRYPOINT" => Kind::Entrypoint(command(rest)),
-                "SHELL" => match json_array(rest) {
-                    Some(v) if !v.is_empty() => Kind::Shell(v),
-                    _ => return Err(err("SHELL needs JSON form, e.g. [\"/bin/bash\", \"-c\"]".into())),
-                },
-                "COPY" | "ADD" => {
-                    let add = instr == "ADD";
-                    let mut from = None;
-                    let mut chown = None;
-                    let mut chmod = None;
-                    let mut checksum = None;
-                    let mut rest = rest;
-                    while rest.starts_with("--") {
-                        let (flag, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-                        if let Some(v) = flag.strip_prefix("--from=") {
-                            from = Some(unquote(v));
-                        } else if let Some(v) = flag.strip_prefix("--chown=") {
-                            chown = Some(unquote(v));
-                        } else if let Some(v) = flag.strip_prefix("--chmod=") {
-                            let val = unquote(v);
-                            if !val.contains('$') {
-                                parse_octal_mode(&val).map_err(err)?;
-                            }
-                            chmod = Some(val);
-                        } else if add && flag.starts_with("--checksum=") {
-                            checksum = Some(unquote(flag.strip_prefix("--checksum=").unwrap()));
-                        } else if flag != "--link" && !flag.starts_with("--link=") && flag != "--keep-git-dir" && !flag.starts_with("--keep-git-dir=") {
-                            return Err(err(format!("{instr} {flag} isn't supported")));
-                        }
-                        rest = after.trim_start();
-                    }
-                    let mut paths = json_array(rest).unwrap_or_else(|| split_words_keeping_heredoc_tokens(rest));
-                    if paths.len() < 2 {
-                        return Err(err(format!("{instr} needs at least one source and a destination")));
-                    }
-                    let dest = paths.pop().unwrap();
-                    let mut sources = Vec::new();
-                    let mut attached_heredocs = Vec::new();
-                    let mut hd_iter = heredocs.into_iter();
-                    for p in paths {
-                        if parse_heredoc_marker(&p, true).is_some() {
-                            let hd = hd_iter
-                                .next()
-                                .ok_or_else(|| err(format!("{instr} heredoc `{p}` had no body")))?;
-                            attached_heredocs.push(Heredoc {
-                                name: hd.delimiter,
-                                content: hd.content,
-                                expand: hd.expand,
-                            });
-                        } else {
-                            if p.contains("://") {
-                                if !add {
-                                    return Err(err("COPY doesn't accept URLs; use ADD <url> instead".into()));
-                                }
-                                if !p.starts_with("http://") && !p.starts_with("https://") {
-                                    return Err(err(format!("ADD only supports http:// and https:// URLs; got `{p}`")));
-                                }
-                            }
-                            sources.push(p);
-                        }
-                    }
-                    if sources.is_empty() && attached_heredocs.is_empty() {
-                        return Err(err(format!("{instr} needs at least one source")));
-                    }
-                    Kind::Copy { sources, heredocs: attached_heredocs, dest, from, chown, chmod, checksum, add }
-                }
-                "ENV" => Kind::Env(pairs(rest, true).map_err(err)?),
-                "LABEL" => Kind::Label(pairs(rest, false).map_err(err)?),
-                "ARG" => {
-                    let (name, default) = match rest.split_once('=') {
-                        Some((n, d)) => (n.trim().to_string(), Some(unquote(d.trim()))),
-                        None => (rest.to_string(), None),
-                    };
-                    if name.is_empty() || name.contains(char::is_whitespace) {
-                        return Err(err(format!("ARG takes one name, optionally =default; got `{rest}`")));
-                    }
-                    if df.stages.is_empty() {
-                        df.global_args.push((name, default));
-                        continue;
-                    }
-                    Kind::Arg(name, default)
-                }
-                "WORKDIR" => Kind::Workdir(unquote(rest)),
-                "USER" => Kind::User(rest.to_string()),
-                "EXPOSE" => Kind::Expose(split_words(rest)),
-                "VOLUME" => Kind::Volume(json_array(rest).unwrap_or_else(|| split_words(rest))),
-                "STOPSIGNAL" => Kind::StopSignal(rest.to_string()),
-                "MAINTAINER" => Kind::Label(vec![("maintainer".into(), rest.to_string())]),
-                "HEALTHCHECK" => Kind::Healthcheck(parse_healthcheck(rest).map_err(err)?),
-                "ONBUILD" => return Err(err("ONBUILD isn't supported".into())),
-                other => return Err(err(format!("unknown instruction `{other}`"))),
-            };
+            if instr == "ARG" && df.stages.is_empty() {
+                let (name, default) = parse_arg_decl(rest).map_err(err)?;
+                df.global_args.push((name, default));
+                continue;
+            }
             let Some(stage) = df.stages.last_mut() else {
                 return Err(err(format!("{instr} before the first FROM")));
+            };
+            let kind = if instr == "ONBUILD" {
+                if rest.is_empty() {
+                    return Err(err("ONBUILD requires a trigger instruction".into()));
+                }
+                if !heredocs.is_empty() {
+                    return Err(err("ONBUILD does not support inline heredocs".into()));
+                }
+                let parsed = Self::parse_onbuild_trigger(rest, line)?;
+                Kind::OnBuild(parsed.text)
+            } else {
+                parse_stage_instruction(line, &instr, rest, heredocs)?
             };
             stage.instructions.push(Instruction { line, text: trimmed.to_string(), kind });
         }
@@ -274,10 +183,150 @@ impl Dockerfile {
         Ok(df)
     }
 
+    /// Parse a single trigger instruction saved in an image's `config.OnBuild`.
+    pub fn parse_onbuild_trigger(raw: &str, line: usize) -> Result<Instruction, ParseError> {
+        let mut lines = logical_lines(raw).map_err(|mut e| {
+            e.line = line;
+            e
+        })?;
+        if lines.len() != 1 {
+            return Err(ParseError { line, message: "ONBUILD trigger must be a single instruction".into() });
+        }
+        let LogicalLine { text, heredocs, .. } = lines.pop().unwrap();
+        let trimmed = text.trim();
+        let (word, rest) = trimmed.split_once(char::is_whitespace).unwrap_or((trimmed, ""));
+        let rest = rest.trim();
+        let instr = word.to_ascii_uppercase();
+        match instr.as_str() {
+            "FROM" | "ONBUILD" | "MAINTAINER" => {
+                return Err(ParseError {
+                    line,
+                    message: format!("{instr} isn't allowed inside ONBUILD"),
+                });
+            }
+            _ => {}
+        }
+        let kind = parse_stage_instruction(line, &instr, rest, heredocs)?;
+        Ok(Instruction { line, text: trimmed.to_string(), kind })
+    }
+
     /// The stage named or numbered `name`.
     pub fn stage_index(&self, name: &str) -> Option<usize> {
         let lower = name.to_ascii_lowercase();
         self.stages.iter().position(|s| s.name.as_deref() == Some(lower.as_str())).or_else(|| name.parse().ok().filter(|i| *i < self.stages.len()))
+    }
+}
+
+fn parse_arg_decl(rest: &str) -> Result<(String, Option<String>), String> {
+    let (name, default) = match rest.split_once('=') {
+        Some((n, d)) => (n.trim().to_string(), Some(unquote(d.trim()))),
+        None => (rest.to_string(), None),
+    };
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        return Err(format!("ARG takes one name, optionally =default; got `{rest}`"));
+    }
+    Ok((name, default))
+}
+
+fn parse_stage_instruction(line: usize, instr: &str, rest: &str, heredocs: Vec<RawHeredoc>) -> Result<Kind, ParseError> {
+    let err = |message: String| ParseError { line, message };
+    match instr {
+        "RUN" => {
+            let mut rest = rest;
+            let mut mounts = Vec::new();
+            while let Some(flag) = rest.strip_prefix("--") {
+                let (f, after) = flag.split_once(char::is_whitespace).unwrap_or((flag, ""));
+                if let Some(spec) = f.strip_prefix("mount=") {
+                    mounts.push(parse_run_mount(spec).map_err(err)?);
+                } else if !f.starts_with("network=") && !f.starts_with("security=") {
+                    return Err(err(format!("RUN --{f} isn't supported")));
+                }
+                rest = after.trim_start();
+            }
+            let (cmd, stdin) = build_run_command(rest, &heredocs);
+            Ok(Kind::Run { command: cmd, mounts, stdin })
+        }
+        "CMD" => Ok(Kind::Cmd(command(rest))),
+        "ENTRYPOINT" => Ok(Kind::Entrypoint(command(rest))),
+        "SHELL" => match json_array(rest) {
+            Some(v) if !v.is_empty() => Ok(Kind::Shell(v)),
+            _ => Err(err("SHELL needs JSON form, e.g. [\"/bin/bash\", \"-c\"]".into())),
+        },
+        "COPY" | "ADD" => {
+            let add = instr == "ADD";
+            let mut from = None;
+            let mut chown = None;
+            let mut chmod = None;
+            let mut checksum = None;
+            let mut rest = rest;
+            while rest.starts_with("--") {
+                let (flag, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                if let Some(v) = flag.strip_prefix("--from=") {
+                    from = Some(unquote(v));
+                } else if let Some(v) = flag.strip_prefix("--chown=") {
+                    chown = Some(unquote(v));
+                } else if let Some(v) = flag.strip_prefix("--chmod=") {
+                    let val = unquote(v);
+                    if !val.contains('$') {
+                        parse_octal_mode(&val).map_err(err)?;
+                    }
+                    chmod = Some(val);
+                } else if add && flag.starts_with("--checksum=") {
+                    checksum = Some(unquote(flag.strip_prefix("--checksum=").unwrap()));
+                } else if flag != "--link" && !flag.starts_with("--link=") && flag != "--keep-git-dir" && !flag.starts_with("--keep-git-dir=") {
+                    return Err(err(format!("{instr} {flag} isn't supported")));
+                }
+                rest = after.trim_start();
+            }
+            let mut paths = json_array(rest).unwrap_or_else(|| split_words_keeping_heredoc_tokens(rest));
+            if paths.len() < 2 {
+                return Err(err(format!("{instr} needs at least one source and a destination")));
+            }
+            let dest = paths.pop().unwrap();
+            let mut sources = Vec::new();
+            let mut attached_heredocs = Vec::new();
+            let mut hd_iter = heredocs.into_iter();
+            for p in paths {
+                if parse_heredoc_marker(&p, true).is_some() {
+                    let hd = hd_iter
+                        .next()
+                        .ok_or_else(|| err(format!("{instr} heredoc `{p}` had no body")))?;
+                    attached_heredocs.push(Heredoc {
+                        name: hd.delimiter,
+                        content: hd.content,
+                        expand: hd.expand,
+                    });
+                } else {
+                    if p.contains("://") {
+                        if !add {
+                            return Err(err("COPY doesn't accept URLs; use ADD <url> instead".into()));
+                        }
+                        if !p.starts_with("http://") && !p.starts_with("https://") {
+                            return Err(err(format!("ADD only supports http:// and https:// URLs; got `{p}`")));
+                        }
+                    }
+                    sources.push(p);
+                }
+            }
+            if sources.is_empty() && attached_heredocs.is_empty() {
+                return Err(err(format!("{instr} needs at least one source")));
+            }
+            Ok(Kind::Copy { sources, heredocs: attached_heredocs, dest, from, chown, chmod, checksum, add })
+        }
+        "ENV" => Ok(Kind::Env(pairs(rest, true).map_err(err)?)),
+        "LABEL" => Ok(Kind::Label(pairs(rest, false).map_err(err)?)),
+        "ARG" => {
+            let (name, default) = parse_arg_decl(rest).map_err(err)?;
+            Ok(Kind::Arg(name, default))
+        }
+        "WORKDIR" => Ok(Kind::Workdir(unquote(rest))),
+        "USER" => Ok(Kind::User(rest.to_string())),
+        "EXPOSE" => Ok(Kind::Expose(split_words(rest))),
+        "VOLUME" => Ok(Kind::Volume(json_array(rest).unwrap_or_else(|| split_words(rest)))),
+        "STOPSIGNAL" => Ok(Kind::StopSignal(rest.to_string())),
+        "MAINTAINER" => Ok(Kind::Label(vec![("maintainer".into(), rest.to_string())])),
+        "HEALTHCHECK" => Ok(Kind::Healthcheck(parse_healthcheck(rest).map_err(err)?)),
+        other => Err(err(format!("unknown instruction `{other}`"))),
     }
 }
 
@@ -1075,6 +1124,36 @@ ADD --chmod=0644 --checksum=sha256:abcdef https://example.com/app.tar.gz /opt/
         assert!(Dockerfile::parse("# only a comment\n").is_err());
         // Bit-shifts and here-strings are not heredocs.
         assert!(Dockerfile::parse("FROM a\nRUN echo $((1 << 2)) && echo $((1<<2)) && cat <<<hi\n").is_ok());
+    }
+
+    #[test]
+    fn parses_onbuild_and_rejects_chained_from_or_maintainer() {
+        let df = Dockerfile::parse(
+            "FROM alpine\nONBUILD ENV FOO=bar\nONBUILD COPY . /app\nONBUILD RUN echo hi\nONBUILD ARG BUILD_ENV=dev\n",
+        )
+        .unwrap();
+        assert_eq!(
+            df.stages[0].instructions.iter().map(|i| &i.kind).collect::<Vec<_>>(),
+            vec![
+                &Kind::OnBuild("ENV FOO=bar".into()),
+                &Kind::OnBuild("COPY . /app".into()),
+                &Kind::OnBuild("RUN echo hi".into()),
+                &Kind::OnBuild("ARG BUILD_ENV=dev".into()),
+            ]
+        );
+        let parsed = Dockerfile::parse_onbuild_trigger("ENV FOO=bar", 1).unwrap();
+        assert_eq!(parsed.kind, Kind::Env(vec![("FOO".into(), "bar".into())]));
+        assert!(matches!(Dockerfile::parse_onbuild_trigger("ARG V=1", 1).unwrap().kind, Kind::Arg(ref k, Some(ref v)) if k == "V" && v == "1"));
+
+        for bad in [
+            "FROM alpine\nONBUILD\n",
+            "FROM alpine\nONBUILD ONBUILD RUN echo hi\n",
+            "FROM alpine\nONBUILD FROM busybox\n",
+            "FROM alpine\nONBUILD MAINTAINER someone\n",
+            "ONBUILD RUN echo early\nFROM alpine\n",
+        ] {
+            assert!(Dockerfile::parse(bad).is_err(), "expected error for:\n{bad}");
+        }
     }
 
     #[test]

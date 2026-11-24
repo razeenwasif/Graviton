@@ -3,6 +3,7 @@
 mod compose;
 mod remote;
 mod service;
+mod update;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
@@ -265,6 +266,12 @@ enum Command {
         /// Connect the container to one or more named networks (defaults to `graviton`).
         #[arg(long = "network", visible_alias = "net", value_name = "NETWORK")]
         network: Vec<String>,
+        /// Size of `/dev/shm` (`64m`, `128mb`, `1g`, etc.).
+        #[arg(long = "shm-size", value_name = "BYTES")]
+        shm_size: Option<String>,
+        /// Set POSIX resource limits (`NAME=SOFT[:HARD]`, e.g. `nofile=1024:4096`); repeatable.
+        #[arg(long = "ulimit", value_name = "NAME=SOFT[:HARD]")]
+        ulimit: Vec<String>,
         image: String,
         /// Command (replaces the image's default command).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -438,6 +445,15 @@ enum Command {
         /// Target shell (`zsh`, `bash`, or `fish`).
         #[arg(value_enum)]
         shell: CompletionShell,
+    },
+    /// Check GitHub Releases for a newer version of Graviton (no daemon needed).
+    Update {
+        /// Exit 1 when an update is available and 2 if the check cannot complete.
+        #[arg(long)]
+        check: bool,
+        /// Output machine-readable JSON instead of human-friendly text.
+        #[arg(long)]
+        json: bool,
     },
     /// Parse and normalise an image reference (no daemon needed).
     Resolve { reference: String },
@@ -676,6 +692,13 @@ fn run(cli: Cli) -> Result<()> {
             write_completions(*shell, &mut stdout)?;
             return Ok(());
         }
+        Command::Update { check, json } => {
+            let code = update::run_update(*check, *json);
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -848,6 +871,8 @@ fn run(cli: Cli) -> Result<()> {
             tmpfs,
             init,
             network,
+            shm_size,
+            ulimit,
             image,
             command,
         } => {
@@ -936,6 +961,14 @@ fn run(cli: Cli) -> Result<()> {
                 .iter()
                 .map(|s| graviton_proto::parse_tmpfs_spec(s).map_err(|e| anyhow::anyhow!(e)))
                 .collect::<Result<Vec<_>>>()?;
+            let shm_size_bytes = shm_size
+                .as_deref()
+                .map(|s| graviton_proto::parse_byte_size(s).map_err(|e| anyhow::anyhow!(e)))
+                .transpose()?;
+            let ulimits = ulimit
+                .iter()
+                .map(|s| graviton_proto::parse_ulimit_spec(s).map_err(|e| anyhow::anyhow!(e)))
+                .collect::<Result<Vec<_>>>()?;
             let spec = RunSpec {
                 image,
                 name,
@@ -966,6 +999,8 @@ fn run(cli: Cli) -> Result<()> {
                 tmpfs,
                 init,
                 networks: network,
+                shm_size_bytes,
+                ulimits,
             };
             if tty {
                 let code = run_tty(&target, spec, interactive)?;
@@ -1362,7 +1397,12 @@ fn run(cli: Cli) -> Result<()> {
             Response::Revoked { id } => println!("{id} revoked"),
             other => unexpected(other)?,
         },
-        Command::Resolve { .. } | Command::DockerEnv { .. } | Command::Completions { .. } | Command::Hosts { .. } | Command::Service { .. } => unreachable!(),
+        Command::Resolve { .. }
+        | Command::DockerEnv { .. }
+        | Command::Completions { .. }
+        | Command::Update { .. }
+        | Command::Hosts { .. }
+        | Command::Service { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -2974,6 +3014,10 @@ mod tests {
             "CAP_NET_BIND_SERVICE",
             "--tmpfs",
             "/tmp:rw,noexec,size=64m",
+            "--shm-size",
+            "128m",
+            "--ulimit",
+            "nofile=2048:4096",
             "alpine",
             "id",
         ])
@@ -2986,10 +3030,14 @@ mod tests {
                 ref cap_drop,
                 ref cap_add,
                 ref tmpfs,
+                ref shm_size,
+                ref ulimit,
                 ..
             } if cap_drop == &["ALL"]
                 && cap_add == &["CAP_NET_BIND_SERVICE"]
                 && tmpfs == &["/tmp:rw,noexec,size=64m"]
+                && shm_size.as_deref() == Some("128m")
+                && ulimit == &["nofile=2048:4096"]
         ));
 
         let st_default = Cli::try_parse_from(["grav", "stats"]).unwrap();
@@ -3028,6 +3076,11 @@ mod tests {
             assert!(matches!(parsed.command, Command::Completions { shell } if shell == expected));
         }
         assert!(Cli::try_parse_from(["grav", "completions", "cmd"]).is_err());
+
+        let up_plain = Cli::try_parse_from(["grav", "update"]).unwrap();
+        assert!(matches!(up_plain.command, Command::Update { check: false, json: false }));
+        let up_flags = Cli::try_parse_from(["grav", "update", "--check", "--json"]).unwrap();
+        assert!(matches!(up_flags.command, Command::Update { check: true, json: true }));
     }
 
     #[test]

@@ -105,6 +105,8 @@ fn filters_containers_with_label_and_semantics() {
         tmpfs: vec![],
         init: false,
         networks: vec![],
+        shm_size_bytes: None,
+        ulimits: vec![],
     };
 
     // Go map filter style (AND across label keys)
@@ -420,6 +422,17 @@ fn docker_stats_json_includes_pids_and_sequential_precpu() {
     let parsed = super::containers::normalize_docker_tmpfs_mount(&tmp).unwrap().unwrap();
     assert_eq!(parsed.target, "/cache");
     assert_eq!(parsed.options, "size=67108864,mode=750");
+
+    let ulims = serde_json::json!([
+        {"Name": "NOFILE", "Soft": 2048, "Hard": 4096},
+        {"Name": "core", "Soft": -1, "Hard": -1}
+    ]);
+    let parsed_ulims = super::containers::normalize_docker_ulimits(&ulims).unwrap();
+    assert_eq!(parsed_ulims.len(), 2);
+    assert_eq!(parsed_ulims[0].name, "nofile");
+    assert_eq!((parsed_ulims[0].soft, parsed_ulims[0].hard), (2048, 4096));
+    assert_eq!(parsed_ulims[1].soft, -1);
+    assert!(super::containers::normalize_docker_ulimits(&serde_json::json!([{"Name": "nofile", "Soft": 4096, "Hard": 1024}])).is_err());
 }
 
 async fn read_http_response(stream: &mut UnixStream) -> (u16, std::collections::HashMap<String, String>, Vec<u8>) {
