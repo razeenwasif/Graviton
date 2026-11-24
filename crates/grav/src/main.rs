@@ -262,6 +262,9 @@ enum Command {
         /// Run `docker-init` as container PID 1 for signal forwarding and zombie reaping.
         #[arg(long)]
         init: bool,
+        /// Connect the container to one or more named networks (defaults to `graviton`).
+        #[arg(long = "network", visible_alias = "net", value_name = "NETWORK")]
+        network: Vec<String>,
         image: String,
         /// Command (replaces the image's default command).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -376,9 +379,12 @@ enum Command {
         #[command(subcommand)]
         action: Option<VolumeAction>,
     },
-    /// The shared container network: addresses, DNS names and published ports.
+    /// Container networks (`ls`, `create`, `rm`, `connect`, `disconnect`).
     #[command(visible_alias = "networks")]
-    Network,
+    Network {
+        #[command(subcommand)]
+        action: Option<NetworkAction>,
+    },
     /// Manage cached VM memory snapshots for fast container starts (`status`, `warm`, `clear`).
     #[command(visible_alias = "snapshots")]
     Snapshot {
@@ -473,6 +479,25 @@ enum VolumeAction {
     Create { name: String },
     /// Remove a named volume no container uses.
     Rm { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum NetworkAction {
+    /// Show switch/DNS status, configured networks, and connected endpoints.
+    Ls,
+    /// Create a user-defined isolated container network.
+    Create {
+        name: String,
+        /// Restrict external/gateway routing semantics (`--internal`).
+        #[arg(long)]
+        internal: bool,
+    },
+    /// Remove an unused user-defined network.
+    Rm { name: String },
+    /// Connect a container to a network (live without restarting running containers).
+    Connect { network: String, container: String },
+    /// Disconnect a container from a network (live without restarting running containers).
+    Disconnect { network: String, container: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -822,6 +847,7 @@ fn run(cli: Cli) -> Result<()> {
             cap_drop,
             tmpfs,
             init,
+            network,
             image,
             command,
         } => {
@@ -939,6 +965,7 @@ fn run(cli: Cli) -> Result<()> {
                 cap_drop,
                 tmpfs,
                 init,
+                networks: network,
             };
             if tty {
                 let code = run_tty(&target, spec, interactive)?;
@@ -1047,50 +1074,88 @@ fn run(cli: Cli) -> Result<()> {
                 other => unexpected(other)?,
             },
         },
-        Command::Network => match client.call(&Request::NetworkInfo)? {
-            Response::Network(net) => {
-                println!("Network   {} ({})", net.name, net.driver);
-                println!("Subnet    {}  gateway {}", net.subnet, net.gateway);
-                println!("DNS       {}  (*.{})", net.dns_server, net.dns_domain);
-                println!(
-                    "Switch    {} connected  {} MACs  {} frames ({})",
-                    net.connected_ports,
-                    net.learned_macs,
-                    net.frames_forwarded,
-                    bytes(net.bytes_forwarded)
-                );
-                if !net.endpoints.is_empty() {
-                    println!();
-                    println!("{:<18} {:<10} {:<16} {:<24} PORTS", "CONTAINER", "STATUS", "IP", "DNS");
-                    for ep in net.endpoints {
-                        let st = match ep.status {
-                            ContainerStatus::Running => "running",
-                            ContainerStatus::Exited => "exited",
-                            ContainerStatus::Created => "created",
-                            ContainerStatus::Paused => "paused",
-                        };
-                        let ip = ep.ip_address.as_deref().unwrap_or("—");
-                        let dns = ep.dns_names.get(1).or_else(|| ep.dns_names.first()).map(String::as_str).unwrap_or("—");
-                        let ports = ep
-                            .ports
-                            .iter()
-                            .map(|p| {
-                                let proto = match p.protocol {
-                                    graviton_proto::PortProtocol::Tcp => "tcp",
-                                    graviton_proto::PortProtocol::Udp => "udp",
-                                };
-                                match &p.host_ip {
-                                    Some(host_ip) => format!("{host_ip}:{}->{}/{proto}", p.host_port, p.container_port),
-                                    None => format!("{}->{}/{proto}", p.host_port, p.container_port),
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        println!("{:<18} {:<10} {:<16} {:<24} {ports}", ep.container_name, st, ip, dns);
+        Command::Network { action } => match action.unwrap_or(NetworkAction::Ls) {
+            NetworkAction::Ls => match client.call(&Request::NetworkInfo)? {
+                Response::Network(net) => {
+                    println!("Network   {} ({})", net.name, net.driver);
+                    println!("Subnet    {}  gateway {}", net.subnet, net.gateway);
+                    println!("DNS       {}  (*.{})", net.dns_server, net.dns_domain);
+                    println!(
+                        "Switch    {} connected  {} MACs  {} frames ({})",
+                        net.connected_ports,
+                        net.learned_macs,
+                        net.frames_forwarded,
+                        bytes(net.bytes_forwarded)
+                    );
+                    if !net.networks.is_empty() {
+                        println!();
+                        println!("{:<18} {:<16} {:<10} CONTAINERS", "NETWORK", "DRIVER", "SCOPE");
+                        for n in &net.networks {
+                            let scope = if n.builtin { "built-in" } else if n.internal { "internal" } else { "local" };
+                            let members = if n.containers.is_empty() { "—".into() } else { n.containers.join(", ") };
+                            println!("{:<18} {:<16} {:<10} {members}", n.name, n.driver, scope);
+                        }
+                    }
+                    if !net.endpoints.is_empty() {
+                        println!();
+                        println!("{:<18} {:<10} {:<16} {:<20} {:<18} PORTS", "CONTAINER", "STATUS", "IP", "DNS", "NETWORKS");
+                        for ep in net.endpoints {
+                            let st = match ep.status {
+                                ContainerStatus::Running => "running",
+                                ContainerStatus::Exited => "exited",
+                                ContainerStatus::Created => "created",
+                                ContainerStatus::Paused => "paused",
+                            };
+                            let ip = ep.ip_address.as_deref().unwrap_or("—");
+                            let dns = ep.dns_names.get(1).or_else(|| ep.dns_names.first()).map(String::as_str).unwrap_or("—");
+                            let nets = if ep.networks.is_empty() { "graviton".into() } else { ep.networks.join(", ") };
+                            let ports = ep
+                                .ports
+                                .iter()
+                                .map(|p| {
+                                    let proto = match p.protocol {
+                                        graviton_proto::PortProtocol::Tcp => "tcp",
+                                        graviton_proto::PortProtocol::Udp => "udp",
+                                    };
+                                    match &p.host_ip {
+                                        Some(host_ip) => format!("{host_ip}:{}->{}/{proto}", p.host_port, p.container_port),
+                                        None => format!("{}->{}/{proto}", p.host_port, p.container_port),
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            println!("{:<18} {:<10} {:<16} {:<20} {:<18} {ports}", ep.container_name, st, ip, dns, nets);
+                        }
                     }
                 }
+                other => unexpected(other)?,
+            },
+            NetworkAction::Create { name, internal } => {
+                match client.call(&Request::CreateNetwork { name, internal, labels: BTreeMap::new() })? {
+                    Response::NetworkCreated(net) => println!("{}", net.name),
+                    other => unexpected(other)?,
+                }
             }
-            other => unexpected(other)?,
+            NetworkAction::Rm { name } => match client.call(&Request::RemoveNetwork { name })? {
+                Response::NetworkRemoved { name } => println!("Removed network {name}."),
+                other => unexpected(other)?,
+            },
+            NetworkAction::Connect { network, container } => {
+                match client.call(&Request::ConnectNetwork { network, container })? {
+                    Response::NetworkUpdated { network, container, .. } => {
+                        println!("Connected {container} to {network}.");
+                    }
+                    other => unexpected(other)?,
+                }
+            }
+            NetworkAction::Disconnect { network, container } => {
+                match client.call(&Request::DisconnectNetwork { network, container })? {
+                    Response::NetworkUpdated { network, container, .. } => {
+                        println!("Disconnected {container} from {network}.");
+                    }
+                    other => unexpected(other)?,
+                }
+            }
         },
         Command::Snapshot { action } => {
             let req = match action.unwrap_or(SnapshotAction::Status) {
@@ -2985,5 +3050,43 @@ mod tests {
                 assert!(script.contains(&needle), "{shell:?} missing `{needle}`");
             }
         }
+    }
+
+    #[test]
+    fn parses_network_flags_and_subcommands() {
+        let r = Cli::try_parse_from([
+            "grav", "run", "--network", "frontend", "--net", "backend", "alpine", "sh",
+        ])
+        .unwrap();
+        assert!(matches!(r.command, Command::Run { ref network, .. } if network == &["frontend", "backend"]));
+
+        let ls = Cli::try_parse_from(["grav", "network"]).unwrap();
+        assert!(matches!(ls.command, Command::Network { action: None }));
+
+        let create = Cli::try_parse_from(["grav", "network", "create", "--internal", "backend"]).unwrap();
+        assert!(matches!(
+            create.command,
+            Command::Network { action: Some(NetworkAction::Create { ref name, internal: true }) } if name == "backend"
+        ));
+
+        let rm = Cli::try_parse_from(["grav", "network", "rm", "backend"]).unwrap();
+        assert!(matches!(
+            rm.command,
+            Command::Network { action: Some(NetworkAction::Rm { ref name }) } if name == "backend"
+        ));
+
+        let conn = Cli::try_parse_from(["grav", "network", "connect", "backend", "api"]).unwrap();
+        assert!(matches!(
+            conn.command,
+            Command::Network { action: Some(NetworkAction::Connect { ref network, ref container }) }
+                if network == "backend" && container == "api"
+        ));
+
+        let disc = Cli::try_parse_from(["grav", "network", "disconnect", "backend", "api"]).unwrap();
+        assert!(matches!(
+            disc.command,
+            Command::Network { action: Some(NetworkAction::Disconnect { ref network, ref container }) }
+                if network == "backend" && container == "api"
+        ));
     }
 }

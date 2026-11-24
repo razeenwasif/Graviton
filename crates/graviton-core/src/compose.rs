@@ -59,6 +59,15 @@ pub struct ComposeProject {
     pub files: Vec<PathBuf>,
     pub services: BTreeMap<String, ComposeService>,
     pub volumes: BTreeMap<String, ComposeVolumeDef>,
+    pub networks: BTreeMap<String, ComposeNetworkDef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ComposeNetworkDef {
+    /// Actual Graviton network name (`<project>_<key>` unless `external` or custom `name`).
+    pub network_name: String,
+    pub external: bool,
+    pub internal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -106,6 +115,7 @@ pub struct ComposeService {
     pub memory_mib: Option<u64>,
     pub labels: BTreeMap<String, String>,
     pub dns_aliases: Vec<String>,
+    pub networks: Vec<String>,
     pub profiles: Vec<String>,
     pub healthcheck: Option<Healthcheck>,
     pub read_only: bool,
@@ -226,6 +236,38 @@ impl ComposeProject {
             }
         }
 
+        // Parse top-level named networks.
+        let mut networks = BTreeMap::new();
+        if let Some(Yaml::Hash(net_map)) = yaml_get(&merged_root, "networks") {
+            for (k, v) in net_map {
+                let Some(key) = k.as_str() else { continue };
+                let (external, internal, custom_name) = match v {
+                    Yaml::Hash(h) => {
+                        let ext = match yaml_get(h, "external") {
+                            Some(Yaml::Boolean(b)) => *b,
+                            Some(Yaml::Hash(_)) => true,
+                            _ => false,
+                        };
+                        let intl = matches!(yaml_get(h, "internal"), Some(Yaml::Boolean(true)));
+                        let custom = yaml_get_str(h, "name").or_else(|| {
+                            yaml_get(h, "external")
+                                .and_then(Yaml::as_hash)
+                                .and_then(|eh| yaml_get_str(eh, "name"))
+                        });
+                        (ext, intl, custom)
+                    }
+                    _ => (false, false, None),
+                };
+                let network_name = match custom_name {
+                    Some(n) => n,
+                    None if external => key.to_string(),
+                    None if key == "default" => "graviton".to_string(),
+                    None => format!("{project_name}_{key}"),
+                };
+                networks.insert(key.to_string(), ComposeNetworkDef { network_name, external, internal });
+            }
+        }
+
         // Parse services.
         let Some(Yaml::Hash(svc_map)) = yaml_get(&merged_root, "services") else {
             return Err(ComposeError::Spec("compose file has no `services:` mapping".into()));
@@ -240,7 +282,7 @@ impl ComposeProject {
             let Yaml::Hash(h) = v else {
                 return Err(ComposeError::Spec(format!("service `{svc_name}` must be a mapping")));
             };
-            let svc = parse_service(&project_name, svc_name, h, &project_dir, &volumes, &vars)?;
+            let svc = parse_service(&project_name, svc_name, h, &project_dir, &volumes, &networks, &vars)?;
             services.insert(svc_name.to_string(), svc);
         }
 
@@ -256,7 +298,7 @@ impl ComposeProject {
             }
         }
 
-        Ok(Self { name: project_name, project_dir, files, services, volumes })
+        Ok(Self { name: project_name, project_dir, files, services, volumes, networks })
     }
 
     /// Return services in topological startup order (dependencies first).
@@ -349,6 +391,14 @@ impl ComposeProject {
             .values()
             .filter(|v| !v.external)
             .map(|v| v.volume_name.clone())
+            .collect()
+    }
+
+    /// Networks owned (non-external, non-default) by this project.
+    pub fn owned_networks(&self) -> Vec<&ComposeNetworkDef> {
+        self.networks
+            .values()
+            .filter(|n| !n.external && n.network_name != "graviton")
             .collect()
     }
 }
@@ -701,6 +751,7 @@ fn parse_service(
     h: &YamlHash,
     project_dir: &Path,
     volumes_def: &BTreeMap<String, ComposeVolumeDef>,
+    networks_def: &BTreeMap<String, ComposeNetworkDef>,
     vars: &BTreeMap<String, String>,
 ) -> Result<ComposeService> {
     let build = match yaml_get(h, "build") {
@@ -785,7 +836,7 @@ fn parse_service(
     }
 
     let (cpus, memory_mib) = parse_resources(name, h)?;
-    let dns_aliases = parse_network_aliases(h);
+    let (svc_networks, dns_aliases) = parse_service_networks(name, h, networks_def)?;
     let profiles = parse_string_list(yaml_get(h, "profiles"));
     let healthcheck = match yaml_get(h, "healthcheck").filter(|y| !matches!(y, Yaml::Null)) {
         Some(v) => Some(parse_healthcheck(name, v)?),
@@ -817,6 +868,7 @@ fn parse_service(
         memory_mib,
         labels,
         dns_aliases,
+        networks: svc_networks,
         profiles,
         healthcheck,
         read_only,
@@ -1297,20 +1349,60 @@ pub fn parse_memory_mib(raw: &str) -> Option<u64> {
     Some(((bytes / (1024.0 * 1024.0)).ceil() as u64).max(128))
 }
 
-fn parse_network_aliases(h: &YamlHash) -> Vec<String> {
+fn parse_service_networks(
+    service: &str,
+    h: &YamlHash,
+    networks_def: &BTreeMap<String, ComposeNetworkDef>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let Some(val) = yaml_get(h, "networks").filter(|y| !matches!(y, Yaml::Null)) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let mut attached = Vec::new();
     let mut aliases = Vec::new();
-    if let Some(Yaml::Hash(nets)) = yaml_get(h, "networks") {
-        for (_, net_cfg) in nets {
-            if let Some(nh) = net_cfg.as_hash() {
-                for alias in parse_string_list(yaml_get(nh, "aliases")) {
-                    if !aliases.contains(&alias) {
-                        aliases.push(alias);
+    let resolve_net = |key: &str| -> Result<String> {
+        if let Some(def) = networks_def.get(key) {
+            Ok(def.network_name.clone())
+        } else if key == "default" {
+            Ok("graviton".to_string())
+        } else {
+            Err(ComposeError::Spec(format!("service `{service}` references unknown network `{key}`")))
+        }
+    };
+    match val {
+        Yaml::Array(arr) => {
+            for item in arr {
+                let key = yaml_scalar_to_string(item).ok_or_else(|| {
+                    ComposeError::Spec(format!("service `{service}`: `networks` items must be strings"))
+                })?;
+                let resolved = resolve_net(&key)?;
+                if !attached.contains(&resolved) {
+                    attached.push(resolved);
+                }
+            }
+        }
+        Yaml::Hash(nets) => {
+            for (k, net_cfg) in nets {
+                let Some(key) = k.as_str() else { continue };
+                let resolved = resolve_net(key)?;
+                if !attached.contains(&resolved) {
+                    attached.push(resolved);
+                }
+                if let Some(nh) = net_cfg.as_hash() {
+                    for alias in parse_string_list(yaml_get(nh, "aliases")) {
+                        if !aliases.contains(&alias) {
+                            aliases.push(alias);
+                        }
                     }
                 }
             }
         }
+        _ => {
+            return Err(ComposeError::Spec(format!(
+                "service `{service}`: `networks` must be a list or mapping"
+            )));
+        }
     }
-    aliases
+    Ok((attached, aliases))
 }
 
 fn parse_string_list(v: Option<&Yaml>) -> Vec<String> {
@@ -1602,6 +1694,9 @@ volumes:
   pgdata:
   shared_ext:
     external: true
+
+networks:
+  backend: {}
 "#,
         )
         .unwrap();
@@ -1730,6 +1825,59 @@ services:
         fs::write(
             dir.join("compose.yaml"),
             "services:\n  bad:\n    image: alpine\n    cap_add: [NOT_A_CAP]\n",
+        )
+        .unwrap();
+        assert!(ComposeProject::load_with_env(&dir, &LoadOptions::default(), &BTreeMap::new()).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_compose_networks_custom_internal_external_and_rejects_unknown() {
+        let dir = PathBuf::from(format!("/tmp/graviton-compose-net-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("compose.yaml"),
+            r#"
+name: demo
+networks:
+  frontend: {}
+  backend:
+    internal: true
+    name: custom_backend
+  shared:
+    external: true
+services:
+  web:
+    image: alpine:3.22
+    networks: [frontend, default]
+  api:
+    image: alpine:3.22
+    networks:
+      frontend:
+        aliases: [edge]
+      backend: {}
+      shared: {}
+"#,
+        )
+        .unwrap();
+        let proj = ComposeProject::load_with_env(&dir, &LoadOptions::default(), &BTreeMap::new()).unwrap();
+        assert_eq!(proj.networks["frontend"].network_name, "demo_frontend");
+        assert!(!proj.networks["frontend"].internal);
+        assert_eq!(proj.networks["backend"].network_name, "custom_backend");
+        assert!(proj.networks["backend"].internal);
+        assert_eq!(proj.networks["shared"].network_name, "shared");
+        assert!(proj.networks["shared"].external);
+
+        assert_eq!(proj.services["web"].networks, vec!["demo_frontend", "graviton"]);
+        assert_eq!(proj.services["api"].networks, vec!["demo_frontend", "custom_backend", "shared"]);
+        assert_eq!(proj.services["api"].dns_aliases, vec!["edge"]);
+        let owned: Vec<&str> = proj.owned_networks().into_iter().map(|n| n.network_name.as_str()).collect();
+        assert_eq!(owned, vec!["custom_backend", "demo_frontend"]);
+
+        fs::write(
+            dir.join("compose.yaml"),
+            "services:\n  bad:\n    image: alpine\n    networks: [missing_net]\n",
         )
         .unwrap();
         assert!(ComposeProject::load_with_env(&dir, &LoadOptions::default(), &BTreeMap::new()).is_err());

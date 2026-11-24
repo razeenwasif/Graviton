@@ -10,7 +10,7 @@
 //! gateway), so containers reach each other at the addresses `grav ps` shows,
 //! TCP and UDP alike, while the internet and the Mac stay on `eth0`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,11 +30,17 @@ pub struct SwitchStats {
 const MAC_TTL: Duration = Duration::from_secs(300);
 /// Biggest Ethernet frame (1500-byte MTU plus header and VLAN tag), with room to spare.
 const FRAME_MAX: usize = 1600;
+const DEFAULT_NET: &str = "graviton";
+
+struct PortEntry {
+    fd: Arc<OwnedFd>,
+    networks: HashSet<String>,
+}
 
 #[derive(Default)]
 struct Inner {
-    /// Port id → our end of its socket pair.
-    ports: HashMap<u64, Arc<OwnedFd>>,
+    /// Port id → our end of its socket pair and its attached networks.
+    ports: HashMap<u64, PortEntry>,
     /// MAC → (port id, last seen).
     macs: HashMap<[u8; 6], (u64, Instant)>,
     next_id: u64,
@@ -56,6 +62,11 @@ pub struct Port {
 }
 
 impl Port {
+    /// Switch port identifier (used for live `set_port_networks` updates).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     /// The VM's end of the socket pair (keep the `Port` alive while the VM runs).
     pub fn vm_fd(&self) -> RawFd {
         self.vm.as_raw_fd()
@@ -91,8 +102,22 @@ impl Switch {
         }
     }
 
-    /// Plug in a new port.
+    /// Plug in a new port attached to the default network (`graviton`).
+    #[cfg(test)]
     pub fn attach(&self) -> io::Result<Port> {
+        self.attach_to([DEFAULT_NET])
+    }
+
+    /// Plug in a new port attached to `networks`.
+    pub fn attach_to<I, S>(&self, networks: I) -> io::Result<Port>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut nets: HashSet<String> = networks.into_iter().map(Into::into).filter(|s| !s.is_empty()).collect();
+        if nets.is_empty() {
+            nets.insert(DEFAULT_NET.to_string());
+        }
         let mut fds = [0; 2];
         // SAFETY: socketpair(2) fills two descriptors.
         if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) } != 0 {
@@ -112,13 +137,26 @@ impl Switch {
             let mut inner = self.inner.lock().unwrap();
             inner.next_id += 1;
             let id = inner.next_id;
-            inner.ports.insert(id, Arc::clone(&ours));
+            inner.ports.insert(id, PortEntry { fd: Arc::clone(&ours), networks: nets });
             id
         };
         let switch = self.clone();
         let reader = Arc::clone(&ours);
         std::thread::Builder::new().name(format!("switch-port-{id}")).spawn(move || switch.serve(id, &reader))?;
         Ok(Port { switch: self.clone(), id, ours, vm })
+    }
+
+    /// Live-update the attached networks on an active port (used by `network connect`/`disconnect`).
+    pub fn set_port_networks<I, S>(&self, port_id: u64, networks: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let nets: HashSet<String> = networks.into_iter().map(Into::into).filter(|s| !s.is_empty()).collect();
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(entry) = inner.ports.get_mut(&port_id) {
+            entry.networks = nets;
+        }
     }
 
     /// Read frames from one port and pass them on, until the port is unplugged.
@@ -155,6 +193,12 @@ impl Switch {
         let src: [u8; 6] = frame[6..12].try_into().unwrap();
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
+        let Some(from_nets) = inner.ports.get(&from).map(|e| e.networks.clone()) else {
+            return vec![];
+        };
+        if from_nets.is_empty() {
+            return vec![];
+        }
         if src[0] & 1 == 0 {
             inner.macs.insert(src, (from, now));
         }
@@ -163,8 +207,19 @@ impl Switch {
             .flatten();
         match known {
             Some(port) if port == from => vec![],
-            Some(port) => inner.ports.get(&port).cloned().into_iter().collect(),
-            None => inner.ports.iter().filter(|(id, _)| **id != from).map(|(_, fd)| Arc::clone(fd)).collect(),
+            Some(port) => inner
+                .ports
+                .get(&port)
+                .filter(|entry| !from_nets.is_disjoint(&entry.networks))
+                .map(|entry| Arc::clone(&entry.fd))
+                .into_iter()
+                .collect(),
+            None => inner
+                .ports
+                .iter()
+                .filter(|(id, entry)| **id != from && !from_nets.is_disjoint(&entry.networks))
+                .map(|(_, entry)| Arc::clone(&entry.fd))
+                .collect(),
         }
     }
 }
@@ -229,5 +284,46 @@ mod tests {
         drop(b);
         send(a.vm_fd(), &frame(mb, ma, b"still there?"));
         assert!(recv(c.vm_fd()).is_some());
+    }
+
+    #[test]
+    fn isolates_disjoint_networks_and_bridges_multi_network_ports() {
+        let sw = Switch::new();
+        let a = sw.attach_to(["frontend"]).unwrap();
+        let b = sw.attach_to(["backend"]).unwrap();
+        let c = sw.attach_to(["frontend", "backend"]).unwrap();
+        let (ma, mb, mc) = ([2, 0, 0, 0, 0, 0x1a], [2, 0, 0, 0, 0, 0x1b], [2, 0, 0, 0, 0, 0x1c]);
+        let bcast = [0xff; 6];
+
+        // Broadcast from A reaches C (shared frontend), NOT B (disjoint backend).
+        send(a.vm_fd(), &frame(bcast, ma, b"arp from a"));
+        assert_eq!(recv(c.vm_fd()).unwrap(), frame(bcast, ma, b"arp from a"));
+        assert!(recv(b.vm_fd()).is_none());
+
+        // B announces itself on backend -> C learns B's MAC; A does not receive it.
+        send(b.vm_fd(), &frame(bcast, mb, b"arp from b"));
+        assert_eq!(recv(c.vm_fd()).unwrap(), frame(bcast, mb, b"arp from b"));
+        assert!(recv(a.vm_fd()).is_none());
+
+        // Direct unicast from A to B's learned MAC MUST still be dropped across disjoint networks.
+        send(a.vm_fd(), &frame(mb, ma, b"blocked unicast"));
+        assert!(recv(b.vm_fd()).is_none());
+        assert!(recv(c.vm_fd()).is_none());
+
+        // C (multi-networked) can talk to both A and B.
+        send(c.vm_fd(), &frame(ma, mc, b"c->a"));
+        assert_eq!(recv(a.vm_fd()).unwrap(), frame(ma, mc, b"c->a"));
+        send(c.vm_fd(), &frame(mb, mc, b"c->b"));
+        assert_eq!(recv(b.vm_fd()).unwrap(), frame(mb, mc, b"c->b"));
+
+        // Live connect B to frontend -> A can now reach B!
+        sw.set_port_networks(b.id(), ["backend", "frontend"]);
+        send(a.vm_fd(), &frame(mb, ma, b"now connected"));
+        assert_eq!(recv(b.vm_fd()).unwrap(), frame(mb, ma, b"now connected"));
+
+        // Live disconnect B from frontend -> A is isolated from B again.
+        sw.set_port_networks(b.id(), ["backend"]);
+        send(a.vm_fd(), &frame(mb, ma, b"isolated again"));
+        assert!(recv(b.vm_fd()).is_none());
     }
 }

@@ -8,6 +8,7 @@ public actor DemoEngine: EngineService {
     private var logLines: [String: [LogLine]]
     private var imageList: [ImageInfo]
     private var volumeList: [VolumeInfo]
+    private var networkList: [UserNetwork]
     private var loginsList: [RegistryLoginInfo] = [
         RegistryLoginInfo(registry: "ghcr.io", username: "demo")
     ]
@@ -62,6 +63,28 @@ public actor DemoEngine: EngineService {
             VolumeInfo(name: "pgdata", path: "~/Library/Application Support/Graviton/volumes/pgdata", sizeBytes: 184 * mib, fileCount: 412, createdAt: now - 4 * 3600),
             VolumeInfo(name: "redis-snapshots", path: "~/Library/Application Support/Graviton/volumes/redis-snapshots", sizeBytes: 18 * mib, fileCount: 14, createdAt: now - 26 * 3600),
             VolumeInfo(name: "model-cache", path: "~/Library/Application Support/Graviton/volumes/model-cache", sizeBytes: 642 * mib, fileCount: 83, createdAt: now - 72 * 3600),
+        ]
+
+        networkList = [
+            UserNetwork(
+                id: "graviton",
+                name: "graviton",
+                driver: "L2 switch + NAT",
+                internalOnly: false,
+                builtin: true,
+                createdAt: now - 7 * 24 * 3600,
+                containers: ["api-gateway", "postgres", "redis-cache", "web", "worker", "minio"]
+            ),
+            UserNetwork(
+                id: "demo-storefront-backend",
+                name: "storefront_backend",
+                driver: "bridge",
+                internalOnly: false,
+                builtin: false,
+                createdAt: now - 4 * 3600,
+                labels: ["com.docker.compose.project": "storefront"],
+                containers: ["api-gateway", "postgres", "redis-cache"]
+            ),
         ]
 
         let t0 = (now - 30) * 1000
@@ -155,6 +178,12 @@ public actor DemoEngine: EngineService {
 
     public func networkInfo() -> NetworkInfo {
         var info = NetworkInfo.synthesized(from: list)
+        info.endpoints = info.endpoints.map { ep in
+            var copy = ep
+            copy.networks = attachedNetworks(for: ep.containerName)
+            return copy
+        }
+        info.networks = networks()
         info.framesForwarded = UInt64(1840 + tick * 14)
         info.bytesForwarded = UInt64(4_810_000 + tick * 6120)
         return info
@@ -263,6 +292,9 @@ public actor DemoEngine: EngineService {
         guard !list[i].isActive else { throw EngineError.daemon("container \(list[i].name) is running; stop it first") }
         let removed = list.remove(at: i)
         logLines[removed.id] = nil
+        for ni in networkList.indices {
+            networkList[ni].containers.removeAll { $0 == removed.name }
+        }
         return removed.id
     }
 
@@ -297,9 +329,16 @@ public actor DemoEngine: EngineService {
         var report = PruneReport(containers: [], images: [], buildCacheSteps: cacheSteps, blobs: cacheSteps > 0 ? 31 : 0,
                                  freedBytes: before.alwaysReclaimable, dryRun: spec.dryRun)
         if spec.containers {
-            report.containers = list.filter { !$0.isRunning }.map(\.name)
+            let pruned = list.filter { !$0.isRunning }.map(\.name)
+            report.containers = pruned
             report.freedBytes += before.stoppedDisksBytes
-            if !spec.dryRun { list.removeAll { !$0.isRunning } }
+            if !spec.dryRun {
+                let prunedSet = Set(pruned)
+                list.removeAll { !$0.isRunning }
+                for ni in networkList.indices {
+                    networkList[ni].containers.removeAll { prunedSet.contains($0) }
+                }
+            }
         }
         if spec.images {
             let unused = imageList.filter { !inUse($0) }
@@ -397,6 +436,79 @@ public actor DemoEngine: EngineService {
         throw EngineError.daemon("\(path): No such file or directory")
     }
 
+    private func attachedNetworks(for containerName: String) -> [String] {
+        let attached = networkList.filter { $0.containers.contains(containerName) }.map(\.name)
+        return attached.isEmpty ? ["graviton"] : attached
+    }
+
+    public func networks() -> [UserNetwork] {
+        networkList.sorted {
+            if $0.builtin != $1.builtin { return $0.builtin }
+            return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
+
+    public func createNetwork(name: String, internalOnly: Bool = false, labels: [String: String] = [:]) throws -> UserNetwork {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_" || $0 == "." || $0 == "-") }),
+              let first = trimmed.first, first.isLetter || first.isNumber else {
+            throw EngineError.daemon("invalid network name '\(name)'")
+        }
+        let canonical = (trimmed == "bridge" || trimmed == "default") ? "graviton" : trimmed
+        guard !networkList.contains(where: { $0.name == canonical }) else {
+            throw EngineError.daemon("network with name \(canonical) already exists")
+        }
+        let hash = trimmed.utf8.reduce(UInt64(5381)) { ($0 &* 33) &+ UInt64($1) }
+        let net = UserNetwork(
+            id: String(format: "%012llx", hash & 0xffff_ffff_ffff),
+            name: canonical,
+            driver: "bridge",
+            internalOnly: internalOnly,
+            builtin: false,
+            createdAt: UInt64(Date.now.timeIntervalSince1970),
+            labels: labels,
+            containers: []
+        )
+        networkList.append(net)
+        return net
+    }
+
+    public func removeNetwork(name: String) throws -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed != "graviton", trimmed != "bridge", trimmed != "default" else {
+            throw EngineError.daemon("cannot remove built-in network \(trimmed)")
+        }
+        guard let i = networkList.firstIndex(where: { $0.name == trimmed || $0.id == trimmed }) else {
+            throw EngineError.daemon("no such network: \(name)")
+        }
+        if !networkList[i].containers.isEmpty {
+            throw EngineError.daemon("network \(networkList[i].name) has active endpoints; disconnect or remove them first")
+        }
+        return networkList.remove(at: i).name
+    }
+
+    public func connectNetwork(network: String, container: String) throws -> Bool {
+        let cname = list[try resolve(container)].name
+        let targetName = (network == "bridge" || network == "default") ? "graviton" : network
+        guard let ni = networkList.firstIndex(where: { $0.name == targetName || $0.id == targetName }) else {
+            throw EngineError.daemon("no such network: \(network)")
+        }
+        if !networkList[ni].containers.contains(cname) {
+            networkList[ni].containers.append(cname)
+        }
+        return true
+    }
+
+    public func disconnectNetwork(network: String, container: String) throws -> Bool {
+        let cname = list[try resolve(container)].name
+        let targetName = (network == "bridge" || network == "default") ? "graviton" : network
+        guard let ni = networkList.firstIndex(where: { $0.name == targetName || $0.id == targetName }) else {
+            throw EngineError.daemon("no such network: \(network)")
+        }
+        networkList[ni].containers.removeAll { $0 == cname }
+        return false
+    }
+
     public func inspect(id: String) throws -> ContainerDetails {
         let c = list[try resolve(id)]
         let command: [String] = switch c.name {
@@ -428,7 +540,7 @@ public actor DemoEngine: EngineService {
                                 hostname: c.name, cpus: 2, memoryMib: (c.memoryLimitBytes ?? 1 << 30) >> 20,
                                 kernel: "Linux 6.12 (demo)", vmDir: "~/Library/Application Support/Graviton/vms/\(c.id)", restart: restart,
                                 project: c.project, service: c.service, labels: labels.isEmpty ? nil : labels,
-                                healthcheck: hc, health: healthState)
+                                healthcheck: hc, health: healthState, networks: attachedNetworks(for: c.name))
     }
 
     public func openTerminal(_ spec: ExecSpec) throws -> any TerminalSession {

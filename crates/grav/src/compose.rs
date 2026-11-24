@@ -306,7 +306,19 @@ fn up(
         }
     }
 
-    // Ensure non-external named volumes exist before starting services.
+    // Ensure non-external named networks and volumes exist before starting services.
+    for net in proj.owned_networks() {
+        let req = Request::CreateNetwork {
+            name: net.network_name.clone(),
+            internal: net.internal,
+            labels: BTreeMap::new(),
+        };
+        match client.call(&req) {
+            Ok(_) => eprintln!("  + network {}", net.network_name),
+            Err(err) if err.to_string().contains("already exists") => {}
+            Err(err) => return Err(err).with_context(|| format!("creating network {}", net.network_name)),
+        }
+    }
     for vol in proj.owned_volume_names() {
         match client.call(&Request::CreateVolume { name: vol.clone() }) {
             Ok(_) => eprintln!("  + volume {vol}"),
@@ -476,6 +488,16 @@ fn down(client: &mut Client, args: &ComposeArgs, remove_volumes: bool) -> Result
                     Err(err) if err.to_string().contains("no volume") => {}
                     Err(err) => eprintln!("  ! volume {vol}: {err}"),
                 }
+            }
+        }
+    }
+    if let Some(proj) = &loaded {
+        for net in proj.owned_networks() {
+            match client.call(&Request::RemoveNetwork { name: net.network_name.clone() }) {
+                Ok(Response::NetworkRemoved { name }) => eprintln!("  ✗ removed network {name}"),
+                Ok(_) => {}
+                Err(err) if err.to_string().contains("not found") || err.to_string().contains("active endpoint") => {}
+                Err(err) => eprintln!("  ! network {}: {err}", net.network_name),
             }
         }
     }
@@ -700,6 +722,7 @@ fn service_to_run_spec(proj: &ComposeProject, svc: &ComposeService) -> RunSpec {
         cap_drop: svc.cap_drop.clone(),
         tmpfs: svc.tmpfs.clone(),
         init: svc.init,
+        networks: svc.networks.clone(),
     }
 }
 

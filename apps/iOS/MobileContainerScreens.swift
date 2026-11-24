@@ -370,6 +370,7 @@ struct MobileInspectView: View {
                         row("Kernel", d.kernel)
                     }
                     section("Network") {
+                        row("Networks", d.attachedNetworks.joined(separator: ", "))
                         row("IP address", d.container.ipAddress ?? "—")
                         row("Ports", d.container.ports.isEmpty ? "—" : d.container.ports.map(\.fullLabel).joined(separator: "\n"))
                     }

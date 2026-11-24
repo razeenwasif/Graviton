@@ -1114,7 +1114,8 @@ fn builtin_networks(state: &DockerState) -> Vec<Value> {
     };
     let mut bridge_containers = serde_json::Map::new();
     for ep in endpoints {
-        if let Some(ip) = ep.ip_address {
+        let on_default = ep.networks.is_empty() || ep.networks.iter().any(|n| n == graviton_proto::DEFAULT_NETWORK_NAME);
+        if on_default && let Some(ip) = ep.ip_address {
             bridge_containers.insert(
                 ep.container_id.clone(),
                 json!({
@@ -1181,22 +1182,66 @@ fn builtin_networks(state: &DockerState) -> Vec<Value> {
 
 fn all_networks_json(state: &DockerState) -> Vec<Value> {
     let mut list = builtin_networks(state);
-    for net in state.networks.lock().unwrap().values() {
-        list.push(json!({
-            "Name": net.name,
-            "Id": net.id,
-            "Created": net.created,
-            "Scope": net.scope,
-            "Driver": net.driver,
-            "EnableIPv6": net.enable_ipv6,
-            "IPAM": net.ipam,
-            "Internal": net.internal,
-            "Attachable": net.attachable,
-            "Ingress": net.ingress,
-            "Containers": {},
-            "Options": net.options,
-            "Labels": net.labels,
-        }));
+    if let Some(engine) = state.engine() {
+        let ni = engine.network_info();
+        for net in &ni.networks {
+            if net.builtin {
+                continue;
+            }
+            let mut containers = serde_json::Map::new();
+            for ep in &ni.endpoints {
+                if ep.networks.iter().any(|n| n == &net.name)
+                    && let Some(ip) = &ep.ip_address
+                {
+                    containers.insert(
+                        ep.container_id.clone(),
+                        json!({
+                            "Name": ep.container_name,
+                            "EndpointID": ep.container_id,
+                            "MacAddress": "",
+                            "IPv4Address": format!("{ip}/24"),
+                            "IPv6Address": ""
+                        }),
+                    );
+                }
+            }
+            list.push(json!({
+                "Name": net.name,
+                "Id": net.id,
+                "Created": crate::build::rfc3339(net.created_at),
+                "Scope": "local",
+                "Driver": net.driver,
+                "EnableIPv6": false,
+                "IPAM": {
+                    "Driver": "default",
+                    "Config": [{ "Subnet": ni.subnet, "Gateway": ni.gateway }]
+                },
+                "Internal": net.internal,
+                "Attachable": true,
+                "Ingress": false,
+                "Containers": Value::Object(containers),
+                "Options": {},
+                "Labels": net.labels,
+            }));
+        }
+    } else {
+        for net in state.networks.lock().unwrap().values() {
+            list.push(json!({
+                "Name": net.name,
+                "Id": net.id,
+                "Created": net.created,
+                "Scope": net.scope,
+                "Driver": net.driver,
+                "EnableIPv6": net.enable_ipv6,
+                "IPAM": net.ipam,
+                "Internal": net.internal,
+                "Attachable": net.attachable,
+                "Ingress": net.ingress,
+                "Containers": {},
+                "Options": net.options,
+                "Labels": net.labels,
+            }));
+        }
     }
     list
 }
@@ -1284,11 +1329,13 @@ pub async fn create_network(
         .filter(|v| !v.is_null())
         .cloned()
         .unwrap_or_else(|| json!({ "Driver": "default", "Config": [{ "Subnet": "192.168.64.0/24", "Gateway": "192.168.64.1" }] }));
-    let mut labels = HashMap::new();
+    let mut labels_map = HashMap::new();
+    let mut labels_btree = std::collections::BTreeMap::new();
     if let Some(obj) = payload["Labels"].as_object() {
         for (k, v) in obj {
             if let Some(s) = v.as_str() {
-                labels.insert(k.clone(), s.to_string());
+                labels_map.insert(k.clone(), s.to_string());
+                labels_btree.insert(k.clone(), s.to_string());
             }
         }
     }
@@ -1299,6 +1346,18 @@ pub async fn create_network(
                 options.insert(k.clone(), s.to_string());
             }
         }
+    }
+
+    if let Some(engine) = state.engine() {
+        match engine.create_network(&name, internal, labels_btree) {
+            Ok(net) => write_json(write, 201, &json!({ "Id": net.id, "Warning": "" }), head.close_after).await?,
+            Err(err) => {
+                let msg = format!("{err:#}");
+                let status = if msg.contains("already exists") || msg.contains("reserved") { 409 } else { 400 };
+                write_error(write, status, &msg, head.close_after).await?;
+            }
+        }
+        return Ok(RouteOutcome::Continue);
     }
 
     let dup = {
@@ -1320,7 +1379,7 @@ pub async fn create_network(
                     attachable,
                     ingress: false,
                     options,
-                    labels,
+                    labels: labels_map,
                 },
             );
             false
@@ -1342,8 +1401,19 @@ pub async fn remove_network(
     write: &mut OwnedWriteHalf,
 ) -> Result<RouteOutcome> {
     drain_body(reader, write, head).await?;
-    if matches!(id_or_name, "bridge" | "host" | "none" | "graviton-bridge" | "graviton-host" | "graviton-none") {
+    if matches!(id_or_name, "graviton" | "bridge" | "host" | "none" | "graviton-bridge" | "graviton-host" | "graviton-none") {
         write_error(write, 403, &format!("{id_or_name} is a pre-defined network and cannot be removed"), head.close_after).await?;
+        return Ok(RouteOutcome::Continue);
+    }
+    if let Some(engine) = state.engine() {
+        match engine.remove_network(id_or_name) {
+            Ok(_) => write_empty(write, 204, &[], head.close_after).await?,
+            Err(err) => {
+                let msg = format!("{err:#}");
+                let status = if msg.contains("active endpoint") { 403 } else { 404 };
+                write_error(write, status, &msg, head.close_after).await?;
+            }
+        }
         return Ok(RouteOutcome::Continue);
     }
     let found = {
@@ -1395,6 +1465,21 @@ pub async fn connect_network(
         }
     };
 
+    if let Some(engine) = state.engine() {
+        let engine_net = if net_name == "bridge" { graviton_proto::DEFAULT_NETWORK_NAME } else { net_name.as_str() };
+        let res = if connect {
+            engine.connect_network(engine_net, container_key)
+        } else {
+            engine.disconnect_network(engine_net, container_key)
+        };
+        if let Err(err) = res {
+            let msg = format!("{err:#}");
+            let status = if msg.contains("not found") || msg.contains("no container") { 404 } else { 400 };
+            write_error(write, status, &msg, head.close_after).await?;
+            return Ok(RouteOutcome::Continue);
+        }
+    }
+
     {
         let mut meta = state.container_meta.lock().unwrap();
         let entry = meta.entry(cid).or_default();
@@ -1418,7 +1503,11 @@ pub async fn prune_networks(
     write: &mut OwnedWriteHalf,
 ) -> Result<RouteOutcome> {
     drain_body(reader, write, head).await?;
-    let deleted: Vec<String> = state.networks.lock().unwrap().drain().map(|(_, n)| n.name).collect();
+    let deleted: Vec<String> = if let Some(engine) = state.engine() {
+        engine.prune_unused_networks().unwrap_or_default()
+    } else {
+        state.networks.lock().unwrap().drain().map(|(_, n)| n.name).collect()
+    };
     write_json(write, 200, &json!({ "NetworksDeleted": deleted }), head.close_after).await?;
     Ok(RouteOutcome::Continue)
 }

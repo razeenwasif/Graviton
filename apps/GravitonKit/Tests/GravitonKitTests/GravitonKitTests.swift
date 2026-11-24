@@ -1474,4 +1474,96 @@ import Testing
         #expect(secLine.contains(#""cap_add":["NET_BIND_SERVICE"]"#))
         #expect(secLine.contains(#""target":"/tmp""#) && secLine.contains(#""options":"rw,noexec,size=64m""#))
     }
+
+    @Test func userNetworkWireAndDemoLifecycle() async throws {
+        // 1. Request wire encoding (snake_case + CodingKeys override `"internal"`).
+        let createLine = String(decoding: try Wire.line(.createNetwork(name: "app-net", internal: true, labels: ["env": "dev"])), as: UTF8.self)
+        #expect(createLine.contains(#""method":"create_network""#))
+        #expect(createLine.contains(#""name":"app-net""#))
+        #expect(createLine.contains(#""internal":true"#))
+        #expect(createLine.contains(#""env":"dev""#))
+
+        for req: EngineRequest in [
+            .listNetworks,
+            .removeNetwork(name: "app-net"),
+            .connectNetwork(network: "app-net", container: "web"),
+            .disconnectNetwork(network: "app-net", container: "web"),
+        ] {
+            let encoded = try Wire.line(req)
+            #expect(!encoded.isEmpty)
+        }
+
+        // 2. RunSpec omits networks when nil, encodes when present.
+        let plainRun = String(decoding: try Wire.line(.run(RunSpec(image: "alpine:3.22"))), as: UTF8.self)
+        #expect(!plainRun.contains("networks"))
+        let netRun = String(decoding: try Wire.line(.run(RunSpec(image: "alpine:3.22", networks: ["app-net", "db-net"]))), as: UTF8.self)
+        #expect(netRun.contains(#""networks":["app-net","db-net"]"#))
+
+        // 3. Response decoding + backward compatibility when `networks` is omitted.
+        let listJson = #"{"type":"networks","data":[{"id":"net1","name":"app-net","driver":"bridge","internal":true,"builtin":false,"created_at":1700000000,"labels":{"env":"dev"},"containers":["web"]}]}"#
+        guard case let .networks(decodedNets) = try Wire.decoder.decode(EngineResponse.self, from: Data(listJson.utf8)) else {
+            Issue.record("expected .networks"); return
+        }
+        #expect(decodedNets.count == 1)
+        #expect(decodedNets[0].name == "app-net")
+        #expect(decodedNets[0].internalOnly == true)
+        #expect(decodedNets[0].containers == ["web"])
+
+        let createdJson = #"{"type":"network_created","data":{"id":"net2","name":"db-net","driver":"bridge","internal":false,"builtin":false,"created_at":1700000001}}"#
+        guard case let .networkCreated(created) = try Wire.decoder.decode(EngineResponse.self, from: Data(createdJson.utf8)) else {
+            Issue.record("expected .networkCreated"); return
+        }
+        #expect(created.name == "db-net")
+
+        let removedJson = #"{"type":"network_removed","data":{"name":"db-net"}}"#
+        guard case let .networkRemoved(remName) = try Wire.decoder.decode(EngineResponse.self, from: Data(removedJson.utf8)) else {
+            Issue.record("expected .networkRemoved"); return
+        }
+        #expect(remName == "db-net")
+
+        let updatedJson = #"{"type":"network_updated","data":{"network":"app-net","container":"web","connected":true}}"#
+        guard case let .networkUpdated(netName, ctr, conn) = try Wire.decoder.decode(EngineResponse.self, from: Data(updatedJson.utf8)) else {
+            Issue.record("expected .networkUpdated"); return
+        }
+        #expect(netName == "app-net" && ctr == "web" && conn)
+
+        let legacyNetJson = #"{"name":"graviton","driver":"L2 switch + NAT","subnet":"192.168.64.0/24","gateway":"192.168.64.1","dns_server":"127.0.0.11:53","dns_domain":"graviton","connected_ports":1,"learned_macs":1,"frames_forwarded":10,"bytes_forwarded":200,"endpoints":[{"container_id":"abc","container_name":"web","image":"nginx","status":"running","ip_address":"192.168.64.2","dns_names":["web"],"dns_enabled":true,"ports":[]}]}"#
+        let legacyInfo = try Wire.decoder.decode(NetworkInfo.self, from: Data(legacyNetJson.utf8))
+        #expect(legacyInfo.networks.isEmpty)
+        #expect(legacyInfo.endpoints.first?.attachedNetworks == ["graviton"])
+
+        // 4. DemoEngine network CRUD, validation, connect/disconnect, inspect & networkInfo sync.
+        let demo = DemoEngine()
+        let createdNet = try await demo.createNetwork(name: "qa-net", internalOnly: true, labels: ["tier": "qa"])
+        #expect(createdNet.name == "qa-net" && createdNet.internalOnly)
+
+        do {
+            _ = try await demo.createNetwork(name: "qa-net")
+            Issue.record("duplicate network should fail")
+        } catch {}
+
+        let attached = try await demo.connectNetwork(network: "qa-net", container: "web")
+        #expect(attached)
+        let webInspect = try await demo.inspect(id: "web")
+        #expect(webInspect.attachedNetworks.contains("qa-net"))
+        let netSnapshot = await demo.networkInfo()
+        #expect(netSnapshot.networks.contains { $0.name == "qa-net" && $0.containers.contains("web") })
+        #expect(netSnapshot.endpoints.first { $0.containerName == "web" }?.attachedNetworks.contains("qa-net") == true)
+
+        do {
+            _ = try await demo.removeNetwork(name: "qa-net")
+            Issue.record("removing network with active container should fail")
+        } catch {}
+
+        do {
+            _ = try await demo.removeNetwork(name: "graviton")
+            Issue.record("removing built-in graviton network should fail")
+        } catch {}
+
+        let detached = try await demo.disconnectNetwork(network: "qa-net", container: "web")
+        #expect(!detached)
+        let removed = try await demo.removeNetwork(name: "qa-net")
+        #expect(removed == "qa-net")
+        #expect(await demo.networks().contains { $0.name == "qa-net" } == false)
+    }
 }

@@ -23,6 +23,7 @@ public final class EngineStore {
     public private(set) var volumes: [VolumeInfo] = []
     public private(set) var registryLogins: [RegistryLoginInfo] = []
     public private(set) var network: NetworkInfo?
+    public private(set) var networks: [UserNetwork] = []
     public private(set) var engine: EngineInfo?
     public private(set) var logs: [String: [LogLine]] = [:]
     /// Recent events, newest last.
@@ -74,6 +75,7 @@ public final class EngineStore {
         volumesLoaded = false
         registryLogins = []
         network = nil
+        networks = []
         self.engine = nil
         logs = [:]
         events = []
@@ -140,8 +142,17 @@ public final class EngineStore {
             // Gracefully fall back if talking to an older gravitond without network_info / list_volumes.
             if let net = try? await service.networkInfo() {
                 network = net
+                if !net.networks.isEmpty {
+                    networks = net.networks
+                } else if let nets = try? await service.networks() {
+                    networks = nets
+                } else {
+                    networks = [UserNetwork(id: "graviton", name: net.name, driver: net.driver, internalOnly: false, builtin: true, createdAt: 0, containers: net.endpoints.map(\.containerName))]
+                }
             } else {
-                network = NetworkInfo.synthesized(from: containers)
+                let synth = NetworkInfo.synthesized(from: containers)
+                network = synth
+                networks = synth.networks
             }
             if !volumesLoaded, let vols = try? await service.volumes() {
                 volumes = vols
@@ -393,6 +404,41 @@ public final class EngineStore {
         let freed = try await service.removeVolume(name: volume.name)
         await loadVolumes()
         return freed
+    }
+
+    // Networks.
+    public func loadNetworks() async {
+        if let list = try? await service.networks() {
+            networks = list
+        }
+    }
+
+    @discardableResult
+    public func createNetwork(name: String, internalOnly: Bool = false, labels: [String: String] = [:]) async throws -> UserNetwork {
+        let net = try await service.createNetwork(name: name, internalOnly: internalOnly, labels: labels)
+        await refresh()
+        return net
+    }
+
+    @discardableResult
+    public func removeNetwork(_ name: String) async throws -> String {
+        let removed = try await service.removeNetwork(name: name)
+        await refresh()
+        return removed
+    }
+
+    @discardableResult
+    public func connectNetwork(_ network: String, container: String) async throws -> Bool {
+        let connected = try await service.connectNetwork(network: network, container: container)
+        await refresh()
+        return connected
+    }
+
+    @discardableResult
+    public func disconnectNetwork(_ network: String, container: String) async throws -> Bool {
+        let connected = try await service.disconnectNetwork(network: network, container: container)
+        await refresh()
+        return connected
     }
 
     // Registry logins (usernames on disk; passwords stored in the Mac's Keychain).

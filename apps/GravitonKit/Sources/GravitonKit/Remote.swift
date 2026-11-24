@@ -470,6 +470,39 @@ public actor RemoteEngine: EngineService {
         return info
     }
 
+    public func networks() async throws -> [UserNetwork] {
+        guard case let .networks(list) = try await call(.listNetworks) else { throw EngineError.unexpectedResponse }
+        return list
+    }
+
+    public func createNetwork(name: String, internalOnly: Bool = false, labels: [String: String] = [:]) async throws -> UserNetwork {
+        guard case let .networkCreated(net) = try await call(.createNetwork(name: name, internal: internalOnly, labels: labels)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return net
+    }
+
+    public func removeNetwork(name: String) async throws -> String {
+        guard case let .networkRemoved(removed) = try await call(.removeNetwork(name: name)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return removed
+    }
+
+    public func connectNetwork(network: String, container: String) async throws -> Bool {
+        guard case let .networkUpdated(_, _, connected) = try await call(.connectNetwork(network: network, container: container)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return connected
+    }
+
+    public func disconnectNetwork(network: String, container: String) async throws -> Bool {
+        guard case let .networkUpdated(_, _, connected) = try await call(.disconnectNetwork(network: network, container: container)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return connected
+    }
+
     public func logs(id: String, tail: Int?, sinceMs: UInt64? = nil, untilMs: UInt64? = nil) async throws -> [LogLine] {
         guard case let .logs(lines) = try await call(.logs(id: id, tail: tail, follow: false, sinceMs: sinceMs, untilMs: untilMs)) else {
             throw EngineError.unexpectedResponse

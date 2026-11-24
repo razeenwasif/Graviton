@@ -33,10 +33,11 @@ use graviton_core::{ImageReference, Store, paths};
 use graviton_image::{BlobStore, Credentials, HealthcheckConfig, ImageError, ImageIndex, LocalImage, Progress, PullOptions, PushProgress, Registry};
 use graviton_proto::{
     AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ContainerDetails, ContainerStatRow, ContainerStats, ContainerStatus,
-    ContainerSummary, DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats, HealthLog, HealthState,
-    HealthStatus, Healthcheck, HostEntry, ImageSummary, LogLevel, LogLine, LogStream, Mount, NetworkEndpoint, NetworkInfo,
-    PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy, RunSpec, SnapshotInfo, StatSample,
-    TmpfsMount, VolumeMountRef, VolumeSummary, caps, decode_line, encode_line, parse_tmpfs_spec,
+    ContainerSummary, DEFAULT_NETWORK_NAME, DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats,
+    HealthLog, HealthState, HealthStatus, Healthcheck, HostEntry, ImageSummary, LogLevel, LogLine, LogStream, Mount,
+    NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy,
+    RunSpec, SnapshotInfo, StatSample, TmpfsMount, UserNetwork, VolumeMountRef, VolumeSummary, caps, decode_line,
+    encode_line, parse_tmpfs_spec,
 };
 use graviton_vmm::apple::{AppleHypervisor, AppleVm};
 use graviton_vmm::{NetworkMode, SharedDirectory, VmConfig, VmHandle};
@@ -117,6 +118,8 @@ pub(crate) struct ContainerSpec {
     pub(crate) tmpfs: Vec<TmpfsMount>,
     #[serde(default)]
     pub(crate) init: bool,
+    #[serde(default)]
+    pub(crate) networks: Vec<String>,
 }
 
 /// Interactive `grav run -it` handle returned to the control connection.
@@ -145,10 +148,24 @@ pub(crate) struct Volume {
     pub(crate) name: Option<String>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct SavedNetwork {
+    id: String,
+    name: String,
+    #[serde(default)]
+    internal: bool,
+    #[serde(default)]
+    created_at: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    labels: BTreeMap<String, String>,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct SavedState {
     containers: Vec<ContainerSummary>,
     specs: HashMap<String, ContainerSpec>,
+    #[serde(default)]
+    networks: Vec<SavedNetwork>,
 }
 
 struct Running {
@@ -156,6 +173,7 @@ struct Running {
     project: Option<String>,
     service: Option<String>,
     dns_aliases: Vec<String>,
+    networks: Vec<String>,
     vm: Arc<AppleVm>,
     agent: Arc<Mutex<File>>,
     paused: Arc<AtomicBool>,
@@ -167,7 +185,7 @@ struct Running {
     forwards: Vec<tokio::task::JoinHandle<()>>,
     healthcheck: Option<tokio::task::JoinHandle<()>>,
     /// The VM's port on the container network; unplugged when this is dropped (after the VM stops).
-    _port: Option<crate::switch::Port>,
+    port: Option<crate::switch::Port>,
     /// Exclusive lease on the snapshot slot this VM restored from; released after the VM stops.
     _snapshot: Option<crate::snapshot::SnapshotLease>,
 }
@@ -202,6 +220,7 @@ pub struct Engine {
     running: Mutex<HashMap<String, Running>>,
     stats: Mutex<HashMap<String, StatsHistory>>,
     health: Mutex<HashMap<String, HealthState>>,
+    networks: Mutex<BTreeMap<String, SavedNetwork>>,
     log_io: Mutex<()>,
     log_tx: tokio::sync::broadcast::Sender<LogEvent>,
     stats_tx: tokio::sync::broadcast::Sender<StatsEvent>,
@@ -242,6 +261,7 @@ impl Engine {
             running: Mutex::new(HashMap::new()),
             stats: Mutex::new(HashMap::new()),
             health: Mutex::new(HashMap::new()),
+            networks: Mutex::new(BTreeMap::new()),
             log_io: Mutex::new(()),
             log_tx,
             stats_tx,
@@ -369,6 +389,17 @@ impl Engine {
             }
         }
         let mut specs = saved.specs;
+        for spec in specs.values_mut() {
+            if spec.networks.is_empty() {
+                spec.networks.push(DEFAULT_NETWORK_NAME.to_string());
+            }
+        }
+        {
+            let mut nets = self.networks.lock().unwrap();
+            for n in saved.networks {
+                nets.insert(n.name.clone(), n);
+            }
+        }
         let mut autostart = Vec::new();
         let mut stopped_logs = Vec::new();
         for (id, spec) in &mut specs {
@@ -405,6 +436,7 @@ impl Engine {
         let state = SavedState {
             containers: self.store.lock().unwrap().containers().to_vec(),
             specs: self.specs.lock().unwrap().clone(),
+            networks: self.networks.lock().unwrap().values().cloned().collect(),
         };
         // Saves from different threads each get their own temporary file: with
         // one shared, a rename could find it already moved away.
@@ -750,6 +782,15 @@ impl Engine {
                 bail!("the name {name} is already in use");
             }
         }
+        let networks = normalize_network_list(&spec.networks);
+        {
+            let nets = self.networks.lock().unwrap();
+            for net in &networks {
+                if net != DEFAULT_NETWORK_NAME && !nets.contains_key(net) {
+                    bail!("network `{net}` not found (create it with `grav network create {net}`)");
+                }
+            }
+        }
         if image.architecture == "amd64" && graviton_image::guest_arch() != "amd64" && !AppleHypervisor::rosetta_available() {
             bail!(
                 "{} is a linux/amd64 image, which needs Apple Rosetta for Linux (run `softwareupdate --install-rosetta`)",
@@ -805,6 +846,7 @@ impl Engine {
             cap_drop,
             tmpfs,
             init: spec.init,
+            networks,
         };
 
         let id = new_id();
@@ -1397,7 +1439,7 @@ impl Engine {
         }
 
         // A second network device on the container network, so containers reach each other.
-        let port = self.switch.attach().context("joining the container network")?;
+        let port = self.switch.attach_to(spec.networks.iter().cloned()).context("joining the container network")?;
         config.switch_port = Some(port.vm_fd());
         let (vm, snapshot_lease, from_snapshot) = match self.snapshots.try_restore(&config)? {
             Some((restored, lease)) => (Arc::new(restored), Some(lease), true),
@@ -1418,6 +1460,7 @@ impl Engine {
                 project: spec.project.clone(),
                 service: spec.service.clone(),
                 dns_aliases: spec.dns_aliases.clone(),
+                networks: spec.networks.clone(),
                 vm: Arc::clone(&vm),
                 agent: Arc::clone(&agent),
                 paused: Arc::clone(&paused),
@@ -1426,7 +1469,7 @@ impl Engine {
                 dns: false,
                 forwards: vec![],
                 healthcheck: None,
-                _port: Some(port),
+                port: Some(port),
                 _snapshot: snapshot_lease,
             },
         );
@@ -1630,9 +1673,12 @@ impl Engine {
             project: Option<String>,
             service: Option<String>,
             dns_aliases: Vec<String>,
+            networks: HashSet<String>,
         }
         struct SyncTarget {
+            id: String,
             project: Option<String>,
+            networks: HashSet<String>,
             agent: Arc<Mutex<File>>,
         }
         let _turn = self.hosts_sync.lock().unwrap();
@@ -1648,13 +1694,19 @@ impl Engine {
                         project: r.project.clone(),
                         service: r.service.clone(),
                         dns_aliases: r.dns_aliases.clone(),
+                        networks: r.networks.iter().cloned().collect(),
                     })
                 })
                 .collect();
             let targets = running
-                .values()
-                .filter(|r| r.dns && r.ip.is_some() && !r.paused.load(Ordering::Acquire))
-                .map(|r| SyncTarget { project: r.project.clone(), agent: Arc::clone(&r.agent) })
+                .iter()
+                .filter(|(_, r)| r.dns && r.ip.is_some() && !r.paused.load(Ordering::Acquire))
+                .map(|(id, r)| SyncTarget {
+                    id: id.clone(),
+                    project: r.project.clone(),
+                    networks: r.networks.iter().cloned().collect(),
+                    agent: Arc::clone(&r.agent),
+                })
                 .collect();
             (peers, targets)
         };
@@ -1662,15 +1714,18 @@ impl Engine {
             return;
         }
         let generation = self.hosts_gen.fetch_add(1, Ordering::Relaxed) + 1;
-        // Canonical entries (first so reverse PTR keeps the container's real name).
-        let base_hosts: Vec<HostEntry> = peers
-            .iter()
-            .map(|p| HostEntry { name: p.name.clone(), id: p.id.clone(), ip: p.ip.clone() })
-            .collect();
-        for SyncTarget { project: target_project, agent } in targets {
-            let mut hosts = base_hosts.clone();
+        for SyncTarget { id: target_id, project: target_project, networks: target_nets, agent } in targets {
+            let visible: Vec<&LivePeer> = peers
+                .iter()
+                .filter(|p| p.id == target_id || !target_nets.is_disjoint(&p.networks))
+                .collect();
+            // Canonical entries first so reverse PTR keeps the container's real name.
+            let mut hosts: Vec<HostEntry> = visible
+                .iter()
+                .map(|p| HostEntry { name: p.name.clone(), id: p.id.clone(), ip: p.ip.clone() })
+                .collect();
             if let Some(proj) = target_project.as_deref() {
-                for p in &peers {
+                for p in visible {
                     if p.project.as_deref() != Some(proj) {
                         continue;
                     }
@@ -2198,6 +2253,7 @@ impl Engine {
             cap_drop: spec.cap_drop,
             tmpfs: spec.tmpfs,
             init: spec.init,
+            networks: spec.networks,
             container,
         })
     }
@@ -2299,6 +2355,209 @@ impl Engine {
         Ok((name.to_string(), freed_bytes))
     }
 
+    pub fn list_networks(&self) -> Vec<UserNetwork> {
+        let mut attached: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let store = self.store.lock().unwrap();
+            let specs = self.specs.lock().unwrap();
+            for c in store.containers() {
+                let nets = specs
+                    .get(&c.id)
+                    .map(|s| s.networks.as_slice())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or(&[]);
+                if nets.is_empty() {
+                    attached.entry(DEFAULT_NETWORK_NAME.into()).or_default().push(c.name.clone());
+                } else {
+                    for net in nets {
+                        attached.entry(net.clone()).or_default().push(c.name.clone());
+                    }
+                }
+            }
+        }
+        for names in attached.values_mut() {
+            names.sort();
+        }
+        let mut out = vec![UserNetwork {
+            id: "graviton-bridge".into(),
+            name: DEFAULT_NETWORK_NAME.into(),
+            driver: "L2 switch + NAT".into(),
+            internal: false,
+            builtin: true,
+            created_at: 0,
+            labels: BTreeMap::new(),
+            containers: attached.remove(DEFAULT_NETWORK_NAME).unwrap_or_default(),
+        }];
+        let nets = self.networks.lock().unwrap();
+        for net in nets.values() {
+            out.push(UserNetwork {
+                id: net.id.clone(),
+                name: net.name.clone(),
+                driver: "bridge".into(),
+                internal: net.internal,
+                builtin: false,
+                created_at: net.created_at,
+                labels: net.labels.clone(),
+                containers: attached.remove(&net.name).unwrap_or_default(),
+            });
+        }
+        out
+    }
+
+    pub fn create_network(&self, raw_name: &str, internal: bool, labels: BTreeMap<String, String>) -> Result<UserNetwork> {
+        let name = validate_user_network_name(raw_name)?;
+        let saved = {
+            let mut nets = self.networks.lock().unwrap();
+            if nets.contains_key(&name) {
+                bail!("network with name {name} already exists");
+            }
+            let entry = SavedNetwork {
+                id: new_id(),
+                name: name.clone(),
+                internal,
+                created_at: now_secs(),
+                labels,
+            };
+            nets.insert(name, entry.clone());
+            entry
+        };
+        self.save();
+        Ok(UserNetwork {
+            id: saved.id,
+            name: saved.name,
+            driver: "bridge".into(),
+            internal: saved.internal,
+            builtin: false,
+            created_at: saved.created_at,
+            labels: saved.labels,
+            containers: Vec::new(),
+        })
+    }
+
+    pub fn remove_network(&self, key: &str) -> Result<String> {
+        let key = key.trim();
+        if matches!(key, "graviton" | "bridge" | "host" | "none" | "graviton-bridge" | "graviton-host" | "graviton-none") {
+            bail!("{key} is a pre-defined network and cannot be removed");
+        }
+        let target_name = {
+            let nets = self.networks.lock().unwrap();
+            if nets.contains_key(key) {
+                key.to_string()
+            } else {
+                nets.values()
+                    .find(|n| n.id == key || n.id.starts_with(key))
+                    .map(|n| n.name.clone())
+                    .ok_or_else(|| anyhow!("network `{key}` not found"))?
+            }
+        };
+        {
+            let store = self.store.lock().unwrap();
+            let specs = self.specs.lock().unwrap();
+            for c in store.containers() {
+                if specs.get(&c.id).is_some_and(|s| s.networks.iter().any(|n| n == &target_name)) {
+                    bail!("network `{target_name}` has active endpoint `{}`", c.name);
+                }
+            }
+        }
+        self.networks.lock().unwrap().remove(&target_name);
+        self.save();
+        Ok(target_name)
+    }
+
+    pub fn connect_network(&self, network: &str, container_key: &str) -> Result<(String, String)> {
+        let net_name = self.resolve_network_name(network)?;
+        let (cid, cname) = {
+            let store = self.store.lock().unwrap();
+            let c = store.container(container_key)?;
+            (c.id.clone(), c.name.clone())
+        };
+        let updated_nets = {
+            let mut specs = self.specs.lock().unwrap();
+            let spec = specs.get_mut(&cid).ok_or_else(|| anyhow!("container {container_key} has no saved settings"))?;
+            if !spec.networks.contains(&net_name) {
+                spec.networks.push(net_name.clone());
+            }
+            spec.networks.clone()
+        };
+        if let Some(r) = self.running.lock().unwrap().get_mut(&cid) {
+            r.networks = updated_nets.clone();
+            if let Some(port) = &r.port {
+                self.switch.set_port_networks(port.id(), updated_nets);
+            }
+        }
+        self.sync_hosts();
+        self.save();
+        Ok((net_name, cname))
+    }
+
+    pub fn disconnect_network(&self, network: &str, container_key: &str) -> Result<(String, String)> {
+        let net_name = self.resolve_network_name(network)?;
+        let (cid, cname) = {
+            let store = self.store.lock().unwrap();
+            let c = store.container(container_key)?;
+            (c.id.clone(), c.name.clone())
+        };
+        let updated_nets = {
+            let mut specs = self.specs.lock().unwrap();
+            let spec = specs.get_mut(&cid).ok_or_else(|| anyhow!("container {container_key} has no saved settings"))?;
+            let before = spec.networks.len();
+            spec.networks.retain(|n| n != &net_name);
+            if spec.networks.len() == before {
+                bail!("container `{cname}` is not connected to network `{net_name}`");
+            }
+            spec.networks.clone()
+        };
+        if let Some(r) = self.running.lock().unwrap().get_mut(&cid) {
+            r.networks = updated_nets.clone();
+            if let Some(port) = &r.port {
+                self.switch.set_port_networks(port.id(), updated_nets);
+            }
+        }
+        self.sync_hosts();
+        self.save();
+        Ok((net_name, cname))
+    }
+
+    pub fn prune_unused_networks(&self) -> Result<Vec<String>> {
+        let in_use: HashSet<String> = {
+            let store = self.store.lock().unwrap();
+            let specs = self.specs.lock().unwrap();
+            store
+                .containers()
+                .iter()
+                .filter_map(|c| specs.get(&c.id))
+                .flat_map(|s| s.networks.iter().cloned())
+                .collect()
+        };
+        let removed: Vec<String> = {
+            let mut nets = self.networks.lock().unwrap();
+            let unused: Vec<String> = nets.keys().filter(|name| !in_use.contains(*name)).cloned().collect();
+            for name in &unused {
+                nets.remove(name);
+            }
+            unused
+        };
+        if !removed.is_empty() {
+            self.save();
+        }
+        Ok(removed)
+    }
+
+    fn resolve_network_name(&self, key: &str) -> Result<String> {
+        let norm = normalize_network_name(key);
+        if norm == DEFAULT_NETWORK_NAME {
+            return Ok(norm);
+        }
+        let nets = self.networks.lock().unwrap();
+        if nets.contains_key(&norm) {
+            return Ok(norm);
+        }
+        nets.values()
+            .find(|n| n.id == norm || n.id.starts_with(&norm))
+            .map(|n| n.name.clone())
+            .ok_or_else(|| anyhow!("network `{key}` not found"))
+    }
+
     pub fn network_info(&self) -> NetworkInfo {
         let sw = self.switch.stats();
         let running: HashMap<String, (Option<String>, bool, Vec<String>)> = self
@@ -2321,6 +2580,13 @@ impl Engine {
                 (id.clone(), (r.ip.clone(), r.dns, aliases))
             })
             .collect();
+        let spec_networks: HashMap<String, Vec<String>> = {
+            let specs = self.specs.lock().unwrap();
+            specs
+                .iter()
+                .map(|(id, s)| (id.clone(), if s.networks.is_empty() { vec![DEFAULT_NETWORK_NAME.into()] } else { s.networks.clone() }))
+                .collect()
+        };
         let containers = self.store.lock().unwrap().containers().to_vec();
         let (subnet, gateway) = containers
             .iter()
@@ -2344,6 +2610,7 @@ impl Engine {
                         dns_names.push(alias);
                     }
                 }
+                let nets = spec_networks.get(&c.id).cloned().unwrap_or_else(|| vec![DEFAULT_NETWORK_NAME.into()]);
                 NetworkEndpoint {
                     container_id: c.id,
                     container_name: c.name,
@@ -2353,6 +2620,7 @@ impl Engine {
                     dns_names,
                     dns_enabled,
                     ports: c.ports,
+                    networks: nets,
                 }
             })
             .collect();
@@ -2373,6 +2641,7 @@ impl Engine {
             frames_forwarded: sw.frames_forwarded,
             bytes_forwarded: sw.bytes_forwarded,
             endpoints,
+            networks: self.list_networks(),
         }
     }
 
@@ -3115,6 +3384,48 @@ fn exec_probe_on_vm(
     }
 }
 
+fn normalize_network_name(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "bridge" || trimmed == "default" {
+        DEFAULT_NETWORK_NAME.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalize_network_list(raw: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in raw {
+        let name = normalize_network_name(item);
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    if out.is_empty() {
+        out.push(DEFAULT_NETWORK_NAME.to_string());
+    }
+    out
+}
+
+pub(crate) fn validate_user_network_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 63 {
+        bail!("network name must be 1–63 characters");
+    }
+    if matches!(name, "graviton" | "bridge" | "host" | "none" | "default") {
+        bail!("network name `{name}` is reserved");
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else { bail!("network name is empty") };
+    if !first.is_ascii_alphanumeric() {
+        bail!("network name `{name}` must start with an ASCII letter or digit");
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')) {
+        bail!("network name `{name}` may contain only letters, digits, `.`, `_`, or `-`");
+    }
+    Ok(name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3356,5 +3667,125 @@ mod tests {
         // 5-entry log cap preserved even across more probes.
         assert_eq!(apply_health_probe(&mut st, &hc, false, entry(0)), None);
         assert_eq!(st.log.len(), 5);
+    }
+
+    fn normalize_network_helpers_and_validation_work() {
+        assert_eq!(normalize_network_list(&[]), vec!["graviton"]);
+        assert_eq!(normalize_network_list(&["bridge".into(), "app".into(), "graviton".into()]), vec!["graviton", "app"]);
+        assert!(validate_user_network_name("app-net.1").is_ok());
+        assert!(validate_user_network_name("bridge").is_err());
+        assert!(validate_user_network_name("graviton").is_err());
+        assert!(validate_user_network_name("-bad").is_err());
+    }
+
+    #[test]
+    fn user_networks_crud_connect_disconnect_and_persistence() {
+        normalize_network_helpers_and_validation_work();
+        let dir = PathBuf::from(format!("/tmp/graviton-net-test-{}", new_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("containers.json");
+
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let engine = Engine {
+            store: Arc::new(Mutex::new(Store::new())),
+            blobs: BlobStore::new(dir.join("blobs")),
+            index: Mutex::new(ImageIndex::load(dir.join("images.json")).unwrap()),
+            specs: Mutex::new(HashMap::new()),
+            snapshots: Arc::new(crate::snapshot::SnapshotPool::open()),
+            running: Mutex::new(HashMap::new()),
+            stats: Mutex::new(HashMap::new()),
+            health: Mutex::new(HashMap::new()),
+            networks: Mutex::new(BTreeMap::new()),
+            log_io: Mutex::new(()),
+            log_tx: tokio::sync::broadcast::channel(8).0,
+            stats_tx: tokio::sync::broadcast::channel(8).0,
+            switch: crate::switch::Switch::new(),
+            hosts_sync: Mutex::new(()),
+            hosts_gen: AtomicU64::new(0),
+            events: Arc::new(crate::events::EventLog::open(dir.join("events.jsonl"))),
+            auth: crate::auth::RegistryAuth::open(),
+            stopping: Mutex::new(HashSet::new()),
+            pending_restarts: Mutex::new(HashMap::new()),
+            shutting_down: AtomicBool::new(false),
+            pulling: Mutex::new(HashMap::new()),
+            rt: rt.handle().clone(),
+            state_path: state_path.clone(),
+        };
+
+        let created = engine.create_network("frontend", false, BTreeMap::from([("tier".into(), "web".into())])).unwrap();
+        assert_eq!(created.name, "frontend");
+        assert!(engine.create_network("frontend", false, BTreeMap::new()).is_err());
+        assert!(engine.create_network("bridge", false, BTreeMap::new()).is_err());
+        assert!(engine.remove_network("graviton").is_err());
+
+        // Seed a container & spec and attach/detach live metadata.
+        let cid = new_id();
+        engine.store.lock().unwrap().insert(ContainerSummary {
+            id: cid.clone(),
+            name: "web".into(),
+            image: "alpine:3.22".into(),
+            status: ContainerStatus::Created,
+            exit_code: None,
+            ports: vec![],
+            mounts: vec![],
+            ip_address: None,
+            cpu_percent: None,
+            memory_bytes: None,
+            memory_limit_bytes: Some(512 << 20),
+            created_at: 1,
+            started_at: None,
+            project: None,
+            service: None,
+            health: None,
+        }).unwrap();
+        engine.specs.lock().unwrap().insert(cid.clone(), ContainerSpec {
+            argv: vec!["sh".into()],
+            env: vec![],
+            cwd: "/".into(),
+            user: None,
+            cpus: 2,
+            memory_mib: 512,
+            image: LocalImage {
+                reference: "alpine:3.22".into(),
+                manifest_digest: "sha256:aa".into(),
+                config_digest: "sha256:bb".into(),
+                layers: vec![],
+                architecture: "arm64".into(),
+                pulled_at: 1,
+                variants: vec![],
+            },
+            ports: vec![],
+            volumes: vec![],
+            restart: RestartPolicy::No,
+            want_running: false,
+            auto_remove: false,
+            hostname: None,
+            project: None,
+            service: None,
+            labels: BTreeMap::new(),
+            dns_aliases: vec![],
+            healthcheck: None,
+            read_only: false,
+            cap_add: vec![],
+            cap_drop: vec![],
+            tmpfs: vec![],
+            init: false,
+            networks: vec![DEFAULT_NETWORK_NAME.into()],
+        });
+
+        engine.connect_network("frontend", "web").unwrap();
+        assert!(engine.remove_network("frontend").is_err()); // busy
+        let ni = engine.network_info();
+        assert_eq!(ni.networks.iter().find(|n| n.name == "frontend").unwrap().containers, vec!["web"]);
+
+        // Persist and reload SavedState -> network survives restart.
+        engine.save();
+        let saved: SavedState = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(saved.networks.len(), 1);
+        assert_eq!(saved.networks[0].name, "frontend");
+
+        engine.disconnect_network("frontend", "web").unwrap();
+        assert_eq!(engine.remove_network("frontend").unwrap(), "frontend");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

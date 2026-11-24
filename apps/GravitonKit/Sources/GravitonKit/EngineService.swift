@@ -31,6 +31,11 @@ public protocol EngineService: Sendable {
     func createVolume(name: String) async throws -> VolumeInfo
     func removeVolume(name: String) async throws -> UInt64
     func networkInfo() async throws -> NetworkInfo
+    func networks() async throws -> [UserNetwork]
+    func createNetwork(name: String, internalOnly: Bool, labels: [String: String]) async throws -> UserNetwork
+    func removeNetwork(name: String) async throws -> String
+    func connectNetwork(network: String, container: String) async throws -> Bool
+    func disconnectNetwork(network: String, container: String) async throws -> Bool
     func logs(id: String, tail: Int?, sinceMs: UInt64?, untilMs: UInt64?) async throws -> [LogLine]
     func start(id: String) async throws -> Container
     func stop(id: String) async throws -> Container
@@ -135,6 +140,39 @@ public final class SocketEngine: EngineService {
     public func networkInfo() async throws -> NetworkInfo {
         guard case let .network(info) = try await call(.networkInfo) else { throw EngineError.unexpectedResponse }
         return info
+    }
+
+    public func networks() async throws -> [UserNetwork] {
+        guard case let .networks(list) = try await call(.listNetworks) else { throw EngineError.unexpectedResponse }
+        return list
+    }
+
+    public func createNetwork(name: String, internalOnly: Bool = false, labels: [String: String] = [:]) async throws -> UserNetwork {
+        guard case let .networkCreated(net) = try await call(.createNetwork(name: name, internal: internalOnly, labels: labels)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return net
+    }
+
+    public func removeNetwork(name: String) async throws -> String {
+        guard case let .networkRemoved(removed) = try await call(.removeNetwork(name: name)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return removed
+    }
+
+    public func connectNetwork(network: String, container: String) async throws -> Bool {
+        guard case let .networkUpdated(_, _, connected) = try await call(.connectNetwork(network: network, container: container)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return connected
+    }
+
+    public func disconnectNetwork(network: String, container: String) async throws -> Bool {
+        guard case let .networkUpdated(_, _, connected) = try await call(.disconnectNetwork(network: network, container: container)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return connected
     }
 
     public func logs(id: String, tail: Int?, sinceMs: UInt64? = nil, untilMs: UInt64? = nil) async throws -> [LogLine] {

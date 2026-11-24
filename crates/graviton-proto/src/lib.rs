@@ -219,6 +219,27 @@ pub struct VolumeSummary {
     pub used_by: Vec<VolumeMountRef>,
 }
 
+/// Default shared container network name.
+pub const DEFAULT_NETWORK_NAME: &str = "graviton";
+
+/// A named container network (either the built-in default `graviton` bridge or a user-defined L2-isolated network).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserNetwork {
+    pub id: String,
+    pub name: String,
+    pub driver: String,
+    #[serde(default)]
+    pub internal: bool,
+    #[serde(default)]
+    pub builtin: bool,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub containers: Vec<String>,
+}
+
 /// One container connected to (or known on) the container network.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkEndpoint {
@@ -230,9 +251,11 @@ pub struct NetworkEndpoint {
     pub dns_names: Vec<String>,
     pub dns_enabled: bool,
     pub ports: Vec<PortMapping>,
+    #[serde(default)]
+    pub networks: Vec<String>,
 }
 
-/// Live view of Graviton's shared container network, switch, and embedded DNS.
+/// Live view of Graviton's container networks, switch, and embedded DNS.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkInfo {
     pub name: String,
@@ -246,6 +269,8 @@ pub struct NetworkInfo {
     pub frames_forwarded: u64,
     pub bytes_forwarded: u64,
     pub endpoints: Vec<NetworkEndpoint>,
+    #[serde(default)]
+    pub networks: Vec<UserNetwork>,
 }
 
 /// Default seconds between `HEALTHCHECK` probes when omitted or `0`.
@@ -659,6 +684,9 @@ pub struct RunSpec {
     /// Run a dedicated `docker-init` zombie reaper as container PID 1 (`--init`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub init: bool,
+    /// Named networks to attach to (empty defaults to `["graviton"]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub networks: Vec<String>,
 }
 
 fn is_zero_u16(n: &u16) -> bool {
@@ -1057,6 +1085,9 @@ pub struct ContainerDetails {
     /// True when started with `--init`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub init: bool,
+    /// Attached networks for this container.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub networks: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1123,6 +1154,22 @@ pub enum Request {
     RemoveVolume { name: String },
     /// Live state of the shared container network, switch and DNS.
     NetworkInfo,
+    /// List configured container networks (built-in and user-defined).
+    ListNetworks,
+    /// Create a user-defined container network.
+    CreateNetwork {
+        name: String,
+        #[serde(default)]
+        internal: bool,
+        #[serde(default)]
+        labels: BTreeMap<String, String>,
+    },
+    /// Remove an unused user-defined network.
+    RemoveNetwork { name: String },
+    /// Attach a container to a network (live on running containers).
+    ConnectNetwork { network: String, container: String },
+    /// Detach a container from a network (live on running containers).
+    DisconnectNetwork { network: String, container: String },
     /// `id` may be a container id, id prefix or name.
     /// With `follow: true`, streams `Response::Log` lines and finishes with `Response::LogEnd`.
     Logs {
@@ -1270,6 +1317,10 @@ pub enum Response {
     Volume(VolumeSummary),
     VolumeRemoved { name: String, freed_bytes: u64 },
     Network(NetworkInfo),
+    Networks(Vec<UserNetwork>),
+    NetworkCreated(UserNetwork),
+    NetworkRemoved { name: String },
+    NetworkUpdated { network: String, container: String, connected: bool },
     Logs(Vec<LogLine>),
     /// Single streamed line for `Request::Logs { follow: true, .. }`.
     Log(LogLine),
@@ -1762,6 +1813,7 @@ mod tests {
             cap_drop: vec![],
             tmpfs: vec![],
             init: false,
+            networks: vec![],
         }));
         assert_eq!(decode_line::<Request>(&encode_line(&compose_run)).unwrap(), compose_run);
         assert_eq!("always".parse::<RestartPolicy>().unwrap(), RestartPolicy::Always);
@@ -2010,6 +2062,17 @@ mod tests {
                 dns_names: vec!["postgres".into(), "postgres.graviton".into(), "abc123def456".into()],
                 dns_enabled: true,
                 ports: vec![PortMapping { host_ip: None, host_port: 5432, container_port: 5432, protocol: PortProtocol::Tcp }],
+                networks: vec![DEFAULT_NETWORK_NAME.into()],
+            }],
+            networks: vec![UserNetwork {
+                id: "graviton-bridge".into(),
+                name: DEFAULT_NETWORK_NAME.into(),
+                driver: "L2 switch + NAT".into(),
+                internal: false,
+                builtin: true,
+                created_at: 1_700_000_000,
+                labels: BTreeMap::new(),
+                containers: vec!["postgres".into()],
             }],
         };
         assert_eq!(decode_line::<Response>(&encode_line(&Response::Network(net.clone()))).unwrap(), Response::Network(net));
@@ -2284,5 +2347,43 @@ mod tests {
         assert!(min_details.cap_drop.is_empty());
         assert!(min_details.tmpfs.is_empty());
         assert!(!min_details.init);
+        assert!(min_details.networks.is_empty());
+    }
+
+    #[test]
+    fn user_network_requests_and_responses_round_trip() {
+        let create = Request::CreateNetwork {
+            name: "app-net".into(),
+            internal: true,
+            labels: BTreeMap::from([("env".into(), "dev".into())]),
+        };
+        for req in [
+            Request::ListNetworks,
+            create,
+            Request::RemoveNetwork { name: "app-net".into() },
+            Request::ConnectNetwork { network: "app-net".into(), container: "web".into() },
+            Request::DisconnectNetwork { network: "app-net".into(), container: "web".into() },
+        ] {
+            assert_eq!(decode_line::<Request>(&encode_line(&req)).unwrap(), req);
+        }
+
+        let net = UserNetwork {
+            id: "net123456789".into(),
+            name: "app-net".into(),
+            driver: "bridge".into(),
+            internal: true,
+            builtin: false,
+            created_at: 1_700_000_000,
+            labels: BTreeMap::from([("env".into(), "dev".into())]),
+            containers: vec!["web".into()],
+        };
+        for resp in [
+            Response::Networks(vec![net.clone()]),
+            Response::NetworkCreated(net),
+            Response::NetworkRemoved { name: "app-net".into() },
+            Response::NetworkUpdated { network: "app-net".into(), container: "web".into(), connected: true },
+        ] {
+            assert_eq!(decode_line::<Response>(&encode_line(&resp)).unwrap(), resp);
+        }
     }
 }

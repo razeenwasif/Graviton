@@ -10,6 +10,11 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case createVolume(name: String)
     case removeVolume(name: String)
     case networkInfo
+    case listNetworks
+    case createNetwork(name: String, internal: Bool = false, labels: [String: String] = [:])
+    case removeNetwork(name: String)
+    case connectNetwork(network: String, container: String)
+    case disconnectNetwork(network: String, container: String)
     case logs(id: String, tail: Int?, follow: Bool = false, sinceMs: UInt64? = nil, untilMs: UInt64? = nil)
     case start(id: String)
     case stop(id: String)
@@ -52,6 +57,17 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     private enum Keys: String, CodingKey { case method, params }
     private struct IDParams: Encodable { let id: String }
     private struct NameParams: Encodable { let name: String }
+    private struct CreateNetworkParams: Encodable {
+        let name: String
+        let internalOnly: Bool
+        let labels: [String: String]
+        enum CodingKeys: String, CodingKey {
+            case name
+            case internalOnly = "internal"
+            case labels
+        }
+    }
+    private struct ConnectNetworkParams: Encodable { let network: String; let container: String }
     private struct LogParams: Encodable {
         let id: String
         let tail: Int?
@@ -93,6 +109,11 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .createVolume: "create_volume"
         case .removeVolume: "remove_volume"
         case .networkInfo: "network_info"
+        case .listNetworks: "list_networks"
+        case .createNetwork: "create_network"
+        case .removeNetwork: "remove_network"
+        case .connectNetwork: "connect_network"
+        case .disconnectNetwork: "disconnect_network"
         case .logs: "logs"
         case .start: "start"
         case .stop: "stop"
@@ -138,7 +159,13 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         var c = encoder.container(keyedBy: Keys.self)
         try c.encode(method, forKey: .method)
         switch self {
-        case .ping, .engineInfo, .listContainers, .listImages, .listVolumes, .networkInfo, .listLogins, .pairBegin, .listDevices, .snapshotStatus, .snapshotClear: break
+        case .ping, .engineInfo, .listContainers, .listImages, .listVolumes, .networkInfo, .listNetworks, .listLogins, .pairBegin, .listDevices, .snapshotStatus, .snapshotClear: break
+        case let .createNetwork(name, internalOnly, labels):
+            try c.encode(CreateNetworkParams(name: name, internalOnly: internalOnly, labels: labels), forKey: .params)
+        case let .removeNetwork(name):
+            try c.encode(NameParams(name: name), forKey: .params)
+        case let .connectNetwork(network, container), let .disconnectNetwork(network, container):
+            try c.encode(ConnectNetworkParams(network: network, container: container), forKey: .params)
         case let .registryLogin(registry, username, password):
             try c.encode(RegistryLoginParams(registry: registry, username: username, password: password), forKey: .params)
         case let .registryLogout(registry):
@@ -191,6 +218,10 @@ public enum EngineResponse: Decodable, Sendable {
     case volume(VolumeInfo)
     case volumeRemoved(name: String, freedBytes: UInt64)
     case network(NetworkInfo)
+    case networks([UserNetwork])
+    case networkCreated(UserNetwork)
+    case networkRemoved(name: String)
+    case networkUpdated(network: String, container: String, connected: Bool)
     case logs([LogLine])
     case log(LogLine)
     case logEnd(exitCode: Int32?)
@@ -242,6 +273,8 @@ public enum EngineResponse: Decodable, Sendable {
     private struct ExecExitedData: Decodable { let code: Int32 }
     private struct LoggedInData: Decodable { let registry: String; let username: String }
     private struct LoggedOutData: Decodable { let registry: String }
+    private struct NetworkRemovedData: Decodable { let name: String }
+    private struct NetworkUpdatedData: Decodable { let network: String; let container: String; let connected: Bool }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
@@ -257,6 +290,12 @@ public enum EngineResponse: Decodable, Sendable {
             let r = try c.decode(VolumeRemovedData.self, forKey: .data)
             self = .volumeRemoved(name: r.name, freedBytes: r.freedBytes)
         case "network": self = .network(try c.decode(NetworkInfo.self, forKey: .data))
+        case "networks": self = .networks(try c.decode([UserNetwork].self, forKey: .data))
+        case "network_created": self = .networkCreated(try c.decode(UserNetwork.self, forKey: .data))
+        case "network_removed": self = .networkRemoved(name: try c.decode(NetworkRemovedData.self, forKey: .data).name)
+        case "network_updated":
+            let u = try c.decode(NetworkUpdatedData.self, forKey: .data)
+            self = .networkUpdated(network: u.network, container: u.container, connected: u.connected)
         case "logs": self = .logs(try c.decode([LogLine].self, forKey: .data))
         case "log": self = .log(try c.decode(LogLine.self, forKey: .data))
         case "log_end": self = .logEnd(exitCode: try c.decode(LogEndData.self, forKey: .data).exitCode)

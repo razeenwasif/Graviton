@@ -104,6 +104,7 @@ fn filters_containers_with_label_and_semantics() {
         cap_drop: vec![],
         tmpfs: vec![],
         init: false,
+        networks: vec![],
     };
 
     // Go map filter style (AND across label keys)
@@ -212,6 +213,36 @@ async fn unix_socket_keepalive_and_endpoints() {
     assert_eq!(status, 200);
     let net: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(net["Name"], "proton-dev");
+
+    // List, connect, disconnect, and remove user network
+    client.write_all(b"GET /v1.47/networks HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+    let (status, _, body) = read_http_response(&mut client).await;
+    assert_eq!(status, 200);
+    let nets: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert!(nets.iter().any(|n| n["Name"] == "proton-dev"));
+
+    let conn_body = r#"{"Container":"worker"}"#;
+    let conn_req = format!(
+        "POST /v1.47/networks/proton-dev/connect HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        conn_body.len(),
+        conn_body
+    );
+    client.write_all(conn_req.as_bytes()).await.unwrap();
+    let (status, _, _) = read_http_response(&mut client).await;
+    assert_eq!(status, 200);
+
+    let disc_req = format!(
+        "POST /v1.47/networks/proton-dev/disconnect HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        conn_body.len(),
+        conn_body
+    );
+    client.write_all(disc_req.as_bytes()).await.unwrap();
+    let (status, _, _) = read_http_response(&mut client).await;
+    assert_eq!(status, 200);
+
+    client.write_all(b"DELETE /v1.47/networks/proton-dev HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+    let (status, _, _) = read_http_response(&mut client).await;
+    assert_eq!(status, 204);
 
     client.write_all(b"POST /v1.47/containers/worker/start HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
     let (status, _, _) = read_http_response(&mut client).await;

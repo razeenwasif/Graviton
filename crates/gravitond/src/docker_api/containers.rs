@@ -326,7 +326,16 @@ fn container_list_json(
     let command = spec.map(|s| s.argv.join(" ")).unwrap_or_default();
     let image_id = spec.map(|s| s.image.config_digest.as_str()).unwrap_or("");
     let labels = spec.map(|s| &s.labels).cloned().unwrap_or_default();
-    let networks = build_networks_map(c, extra_networks);
+    let effective_nets: &[String] = if extra_networks.is_empty() {
+        spec.map(|s| s.networks.as_slice()).unwrap_or(&[])
+    } else {
+        extra_networks
+    };
+    let networks = build_networks_map(c, effective_nets);
+    let network_mode = effective_nets
+        .first()
+        .map(|n| if n == graviton_proto::DEFAULT_NETWORK_NAME { "bridge" } else { n.as_str() })
+        .unwrap_or("bridge");
 
     json!({
         "Id": c.id,
@@ -339,7 +348,7 @@ fn container_list_json(
         "Labels": labels,
         "State": docker_state_str(c.status),
         "Status": docker_status_human(c, now),
-        "HostConfig": { "NetworkMode": "bridge" },
+        "HostConfig": { "NetworkMode": network_mode },
         "NetworkSettings": { "Networks": networks },
         "Mounts": docker_mounts_list(c),
     })
@@ -362,7 +371,8 @@ fn build_networks_map(c: &ContainerSummary, extra_networks: &[String]) -> Value 
         nets.insert("bridge".into(), entry);
     } else {
         for n in extra_networks {
-            nets.insert(n.clone(), entry.clone());
+            let key = if n == graviton_proto::DEFAULT_NETWORK_NAME { "bridge".to_string() } else { n.clone() };
+            nets.insert(key, entry.clone());
         }
     }
     Value::Object(nets)
@@ -577,6 +587,7 @@ pub async fn create_container(
         cap_drop,
         tmpfs,
         init,
+        networks: networks.clone(),
     };
 
     let res = tokio::task::spawn_blocking(move || engine.create_container_local(spec)).await?;
@@ -818,7 +829,8 @@ pub async fn inspect_container(
     let path = details.command.first().cloned().unwrap_or_default();
     let args: Vec<String> = details.command.iter().skip(1).cloned().collect();
     let running = matches!(c.status, ContainerStatus::Running | ContainerStatus::Paused);
-    let networks = build_networks_map(c, &networks_list);
+    let effective_networks = if !details.networks.is_empty() { details.networks.clone() } else { networks_list };
+    let networks = build_networks_map(c, &effective_networks);
     let restart_name = details.restart.as_str();
 
     let mut mounts_json = docker_mounts_list(c);
@@ -874,7 +886,10 @@ pub async fn inspect_container(
             "Binds": binds,
             "ContainerIDFile": "",
             "LogConfig": { "Type": "json-file", "Config": {} },
-            "NetworkMode": networks_list.first().map(String::as_str).unwrap_or("bridge"),
+            "NetworkMode": effective_networks
+                .first()
+                .map(|n| if n == graviton_proto::DEFAULT_NETWORK_NAME { "bridge" } else { n.as_str() })
+                .unwrap_or("bridge"),
             "PortBindings": Value::Object(port_bindings),
             "RestartPolicy": { "Name": restart_name, "MaximumRetryCount": 0 },
             "AutoRemove": auto_remove,

@@ -1131,6 +1131,7 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                 Request::Unpause { id } => result(store.unpause(&id).map(Response::Container)),
                 Request::ListVolumes => Response::Volumes(demo_volumes(&store)),
                 Request::NetworkInfo => Response::Network(demo_network(&store)),
+                Request::ListNetworks => Response::Networks(demo_network(&store).networks),
                 Request::SnapshotStatus => Response::Snapshots(graviton_proto::SnapshotInfo::default()),
                 _ => Response::Error { message: "gravitond is serving demo data; restart it without --demo to pull, run, exec and browse files".into() },
             }
@@ -1148,6 +1149,19 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                         Response::VolumeRemoved { name, freed_bytes }
                     }
                     Request::NetworkInfo => Response::Network(engine.network_info()),
+                    Request::ListNetworks => Response::Networks(engine.list_networks()),
+                    Request::CreateNetwork { name, internal, labels } => {
+                        Response::NetworkCreated(engine.create_network(&name, internal, labels)?)
+                    }
+                    Request::RemoveNetwork { name } => Response::NetworkRemoved { name: engine.remove_network(&name)? },
+                    Request::ConnectNetwork { network, container } => {
+                        let (network, container) = engine.connect_network(&network, &container)?;
+                        Response::NetworkUpdated { network, container, connected: true }
+                    }
+                    Request::DisconnectNetwork { network, container } => {
+                        let (network, container) = engine.disconnect_network(&network, &container)?;
+                        Response::NetworkUpdated { network, container, connected: false }
+                    }
                     Request::Pull { reference, platform, .. } => Response::Image(engine.pull(&reference, platform.as_deref())?),
                     Request::TagImage { source, target } => Response::Image(engine.tag_image(&source, &target)?),
                     Request::PushImage { reference, .. } => Response::ImagePushed(engine.push(&reference)?),
@@ -1258,10 +1272,12 @@ fn demo_network(store: &Store) -> graviton_proto::NetworkInfo {
                 },
                 dns_enabled: running,
                 ports: c.ports.clone(),
+                networks: vec![graviton_proto::DEFAULT_NETWORK_NAME.into()],
             }
         })
         .collect();
     let connected = endpoints.iter().filter(|e| e.status == graviton_proto::ContainerStatus::Running).count() as u32;
+    let names: Vec<String> = store.containers().iter().map(|c| c.name.clone()).collect();
     graviton_proto::NetworkInfo {
         name: "graviton".into(),
         driver: "L2 switch + NAT".into(),
@@ -1274,6 +1290,16 @@ fn demo_network(store: &Store) -> graviton_proto::NetworkInfo {
         frames_forwarded: 1842,
         bytes_forwarded: 4_812_900,
         endpoints,
+        networks: vec![graviton_proto::UserNetwork {
+            id: "graviton-bridge".into(),
+            name: graviton_proto::DEFAULT_NETWORK_NAME.into(),
+            driver: "L2 switch + NAT".into(),
+            internal: false,
+            builtin: true,
+            created_at: 0,
+            labels: std::collections::BTreeMap::new(),
+            containers: names,
+        }],
     }
 }
 

@@ -314,6 +314,8 @@ public struct RunSpec: Codable, Hashable, Sendable {
     public var tmpfs: [TmpfsMount]? = nil
     /// Run `docker-init` as container PID 1 (`--init`).
     public var `init`: Bool? = nil
+    /// Named networks to attach to (empty/nil defaults to `["graviton"]`).
+    public var networks: [String]? = nil
 
     public init(image: String, name: String? = nil, command: [String]? = nil, env: [String] = [], cpus: UInt32? = nil,
                 memoryMib: UInt64? = nil, ports: [String] = [], volumes: [String] = [], restart: RestartPolicy? = nil,
@@ -321,7 +323,7 @@ public struct RunSpec: Codable, Hashable, Sendable {
                 hostname: String? = nil, project: String? = nil, service: String? = nil, labels: [String: String]? = nil,
                 dnsAliases: [String]? = nil, healthcheck: Healthcheck? = nil,
                 readOnly: Bool? = nil, capAdd: [String]? = nil, capDrop: [String]? = nil,
-                tmpfs: [TmpfsMount]? = nil, initProcess: Bool? = nil) {
+                tmpfs: [TmpfsMount]? = nil, initProcess: Bool? = nil, networks: [String]? = nil) {
         self.image = image
         self.name = name
         self.command = command
@@ -346,6 +348,7 @@ public struct RunSpec: Codable, Hashable, Sendable {
         self.capDrop = capDrop
         self.tmpfs = tmpfs
         self.`init` = initProcess
+        self.networks = networks
     }
 
     /// Split a list typed as "8080:80, 5432" or one per line.
@@ -581,8 +584,10 @@ public struct ContainerDetails: Codable, Hashable, Sendable {
     public var capDrop: [String]? = nil
     public var tmpfs: [TmpfsMount]? = nil
     public var `init`: Bool? = nil
+    public var networks: [String]? = nil
 
     public var usesInit: Bool { self.`init` ?? false }
+    public var attachedNetworks: [String] { (networks?.isEmpty == false) ? networks! : ["graviton"] }
 }
 
 /// What `grav exec` asks for.
@@ -917,7 +922,60 @@ public struct VolumeInfo: Codable, Hashable, Sendable, Identifiable {
     }
 }
 
-/// One container on Graviton's shared container network (`NetworkEndpoint` in `graviton-proto`).
+/// One user-defined (or built-in) container network (`UserNetwork` in `graviton-proto`).
+public struct UserNetwork: Codable, Hashable, Sendable, Identifiable {
+    public var id: String
+    public var name: String
+    public var driver: String
+    public var internalOnly: Bool
+    public var builtin: Bool
+    public var createdAt: UInt64
+    public var labels: [String: String]
+    public var containers: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, driver
+        case internalOnly = "internal"
+        case builtin, createdAt, labels, containers
+    }
+
+    public init(
+        id: String = "",
+        name: String,
+        driver: String = "bridge",
+        internalOnly: Bool = false,
+        builtin: Bool = false,
+        createdAt: UInt64 = 0,
+        labels: [String: String] = [:],
+        containers: [String] = []
+    ) {
+        self.id = id
+        self.name = name
+        self.driver = driver
+        self.internalOnly = internalOnly
+        self.builtin = builtin
+        self.createdAt = createdAt
+        self.labels = labels
+        self.containers = containers
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decodeIfPresent(String.self, forKey: .id) ?? ""
+        self.name = try c.decode(String.self, forKey: .name)
+        self.driver = try c.decodeIfPresent(String.self, forKey: .driver) ?? "bridge"
+        self.internalOnly = try c.decodeIfPresent(Bool.self, forKey: .internalOnly) ?? false
+        self.builtin = try c.decodeIfPresent(Bool.self, forKey: .builtin) ?? false
+        self.createdAt = try c.decodeIfPresent(UInt64.self, forKey: .createdAt) ?? 0
+        self.labels = try c.decodeIfPresent([String: String].self, forKey: .labels) ?? [:]
+        self.containers = try c.decodeIfPresent([String].self, forKey: .containers) ?? []
+    }
+
+    public var createdDate: Date { Date(timeIntervalSince1970: Double(createdAt)) }
+    public var isDefault: Bool { builtin || name == "graviton" }
+}
+
+/// One container on Graviton's container network (`NetworkEndpoint` in `graviton-proto`).
 public struct NetworkEndpoint: Codable, Hashable, Sendable, Identifiable {
     public var containerId: String
     public var containerName: String
@@ -927,14 +985,18 @@ public struct NetworkEndpoint: Codable, Hashable, Sendable, Identifiable {
     public var dnsNames: [String]
     public var dnsEnabled: Bool
     public var ports: [PortMapping]
+    public var networks: [String]
 
     public var id: String { containerId }
     public var isRunning: Bool { status == .running }
     public var isPaused: Bool { status == .paused }
     public var isActive: Bool { status == .running || status == .paused }
 
+    public var attachedNetworks: [String] { networks.isEmpty ? ["graviton"] : networks }
+
     public init(containerId: String, containerName: String, image: String, status: ContainerStatus,
-                ipAddress: String? = nil, dnsNames: [String] = [], dnsEnabled: Bool = false, ports: [PortMapping] = []) {
+                ipAddress: String? = nil, dnsNames: [String] = [], dnsEnabled: Bool = false,
+                ports: [PortMapping] = [], networks: [String] = []) {
         self.containerId = containerId
         self.containerName = containerName
         self.image = image
@@ -943,10 +1005,28 @@ public struct NetworkEndpoint: Codable, Hashable, Sendable, Identifiable {
         self.dnsNames = dnsNames
         self.dnsEnabled = dnsEnabled
         self.ports = ports
+        self.networks = networks
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case containerId, containerName, image, status, ipAddress, dnsNames, dnsEnabled, ports, networks
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.containerId = try c.decode(String.self, forKey: .containerId)
+        self.containerName = try c.decode(String.self, forKey: .containerName)
+        self.image = try c.decode(String.self, forKey: .image)
+        self.status = try c.decode(ContainerStatus.self, forKey: .status)
+        self.ipAddress = try c.decodeIfPresent(String.self, forKey: .ipAddress)
+        self.dnsNames = try c.decodeIfPresent([String].self, forKey: .dnsNames) ?? []
+        self.dnsEnabled = try c.decodeIfPresent(Bool.self, forKey: .dnsEnabled) ?? false
+        self.ports = try c.decodeIfPresent([PortMapping].self, forKey: .ports) ?? []
+        self.networks = try c.decodeIfPresent([String].self, forKey: .networks) ?? []
     }
 }
 
-/// Live view of Graviton's shared container network, switch, and embedded DNS.
+/// Live view of Graviton's container networks, switch, and embedded DNS.
 public struct NetworkInfo: Codable, Hashable, Sendable {
     public var name: String
     public var driver: String
@@ -959,9 +1039,11 @@ public struct NetworkInfo: Codable, Hashable, Sendable {
     public var framesForwarded: UInt64
     public var bytesForwarded: UInt64
     public var endpoints: [NetworkEndpoint]
+    public var networks: [UserNetwork]
 
     public init(name: String, driver: String, subnet: String, gateway: String, dnsServer: String, dnsDomain: String,
-                connectedPorts: UInt32, learnedMacs: UInt32, framesForwarded: UInt64, bytesForwarded: UInt64, endpoints: [NetworkEndpoint]) {
+                connectedPorts: UInt32, learnedMacs: UInt32, framesForwarded: UInt64, bytesForwarded: UInt64,
+                endpoints: [NetworkEndpoint], networks: [UserNetwork] = []) {
         self.name = name
         self.driver = driver
         self.subnet = subnet
@@ -973,6 +1055,27 @@ public struct NetworkInfo: Codable, Hashable, Sendable {
         self.framesForwarded = framesForwarded
         self.bytesForwarded = bytesForwarded
         self.endpoints = endpoints
+        self.networks = networks
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name, driver, subnet, gateway, dnsServer, dnsDomain, connectedPorts, learnedMacs, framesForwarded, bytesForwarded, endpoints, networks
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.name = try c.decode(String.self, forKey: .name)
+        self.driver = try c.decode(String.self, forKey: .driver)
+        self.subnet = try c.decode(String.self, forKey: .subnet)
+        self.gateway = try c.decode(String.self, forKey: .gateway)
+        self.dnsServer = try c.decode(String.self, forKey: .dnsServer)
+        self.dnsDomain = try c.decode(String.self, forKey: .dnsDomain)
+        self.connectedPorts = try c.decode(UInt32.self, forKey: .connectedPorts)
+        self.learnedMacs = try c.decode(UInt32.self, forKey: .learnedMacs)
+        self.framesForwarded = try c.decode(UInt64.self, forKey: .framesForwarded)
+        self.bytesForwarded = try c.decode(UInt64.self, forKey: .bytesForwarded)
+        self.endpoints = try c.decodeIfPresent([NetworkEndpoint].self, forKey: .endpoints) ?? []
+        self.networks = try c.decodeIfPresent([UserNetwork].self, forKey: .networks) ?? []
     }
 
     /// Synthesise a network view from `containers` when talking to an older gravitond.
@@ -1001,12 +1104,22 @@ public struct NetworkInfo: Codable, Hashable, Sendable {
                 ipAddress: c.isRunning ? c.ipAddress : nil,
                 dnsNames: dns,
                 dnsEnabled: c.isRunning && c.ipAddress != nil,
-                ports: c.ports
+                ports: c.ports,
+                networks: ["graviton"]
             )
         }.sorted { a, b in
             if a.isRunning != b.isRunning { return a.isRunning }
             return a.containerName.localizedStandardCompare(b.containerName) == .orderedAscending
         }
+        let defaultNet = UserNetwork(
+            id: "graviton",
+            name: "graviton",
+            driver: "L2 switch + NAT",
+            internalOnly: false,
+            builtin: true,
+            createdAt: 0,
+            containers: endpoints.map(\.containerName)
+        )
         return NetworkInfo(
             name: "graviton",
             driver: "L2 switch + NAT",
@@ -1018,7 +1131,8 @@ public struct NetworkInfo: Codable, Hashable, Sendable {
             learnedMacs: UInt32(running.count),
             framesForwarded: 0,
             bytesForwarded: 0,
-            endpoints: endpoints
+            endpoints: endpoints,
+            networks: [defaultNet]
         )
     }
 }

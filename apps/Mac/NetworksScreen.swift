@@ -5,17 +5,35 @@ import SwiftUI
 struct NetworksScreen: View {
     @Environment(EngineStore.self) private var store
     @Environment(AppRouter.self) private var router
-    @State private var tab: Tab = .endpoints
+    @Environment(Dialogs.self) private var dialogs
+    @State private var tab: Tab = .networks
     @State private var search = ""
     @State private var selection: NetworkEndpoint.ID?
+    @State private var networkSelection: UserNetwork.ID?
+    @State private var showCreateNetwork = false
 
     enum Tab: String, CaseIterable, Identifiable {
-        case endpoints = "Containers", ports = "Published Ports"
+        case networks = "Networks", endpoints = "Containers", ports = "Published Ports"
         var id: String { rawValue }
     }
 
     private var info: NetworkInfo {
         store.network ?? NetworkInfo.synthesized(from: store.containers)
+    }
+
+    private var userNetworks: [UserNetwork] {
+        !store.networks.isEmpty ? store.networks : info.networks
+    }
+
+    private var filteredNetworks: [UserNetwork] {
+        let q = search.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !q.isEmpty else { return userNetworks }
+        return userNetworks.filter { net in
+            net.name.lowercased().contains(q)
+                || net.driver.lowercased().contains(q)
+                || net.containers.contains { $0.lowercased().contains(q) }
+                || net.labels.contains { $0.key.lowercased().contains(q) || $0.value.lowercased().contains(q) }
+        }
     }
 
     private var runningEndpoints: [NetworkEndpoint] {
@@ -30,6 +48,7 @@ struct NetworksScreen: View {
                 || ep.image.lowercased().contains(q)
                 || (ep.ipAddress?.lowercased().contains(q) ?? false)
                 || ep.dnsNames.contains { $0.lowercased().contains(q) }
+                || ep.attachedNetworks.contains { $0.lowercased().contains(q) }
                 || ep.ports.contains { $0.fullLabel.lowercased().contains(q) }
         }
     }
@@ -66,32 +85,37 @@ struct NetworksScreen: View {
     }
 
     private var subtitle: String {
+        let netCount = userNetworks.count
         let conn = runningEndpoints.count
         let portLabel = activePortCount == 1 ? "1 active port" : "\(activePortCount) active ports"
-        return "\(info.name) switch · \(conn) connected · \(portLabel)"
+        return "\(netCount) \(netCount == 1 ? "network" : "networks") · \(conn) connected · \(portLabel)"
     }
 
     var body: some View {
         VStack(spacing: 0) {
             ScreenHeader("Networks", subtitle: subtitle) {
-                HeaderSearch(prompt: "Search containers, IPs or ports", text: $search)
+                HeaderSearch(prompt: "Search networks, containers, IPs or ports", text: $search)
                 Button { Task { await store.refresh() } } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.gIconBordered)
                     .help("Refresh")
+                Button("New Network") { showCreateNetwork = true }
+                    .buttonStyle(.gPrimary)
+                    .disabled(!store.canManage && store.connection != .demo)
             }
 
             VStack(alignment: .leading, spacing: 16) {
                 summaryCards
 
                 GSegmented(selection: $tab, options: [
+                    (.networks, "Networks  \(userNetworks.count)"),
                     (.endpoints, "Containers  \(info.endpoints.count)"),
                     (.ports, "Published Ports  \(totalPortCount)"),
                 ])
 
-                if tab == .endpoints {
-                    endpointsContent
-                } else {
-                    portsContent
+                switch tab {
+                case .networks: networksContent
+                case .endpoints: endpointsContent
+                case .ports: portsContent
                 }
             }
             .padding(.horizontal, 28)
@@ -100,6 +124,12 @@ struct NetworksScreen: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .background(G.background)
+        .sheet(isPresented: $showCreateNetwork) {
+            CreateNetworkSheet { created in
+                networkSelection = created.id
+                tab = .networks
+            }
+        }
     }
 
     // MARK: Summary cards
@@ -178,16 +208,46 @@ struct NetworksScreen: View {
 
     // MARK: Tables
 
+    @ViewBuilder private var networksContent: some View {
+        if userNetworks.isEmpty {
+            GEmptyState("No networks", symbol: "network",
+                        detail: "Create an isolated bridge network with New Network or grav network create.")
+                .gravitonCard()
+        } else if filteredNetworks.isEmpty {
+            GEmptyState("Nothing matches", symbol: "magnifyingglass", detail: "No network or container matches “\(search)”.")
+                .gravitonCard()
+        } else {
+            UserNetworksTable(
+                rows: filteredNetworks,
+                containers: store.containers,
+                selection: $networkSelection,
+                canManage: store.canManage || store.connection == .demo,
+                onOpenContainer: { openContainer($0, tab: .inspect) },
+                onConnect: connectNetwork,
+                onDisconnect: disconnectNetwork,
+                onRemove: confirmRemoveNetwork
+            )
+        }
+    }
+
     @ViewBuilder private var endpointsContent: some View {
         if info.endpoints.isEmpty {
             GEmptyState("No containers on the network", symbol: "point.3.connected.trianglepath.dotted",
-                        detail: "Every container joins the shared switch automatically and gets an IP address and DNS name.")
+                        detail: "Every container joins a switch network automatically and gets an IP address and DNS name.")
                 .gravitonCard()
         } else if filteredEndpoints.isEmpty {
-            GEmptyState("Nothing matches", symbol: "magnifyingglass", detail: "No container, IP or port matches “\(search)”.")
+            GEmptyState("Nothing matches", symbol: "magnifyingglass", detail: "No container, network, IP or port matches “\(search)”.")
                 .gravitonCard()
         } else {
-            EndpointTable(rows: filteredEndpoints, selection: $selection, onOpen: openContainer)
+            EndpointTable(
+                rows: filteredEndpoints,
+                userNetworks: userNetworks,
+                canManage: store.canManage || store.connection == .demo,
+                selection: $selection,
+                onOpen: openContainer,
+                onConnect: connectNetwork,
+                onDisconnect: disconnectNetwork
+            )
         }
     }
 
@@ -207,14 +267,54 @@ struct NetworksScreen: View {
     private func openContainer(_ id: String, tab: DetailTab = .inspect) {
         router.pending = .container(id, tab)
     }
+
+    private func connectNetwork(_ network: String, container: String) {
+        Task {
+            do {
+                _ = try await store.connectNetwork(network, container: container)
+            } catch {
+                dialogs.alert("Couldn't connect \(container) to \(network)", message: error.localizedDescription)
+            }
+        }
+    }
+
+    private func disconnectNetwork(_ network: String, container: String) {
+        Task {
+            do {
+                _ = try await store.disconnectNetwork(network, container: container)
+            } catch {
+                dialogs.alert("Couldn't disconnect \(container) from \(network)", message: error.localizedDescription)
+            }
+        }
+    }
+
+    private func confirmRemoveNetwork(_ net: UserNetwork) {
+        dialogs.confirm(
+            "Remove network \(net.name)?",
+            message: "Deletes network \(net.name). Any stopped or running containers must be disconnected first.",
+            confirm: "Remove"
+        ) {
+            Task {
+                do {
+                    _ = try await store.removeNetwork(net.name)
+                } catch {
+                    dialogs.alert("Couldn't remove \(net.name)", message: error.localizedDescription)
+                }
+            }
+        }
+    }
 }
 
 // MARK: - Endpoints table
 
 private struct EndpointTable: View {
     var rows: [NetworkEndpoint]
+    var userNetworks: [UserNetwork]
+    var canManage: Bool
     @Binding var selection: NetworkEndpoint.ID?
     var onOpen: (String, DetailTab) -> Void
+    var onConnect: (String, String) -> Void
+    var onDisconnect: (String, String) -> Void
     @State private var sort: Column = .status
     @State private var ascending = true
     @FocusState private var focused: Bool
@@ -276,7 +376,12 @@ private struct EndpointTable: View {
             HStack(spacing: 10) {
                 StatusDot(running: ep.isRunning)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(ep.containerName).font(.system(size: 13, weight: .medium)).foregroundStyle(G.text).lineLimit(1)
+                    HStack(spacing: 6) {
+                        Text(ep.containerName).font(.system(size: 13, weight: .medium)).foregroundStyle(G.text).lineLimit(1)
+                        ForEach(ep.attachedNetworks, id: \.self) { net in
+                            GBadge(net, color: net == "graviton" ? G.muted : G.accent)
+                        }
+                    }
                     Text(ep.image).font(G.mono(11)).foregroundStyle(G.muted).lineLimit(1).truncationMode(.middle)
                 }
             }
@@ -336,6 +441,27 @@ private struct EndpointTable: View {
         Button("Inspect \(ep.containerName)") { onOpen(ep.containerId, .inspect) }
         if ep.isRunning {
             Button("Open Terminal") { onOpen(ep.containerId, .terminal) }
+        }
+        if canManage {
+            let attached = Set(ep.attachedNetworks)
+            let joinable = userNetworks.filter { !attached.contains($0.name) }
+            if !joinable.isEmpty || !ep.attachedNetworks.isEmpty {
+                Divider()
+            }
+            if !joinable.isEmpty {
+                Menu("Connect to Network") {
+                    ForEach(joinable) { net in
+                        Button(net.name) { onConnect(net.name, ep.containerName) }
+                    }
+                }
+            }
+            if !ep.attachedNetworks.isEmpty {
+                Menu("Disconnect from Network") {
+                    ForEach(ep.attachedNetworks, id: \.self) { netName in
+                        Button(netName) { onDisconnect(netName, ep.containerName) }
+                    }
+                }
+            }
         }
         Divider()
         if let ip = ep.ipAddress {
@@ -461,6 +587,223 @@ private struct PublishedPortTable: View {
             }
         }
         .gravitonCard(G.surface)
+    }
+}
+
+// MARK: - User-defined networks table
+
+private struct UserNetworksTable: View {
+    var rows: [UserNetwork]
+    var containers: [Container]
+    @Binding var selection: UserNetwork.ID?
+    var canManage: Bool
+    var onOpenContainer: (String) -> Void
+    var onConnect: (String, String) -> Void
+    var onDisconnect: (String, String) -> Void
+    var onRemove: (UserNetwork) -> Void
+    @State private var sort: Column = .name
+    @State private var ascending = true
+
+    enum Column: Hashable { case name, driver, endpoints, created }
+
+    private var sorted: [UserNetwork] {
+        let out = rows.sorted { a, b in
+            switch sort {
+            case .name:
+                if a.isDefault != b.isDefault { return a.isDefault }
+                return a.name.localizedStandardCompare(b.name) == .orderedAscending
+            case .driver:
+                return a.driver.localizedStandardCompare(b.driver) == .orderedAscending
+            case .endpoints:
+                return a.containers.count > b.containers.count
+            case .created:
+                return a.createdAt > b.createdAt
+            }
+        }
+        return ascending ? out : out.reversed()
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                GColumnHeader("Network", key: Column.name, sort: $sort, ascending: $ascending).frame(minWidth: 180, maxWidth: .infinity)
+                GColumnHeader("Driver", key: Column.driver, sort: $sort, ascending: $ascending).frame(width: 140)
+                GColumnHeader("Attached Containers", key: Column.endpoints, sort: $sort, ascending: $ascending).frame(minWidth: 220, maxWidth: .infinity)
+                GColumnHeader("Created", key: Column.created, sort: $sort, ascending: $ascending).frame(width: 140)
+                Color.clear.frame(width: 28)
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 34)
+            .overlay(alignment: .bottom) { Rectangle().fill(G.border).frame(height: 1) }
+
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(sorted) { net in
+                        row(net)
+                    }
+                }
+                .padding(6)
+            }
+        }
+        .gravitonCard(G.surface)
+    }
+
+    private func row(_ net: UserNetwork) -> some View {
+        HStack(spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: net.internalOnly ? "lock.shield" : "network")
+                    .font(.system(size: 13))
+                    .foregroundStyle(net.isDefault ? G.muted : G.accent)
+                Text(net.name)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(G.text)
+                    .lineLimit(1)
+                if net.isDefault {
+                    GBadge("Built-in", color: G.muted)
+                } else if net.internalOnly {
+                    GBadge("Internal", color: G.warning)
+                }
+            }
+            .frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
+
+            Text(net.driver)
+                .font(G.mono(12))
+                .foregroundStyle(G.textSecondary)
+                .lineLimit(1)
+                .frame(width: 140, alignment: .leading)
+
+            attachedContainersView(net)
+                .frame(minWidth: 220, maxWidth: .infinity, alignment: .leading)
+
+            Text(net.createdAt == 0 ? "Built-in" : net.createdDate.formatted(.relative(presentation: .named)))
+                .font(.system(size: 12))
+                .foregroundStyle(G.muted)
+                .lineLimit(1)
+                .frame(width: 140, alignment: .leading)
+
+            Menu { menuItems(net) } label: {
+                Image(systemName: "ellipsis").font(.system(size: 12, weight: .bold)).foregroundStyle(G.muted)
+                    .frame(width: 26, height: 26).contentShape(Rectangle())
+            }
+            .gravitonMenu()
+            .frame(width: 28)
+            .accessibilityLabel("More actions for \(net.name)")
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 46)
+        .gravitonRow(selected: selection == net.id)
+        .onTapGesture { selection = net.id }
+        .contextMenu { menuItems(net) }
+    }
+
+    @ViewBuilder
+    private func attachedContainersView(_ net: UserNetwork) -> some View {
+        if net.containers.isEmpty {
+            Text("—").font(G.mono(12)).foregroundStyle(G.faint)
+        } else {
+            HStack(spacing: 6) {
+                GBadge("\(net.containers.count)", color: G.running)
+                Text(net.containers.joined(separator: ", "))
+                    .font(G.mono(11.5))
+                    .foregroundStyle(G.textSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func menuItems(_ net: UserNetwork) -> some View {
+        let attachedSet = Set(net.containers)
+        let joinable = containers.filter { !attachedSet.contains($0.name) }
+        if canManage {
+            Menu("Connect Container") {
+                if joinable.isEmpty {
+                    Text("All containers attached")
+                } else {
+                    ForEach(joinable) { c in
+                        Button(c.name) { onConnect(net.name, c.name) }
+                    }
+                }
+            }
+            .disabled(joinable.isEmpty)
+
+            Menu("Disconnect Container") {
+                if net.containers.isEmpty {
+                    Text("No attached containers")
+                } else {
+                    ForEach(net.containers, id: \.self) { cname in
+                        Button(cname) { onDisconnect(net.name, cname) }
+                    }
+                }
+            }
+            .disabled(net.containers.isEmpty)
+        }
+        if let firstName = net.containers.first, let ctr = containers.first(where: { $0.name == firstName }) {
+            Button("Inspect \(firstName)") { onOpenContainer(ctr.id) }
+        }
+        if canManage {
+            Divider()
+            Button("Remove Network", role: .destructive) { onRemove(net) }
+                .disabled(net.isDefault || !net.containers.isEmpty)
+        }
+    }
+}
+
+// MARK: - Create network sheet
+
+private struct CreateNetworkSheet: View {
+    @Environment(EngineStore.self) private var store
+    @Environment(\.dismiss) private var dismiss
+    var onCreated: (UserNetwork) -> Void
+    @State private var name = ""
+    @State private var internalOnly = false
+    @State private var working = false
+    @State private var problem: String?
+
+    var body: some View {
+        GSheet("New network", subtitle: "Creates an L2-isolated bridge network with scoped container DNS.", symbol: "network", width: 460) {
+            GFormRow("Name", hint: "Start with a letter or digit; letters, digits, _, . and - are allowed.") {
+                GTextField("e.g. app-net", text: $name)
+                    .disabled(working)
+                    .onSubmit(create)
+                    .gravitonField(mono: true)
+            }
+            GFormRow("Isolation", hint: "Internal networks allow VM-to-VM traffic without outbound host NAT.") {
+                Toggle("Internal only (no outbound NAT)", isOn: $internalOnly)
+                    .toggleStyle(.gSwitch)
+                    .disabled(working)
+            }
+            if working {
+                GStatusLine(.working, "Creating \(name)…")
+            } else if let problem {
+                GStatusLine(.failure, problem)
+            }
+        } footer: {
+            Spacer()
+            Button("Cancel") { dismiss() }.buttonStyle(.gSecondary).keyboardShortcut(.cancelAction)
+            Button("Create", action: create)
+                .buttonStyle(.gPrimary)
+                .keyboardShortcut(.defaultAction)
+                .disabled(working || name.trimmingCharacters(in: .whitespaces).isEmpty)
+        }
+    }
+
+    private func create() {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, !working else { return }
+        working = true
+        problem = nil
+        Task {
+            do {
+                let net = try await store.createNetwork(name: trimmed, internalOnly: internalOnly)
+                onCreated(net)
+                dismiss()
+            } catch {
+                working = false
+                problem = error.localizedDescription
+            }
+        }
     }
 }
 

@@ -58,6 +58,7 @@ struct InspectPanel: View {
                         InspectRow("Folder", d.vmDir)
                     }
                     InspectSection("Network") {
+                        InspectRow("Networks", d.attachedNetworks.joined(separator: ", "))
                         InspectRow("IP address", d.container.ipAddress ?? "—")
                         InspectRow("Ports", d.container.ports.isEmpty ? "—" : d.container.ports.map(\.fullLabel).joined(separator: "\n"))
                     }
