@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "grav"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "graviton-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "flate2",
  "graviton-proto",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "graviton-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "graviton-proto",
  "serde",
@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "graviton-image"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "graviton-core",
@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "graviton-proto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -578,7 +578,7 @@ dependencies = [
 
 [[package]]
 name = "graviton-vmm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "block2",
  "dispatch2",
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "gravitond"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -605,6 +605,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rustls",
+ "ruzstd",
  "security-framework",
  "serde",
  "serde_json",

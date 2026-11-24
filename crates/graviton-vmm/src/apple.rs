@@ -67,6 +67,12 @@ impl AppleHypervisor {
         unsafe { VZLinuxRosettaDirectoryShare::availability() == VZLinuxRosettaAvailability::Installed }
     }
 
+    /// Minimum VM memory size accepted by Virtualization.framework on this host.
+    pub fn minimum_allowed_memory_bytes() -> u64 {
+        // SAFETY: class method with no arguments.
+        unsafe { VZVirtualMachineConfiguration::minimumAllowedMemorySize() }
+    }
+
     /// Generate a fresh serialisable machine identifier for VM snapshot save/restore.
     pub fn new_machine_id() -> Vec<u8> {
         // SAFETY: creating a brand new VZGenericMachineIdentifier and reading its bytes.
@@ -250,6 +256,17 @@ impl AppleVm {
         });
     }
 
+    /// Current target physical RAM (bytes) configured on the VM's `virtio-balloon`.
+    pub fn balloon_target_bytes(&self) -> Option<u64> {
+        self.on_queue(|vm| unsafe {
+            let devices = vm.memoryBalloonDevices();
+            devices
+                .firstObject()
+                .and_then(|dev| dev.downcast::<VZVirtioTraditionalMemoryBalloonDevice>().ok())
+                .map(|balloon| balloon.targetVirtualMachineMemorySize())
+        })
+    }
+
     /// Run `f` on the VM's queue and return its result.
     fn on_queue<R: Send>(&self, f: impl FnOnce(&VZVirtualMachine) -> R + Send) -> R {
         let mut out = None;
@@ -387,7 +404,14 @@ unsafe fn build_configuration(
     unsafe {
         let boot = VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &file_url(&config.kernel));
         boot.setInitialRamdiskURL(Some(&file_url(&config.initrd)));
-        boot.setCommandLine(&NSString::from_str(&config.cmdline));
+        let cmdline = if config.cmdline.split_whitespace().any(|tok| tok.starts_with("nr_cpus=")) {
+            config.cmdline.clone()
+        } else if config.cmdline.is_empty() {
+            format!("nr_cpus={}", config.cpus)
+        } else {
+            format!("{} nr_cpus={}", config.cmdline, config.cpus)
+        };
+        boot.setCommandLine(&NSString::from_str(&cmdline));
 
         let c = VZVirtualMachineConfiguration::new();
         let boot: &VZBootLoader = &boot;
@@ -507,19 +531,37 @@ unsafe fn build_configuration(
             c.setDirectorySharingDevices(&NSArray::from_retained_slice(&shares));
         }
 
-        // The disk the guest keeps containers' files on (/dev/vda).
+        // `/dev/vda`: read-write container scratch disk (uncached on host to avoid double caching).
+        // `/dev/vdb`: optional read-only EROFS image disk shared across containers (`lowerdir`).
+        let mut storage: Vec<Retained<VZStorageDeviceConfiguration>> = Vec::new();
         if !config.rootfs.as_os_str().is_empty() {
             let disk = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
                 VZDiskImageStorageDeviceAttachment::alloc(),
                 &file_url(&config.rootfs),
                 false,
-                VZDiskImageCachingMode::Cached,
+                VZDiskImageCachingMode::Uncached,
                 VZDiskImageSynchronizationMode::None,
             )
             .map_err(|e| VmmError::Framework(format!("disk {}: {}", config.rootfs.display(), e.localizedDescription())))?;
             let disk: &VZStorageDeviceAttachment = &disk;
             let block = VZVirtioBlockDeviceConfiguration::initWithAttachment(VZVirtioBlockDeviceConfiguration::alloc(), disk);
-            c.setStorageDevices(&NSArray::<VZStorageDeviceConfiguration>::from_retained_slice(&[block.into_super()]));
+            storage.push(block.into_super());
+        }
+        if let Some(img) = &config.image_disk {
+            let disk = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
+                VZDiskImageStorageDeviceAttachment::alloc(),
+                &file_url(img),
+                true,
+                VZDiskImageCachingMode::Cached,
+                VZDiskImageSynchronizationMode::None,
+            )
+            .map_err(|e| VmmError::Framework(format!("image disk {}: {}", img.display(), e.localizedDescription())))?;
+            let disk: &VZStorageDeviceAttachment = &disk;
+            let block = VZVirtioBlockDeviceConfiguration::initWithAttachment(VZVirtioBlockDeviceConfiguration::alloc(), disk);
+            storage.push(block.into_super());
+        }
+        if !storage.is_empty() {
+            c.setStorageDevices(&NSArray::<VZStorageDeviceConfiguration>::from_retained_slice(&storage));
         }
 
         c.validateWithError()

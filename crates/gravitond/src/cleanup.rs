@@ -119,7 +119,25 @@ pub fn disk_usage(engine: &Engine) -> DiskUsage {
     let (snapshots, snapshots_bytes) = engine.snapshots.disk_usage();
     usage.snapshots = snapshots;
     usage.snapshots_bytes = snapshots_bytes;
+    usage.blobs_bytes += crate::erofs::images_allocated_bytes();
     usage
+}
+
+fn active_erofs_keys(engine: &Engine, removed_container_ids: Option<&HashSet<String>>, removed_image_refs: Option<&HashSet<String>>) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    for (id, spec) in engine.specs.lock().unwrap().iter() {
+        if removed_container_ids.is_some_and(|gone| gone.contains(id)) {
+            continue;
+        }
+        keys.insert(crate::erofs::layers_cache_key(&spec.image.layers));
+    }
+    for img in engine.index.lock().unwrap().images() {
+        if removed_image_refs.is_some_and(|gone| gone.contains(&img.reference)) {
+            continue;
+        }
+        keys.insert(crate::erofs::layers_cache_key(&img.layers));
+    }
+    keys
 }
 
 /// Remove an image no container uses. Returns (freed, kept for the build cache).
@@ -157,6 +175,9 @@ pub fn remove_image(engine: &Engine, reference: &str) -> Result<(String, u64, u6
             freed += size;
         }
     }
+    let active_keys = active_erofs_keys(engine, None, None);
+    let (_, erofs_freed) = crate::erofs::prune_unreferenced_images(&active_keys, false);
+    freed += erofs_freed;
     Ok((image.reference, freed, kept))
 }
 
@@ -241,6 +262,16 @@ pub fn prune(engine: &Engine, spec: &PruneSpec) -> Result<PruneReport> {
     let (snap_count, snap_bytes) = engine.snapshots.clear_idle(spec.dry_run);
     report.snapshots = snap_count;
     report.freed_bytes += snap_bytes;
+
+    // 6. Unreferenced materialized EROFS image disks.
+    let kept_images: HashSet<String> = report.images.iter().cloned().collect();
+    let active_erofs = if spec.dry_run {
+        active_erofs_keys(engine, spec.containers.then_some(&gone), spec.images.then_some(&kept_images))
+    } else {
+        active_erofs_keys(engine, None, None)
+    };
+    let (_, erofs_freed) = crate::erofs::prune_unreferenced_images(&active_erofs, spec.dry_run);
+    report.freed_bytes += erofs_freed;
 
     if !spec.dry_run {
         remove_stale_builds(&paths::support_dir().join("builds"));

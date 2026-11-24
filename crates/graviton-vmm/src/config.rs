@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 /// Smallest memory a Graviton guest is allowed (kernel + agent + a process).
-pub const MIN_MEMORY_MIB: u64 = 128;
+pub const MIN_MEMORY_MIB: u64 = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkMode {
@@ -41,6 +41,8 @@ pub struct VmConfig {
     /// A disk image attached read-write as the guest's `/dev/vda`, where the
     /// agent keeps containers' files; empty for none.
     pub rootfs: PathBuf,
+    /// Optional read-only EROFS image attached as `/dev/vdb` (`lowerdir` for overlayfs).
+    pub image_disk: Option<PathBuf>,
     pub cmdline: String,
     pub network: NetworkMode,
     pub shares: Vec<SharedDirectory>,
@@ -85,6 +87,7 @@ impl VmConfig {
             kernel: kernel.into(),
             initrd: initrd.into(),
             rootfs: rootfs.into(),
+            image_disk: None,
             cmdline: "console=hvc0 quiet panic=-1".into(),
             network: NetworkMode::Nat,
             shares: Vec::new(),
@@ -138,8 +141,8 @@ mod tests {
         assert_eq!(c.validate(), Err(ConfigError::Cpus(0)));
 
         let mut c = cfg();
-        c.memory_mib = 64;
-        assert_eq!(c.validate(), Err(ConfigError::Memory(64)));
+        c.memory_mib = 32;
+        assert_eq!(c.validate(), Err(ConfigError::Memory(32)));
 
         let mut c = cfg();
         let share = SharedDirectory { host_path: "/tmp".into(), tag: "app".into(), read_only: false };

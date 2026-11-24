@@ -73,6 +73,7 @@ cpus=$(sysctl -n hw.ncpu 2>/dev/null || echo 8)
 
 echo "Building Linux ${KERNEL_VERSION}-graviton (arm64, ${cpus} vCPU) inside a Graviton container..." >&2
 "$grav" --host local run --rm \
+  --platform linux/arm64 \
   --cpus "$cpus" --memory 4096 \
   -v "$cache:/downloads:ro" \
   -v "$work:/work" \
@@ -83,7 +84,7 @@ echo "Building Linux ${KERNEL_VERSION}-graviton (arm64, ${cpus} vCPU) inside a G
     cd /tmp/src/linux-${KERNEL_VERSION}
     make ARCH=arm64 KCONFIG_ALLCONFIG=/work/kernel.config allnoconfig >/dev/null
     # Verify critical symbols stayed enabled after dependency resolution
-    for sym in CONFIG_VIRTIO_VSOCKETS CONFIG_VIRTIO_FS CONFIG_VIRTIO_NET CONFIG_VIRTIO_BLK CONFIG_VIRTIO_BALLOON CONFIG_EXT4_FS CONFIG_OVERLAY_FS CONFIG_BINFMT_MISC CONFIG_VIRTIO_CONSOLE CONFIG_PCI_HOST_GENERIC; do
+    for sym in CONFIG_VIRTIO_VSOCKETS CONFIG_VIRTIO_FS CONFIG_VIRTIO_NET CONFIG_VIRTIO_BLK CONFIG_VIRTIO_BALLOON CONFIG_VM_EVENT_COUNTERS CONFIG_EXT4_FS CONFIG_EROFS_FS CONFIG_OVERLAY_FS CONFIG_BINFMT_MISC CONFIG_VIRTIO_CONSOLE CONFIG_PCI_HOST_GENERIC CONFIG_CC_OPTIMIZE_FOR_SIZE; do
       grep -q \"^\${sym}=y\$\" .config || { echo \"MISSING REQUIRED SYMBOL: \$sym\" >&2; exit 1; }
     done
     make -j${cpus} ARCH=arm64 Image

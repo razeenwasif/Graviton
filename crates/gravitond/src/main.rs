@@ -11,6 +11,7 @@ mod boot_check;
 mod build;
 mod cleanup;
 mod docker_api;
+mod erofs;
 mod events;
 mod persistence;
 mod push;

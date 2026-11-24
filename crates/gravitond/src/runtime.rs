@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::hash::{BuildHasher, RandomState};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -325,13 +325,19 @@ impl Engine {
     }
 
     pub fn engine_info(&self) -> EngineInfo {
-        let running = self.running.lock().unwrap();
-        let specs = self.specs.lock().unwrap();
-        let used: u64 = running.keys().filter_map(|id| specs.get(id)).map(|s| s.memory_mib << 20).sum();
-        // Images, plus what containers' disks really take (they're sparse).
-        let images: u64 = self.index.lock().unwrap().images().map(LocalImage::size).sum();
-        let disks: u64 = self.store.lock().unwrap().containers().iter().map(|c| disk_usage(&paths::vms_dir().join(&c.id))).sum();
-        let disk_used = images + disks;
+        let running_ids: Vec<String> = self.running.lock().unwrap().keys().cloned().collect();
+        let store = self.store.lock().unwrap();
+        let used: u64 = running_ids
+            .iter()
+            .filter_map(|id| store.container(id).ok())
+            .map(|c| c.memory_bytes.unwrap_or(0))
+            .sum();
+        let container_disks: u64 = store.containers().iter().map(|c| disk_usage(&paths::vms_dir().join(&c.id))).sum();
+        drop(store);
+        // Images (OCI blobs + materialized EROFS disks), plus sparse container disks.
+        let images: u64 = self.index.lock().unwrap().images().map(LocalImage::size).sum::<u64>()
+            + crate::erofs::images_allocated_bytes();
+        let disk_used = images + container_disks;
         EngineInfo {
             version: env!("CARGO_PKG_VERSION").into(),
             protocol: PROTOCOL_VERSION,
@@ -1431,7 +1437,10 @@ impl Engine {
         if rosetta && !AppleHypervisor::rosetta_available() {
             bail!("linux/amd64 images need Apple Rosetta for Linux (run `softwareupdate --install-rosetta`)");
         }
+        let erofs_disk = crate::erofs::ensure_image_disk(&self.blobs, &spec.image.layers)
+            .context("preparing read-only image disk")?;
         let mut config = VmConfig::new(guest.join("vmlinux"), guest.join("initrd.img"), container_disk(&vm_dir)?);
+        config.image_disk = Some(erofs_disk);
         config.cpus = spec.cpus;
         config.memory_mib = spec.memory_mib;
         config.network = NetworkMode::Nat;
@@ -1862,6 +1871,8 @@ impl Engine {
                 history.processes.clear();
             }
             let mut previous: Option<GuestStats> = None;
+            let min_allowed = AppleHypervisor::minimum_allowed_memory_bytes();
+            let mut balloon = BalloonController::new(limit, min_allowed);
             loop {
                 let still_running = engine.running.lock().unwrap().get(&id).is_some_and(|r| Arc::ptr_eq(&r.vm, &vm));
                 if !still_running {
@@ -1876,6 +1887,9 @@ impl Engine {
                     break;
                 }
                 let Ok(AgentEvent::Stats(now)) = events.next() else { break };
+                if let Some(target) = balloon.update(&now) {
+                    vm.set_balloon_target_bytes(target);
+                }
                 let sample = match &previous {
                     Some(prev) => sample_between(prev, &now, limit),
                     None => initial_sample(&now, limit),
@@ -3109,6 +3123,69 @@ fn sample_between(prev: &GuestStats, now: &GuestStats, limit: u64) -> StatSample
     }
 }
 
+/// Adaptive `virtio-balloon` target controller driven by live guest `/proc/meminfo` stats.
+struct BalloonController {
+    min_target: u64,
+    max_target: u64,
+    current_target: u64,
+    shrink_streak: u32,
+    first_sample: bool,
+}
+
+impl BalloonController {
+    fn new(limit: u64, min_allowed_bytes: u64) -> Self {
+        let min_target = (64 << 20).max(min_allowed_bytes).min(limit);
+        Self { min_target, max_target: limit, current_target: limit, shrink_streak: 0, first_sample: true }
+    }
+
+    fn update(&mut self, stats: &GuestStats) -> Option<u64> {
+        if stats.memory_total_bytes == 0 || self.max_target <= self.min_target {
+            self.first_sample = false;
+            return None;
+        }
+        let avail = stats.memory_available_bytes;
+        let working_set = stats.memory_total_bytes.saturating_sub(avail);
+
+        // Grow immediately on low free RAM to prevent guest OOM kills.
+        if avail < (32 << 20) {
+            self.shrink_streak = 0;
+            self.first_sample = false;
+            let target = align_up_16m(working_set.saturating_add(128 << 20))
+                .max(self.current_target.saturating_add(64 << 20))
+                .min(self.max_target);
+            if target > self.current_target {
+                self.current_target = target;
+                return Some(target);
+            }
+            return None;
+        }
+
+        // Inflate the balloon (reclaim idle guest pages) after sustained headroom, or right after boot.
+        if avail > (96 << 20) {
+            self.shrink_streak = self.shrink_streak.saturating_add(1);
+            let ready = self.first_sample || self.shrink_streak >= 2;
+            self.first_sample = false;
+            if ready {
+                let desired = align_up_16m(working_set.saturating_add(80 << 20)).clamp(self.min_target, self.max_target);
+                if self.current_target.saturating_sub(desired) >= (16 << 20) {
+                    self.current_target = desired;
+                    self.shrink_streak = 0;
+                    return Some(desired);
+                }
+            }
+        } else {
+            self.shrink_streak = 0;
+            self.first_sample = false;
+        }
+        None
+    }
+}
+
+fn align_up_16m(bytes: u64) -> u64 {
+    const STEP: u64 = 16 << 20;
+    bytes.saturating_add(STEP - 1) / STEP * STEP
+}
+
 fn dial_guest_tcp(vm: &AppleVm, port: u16) -> Result<OwnedFd> {
     let mut conn = File::from(vm.connect(AGENT_VSOCK_PORT)?);
     match read_event_unbuffered(&mut conn)? {
@@ -3243,14 +3320,116 @@ fn extract_linux_version(bytes: &[u8]) -> Option<String> {
 /// The file a VM's scratch disk lives in, beside its console log.
 pub(crate) const SCRATCH_DISK: &str = "disk.img";
 
+const GVSP_MAGIC: &[u8; 8] = b"GVSP\x01\x00\x00\x00";
+
+fn extract_gvsp_gz(src: &Path, dst: &Path) -> Result<()> {
+    let file = File::open(src).with_context(|| format!("opening {}", src.display()))?;
+    let mut gz = flate2::read::GzDecoder::new(BufReader::new(file));
+    let mut header = [0u8; 16];
+    gz.read_exact(&mut header).context("reading GVSP header")?;
+    if &header[..8] != GVSP_MAGIC {
+        bail!("invalid GVSP magic in {}", src.display());
+    }
+    let total_size = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    let mut out = File::create(dst).with_context(|| format!("creating {}", dst.display()))?;
+    out.set_len(total_size).with_context(|| format!("sizing {}", dst.display()))?;
+    let mut rec = [0u8; 12];
+    let mut buf = Vec::new();
+    loop {
+        gz.read_exact(&mut rec).context("reading GVSP chunk header")?;
+        let offset = u64::from_le_bytes(rec[0..8].try_into().unwrap());
+        let len = u32::from_le_bytes(rec[8..12].try_into().unwrap());
+        if offset == 0 && len == 0 {
+            break;
+        }
+        if len > (32 << 20) || offset.checked_add(u64::from(len)).is_none_or(|end| end > total_size) {
+            bail!("corrupt GVSP chunk at {offset} (len {len}, total {total_size})");
+        }
+        buf.resize(len as usize, 0);
+        gz.read_exact(&mut buf).context("reading GVSP chunk data")?;
+        out.seek(std::io::SeekFrom::Start(offset))?;
+        out.write_all(&buf)?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+fn ensure_ext4_template() -> Result<Option<PathBuf>> {
+    use std::sync::OnceLock;
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+
+    let gvsp = paths::guest_dir().join("empty-disk.gvsp.gz");
+    let Ok(meta) = fs::metadata(&gvsp) else {
+        return Ok(None);
+    };
+    let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+    let wanted = format!("{}:{mtime}", meta.len());
+
+    let dir = paths::vms_dir();
+    fs::create_dir_all(&dir)?;
+    let tpl = dir.join(".template-64g.ext4");
+    let stamp = dir.join(".template-64g.stamp");
+    if tpl.is_file() && fs::read_to_string(&stamp).is_ok_and(|s| s == wanted) {
+        return Ok(Some(tpl));
+    }
+
+    let tmp = dir.join(format!(".template-64g.{}.tmp", std::process::id()));
+    extract_gvsp_gz(&gvsp, &tmp)?;
+    fs::rename(&tmp, &tpl)?;
+    let _ = fs::write(&stamp, wanted);
+    Ok(Some(tpl))
+}
+
+fn clone_sparse_file(src: &Path, dst: &Path) -> Result<()> {
+    let _ = fs::remove_file(dst);
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        unsafe extern "C" {
+            fn clonefile(src: *const libc::c_char, dst: *const libc::c_char, flags: u32) -> libc::c_int;
+        }
+        if let (Ok(cs), Ok(cd)) = (CString::new(src.as_os_str().as_bytes()), CString::new(dst.as_os_str().as_bytes())) {
+            // SAFETY: valid NUL-terminated paths passed to Darwin `clonefile(2)`.
+            if unsafe { clonefile(cs.as_ptr(), cd.as_ptr(), 0) } == 0 {
+                return Ok(());
+            }
+        }
+    }
+    let mut reader = BufReader::new(File::open(src)?);
+    let total = reader.get_ref().metadata()?.len();
+    let mut out = File::create(dst)?;
+    out.set_len(total)?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut off = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if buf[..n].iter().any(|&b| b != 0) {
+            out.seek(std::io::SeekFrom::Start(off))?;
+            out.write_all(&buf[..n])?;
+        }
+        off += n as u64;
+    }
+    out.flush()?;
+    Ok(())
+}
+
 /// A fresh, empty, sparse disk image in `dir` for a VM to keep containers'
-/// files on (the guest formats it at boot). It holds up to
-/// `$GRAVITON_DISK_GIB` (default 64) GiB, but takes only what's written to it
-/// on the Mac's disk. Their files used to live in the VM's RAM, so an image
-/// and its build's output had to fit in the memory the container was given.
+/// files on (copied from the pre-formatted sparse template when `64 GiB`, else
+/// zeroed sparse for the guest's `format` fallback).
 pub(crate) fn scratch_disk(dir: &Path) -> Result<PathBuf> {
     let gib: u64 = std::env::var("GRAVITON_DISK_GIB").ok().and_then(|v| v.parse().ok()).filter(|g| (1..=2048).contains(g)).unwrap_or(64);
     let path = dir.join(SCRATCH_DISK);
+    if gib == 64 {
+        if let Some(tpl) = ensure_ext4_template()? {
+            clone_sparse_file(&tpl, &path).with_context(|| format!("cloning {}", path.display()))?;
+            return Ok(path);
+        }
+    }
     let _ = fs::remove_file(&path);
     let file = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
     file.set_len(gib << 30).with_context(|| format!("sizing {}", path.display()))?;
@@ -3812,6 +3991,82 @@ mod tests {
 
         engine.disconnect_network("frontend", "web").unwrap();
         assert_eq!(engine.remove_network("frontend").unwrap(), "frontend");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn balloon_controller_reclaims_grows_and_suppresses_jitter() {
+        let mib = 1024 * 1024;
+        let gstats = |total_mib: u64, avail_mib: u64| GuestStats {
+            cpus: 2,
+            cpu_busy: 0,
+            cpu_total: 0,
+            memory_total_bytes: total_mib * mib,
+            memory_available_bytes: avail_mib * mib,
+            net_rx_bytes: 0,
+            net_tx_bytes: 0,
+            processes: vec![],
+        };
+
+        let mut c = BalloonController::new(1024 * mib, 4 * mib);
+        // First sample with lots of idle RAM reclaims immediately down to working_set + 80 MiB aligned to 16 MiB.
+        assert_eq!(c.update(&gstats(1024, 960)), Some(144 * mib));
+        // Headroom in the 32..96 MiB deadband keeps streak reset and triggers no update.
+        assert_eq!(c.update(&gstats(144, 60)), None);
+        // 1st sample > 96 MiB builds hysteresis streak without shrinking yet.
+        assert_eq!(c.update(&gstats(256, 236)), None);
+        // 2nd consecutive sample > 96 MiB shrinks down to working_set(20) + 80 = 112 MiB (aligned).
+        assert_eq!(c.update(&gstats(256, 236)), Some(112 * mib));
+        // Shrinks down to 80 MiB when working set drops to 0.
+        assert_eq!(c.update(&gstats(256, 256)), None);
+        assert_eq!(c.update(&gstats(256, 256)), Some(80 * mib));
+
+        // Low available memory (< 32 MiB) grows immediately, clamped at max_target.
+        let mut grow = BalloonController::new(512 * mib, 4 * mib);
+        assert_eq!(grow.update(&gstats(512, 480)), Some(112 * mib));
+        assert_eq!(grow.update(&gstats(112, 16)), Some(224 * mib));
+        assert_eq!(grow.update(&gstats(224, 10)), Some(352 * mib));
+        assert_eq!(grow.update(&gstats(512, 20)), Some(512 * mib));
+        assert_eq!(grow.update(&gstats(512, 20)), None);
+    }
+
+    #[test]
+    fn gvsp_extract_round_trip() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Read;
+
+        let dir = std::env::temp_dir().join(format!("graviton-gvsp-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("tpl.gvsp.gz");
+        let dst = dir.join("disk.img");
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(GVSP_MAGIC);
+        raw.extend_from_slice(&(128 * 1024u64).to_le_bytes());
+        raw.extend_from_slice(&1080u64.to_le_bytes());
+        raw.extend_from_slice(&2u32.to_le_bytes());
+        raw.extend_from_slice(&[0x53, 0xef]);
+        raw.extend_from_slice(&(65536u64).to_le_bytes());
+        raw.extend_from_slice(&4u32.to_le_bytes());
+        raw.extend_from_slice(b"EXT4");
+        raw.extend_from_slice(&0u64.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&raw).unwrap();
+        fs::write(&src, enc.finish().unwrap()).unwrap();
+
+        extract_gvsp_gz(&src, &dst).unwrap();
+        let mut f = File::open(&dst).unwrap();
+        assert_eq!(f.metadata().unwrap().len(), 128 * 1024);
+        let mut buf = vec![0u8; 128 * 1024];
+        f.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf[1080..1082], &[0x53, 0xef]);
+        assert_eq!(&buf[65536..65540], b"EXT4");
+        assert!(buf[..1080].iter().all(|&b| b == 0));
+        assert!(buf[1082..65536].iter().all(|&b| b == 0));
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

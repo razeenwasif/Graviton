@@ -34,7 +34,7 @@ pub struct BootCheckArgs {
     #[arg(long)]
     snapshot: bool,
     /// Command to run in the guest.
-    #[arg(last = true, default_values_t = ["/bin/busybox".to_string(), "uname".to_string(), "-a".to_string()])]
+    #[arg(last = true, default_values_t = ["/init".to_string(), "--uname".to_string()])]
     command: Vec<String>,
 }
 

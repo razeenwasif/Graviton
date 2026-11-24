@@ -15,7 +15,9 @@
 //!
 //! Build it for the guest with `scripts/build-guest.sh`.
 
+mod net;
 mod ns;
+mod stats;
 mod zstd_stream;
 
 #[cfg(target_os = "linux")]
@@ -27,11 +29,7 @@ mod dns;
 #[cfg(target_os = "linux")]
 mod files;
 #[cfg(target_os = "linux")]
-mod net;
-#[cfg(target_os = "linux")]
 mod reap;
-#[cfg(target_os = "linux")]
-mod stats;
 #[cfg(target_os = "linux")]
 mod tty;
 
@@ -62,6 +60,9 @@ pub(crate) mod linux {
     type Writer = Arc<Mutex<File>>;
 
     pub fn main() {
+        if std::env::args().nth(1).as_deref() == Some("--uname") {
+            print_uname_and_exit();
+        }
         if let Ok(fd_str) = std::env::var(crate::ns::LAUNCH_FD_ENV) {
             crate::ns::run_launcher(&fd_str);
         }
@@ -72,10 +73,6 @@ pub(crate) mod linux {
             }
             // SAFETY: single-threaded at this point.
             unsafe { std::env::set_var("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin") };
-            // The initramfs ships one static busybox; give the guest its applets (ls, cat, ...).
-            if fs::metadata("/bin/busybox").is_ok() {
-                let _ = crate::reap::status(Command::new("/bin/busybox").args(["--install", "-s", "/bin"]));
-            }
             // Orphans inside containers are re-parented to us; wait for them.
             crate::reap::start();
         }
@@ -652,5 +649,25 @@ pub(crate) mod linux {
 
     fn cstr(s: &str) -> io::Result<CString> {
         CString::new(s).map_err(|_| io::Error::other("string contains NUL"))
+    }
+
+    fn print_uname_and_exit() -> ! {
+        use std::ffi::CStr;
+        // SAFETY: `utsname` is plain old data; `uname(2)` populates it cleanly.
+        let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+        // SAFETY: valid pointer to `uts`.
+        if unsafe { libc::uname(&raw mut uts) } == 0 {
+            let field = |buf: &[libc::c_char]| unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned();
+            println!(
+                "{} {} {} {} {}",
+                field(&uts.sysname),
+                field(&uts.nodename),
+                field(&uts.release),
+                field(&uts.version),
+                field(&uts.machine),
+            );
+            std::process::exit(0);
+        }
+        std::process::exit(1);
     }
 }

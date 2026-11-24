@@ -14,9 +14,6 @@ set -eu
 ALPINE=${ALPINE:-v3.22}
 KERNEL_VERSION=${KERNEL_VERSION:-6.12.118}
 KERNEL_PKG=${KERNEL_PKG:-linux-virt-6.12.118-r0}
-BUSYBOX_PKG=${BUSYBOX_PKG:-busybox-static-1.37.0-r20}
-# mke2fs, to format each VM's scratch disk, with the libraries it links against.
-E2FS_PKGS=${E2FS_PKGS:-"e2fsprogs-1.47.2-r2 e2fsprogs-libs-1.47.2-r2 libcom_err-1.47.2-r2 libblkid-2.41.6-r1 libuuid-2.41.6-r1 libeconf-0.6.3-r0 musl-1.2.5-r13"}
 MIRROR="https://dl-cdn.alpinelinux.org/alpine/$ALPINE/main/aarch64"
 
 kernel_mode="auto"
@@ -63,10 +60,6 @@ if [ "$kernel_mode" != "alpine" ]; then
   fi
 fi
 
-busybox_dir=$(fetch "$BUSYBOX_PKG")
-e2fs_dirs=""
-for p in $E2FS_PKGS; do e2fs_dirs="$e2fs_dirs $(fetch "$p")"; done
-
 # 1. Kernel.
 kernel_dir=""
 if [ -n "$custom_kernel" ]; then
@@ -103,41 +96,29 @@ print(f"Kernel: {len(image) / 2**20:.1f} MiB arm64 Image (Alpine linux-virt)")
 PY
 fi
 
-# 2. Agent, statically linked for the guest.
-cargo build --quiet --manifest-path "$repo/Cargo.toml" -p graviton-agent --release --target aarch64-unknown-linux-musl
+# 2. Agent, statically linked and size-optimized for the guest.
+cargo build --quiet --manifest-path "$repo/Cargo.toml" -p graviton-agent --profile guest --target aarch64-unknown-linux-musl
 target_dir=$(cargo metadata --format-version 1 --no-deps --manifest-path "$repo/Cargo.toml" |
   python3 -I -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
-agent="$target_dir/aarch64-unknown-linux-musl/release/graviton-agent"
+agent="$target_dir/aarch64-unknown-linux-musl/guest/graviton-agent"
 
-# 3. Initramfs tree.
+# 3. Minimal initramfs tree (agent /init only; kernel drivers are built-in unless --alpine).
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
-mkdir -p "$root/bin" "$root/sbin" "$root/dev" "$root/proc" "$root/sys" "$root/tmp" "$root/run" "$root/etc" "$root/lib/modules" "$root/usr/lib"
+mkdir -p "$root/dev" "$root/proc" "$root/sys" "$root/tmp" "$root/run" "$root/etc" "$root/lib/modules"
 cp "$agent" "$root/init"
-cp "$busybox_dir/bin/busybox.static" "$root/bin/busybox"
-ln -s busybox "$root/bin/sh"
-
-# mke2fs (dynamically linked against musl) for the scratch disk, its config,
-# and the shared libraries it needs, where musl's loader looks.
-for d in $e2fs_dirs; do
-  [ -f "$d/sbin/mke2fs" ] && cp "$d/sbin/mke2fs" "$root/sbin/mke2fs"
-  [ -f "$d/etc/mke2fs.conf" ] && cp "$d/etc/mke2fs.conf" "$root/etc/mke2fs.conf"
-  [ -d "$d/usr/lib" ] && find "$d/usr/lib" -maxdepth 1 -name 'lib*.so*' -exec cp -P {} "$root/usr/lib/" \;
-  [ -d "$d/lib" ] && find "$d/lib" -maxdepth 1 -name '*musl*' -exec cp -P {} "$root/lib/" \;
-done
-[ -x "$root/sbin/mke2fs" ] && [ -e "$root/lib/ld-musl-aarch64.so.1" ] || { echo "mke2fs or musl missing from the guest" >&2; exit 1; }
 
 : > "$root/lib/modules/order"
 if [ -n "$kernel_dir" ]; then
   moddir="$kernel_dir/lib/modules/$(ls "$kernel_dir/lib/modules")/kernel"
   # vsock for the agent channel; fuse + virtiofs for the image store, volumes and Rosetta;
   # virtio-net (with its failover deps) and af_packet for networking and DHCP;
-  # virtio-blk and ext4 (with its deps, in order) for the scratch disk;
+  # virtio-blk, ext4, erofs and overlay for container roots;
   # binfmt_misc for Rosetta x86_64 execution and virtio_balloon for memory reclaim.
   for m in net/vmw_vsock/vsock net/vmw_vsock/vmw_vsock_virtio_transport_common net/vmw_vsock/vmw_vsock_virtio_transport \
            fs/fuse/fuse fs/fuse/virtiofs \
            net/core/failover drivers/net/net_failover drivers/net/virtio_net net/packet/af_packet \
-           lib/crc16 crypto/crc32c_generic fs/mbcache fs/jbd2/jbd2 fs/ext4/ext4 drivers/block/virtio_blk \
+           lib/crc16 crypto/crc32c_generic fs/mbcache fs/jbd2/jbd2 fs/ext4/ext4 fs/erofs/erofs fs/overlayfs/overlay drivers/block/virtio_blk \
            fs/binfmt_misc drivers/virtio/virtio_balloon; do
     if [ -f "$moddir/$m.ko.gz" ]; then
       name=$(basename "$m")
@@ -147,27 +128,89 @@ if [ -n "$kernel_dir" ]; then
   done
 fi
 
-# udhcpc calls this with the lease; the agent reads /run/graviton-ip.
-cat > "$root/etc/udhcpc.script" <<'SCRIPT'
-#!/bin/sh
-case "$1" in
-  deconfig)
-    ip addr flush dev "$interface"
-    ip link set "$interface" up
-    ;;
-  bound|renew)
-    ip addr flush dev "$interface"
-    ip addr add "$ip/${mask:-24}" dev "$interface"
-    [ -n "$router" ] && ip route replace default via "${router%% *}" dev "$interface"
-    : > /etc/resolv.conf
-    for server in $dns; do echo "nameserver $server" >> /etc/resolv.conf; done
-    echo "$ip" > /run/graviton-ip
-    ;;
-esac
-exit 0
-SCRIPT
-chmod 755 "$root/etc/udhcpc.script"
-
 (cd "$root" && find . | sort | cpio -o -H newc --quiet) | gzip -9 > "$out/initrd.img"
 printf 'Initramfs: %s KiB\n' "$(( $(stat -f %z "$out/initrd.img") / 1024 ))"
+
+# 4. Pre-formatted sparse 64 GiB ext4 template (GVSP v1) so guests never need mke2fs.
+tpl="$cache/empty-disk-64g-ext4-j4.gvsp.gz"
+if [ ! -f "$tpl" ]; then
+  disk_tmp="$root/empty-disk.img"
+  python3 -I - "$disk_tmp" <<'PY'
+import sys
+with open(sys.argv[1], "wb") as f:
+    f.truncate(64 * 1024 * 1024 * 1024)
+PY
+  mke2fs_bin=""
+  for cand in "$(command -v mke2fs 2>/dev/null || true)" \
+              "/opt/homebrew/opt/e2fsprogs/sbin/mke2fs" \
+              "/usr/local/opt/e2fsprogs/sbin/mke2fs" \
+              "$HOME/Library/Android/sdk/platform-tools/mke2fs"; do
+    if [ -n "$cand" ] && [ -x "$cand" ]; then
+      if "$cand" -q -F -t ext4 -J size=4 -O ^metadata_csum \
+          -E lazy_itable_init=1,nodiscard,hash_seed=67726176-6974-6f6e-0000-000000000001 \
+          -U 67726176-6974-6f6e-0000-000000000002 -m 0 "$disk_tmp" >/dev/null 2>&1; then
+        mke2fs_bin="$cand"
+        break
+      fi
+      python3 -I - "$disk_tmp" <<'PY'
+import sys
+with open(sys.argv[1], "wb") as f:
+    f.truncate(64 * 1024 * 1024 * 1024)
+PY
+    fi
+  done
+  if [ -z "$mke2fs_bin" ]; then
+    grav_bin=${GRAV:-}
+    [ -z "$grav_bin" ] && [ -x /Applications/Graviton.app/Contents/MacOS/grav ] && grav_bin=/Applications/Graviton.app/Contents/MacOS/grav
+    [ -z "$grav_bin" ] && grav_bin=$(command -v grav 2>/dev/null || true)
+    [ -n "$grav_bin" ] || { echo "build-guest: need mke2fs or grav to generate empty-disk.gvsp.gz" >&2; exit 1; }
+    "$grav_bin" --host local run --rm -v "$root:/work" alpine:3.22 sh -eu -c \
+      "apk add --no-cache e2fsprogs >/dev/null && mke2fs -q -F -t ext4 -J size=4 -O ^metadata_csum -E lazy_itable_init=1,nodiscard,hash_seed=67726176-6974-6f6e-0000-000000000001 -U 67726176-6974-6f6e-0000-000000000002 -m 0 /work/empty-disk.img"
+  fi
+  python3 -I - "$disk_tmp" "$tpl.tmp" <<'PY'
+import gzip, os, struct, sys
+src, dst = sys.argv[1], sys.argv[2]
+total = os.path.getsize(src)
+with open(src, "rb") as f, gzip.open(dst, "wb", compresslevel=9) as gz:
+    gz.write(b"GVSP\x01\x00\x00\x00")
+    gz.write(struct.pack("<Q", total))
+    fd = f.fileno()
+    off = 0
+    used_seek = hasattr(os, "SEEK_DATA") and hasattr(os, "SEEK_HOLE")
+    if used_seek:
+        try:
+            while off < total:
+                data_start = os.lseek(fd, off, os.SEEK_DATA)
+                hole_start = os.lseek(fd, data_start, os.SEEK_HOLE)
+                pos = data_start
+                while pos < hole_start:
+                    f.seek(pos)
+                    chunk = f.read(min(1 << 20, hole_start - pos))
+                    if not chunk:
+                        break
+                    if any(chunk):
+                        gz.write(struct.pack("<QI", pos, len(chunk)))
+                        gz.write(chunk)
+                    pos += len(chunk)
+                off = hole_start
+        except OSError as e:
+            if e.errno != 6:  # ENXIO == no more data
+                used_seek = False
+    if not used_seek:
+        f.seek(0)
+        pos = 0
+        while pos < total:
+            chunk = f.read(4096)
+            if not chunk:
+                break
+            if any(chunk):
+                gz.write(struct.pack("<QI", pos, len(chunk)))
+                gz.write(chunk)
+            pos += len(chunk)
+    gz.write(struct.pack("<QI", 0, 0))
+PY
+  mv "$tpl.tmp" "$tpl"
+fi
+cp "$tpl" "$out/empty-disk.gvsp.gz"
+printf 'Template:  %s KiB (sparse 64 GiB ext4)\n' "$(( $(stat -f %z "$out/empty-disk.gvsp.gz") / 1024 ))"
 echo "Guest written to $out"

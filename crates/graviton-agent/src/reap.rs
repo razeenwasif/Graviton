@@ -14,7 +14,7 @@
 
 use std::collections::BTreeSet;
 use std::io;
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -32,14 +32,6 @@ pub fn spawn(cmd: &mut Command) -> io::Result<Child> {
 /// The caller has waited for `pid`; it's nobody's now.
 pub fn release(pid: i32) {
     OWNED.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
-}
-
-/// `Command::status`, recorded.
-pub fn status(cmd: &mut Command) -> io::Result<ExitStatus> {
-    let mut child = spawn(cmd)?;
-    let result = child.wait();
-    release(child.id() as i32);
-    result
 }
 
 /// `Command::output`, recorded.

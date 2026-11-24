@@ -117,7 +117,7 @@ public actor DemoEngine: EngineService {
 
     public func engineInfo() -> EngineInfo {
         let used = list.compactMap(\.memoryBytes).reduce(0, +) + 1_900 * 1024 * 1024
-        return EngineInfo(version: "0.2.0", protocol: 2, kernel: "Linux 6.12 (demo)", arch: "arm64", cpus: 4,
+        return EngineInfo(version: "0.3.0", protocol: 2, kernel: "Linux 6.12 (demo)", arch: "arm64", cpus: 4,
                           memoryBytes: 8 << 30, memoryUsedBytes: used, diskBytes: 64 << 30, diskUsedBytes: 6963 << 20,
                           rosetta: true, hostMemoryUsedBytes: min(8 << 30, (2_800 << 20) + used))
     }

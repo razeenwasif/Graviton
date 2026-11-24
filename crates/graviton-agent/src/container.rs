@@ -17,6 +17,7 @@
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -25,8 +26,10 @@ use flate2::read::GzDecoder;
 const BLOBS: &str = "/run/blobs";
 const SHARES: &str = "/run/shares";
 const CONTAINERS: &str = "/run/containers";
-/// The scratch disk gravitond attaches, if it does.
+/// The scratch disk gravitond attaches (`ext4`, `/dev/vda`).
 const DISK: &str = "/dev/vda";
+/// Optional read-only shared image disk (`erofs`, `/dev/vdb`).
+const IMAGE_DISK: &str = "/dev/vdb";
 
 /// Whether container roots live on the scratch disk: formats and mounts it at
 /// `CONTAINERS` the first time it's asked, once per boot.
@@ -54,12 +57,26 @@ fn format_disk() -> io::Result<bool> {
     }
     invalidate_block_cache(DISK);
     if !is_ext4(DISK) {
+        if !Path::new("/sbin/mke2fs").is_file() {
+            return Err(io::Error::other("scratch disk is unformatted and /sbin/mke2fs is absent"));
+        }
         format(DISK)?;
     }
     fs::create_dir_all(CONTAINERS)?;
     crate::linux::mount_with(DISK, CONTAINERS, "ext4", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOATIME, None)
         .map_err(|e| io::Error::other(format!("mounting {DISK}: {e}")))?;
     Ok(true)
+}
+
+/// Whether `dev` holds an EROFS filesystem (`EROFS_SUPER_MAGIC_V1` at offset 1024).
+fn is_erofs(dev: &str) -> bool {
+    let mut magic = [0u8; 4];
+    File::open(dev).and_then(|mut f| {
+        f.seek(SeekFrom::Start(1024))?;
+        f.read_exact(&mut magic)
+    })
+    .is_ok()
+        && u32::from_le_bytes(magic) == 0xE0F5_E1E2
 }
 
 /// Whether `dev` already holds an ext2/3/4 filesystem (a container's disk from an earlier run).
@@ -110,22 +127,83 @@ pub fn rootfs(id: &str) -> io::Result<PathBuf> {
     Ok(Path::new(CONTAINERS).join(id).join("rootfs"))
 }
 
-/// Unpack `layers` (sha256 digests, lowest first) into the container's root.
-/// On its disk, files from an earlier run of the same image are kept as they
-/// are (`(0, true)`); otherwise the root starts fresh. Returns the entry
-/// count unpacked and whether the files were reused.
+/// Mount or unpack `layers` (sha256 digests, lowest first) into the container's root.
+/// When a read-only EROFS image disk (`/dev/vdb`) is attached alongside `/dev/vda`,
+/// mounts `overlayfs` directly (`lowerdir` on `/dev/vdb`, `upperdir` on `/dev/vda`) with
+/// zero layer unpacking; otherwise falls back to unpacking blobs into `rootfs`.
 pub fn prepare(id: &str, layers: &[String]) -> io::Result<(u64, bool)> {
-    mount_blobs()?;
     let disk = on_disk()?;
     let root = rootfs(id)?;
-    // Written once a root is fully unpacked: which image it came from.
-    let marker = root.with_file_name("image");
+    let base = root.parent().ok_or_else(|| io::Error::other("missing container base dir"))?;
+    let marker = base.join("image");
+    let upper = base.join("upper");
     let wanted = layers.join("\n");
-    if disk && root.is_dir() && fs::read_to_string(&marker).is_ok_and(|m| m == wanted) {
+
+    if disk && root.is_dir() && !upper.is_dir() && fs::read_to_string(&marker).is_ok_and(|m| m == wanted) {
         let path = root.to_string_lossy();
         crate::linux::mount_with(&path, &path, "none", libc::MS_BIND, None)?;
         return Ok((0, true));
     }
+
+    if disk && Path::new(IMAGE_DISK).exists() {
+        invalidate_block_cache(IMAGE_DISK);
+        if is_erofs(IMAGE_DISK) {
+            let lower = base.join("lower");
+            let work = base.join("work");
+            let reused = upper.is_dir() && fs::read_to_string(&marker).is_ok_and(|m| m == wanted);
+            if !reused {
+                let _ = fs::remove_file(&marker);
+                let _ = umount(&root);
+                let _ = umount(&lower);
+                if upper.exists() {
+                    fs::remove_dir_all(&upper)?;
+                }
+                if work.exists() {
+                    fs::remove_dir_all(&work)?;
+                }
+                if root.exists() {
+                    let _ = fs::remove_dir_all(&root);
+                }
+            }
+            fs::create_dir_all(&lower)?;
+            fs::create_dir_all(&upper)?;
+            fs::create_dir_all(&work)?;
+            fs::create_dir_all(&root)?;
+
+            crate::linux::mount_with(
+                IMAGE_DISK,
+                &lower.to_string_lossy(),
+                "erofs",
+                libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
+                None,
+            )
+            .map_err(|e| io::Error::other(format!("mounting {IMAGE_DISK}: {e}")))?;
+
+            let opts = format!("lowerdir={},upperdir={},workdir={}", lower.display(), upper.display(), work.display());
+            crate::linux::mount_with("overlay", &root.to_string_lossy(), "overlay", 0, Some(&opts))
+                .map_err(|e| io::Error::other(format!("mounting overlay: {e}")))?;
+
+            for (dir, mode) in [("proc", 0o555), ("sys", 0o555), ("dev", 0o755), ("tmp", 0o1777), ("etc", 0o755)] {
+                let p = root.join(dir);
+                if fs::symlink_metadata(&p).is_err() {
+                    fs::create_dir_all(&p)?;
+                    set_mode(&p, mode)?;
+                }
+            }
+            if !reused {
+                fs::write(&marker, &wanted)?;
+                if let Ok(dir) = File::open(CONTAINERS) {
+                    // SAFETY: syncfs(2) on an open directory fd.
+                    unsafe {
+                        let _ = libc::syncfs(dir.as_raw_fd());
+                    }
+                }
+            }
+            return Ok((0, reused));
+        }
+    }
+
+    mount_blobs()?;
     let _ = fs::remove_file(&marker);
     if root.exists() {
         let _ = umount(&root);
@@ -154,7 +232,7 @@ pub fn prepare(id: &str, layers: &[String]) -> io::Result<(u64, bool)> {
 
     for (dir, mode) in [("proc", 0o555), ("sys", 0o555), ("dev", 0o755), ("tmp", 0o1777), ("etc", 0o755)] {
         let p = root.join(dir);
-        if !p.exists() {
+        if fs::symlink_metadata(&p).is_err() {
             fs::create_dir_all(&p)?;
             set_mode(&p, mode)?;
         }
@@ -167,9 +245,10 @@ pub fn prepare(id: &str, layers: &[String]) -> io::Result<(u64, bool)> {
         fs::write(&marker, &wanted)?;
         let dir = File::open(CONTAINERS)?;
         // SAFETY: syncfs(2) on a descriptor we own.
-        if unsafe { libc::syncfs(std::os::fd::AsRawFd::as_raw_fd(&dir)) } != 0 {
+        if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        let _ = fs::write("/proc/sys/vm/drop_caches", b"1\n");
     }
     Ok((files, false))
 }
@@ -300,6 +379,7 @@ pub fn unpack_into(archive: &Path, dir: &Path) -> io::Result<u64> {
 
 fn unpack_layer(blob: &Path, root: &Path) -> io::Result<u64> {
     let mut file = File::open(blob)?;
+    let hint_fd = file.try_clone().ok();
     let mut magic = [0u8; 4];
     let n = file.read(&mut magic)?;
     file.seek(SeekFrom::Start(0))?;
@@ -363,6 +443,12 @@ fn unpack_layer(blob: &Path, root: &Path) -> io::Result<u64> {
         }
         entry.unpack_in(root)?;
         count += 1;
+    }
+    if let Some(hf) = hint_fd {
+        // SAFETY: valid open file descriptor; best-effort hint to drop virtiofs blob read cache.
+        unsafe {
+            let _ = libc::posix_fadvise(hf.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        }
     }
     Ok(count)
 }

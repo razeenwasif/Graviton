@@ -80,6 +80,11 @@ pub fn volumes_dir() -> PathBuf {
     support_dir().join("volumes")
 }
 
+/// Shared read-only container image disks (EROFS) backing overlayfs roots.
+pub fn images_dir() -> PathBuf {
+    support_dir().join("images")
+}
+
 /// Cached VM memory snapshots (`.vzsave` + per-slot machine identities).
 pub fn snapshots_dir() -> PathBuf {
     support_dir().join("snapshots")

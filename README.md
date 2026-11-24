@@ -53,8 +53,8 @@ periwinkle accent `#7C8CFF`; green, amber and red only for status).
 
 On Apple silicon (`arm64`) Macs running macOS 15 or later:
 
-- **Disk image (DMG):** Download the signed and Apple-notarized `Graviton-0.1.0.dmg`
-  from [GitHub Releases](https://github.com/razeenwasif/Graviton/releases/tag/v0.1.0),
+- **Disk image (DMG):** Download the signed and Apple-notarized `Graviton-0.3.0.dmg`
+  from [GitHub Releases](https://github.com/razeenwasif/Graviton/releases/latest),
   drag **Graviton.app** to **Applications**, and start the background engine with
   `/Applications/Graviton.app/Contents/MacOS/grav service install`. **GravitonMac**
   also checks GitHub Releases quietly in **Settings (`⌘,`) ▸ Updates**.

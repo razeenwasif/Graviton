@@ -1,11 +1,17 @@
 //! Resource counters for the guest, read from /proc. One guest runs one
 //! container, so the guest's numbers are the container's.
 
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::fs;
 
+#[cfg(target_os = "linux")]
 use graviton_proto::{GuestStats, ProcessInfo};
 
+#[cfg(target_os = "linux")]
 pub fn collect(processes: bool) -> GuestStats {
     let (cpu_busy, cpu_total, cpus) = cpu();
     let (memory_total_bytes, memory_available_bytes) = memory();
@@ -23,6 +29,7 @@ pub fn collect(processes: bool) -> GuestStats {
 }
 
 /// Busy and total jiffies across all CPUs, and the CPU count.
+#[cfg(target_os = "linux")]
 fn cpu() -> (u64, u64, u32) {
     let stat = fs::read_to_string("/proc/stat").unwrap_or_default();
     let mut cpus = 0;
@@ -41,18 +48,43 @@ fn cpu() -> (u64, u64, u32) {
     (busy, total, cpus)
 }
 
+#[cfg(target_os = "linux")]
 fn memory() -> (u64, u64) {
     let info = fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let field = |name: &str| {
-        info.lines()
+    let vmstat = fs::read_to_string("/proc/vmstat").unwrap_or_default();
+    // SAFETY: sysconf has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE).max(4096) as u64 };
+    parse_memory(&info, &vmstat, page)
+}
+
+fn parse_memory(meminfo: &str, vmstat: &str, page_size: u64) -> (u64, u64) {
+    let mem_field = |name: &str| {
+        meminfo
+            .lines()
             .find_map(|l| l.strip_prefix(name)?.strip_prefix(':'))
             .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
             .map_or(0, |kib| kib * 1024)
     };
-    (field("MemTotal"), field("MemAvailable"))
+    let vm_field = |name: &str| {
+        vmstat
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let raw_total = mem_field("MemTotal");
+    let avail = mem_field("MemAvailable");
+    // Linux virtio_balloon with VIRTIO_BALLOON_F_DEFLATE_ON_OOM leaves MemTotal
+    // constant while inflated pages reduce MemAvailable; subtract held balloon
+    // pages so (MemTotal - MemAvailable) stays equal to genuine guest working set.
+    let balloon_pages = vm_field("balloon_inflate").saturating_sub(vm_field("balloon_deflate"));
+    let balloon_bytes = balloon_pages.saturating_mul(page_size);
+    let effective_total = raw_total.saturating_sub(balloon_bytes).max(avail);
+    (effective_total, avail)
 }
 
 /// Bytes received and sent on every interface but loopback.
+#[cfg(target_os = "linux")]
 fn network() -> (u64, u64) {
     let dev = fs::read_to_string("/proc/net/dev").unwrap_or_default();
     let (mut rx, mut tx) = (0, 0);
@@ -72,6 +104,7 @@ fn network() -> (u64, u64) {
 
 /// Processes inside container PID namespaces (excluding the agent, DHCP,
 /// outer launchers, and kernel threads), mapped to their container-local PIDs.
+#[cfg(target_os = "linux")]
 fn container_processes() -> Vec<ProcessInfo> {
     let own_pid_ns = fs::read_link("/proc/self/ns/pid").ok();
     // SAFETY: sysconf has no preconditions.
@@ -136,4 +169,22 @@ fn container_processes() -> Vec<ProcessInfo> {
         .collect();
     out.sort_by_key(|p| p.pid);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_memory;
+
+    #[test]
+    fn parse_memory_subtracts_inflated_balloon_pages() {
+        let meminfo = "MemTotal:         507612 kB\nMemFree:           21000 kB\nMemAvailable:      58152 kB\n";
+        let vmstat = "nr_free_pages 5250\nballoon_inflate 90112\nballoon_deflate 0\n";
+        let (total, avail) = parse_memory(meminfo, vmstat, 4096);
+        assert_eq!(avail, 58152 * 1024);
+        assert_eq!(total.saturating_sub(avail), 89_012 * 1024);
+
+        // Deflated or absent balloon leaves MemTotal unchanged.
+        let (t2, a2) = parse_memory(meminfo, "balloon_inflate 100\nballoon_deflate 200\n", 4096);
+        assert_eq!((t2, a2), (507_612 * 1024, 58_152 * 1024));
+    }
 }

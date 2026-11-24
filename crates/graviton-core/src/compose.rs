@@ -1411,7 +1411,7 @@ fn parse_resources(service: &str, h: &YamlHash) -> Result<(Option<u32>, Option<u
     Ok((cpus, memory_mib))
 }
 
-/// Parse Docker memory strings (`512m`, `2g`, `1024mb`, `1073741824`) into MiB (min 128 MiB).
+/// Parse Docker memory strings (`512m`, `2g`, `1024mb`, `1073741824`) into MiB (min 64 MiB).
 pub fn parse_memory_mib(raw: &str) -> Option<u64> {
     let s = raw.trim().to_ascii_lowercase();
     if s.is_empty() {
@@ -1430,7 +1430,7 @@ pub fn parse_memory_mib(raw: &str) -> Option<u64> {
         "g" | "gb" | "gib" => num * 1024.0 * 1024.0 * 1024.0,
         _ => return None,
     };
-    Some(((bytes / (1024.0 * 1024.0)).ceil() as u64).max(128))
+    Some(((bytes / (1024.0 * 1024.0)).ceil() as u64).max(64))
 }
 
 fn parse_service_networks(
@@ -1619,7 +1619,8 @@ mod tests {
         );
         assert_eq!(parse_memory_mib("512m"), Some(512));
         assert_eq!(parse_memory_mib("2g"), Some(2048));
-        assert_eq!(parse_memory_mib("64m"), Some(128)); // clamped to MIN_MEMORY_MIB
+        assert_eq!(parse_memory_mib("64m"), Some(64));
+        assert_eq!(parse_memory_mib("32m"), Some(64)); // clamped to MIN_MEMORY_MIB
         assert_eq!(split_shell_words("sh -c 'echo \"hi there\"'"), vec!["sh", "-c", "echo \"hi there\""]);
         assert_eq!(sanitize_project_name("My App_2!"), "myapp_2");
     }

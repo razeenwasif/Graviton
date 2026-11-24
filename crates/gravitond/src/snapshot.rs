@@ -370,6 +370,7 @@ impl SnapshotPool {
         config.multi_share_tag = Some("graviton".into());
         config.rosetta = shape.rosetta;
         config.balloon = true;
+        config.image_disk = Some(self.ensure_ro_placeholder()?);
         config.identity = Some(VmIdentity {
             machine_id,
             nat_mac: Some(nat_mac.clone()),
@@ -539,6 +540,20 @@ impl SnapshotPool {
         (removed, freed)
     }
 
+    fn ensure_ro_placeholder(&self) -> Result<PathBuf> {
+        let path = self.root.join(".placeholder-ro-16g.img");
+        let wanted = crate::erofs::EROFS_LOGICAL_BYTES;
+        if path.is_file() && fs::metadata(&path).is_ok_and(|m| m.len() == wanted) {
+            return Ok(path);
+        }
+        fs::create_dir_all(&self.root)?;
+        let tmp = self.root.join(format!(".placeholder-ro-16g.{}.tmp", std::process::id()));
+        let f = File::create(&tmp)?;
+        f.set_len(wanted)?;
+        fs::rename(&tmp, &path)?;
+        Ok(path)
+    }
+
     /// Drop any snapshot directories built for an older guest kernel/initrd or macOS build.
     fn prune_stale_fingerprints(&self, active_fp: &str) {
         let Ok(entries) = fs::read_dir(&self.root) else { return };
@@ -566,6 +581,7 @@ impl Drop for TempDirGuard {
 /// Any change automatically invalidates cached `.vzsave` files.
 pub fn guest_fingerprint(guest_dir: &Path) -> Result<String> {
     let mut h = Sha256::new();
+    h.update(b"v2-erofs");
     for name in ["vmlinux", "initrd.img"] {
         let meta = fs::metadata(guest_dir.join(name))
             .with_context(|| format!("reading guest image metadata ({name})"))?;

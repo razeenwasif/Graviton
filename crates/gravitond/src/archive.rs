@@ -546,6 +546,7 @@ fn commit_stopped_container(blobs: &BlobStore, id: &str, base_img: &LocalImage, 
     let guest = paths::guest_dir();
     let work = TempDirGuard::new("graviton-commit")?;
     let mut cfg = VmConfig::new(guest.join("vmlinux"), guest.join("initrd.img"), disk_path.to_path_buf());
+    cfg.image_disk = Some(crate::erofs::ensure_image_disk(blobs, &base_img.layers)?);
     cfg.cpus = 2;
     cfg.memory_mib = 512;
     cfg.network = NetworkMode::None;
