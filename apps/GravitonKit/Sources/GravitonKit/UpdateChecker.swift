@@ -258,7 +258,7 @@ public final class UpdateChecker {
 
     public static func bundleVersion() -> SemVer {
         let raw = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
-        return raw.flatMap(SemVer.init) ?? SemVer(major: 0, minor: 1, patch: 0)
+        return raw.flatMap(SemVer.init) ?? SemVer(major: 0, minor: 2, patch: 0)
     }
 
     public static func defaultFeedURL() -> URL {

@@ -1,6 +1,6 @@
 cask "graviton" do
-  version "0.1.0"
-  sha256 "0dc684483b2bdac1cf795d4db15cae1a47482fbf6ca2f79a4ab7c1afc9746eb9"
+  version "0.2.0"
+  sha256 "03dc13b5cc7829fe0bbf7197ffc17613def92a6114163904ef5f23388e4e1345"
 
   url "https://github.com/razeenwasif/Graviton/releases/download/v#{version}/Graviton-#{version}.dmg"
   name "Graviton"
