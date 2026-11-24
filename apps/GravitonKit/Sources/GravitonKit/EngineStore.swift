@@ -405,6 +405,12 @@ public final class EngineStore {
     }
 
     @discardableResult
+    public func listLogins() async -> [RegistryLoginInfo] {
+        await loadRegistryLogins()
+        return registryLogins
+    }
+
+    @discardableResult
     public func registryLogin(registry: String, username: String, password: String) async throws -> RegistryLoginInfo {
         let info = try await service.registryLogin(registry: registry, username: username, password: password)
         await loadRegistryLogins()

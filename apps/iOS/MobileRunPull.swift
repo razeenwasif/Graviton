@@ -12,6 +12,12 @@ struct MobileRunSheet: View {
     @State private var env = ""
     @State private var memory: Double = 1024
     @State private var restartPolicy: RestartPolicy = .no
+    @State private var showSecurity = false
+    @State private var readOnlyRootfs = false
+    @State private var useInit = false
+    @State private var capDrop = ""
+    @State private var capAdd = ""
+    @State private var tmpfsText = ""
     @State private var phase: Phase = .idle
     var onRun: (Container) -> Void = { _ in }
 
@@ -27,11 +33,18 @@ struct MobileRunSheet: View {
 
     private var busy: Bool { if case .running = phase { true } else { false } }
     private var trimmedImage: String { image.trimmingCharacters(in: .whitespaces) }
+    private var badTmpfs: String? { TmpfsMount.invalidLine(in: tmpfsText) }
+    private var capDropList: [String] { RunSpec.list(capDrop) }
+    private var capAddList: [String] { RunSpec.list(capAdd) }
+    private var tmpfsMounts: [TmpfsMount] { TmpfsMount.parseLines(tmpfsText) }
+    private var securityActiveCount: Int {
+        (readOnlyRootfs ? 1 : 0) + (useInit ? 1 : 0) + capDropList.count + capAddList.count + tmpfsMounts.count
+    }
 
     private static let memoryChoices: [Double] = [512, 1024, 2048, 4096, 8192]
 
     var body: some View {
-        MobileSheet("Run container", actionTitle: "Run", actionEnabled: !busy && !trimmedImage.isEmpty && store.canManage, action: run) {
+        MobileSheet("Run container", actionTitle: "Run", actionEnabled: !busy && !trimmedImage.isEmpty && badTmpfs == nil && store.canManage, action: run) {
             GFormRow("Image", hint: "Pulled first if \(store.liveName ?? "the Mac") doesn't have it.") {
                 MobileField(placeholder: "e.g. postgres:17-alpine", text: $image)
             }
@@ -58,6 +71,57 @@ struct MobileRunSheet: View {
                 GSegmented(selection: $restartPolicy, options: RestartPolicy.allCases.map { ($0, $0.label) }, stretch: true)
             }
 
+            VStack(alignment: .leading, spacing: 12) {
+                Button {
+                    withAnimation(.snappy(duration: 0.18)) { showSecurity.toggle() }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: showSecurity ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(G.muted)
+                            .frame(width: 14)
+                        Text("Security & Runtime")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(G.textSecondary)
+                        if securityActiveCount > 0 {
+                            GBadge("\(securityActiveCount)", color: G.accent)
+                        } else if badTmpfs != nil {
+                            GBadge("!", color: G.danger)
+                        }
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                if showSecurity {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Toggle("Read-only root filesystem", isOn: $readOnlyRootfs)
+                            .toggleStyle(.gSwitch)
+                        Toggle("Init process reaper (docker-init)", isOn: $useInit)
+                            .toggleStyle(.gSwitch)
+                        GFormRow("Drop capabilities", hint: "Comma-separated, e.g. ALL, NET_RAW") {
+                            MobileField(placeholder: "ALL", text: $capDrop)
+                        }
+                        GFormRow("Add capabilities", hint: "Comma-separated, e.g. NET_BIND_SERVICE") {
+                            MobileField(placeholder: "NET_BIND_SERVICE", text: $capAdd)
+                        }
+                        GFormRow("Tmpfs mounts",
+                                 hint: "One /path[:options] per line, e.g. /tmp:rw,noexec,size=64m",
+                                 error: badTmpfs.map { "“\($0)” must start with /" }) {
+                            TextEditor(text: $tmpfsText)
+                                .scrollContentBackground(.hidden)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                                .frame(height: 68)
+                                .gravitonField(mono: true, height: nil, invalid: badTmpfs != nil, size: 15)
+                        }
+                    }
+                    .padding(14)
+                    .mobileCard(radius: 12)
+                }
+            }
+
             switch phase {
             case .idle:
                 EmptyView()
@@ -73,9 +137,20 @@ struct MobileRunSheet: View {
 
     private func run() {
         let words = RunSpec.words(command)
-        let spec = RunSpec(image: trimmedImage, name: name.trimmingCharacters(in: .whitespaces).isEmpty ? nil : name.trimmingCharacters(in: .whitespaces),
-                           command: words.isEmpty ? nil : words, env: RunSpec.list(env), memoryMib: UInt64(memory), ports: RunSpec.list(ports),
-                           restart: restartPolicy == .no ? nil : restartPolicy)
+        let spec = RunSpec(
+            image: trimmedImage,
+            name: name.trimmingCharacters(in: .whitespaces).isEmpty ? nil : name.trimmingCharacters(in: .whitespaces),
+            command: words.isEmpty ? nil : words,
+            env: RunSpec.list(env),
+            memoryMib: UInt64(memory),
+            ports: RunSpec.list(ports),
+            restart: restartPolicy == .no ? nil : restartPolicy,
+            readOnly: readOnlyRootfs ? true : nil,
+            capAdd: capAddList.isEmpty ? nil : capAddList,
+            capDrop: capDropList.isEmpty ? nil : capDropList,
+            tmpfs: tmpfsMounts.isEmpty ? nil : tmpfsMounts,
+            initProcess: useInit ? true : nil
+        )
         phase = .running
         Task {
             do {

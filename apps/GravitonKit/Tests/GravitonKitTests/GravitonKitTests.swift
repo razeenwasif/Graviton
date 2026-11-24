@@ -613,11 +613,11 @@ import Testing
     }
 
     @Test func approvalPolicyMatchesTieredRules() {
-        #expect(FairyApprovalPolicy.supportedTools.count == 30)
+        #expect(FairyApprovalPolicy.supportedTools.count == 31)
 
         // Auto-run reads & reversible operations
         for readTool in ["status", "events", "containers", "inspect", "logs", "stats",
-                         "list_files", "read_file", "images", "volumes", "network",
+                         "list_files", "read_file", "images", "volumes", "network", "list_logins",
                          "navigate", "switch_host", "pull", "tag_image"] {
             #expect(!FairyApprovalPolicy.requiresTouchID(tool: readTool, args: [:]), "\(readTool) should not need Touch ID")
         }
@@ -715,6 +715,25 @@ import Testing
         )
         #expect(multiArchBuild.detail.contains("Platform: linux/arm64,linux/amd64"))
         #expect(multiArchBuild.touchIDReason.contains("linux/arm64,linux/amd64"))
+
+        let secRun = FairyApprovalPolicy.summarize(
+            tool: "run",
+            args: [
+                "image": .string("alpine:3.22"),
+                "read_only": .bool(true),
+                "init": .bool(true),
+                "cap_drop": .array([.string("ALL")]),
+                "cap_add": .array([.string("NET_BIND_SERVICE")]),
+                "tmpfs": .array([.string("/tmp:rw,noexec,size=64m")]),
+                "reason": .string("locked down service"),
+            ],
+            host: "local"
+        )
+        #expect(secRun.detail.contains("Read-only rootfs"))
+        #expect(secRun.detail.contains("Init: docker-init"))
+        #expect(secRun.detail.contains("Cap drop: ALL"))
+        #expect(secRun.detail.contains("Cap add: NET_BIND_SERVICE"))
+        #expect(secRun.detail.contains("Tmpfs: /tmp:rw,noexec,size=64m"))
     }
 
     @Test func redactsSecretsByDefaultAndPreservesWhenAsked() {
@@ -1419,5 +1438,40 @@ import Testing
         guard case .unavailable = checker.state else {
             Issue.record("expected .unavailable on 403"); return
         }
+    }
+
+    @Test func runSpecSecurityFieldsAndTmpfsParsing() throws {
+        #expect(TmpfsMount.parse("/tmp") == TmpfsMount(target: "/tmp", options: ""))
+        #expect(TmpfsMount.parse(" /run:rw,noexec,size=64m ") == TmpfsMount(target: "/run", options: "rw,noexec,size=64m"))
+        #expect(TmpfsMount.parse("") == nil)
+        #expect(TmpfsMount.parse("relative/path") == nil)
+
+        let raw = "\n  /tmp:rw,noexec,size=64m \n /var/cache \n"
+        #expect(TmpfsMount.invalidLine(in: raw) == nil)
+        #expect(TmpfsMount.parseLines(raw) == [
+            TmpfsMount(target: "/tmp", options: "rw,noexec,size=64m"),
+            TmpfsMount(target: "/var/cache", options: ""),
+        ])
+        #expect(TmpfsMount.invalidLine(in: "/tmp\nbadpath:size=10m\n") == "badpath:size=10m")
+
+        // Plain RunSpec omits unset security fields so wire compatibility holds.
+        let plainLine = String(decoding: try Wire.line(.run(RunSpec(image: "alpine:3.22"))), as: UTF8.self)
+        #expect(!plainLine.contains("read_only") && !plainLine.contains("cap_drop") && !plainLine.contains("tmpfs"))
+
+        let secSpec = RunSpec(
+            image: "alpine:3.22",
+            name: "locked",
+            readOnly: true,
+            capAdd: ["NET_BIND_SERVICE"],
+            capDrop: ["ALL"],
+            tmpfs: [TmpfsMount(target: "/tmp", options: "rw,noexec,size=64m")],
+            initProcess: true
+        )
+        let secLine = String(decoding: try Wire.line(.run(secSpec)), as: UTF8.self)
+        #expect(secLine.contains(#""read_only":true"#))
+        #expect(secLine.contains(#""init":true"#))
+        #expect(secLine.contains(#""cap_drop":["ALL"]"#))
+        #expect(secLine.contains(#""cap_add":["NET_BIND_SERVICE"]"#))
+        #expect(secLine.contains(#""target":"/tmp""#) && secLine.contains(#""options":"rw,noexec,size=64m""#))
     }
 }

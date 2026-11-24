@@ -113,7 +113,7 @@ public enum FairyApprovalPolicy {
         "container_action", "run", "exec", "commit_container", "stack_action", "compose",
         "list_files", "read_file", "copy_files",
         "images", "pull", "build", "tag_image", "push_image", "save_image", "load_image", "remove_image",
-        "volumes", "volume_action", "network", "disk_and_prune", "snapshots",
+        "volumes", "volume_action", "network", "disk_and_prune", "snapshots", "list_logins",
     ]
 
     /// Tiered Touch ID gate:
@@ -124,7 +124,7 @@ public enum FairyApprovalPolicy {
         let action = args["action"]?.stringValue ?? ""
         switch tool {
         case "status", "events", "containers", "inspect", "logs", "stats",
-             "list_files", "read_file", "images", "volumes", "network",
+             "list_files", "read_file", "images", "volumes", "network", "list_logins",
              "navigate", "switch_host", "pull", "tag_image":
             return false
         case "container_action":
@@ -196,6 +196,11 @@ public enum FairyApprovalPolicy {
             if let cmd = args["command"]?.stringArrayValue, !cmd.isEmpty { parts.append("Cmd: \(cmd.joined(separator: " "))") }
             if let ports = args["ports"]?.stringArrayValue, !ports.isEmpty { parts.append("Ports: \(ports.joined(separator: ", "))") }
             if let vols = args["volumes"]?.stringArrayValue, !vols.isEmpty { parts.append("Volumes: \(vols.joined(separator: ", "))") }
+            if args["read_only"]?.boolValue == true { parts.append("Read-only rootfs") }
+            if args["init"]?.boolValue == true { parts.append("Init: docker-init") }
+            if let capDrop = args["cap_drop"]?.stringArrayValue, !capDrop.isEmpty { parts.append("Cap drop: \(capDrop.joined(separator: ", "))") }
+            if let capAdd = args["cap_add"]?.stringArrayValue, !capAdd.isEmpty { parts.append("Cap add: \(capAdd.joined(separator: ", "))") }
+            if let tmpfs = args["tmpfs"]?.stringArrayValue, !tmpfs.isEmpty { parts.append("Tmpfs: \(tmpfs.joined(separator: ", "))") }
             if !reasonArg.isEmpty { parts.append(reasonArg) }
             detail = parts.joined(separator: "\n")
             macReason = "let Fairy run container \(img)\(suffix)"

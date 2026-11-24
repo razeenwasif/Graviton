@@ -19,6 +19,12 @@ struct RunContainerSheet: View {
     @State private var cpus = 2
     @State private var memoryMib: UInt64 = 1024
     @State private var restartPolicy: RestartPolicy = .no
+    @State private var showSecurity = false
+    @State private var readOnlyRootfs = false
+    @State private var useInit = false
+    @State private var capDropText = ""
+    @State private var capAddText = ""
+    @State private var tmpfsText = ""
     @State private var running: Date?
     @State private var failure: String?
     @FocusState private var imageFocused: Bool
@@ -30,8 +36,15 @@ struct RunContainerSheet: View {
         envText.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     }
     private var badEnv: String? { envPairs.first { !$0.contains("=") || $0.hasPrefix("=") } }
+    private var badTmpfs: String? { TmpfsMount.invalidLine(in: tmpfsText) }
+    private var capDropList: [String] { RunSpec.list(capDropText) }
+    private var capAddList: [String] { RunSpec.list(capAddText) }
+    private var tmpfsMounts: [TmpfsMount] { TmpfsMount.parseLines(tmpfsText) }
+    private var securityActiveCount: Int {
+        (readOnlyRootfs ? 1 : 0) + (useInit ? 1 : 0) + capDropList.count + capAddList.count + tmpfsMounts.count
+    }
     private var trimmedImage: String { image.trimmingCharacters(in: .whitespaces) }
-    private var canRun: Bool { running == nil && !trimmedImage.isEmpty && badEnv == nil && store.canManage }
+    private var canRun: Bool { running == nil && !trimmedImage.isEmpty && badEnv == nil && badTmpfs == nil && store.canManage }
 
     var body: some View {
         GSheet("Run container", subtitle: "Each container boots its own VM. Its output goes to its logs.", symbol: "play.circle", width: 600) {
@@ -93,6 +106,58 @@ struct RunContainerSheet: View {
                 GSegmented(selection: $restartPolicy, options: RestartPolicy.allCases.map { ($0, $0.label) })
             }
 
+            VStack(alignment: .leading, spacing: 10) {
+                Button {
+                    withAnimation(.snappy(duration: 0.18)) { showSecurity.toggle() }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: showSecurity ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(G.muted)
+                            .frame(width: 12)
+                        Text("Security & Runtime")
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(G.textSecondary)
+                        if securityActiveCount > 0 {
+                            GBadge("\(securityActiveCount)", color: G.accent)
+                        } else if badTmpfs != nil {
+                            GBadge("!", color: G.danger)
+                        }
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                if showSecurity {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Toggle("Read-only root filesystem", isOn: $readOnlyRootfs)
+                            .toggleStyle(.gSwitch)
+                        Toggle("Init process reaper (docker-init)", isOn: $useInit)
+                            .toggleStyle(.gSwitch)
+                        HStack(alignment: .top, spacing: 12) {
+                            GFormRow("Drop capabilities", hint: "e.g. ALL, NET_RAW") {
+                                field("ALL", text: $capDropText)
+                            }
+                            GFormRow("Add capabilities", hint: "e.g. NET_BIND_SERVICE") {
+                                field("NET_BIND_SERVICE", text: $capAddText)
+                            }
+                        }
+                        GFormRow("Tmpfs mounts",
+                                 hint: "One /path[:options] per line, e.g. /tmp:rw,noexec,size=64m",
+                                 error: badTmpfs.map { "“\($0)” must start with /" }) {
+                            TextEditor(text: $tmpfsText)
+                                .scrollContentBackground(.hidden)
+                                .frame(height: 52)
+                                .gravitonField(mono: true, height: nil, invalid: badTmpfs != nil)
+                        }
+                    }
+                    .padding(12)
+                    .background(G.background.opacity(0.6), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(G.border))
+                }
+            }
+
             if let since = running {
                 TimelineView(.periodic(from: since, by: 1)) { context in
                     GStatusLine(.working, "Pulling if needed and booting a VM… \(Int(context.date.timeIntervalSince(since))) s")
@@ -136,7 +201,12 @@ struct RunContainerSheet: View {
             memoryMib: memoryMib,
             ports: RunSpec.list(portsText),
             volumes: RunSpec.list(volumesText),
-            restart: restartPolicy == .no ? nil : restartPolicy
+            restart: restartPolicy == .no ? nil : restartPolicy,
+            readOnly: readOnlyRootfs ? true : nil,
+            capAdd: capAddList.isEmpty ? nil : capAddList,
+            capDrop: capDropList.isEmpty ? nil : capDropList,
+            tmpfs: tmpfsMounts.isEmpty ? nil : tmpfsMounts,
+            initProcess: useInit ? true : nil
         )
         failure = nil
         running = .now

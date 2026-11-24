@@ -302,14 +302,26 @@ public struct RunSpec: Codable, Hashable, Sendable {
     public var labels: [String: String]?
     /// Extra project-scoped DNS aliases.
     public var dnsAliases: [String]?
-    /// Healthcheck configuration overrides.
+    /// Overrides or disables (`test: ["NONE"]`) the image's healthcheck.
     public var healthcheck: Healthcheck? = nil
+    /// Mount the container's root filesystem read-only (`--read-only`).
+    public var readOnly: Bool? = nil
+    /// Linux capabilities added to the container (`--cap-add`).
+    public var capAdd: [String]? = nil
+    /// Linux capabilities dropped from the container (`--cap-drop`).
+    public var capDrop: [String]? = nil
+    /// Ephemeral tmpfs mounts (`--tmpfs`).
+    public var tmpfs: [TmpfsMount]? = nil
+    /// Run `docker-init` as container PID 1 (`--init`).
+    public var `init`: Bool? = nil
 
     public init(image: String, name: String? = nil, command: [String]? = nil, env: [String] = [], cpus: UInt32? = nil,
                 memoryMib: UInt64? = nil, ports: [String] = [], volumes: [String] = [], restart: RestartPolicy? = nil,
                 platform: String? = nil, entrypoint: [String]? = nil, workingDir: String? = nil, user: String? = nil,
                 hostname: String? = nil, project: String? = nil, service: String? = nil, labels: [String: String]? = nil,
-                dnsAliases: [String]? = nil, healthcheck: Healthcheck? = nil) {
+                dnsAliases: [String]? = nil, healthcheck: Healthcheck? = nil,
+                readOnly: Bool? = nil, capAdd: [String]? = nil, capDrop: [String]? = nil,
+                tmpfs: [TmpfsMount]? = nil, initProcess: Bool? = nil) {
         self.image = image
         self.name = name
         self.command = command
@@ -329,6 +341,11 @@ public struct RunSpec: Codable, Hashable, Sendable {
         self.labels = labels
         self.dnsAliases = dnsAliases
         self.healthcheck = healthcheck
+        self.readOnly = readOnly
+        self.capAdd = capAdd
+        self.capDrop = capDrop
+        self.tmpfs = tmpfs
+        self.`init` = initProcess
     }
 
     /// Split a list typed as "8080:80, 5432" or one per line.
@@ -501,6 +518,39 @@ public struct TmpfsMount: Codable, Hashable, Sendable {
     public init(target: String, options: String = "") {
         self.target = target
         self.options = options
+    }
+
+    /// Parse `/target[:options]`; returns `nil` when empty or missing leading `/`.
+    public static func parse(_ spec: String) -> TmpfsMount? {
+        let trimmed = spec.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let target: String
+        let options: String
+        if let colon = trimmed.firstIndex(of: ":") {
+            target = String(trimmed[..<colon]).trimmingCharacters(in: .whitespaces)
+            options = String(trimmed[trimmed.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+        } else {
+            target = trimmed
+            options = ""
+        }
+        guard target.hasPrefix("/"), target.count >= 1 else { return nil }
+        return TmpfsMount(target: target, options: options)
+    }
+
+    /// Parse newline-separated tmpfs lines (commas stay inside options like `rw,noexec,size=64m`).
+    public static func parseLines(_ text: String) -> [TmpfsMount] {
+        text.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .compactMap(parse)
+    }
+
+    /// Returns the first non-empty line in `text` that fails `parse(_:)`, if any.
+    public static func invalidLine(in text: String) -> String? {
+        text.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .first { parse($0) == nil }
     }
 }
 

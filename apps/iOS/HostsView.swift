@@ -14,6 +14,8 @@ struct HostsView: View {
     @Binding var pairTarget: PairingTarget?
     @State private var askAddress = false
     @State private var editingHost: RemoteHost?
+    @State private var showRegistryLogin = false
+    @State private var busyRegistry: String?
 
     private var unpaired: [HostBrowser.Found] {
         browser.found.filter { found in
@@ -54,6 +56,71 @@ struct HostsView: View {
                         VStack(alignment: .leading, spacing: 8) {
                             GCaption(store.liveName ?? "Connected Mac").padding(.horizontal, 4)
                             MobileEngineMemoryCard(engine: engine)
+                        }
+                    }
+
+                    if store.connection == .live || !store.registryLogins.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                GCaption("Registry logins").padding(.horizontal, 4)
+                                Spacer()
+                                Button("Sign In…", systemImage: "plus") { showRegistryLogin = true }
+                                    .buttonStyle(.g(.primary, size: .small))
+                                    .disabled(!store.canManage)
+                            }
+                            if store.registryLogins.isEmpty {
+                                HStack(spacing: 12) {
+                                    Image(systemName: "key")
+                                        .font(.system(size: 16))
+                                        .foregroundStyle(G.faint)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("No saved registry logins")
+                                            .font(.system(size: 14, weight: .medium))
+                                            .foregroundStyle(G.textSecondary)
+                                        Text("Sign in to push images or pull private repositories.")
+                                            .font(.system(size: 12))
+                                            .foregroundStyle(G.faint)
+                                    }
+                                    Spacer()
+                                }
+                                .padding(14)
+                                .mobileCard()
+                            } else {
+                                VStack(spacing: 0) {
+                                    ForEach(Array(store.registryLogins.enumerated()), id: \.element.id) { i, login in
+                                        if i > 0 { RowDivider(inset: 52) }
+                                        HStack(spacing: 12) {
+                                            Image(systemName: "lock.shield")
+                                                .font(.system(size: 15, weight: .medium))
+                                                .foregroundStyle(G.accent)
+                                                .frame(width: 28)
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(login.registry)
+                                                    .font(G.mono(13.5, weight: .medium))
+                                                    .foregroundStyle(G.text)
+                                                Text(login.username)
+                                                    .font(G.mono(12))
+                                                    .foregroundStyle(G.muted)
+                                            }
+                                            Spacer()
+                                            Button {
+                                                confirmLogout(login)
+                                            } label: {
+                                                if busyRegistry == login.registry {
+                                                    GSpinner(size: 11)
+                                                } else {
+                                                    Text("Sign Out")
+                                                }
+                                            }
+                                            .buttonStyle(.g(.danger, size: .small))
+                                            .disabled(!store.canManage || busyRegistry != nil)
+                                        }
+                                        .padding(.horizontal, 14)
+                                        .frame(minHeight: 58)
+                                    }
+                                }
+                                .mobileCard()
+                            }
                         }
                     }
 
@@ -111,6 +178,12 @@ struct HostsView: View {
             .onChange(of: browser.found) { _, found in
                 hosts.syncBonjour(found)
             }
+            .task(id: "\(store.liveName ?? "")-\(store.connection == .live)") {
+                await store.loadRegistryLogins()
+            }
+            .sheet(isPresented: $showRegistryLogin) {
+                MobileRegistryLoginSheet()
+            }
             .sheet(item: $editingHost) { host in
                 MobileEditHostSheet(host: host) {
                     if hosts.selectedID == host.id {
@@ -135,6 +208,24 @@ struct HostsView: View {
     private func confirmForget(_ host: RemoteHost) {
         dialogs.confirm("Forget \(host.name)?", message: "This phone stops showing it. Pair again with a new code from grav pair.", confirm: "Forget") {
             forget(host)
+        }
+    }
+
+    private func confirmLogout(_ login: RegistryLoginInfo) {
+        dialogs.confirm(
+            "Sign out of \(login.registry)?",
+            message: "Removes \(login.username) and deletes the saved secret from \(store.liveName ?? "the Mac")'s Keychain.",
+            confirm: "Sign Out"
+        ) {
+            busyRegistry = login.registry
+            Task {
+                defer { busyRegistry = nil }
+                do {
+                    _ = try await store.registryLogout(registry: login.registry)
+                } catch {
+                    dialogs.alert("Sign out failed", message: error.localizedDescription)
+                }
+            }
         }
     }
 
@@ -397,5 +488,104 @@ private struct MobileEditHostSheet: View {
         hosts.updateAddresses(for: host.id, addresses: parsedAddresses, port: port, serviceName: serviceName)
         onSaved()
         dismiss()
+    }
+}
+
+/// Sign in to an OCI registry and store credentials on the paired Mac.
+private struct MobileRegistryLoginSheet: View {
+    @Environment(EngineStore.self) private var store
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var registry = "docker.io"
+    @State private var username = ""
+    @State private var password = ""
+    @State private var revealPassword = false
+    @State private var busy = false
+    @State private var error: String?
+
+    private static let presets = ["docker.io", "ghcr.io", "gcr.io", "quay.io"]
+    private var trimmedUser: String { username.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var effectiveRegistry: String {
+        let trimmed = registry.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "docker.io" : trimmed
+    }
+    private var canSubmit: Bool { !busy && !trimmedUser.isEmpty && !password.isEmpty && store.canManage }
+
+    var body: some View {
+        MobileSheet(
+            "Sign in to registry",
+            subtitle: "Verified live and stored in Keychain on \(store.liveName ?? "the Mac").",
+            actionTitle: "Sign In",
+            actionEnabled: canSubmit,
+            action: signIn
+        ) {
+            GFormRow("Registry", hint: "Pick a preset or type a registry hostname.") {
+                VStack(alignment: .leading, spacing: 8) {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(Self.presets, id: \.self) { host in
+                                Button(host) { registry = host }
+                                    .buttonStyle(.g(registry == host ? .primary : .secondary, size: .small))
+                                    .font(G.mono(12))
+                                    .disabled(busy)
+                            }
+                        }
+                    }
+                    .scrollClipDisabled()
+                    MobileField(placeholder: "docker.io", text: $registry, keyboard: .URL)
+                        .disabled(busy)
+                }
+            }
+            GFormRow("Username") {
+                MobileField(placeholder: "username", text: $username)
+                    .disabled(busy)
+            }
+            GFormRow("Password or token") {
+                HStack(spacing: 8) {
+                    Group {
+                        if revealPassword {
+                            GTextField("token or password", text: $password)
+                        } else {
+                            GSecureField("token or password", text: $password)
+                        }
+                    }
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .disabled(busy)
+
+                    Button {
+                        revealPassword.toggle()
+                    } label: {
+                        Image(systemName: revealPassword ? "eye.slash" : "eye")
+                            .font(.system(size: 14))
+                            .foregroundStyle(G.muted)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(revealPassword ? "Hide secret" : "Show secret")
+                }
+                .gravitonField(mono: true, size: 15)
+            }
+            if busy {
+                GStatusLine(.working, "Verifying credentials with \(effectiveRegistry)…")
+            } else if let error {
+                GStatusLine(.failure, error)
+            }
+        }
+        .interactiveDismissDisabled(busy)
+    }
+
+    private func signIn() {
+        guard canSubmit else { return }
+        busy = true
+        error = nil
+        Task {
+            defer { busy = false }
+            do {
+                _ = try await store.registryLogin(registry: effectiveRegistry, username: trimmedUser, password: password)
+                dismiss()
+            } catch {
+                self.error = error.localizedDescription
+            }
+        }
     }
 }

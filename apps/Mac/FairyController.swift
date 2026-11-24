@@ -679,6 +679,7 @@ final class FairyController {
             case "images": router.pending = .images
             case "volumes": router.pending = .volumes
             case "networks": router.pending = .networks
+            case "settings": router.pending = .settings
             default: throw EngineError.daemon("Unknown section \"\(sec)\".")
             }
             return .object(["navigated": .string(sec)])
@@ -784,6 +785,17 @@ final class FairyController {
             }
             let image = try requireString(args, "image")
             let restart: RestartPolicy? = args["restart"]?.stringValue.flatMap(RestartPolicy.init(rawValue:))
+            let readOnly = args["read_only"]?.boolValue == true
+            let useInit = args["init"]?.boolValue == true
+            let capAdd = args["cap_add"]?.stringArrayValue ?? []
+            let capDrop = args["cap_drop"]?.stringArrayValue ?? []
+            var parsedTmpfs: [TmpfsMount] = []
+            for raw in args["tmpfs"]?.stringArrayValue ?? [] {
+                guard let parsed = TmpfsMount.parse(raw) else {
+                    throw EngineError.daemon("Invalid tmpfs mount \"\(raw)\": must start with '/'.")
+                }
+                parsedTmpfs.append(parsed)
+            }
             let spec = RunSpec(
                 image: image,
                 name: args["name"]?.stringValue,
@@ -800,7 +812,12 @@ final class FairyController {
                 user: args["user"]?.stringValue,
                 hostname: args["hostname"]?.stringValue,
                 project: args["project"]?.stringValue,
-                service: args["service"]?.stringValue
+                service: args["service"]?.stringValue,
+                readOnly: readOnly ? true : nil,
+                capAdd: capAdd.isEmpty ? nil : capAdd,
+                capDrop: capDrop.isEmpty ? nil : capDrop,
+                tmpfs: parsedTmpfs.isEmpty ? nil : parsedTmpfs,
+                initProcess: useInit ? true : nil
             )
             let created = try await store.run(spec)
             return try FairyJSON.fromEncodable(created)
@@ -1002,6 +1019,10 @@ final class FairyController {
         case "network":
             await store.refresh()
             return try FairyJSON.fromEncodable(store.network)
+
+        case "list_logins":
+            let logins = await store.listLogins()
+            return .object(["logins": try FairyJSON.fromEncodable(logins)])
 
         case "disk_and_prune":
             let act = try requireString(args, "action").lowercased()

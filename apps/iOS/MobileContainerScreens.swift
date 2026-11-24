@@ -378,6 +378,29 @@ struct MobileInspectView: View {
                             ForEach(d.container.mounts, id: \.target) { m in row(m.target, m.source + (m.readOnly ? " (read-only)" : "")) }
                         }
                     }
+                    if let tmpfs = d.tmpfs, !tmpfs.isEmpty {
+                        section("Tmpfs") {
+                            ForEach(tmpfs, id: \.target) { t in
+                                row(t.target, t.options.isEmpty ? "tmpfs" : t.options)
+                            }
+                        }
+                    }
+                    if d.readOnly == true || d.usesInit || !(d.capAdd ?? []).isEmpty || !(d.capDrop ?? []).isEmpty {
+                        section("Security & Runtime") {
+                            if d.readOnly == true {
+                                row("Root filesystem", "Read-only")
+                            }
+                            if d.usesInit {
+                                row("Init process", "Enabled (docker-init)")
+                            }
+                            if let add = d.capAdd, !add.isEmpty {
+                                row("Added capabilities", add.joined(separator: ", "))
+                            }
+                            if let drop = d.capDrop, !drop.isEmpty {
+                                row("Dropped capabilities", drop.joined(separator: ", "))
+                            }
+                        }
+                    }
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             GCaption("Environment")
