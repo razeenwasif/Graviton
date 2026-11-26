@@ -2,13 +2,14 @@ import AppKit
 import GravitonKit
 import SwiftUI
 
-/// The Inspect tab: how the container was set up, with a JSON copy.
+/// The Inspect tab: borderless Stratus specification cards with JSON copy.
 struct InspectPanel: View {
     @Environment(EngineStore.self) private var store
     var container: Container
     @State private var details: ContainerDetails?
     @State private var problem: String?
     @State private var showValues = false
+    @State private var copiedJSON = false
 
     var body: some View {
         ScrollView {
@@ -17,9 +18,17 @@ struct InspectPanel: View {
                     GEmptyState("Can't inspect \(container.name)", symbol: "exclamationmark.triangle", detail: problem)
                         .frame(minHeight: 300)
                 } else if let d = details {
-                    HStack {
+                    HStack(spacing: 8) {
                         Spacer()
-                        Button("Copy as JSON", systemImage: "doc.on.doc") { copyJSON(d) }.fixedSize()
+                        Button(copiedJSON ? "Copied JSON" : "Copy as JSON", systemImage: copiedJSON ? "checkmark" : "doc.on.doc") {
+                            copyJSON(d)
+                            copiedJSON = true
+                            Task {
+                                try? await Task.sleep(for: .seconds(1.5))
+                                copiedJSON = false
+                            }
+                        }
+                        .fixedSize()
                         if store.liveName == "This Mac" {
                             Button("Show VM Folder", systemImage: "folder") {
                                 NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: d.vmDir)])
@@ -103,12 +112,12 @@ struct InspectPanel: View {
                         InspectSection("Healthcheck") {
                             if let h = d.health {
                                 GridRow(alignment: .center) {
-                                    Text("Status").foregroundStyle(G.muted).frame(width: 150, alignment: .leading)
+                                    Text("Status").foregroundStyle(G.textMuted).frame(width: 150, alignment: .leading)
                                     HStack(spacing: 10) {
                                         HealthBadge(h.status)
                                         if h.failingStreak > 0 {
                                             Text("\(h.failingStreak) consecutive failure\(h.failingStreak == 1 ? "" : "s")")
-                                                .font(G.mono(11)).foregroundStyle(G.muted)
+                                                .font(G.mono(11)).foregroundStyle(G.textMuted)
                                         }
                                     }
                                 }
@@ -143,7 +152,7 @@ struct InspectPanel: View {
             }
             .frame(maxWidth: 820, alignment: .leading)
             .padding(.horizontal, 28)
-            .padding(.vertical, 20)
+            .padding(.vertical, 18)
         }
         .task(id: container.id) {
             do {
@@ -159,7 +168,7 @@ struct InspectPanel: View {
     }
 
     private func environment(_ env: [String]) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
                 GCaption("Environment")
                 Spacer()
@@ -169,10 +178,10 @@ struct InspectPanel: View {
                 ForEach(env, id: \.self) { pair in
                     let (key, value) = split(pair)
                     GridRow {
-                        Text(key).font(G.mono(12)).foregroundStyle(G.muted)
+                        Text(key).font(G.mono(12)).foregroundStyle(G.textMuted)
                         Text(showValues ? value : String(repeating: "•", count: min(max(value.count, 4), 16)))
                             .font(G.mono(12))
-                            .foregroundStyle(showValues ? G.text : G.faint)
+                            .foregroundStyle(showValues ? G.body : G.faint)
                             .textSelection(.enabled)
                     }
                 }
@@ -180,7 +189,7 @@ struct InspectPanel: View {
         }
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .gravitonCard()
+        .gravitonCard(G.surfaceSubtle)
     }
 
     private func split(_ pair: String) -> (String, String) {
@@ -217,11 +226,10 @@ private struct InspectSection<Content: View>: View {
         }
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .gravitonCard()
+        .gravitonCard(G.surfaceSubtle)
     }
 }
 
-/// A label and value; labels share one width so values line up across cards.
 private struct InspectRow: View {
     var label: String
     var value: String
@@ -233,8 +241,8 @@ private struct InspectRow: View {
 
     var body: some View {
         GridRow(alignment: .firstTextBaseline) {
-            Text(label).foregroundStyle(G.muted).frame(width: 150, alignment: .leading)
-            Text(value).font(G.mono(12)).textSelection(.enabled)
+            Text(label).foregroundStyle(G.textMuted).frame(width: 150, alignment: .leading)
+            Text(value).font(G.mono(12)).foregroundStyle(G.body).textSelection(.enabled)
         }
     }
 }

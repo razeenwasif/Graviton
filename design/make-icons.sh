@@ -14,7 +14,7 @@ for dir in "$apps/iOS/Assets.xcassets" "$apps/Mac/Assets.xcassets"; do
 done
 
 # iOS: one 1024 image; no transparency allowed, so flatten onto the plate colour.
-rsvg-convert -w 1024 -h 1024 -b '#07080B' "$here/icon.svg" -o "$ios/icon-1024.png"
+rsvg-convert -w 1024 -h 1024 -b '#030306' "$here/icon.svg" -o "$ios/icon-1024.png"
 cat > "$ios/Contents.json" <<JSON
 {
   "images" : [

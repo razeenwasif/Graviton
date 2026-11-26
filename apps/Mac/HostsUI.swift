@@ -5,7 +5,7 @@ import SwiftUI
 /// Show another Mac (or this one, for `nil`). Shells belong to the Mac they were opened on, so they close.
 @MainActor
 func switchHost(to mac: PairedMac?, store: EngineStore, hosts: SharedHosts, shells: ShellSessions) {
-    if mac?.name == hosts.selected && (mac != nil || store.isLocal) { return } // already showing it
+    if mac?.name == hosts.selected && (mac != nil || store.isLocal) { return }
     shells.reset()
     hosts.select(mac?.name)
     if let mac {
@@ -41,7 +41,7 @@ struct HostCommands: Commands {
     }
 }
 
-/// Which Mac the window shows: this one, or one paired with `grav hosts add` or the Pair sheet.
+/// Stratus-style top sidebar host switcher: shows active host status dot, name, engine indicator, and menu.
 struct HostMenu: View {
     @Environment(EngineStore.self) private var store
     @Environment(SharedHosts.self) private var hosts
@@ -49,6 +49,16 @@ struct HostMenu: View {
     @Environment(AppRouter.self) private var router
     @Environment(Dialogs.self) private var dialogs
     @State private var editingHost: PairedMac?
+    @State private var hovering = false
+
+    private var statusColor: Color {
+        switch store.connection {
+        case .live: G.mint
+        case .demo: G.amber
+        case .connecting: G.indigo
+        case .unreachable: G.rose
+        }
+    }
 
     var body: some View {
         Menu {
@@ -76,13 +86,38 @@ struct HostMenu: View {
                 Button("Forget \(current.name)…", systemImage: "trash") { confirmForget(current) }
             }
         } label: {
-            GDropdownLabel(hosts.current?.name ?? "This Mac", icon: hosts.selected == nil ? "laptopcomputer" : "desktopcomputer")
-                .frame(maxWidth: .infinity)
+            HStack(spacing: 9) {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 7, height: 7)
+                    .background(Circle().fill(statusColor.opacity(0.22)).frame(width: 13, height: 13))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(hosts.current?.name ?? "This Mac")
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(G.textPrimary)
+                        .lineLimit(1)
+                    Text(hosts.current?.address ?? (store.connection == .live ? "Local gravitond" : (store.connection == .demo ? "Demo runtime" : "Offline")))
+                        .font(G.mono(10))
+                        .foregroundStyle(G.textMuted)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(G.faint)
+            }
+            .padding(.horizontal, 11)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity)
+            .background(hovering ? G.surfaceHover : G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .contentShape(Rectangle())
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
-        .help("Choose the Mac this window shows")
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovering)
+        .help("Switch active Mac host")
         .onAppear(perform: hosts.reload)
         .sheet(item: $editingHost) { mac in
             EditHostAddressesSheet(mac: mac) { updated in
@@ -186,10 +221,9 @@ struct PairMacSheet: View {
                         .kerning(1)
                         .foregroundStyle(G.text)
                         .padding(.horizontal, 16)
-                        .padding(.vertical, 10)
+                        .padding(.vertical, 12)
                         .frame(maxWidth: .infinity)
-                        .background(G.background, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(G.accent.opacity(0.4), style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
+                        .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
             case let .failed(message):
                 GStatusLine(.failure, message)
@@ -236,7 +270,6 @@ struct PairMacSheet: View {
             do {
                 let device = (Host.current().localizedName ?? "Mac") + " (Graviton)"
                 let result = try await Pairing.pair(target, code: code, deviceName: device)
-                // With a link the fingerprint was pinned already; otherwise ask.
                 if target.fingerprint != nil { save(result) } else { phase = .confirm(result) }
             } catch {
                 phase = .failed(error.localizedDescription)

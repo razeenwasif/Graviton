@@ -4,7 +4,7 @@ import SwiftUI
 /// Fairy's eye mark (matching her avatar ring + iris + pupil).
 struct FairyEyeMark: View {
     var size: CGFloat = 18
-    var color: Color = G.accent
+    var color: Color = G.violet
 
     var body: some View {
         Canvas { ctx, dim in
@@ -12,7 +12,6 @@ struct FairyEyeMark: View {
             let scale = s / 24.0
             let center = CGPoint(x: 12 * scale, y: 12 * scale)
 
-            // Outer broken ring (4 arcs)
             var ring = Path()
             let rOuter = 10.2 * scale
             for i in 0..<4 {
@@ -21,29 +20,24 @@ struct FairyEyeMark: View {
             }
             ctx.stroke(ring, with: .color(color), style: StrokeStyle(lineWidth: 1.7 * scale, lineCap: .round))
 
-            // Outer iris disc
             let outerEye = Path(ellipseIn: CGRect(x: 5 * scale, y: 5 * scale, width: 14 * scale, height: 14 * scale))
             ctx.fill(outerEye, with: .color(color))
 
-            // Inner dark ring
             let cutout = Path(ellipseIn: CGRect(x: 7.5 * scale, y: 7.9 * scale, width: 9 * scale, height: 9 * scale))
-            ctx.fill(cutout, with: .color(G.sidebar))
+            ctx.fill(cutout, with: .color(G.inspector))
 
-            // Pupil disc
             let pupil = Path(ellipseIn: CGRect(x: 8.9 * scale, y: 9.3 * scale, width: 6.2 * scale, height: 6.2 * scale))
             ctx.fill(pupil, with: .color(color))
 
-            // Specular highlight dot
             let gleam = Path(ellipseIn: CGRect(x: 12.2 * scale, y: 10.1 * scale, width: 2.2 * scale, height: 2.2 * scale))
-            ctx.fill(gleam, with: .color(G.sidebar))
+            ctx.fill(gleam, with: .color(G.inspector))
         }
         .frame(width: size, height: size)
         .accessibilityHidden(true)
     }
 }
 
-/// Side panel where you talk to Fairy about containers, stacks, images, volumes, and networks,
-/// approve sensitive steps with Touch ID, and see her live steps and replies.
+/// Seamless Stratus right-hand drawer where you talk to Fairy about containers, stacks, images, volumes, and networks.
 struct FairyPanel: View {
     @Environment(FairyController.self) private var fairy
     @State private var draft = ""
@@ -61,7 +55,6 @@ struct FairyPanel: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            Rectangle().fill(G.border).frame(height: 1)
 
             if fairy.showHistory {
                 historyView
@@ -70,19 +63,17 @@ struct FairyPanel: View {
             }
 
             if let pending = fairy.pendingApproval {
-                Rectangle().fill(G.border).frame(height: 1)
                 ApprovalCard(pending: pending)
-                    .padding(12)
-                    .background(G.surface)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 10)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
             if !fairy.showHistory {
-                Rectangle().fill(G.border).frame(height: 1)
                 composer
             }
         }
-        .background(G.sidebar)
+        .background(G.inspector)
         .onAppear { inputFocused = true }
     }
 
@@ -90,17 +81,17 @@ struct FairyPanel: View {
 
     private var header: some View {
         HStack(spacing: 10) {
-            FairyEyeMark(size: 20, color: fairy.fairyOnline || fairy.isAnswering ? G.accent : G.muted)
-            VStack(alignment: .leading, spacing: 1) {
+            FairyEyeMark(size: 20, color: fairy.fairyOnline || fairy.isAnswering ? G.violet : G.textMuted)
+            VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(fairy.fairyName)
                         .font(.system(size: 13.5, weight: .semibold))
-                        .foregroundStyle(G.text)
-                    GBadge(fairy.activeHostDisplay, color: G.accent)
+                        .foregroundStyle(G.textPrimary)
+                    GTagPill(fairy.activeHostDisplay, color: G.violet)
                 }
                 Text(statusLine)
                     .font(.system(size: 11))
-                    .foregroundStyle(fairy.pendingApproval != nil ? G.warning : G.faint)
+                    .foregroundStyle(fairy.pendingApproval != nil ? G.amber : G.textMuted)
                     .lineLimit(1)
             }
             Spacer()
@@ -109,7 +100,7 @@ struct FairyPanel: View {
                 fairy.toggleSpeakReplies()
             } label: {
                 Image(systemName: fairy.speakReplies ? "speaker.wave.2.fill" : "speaker.slash")
-                    .foregroundStyle(fairy.isSpeaking ? G.accent : G.muted)
+                    .foregroundStyle(fairy.isSpeaking ? G.violet : G.textMuted)
             }
             .buttonStyle(GIconButtonStyle())
             .help(fairy.speakReplies ? "Mute Fairy's voice replies" : "Speak Fairy's replies aloud")
@@ -120,7 +111,7 @@ struct FairyPanel: View {
                 fairy.showHistory.toggle()
             } label: {
                 Image(systemName: "clock.arrow.circlepath")
-                    .foregroundStyle(fairy.showHistory ? G.accent : G.muted)
+                    .foregroundStyle(fairy.showHistory ? G.violet : G.textMuted)
             }
             .buttonStyle(GIconButtonStyle())
             .help("Past conversations (\(fairy.conversations.count))")
@@ -145,7 +136,7 @@ struct FairyPanel: View {
             .help("Close Fairy panel (⌥⌘I)")
         }
         .padding(.horizontal, 16)
-        .padding(.top, 18)
+        .padding(.top, 20)
         .padding(.bottom, 12)
         .windowDraggable()
     }
@@ -189,20 +180,20 @@ struct FairyPanel: View {
     }
 
     private var emptyState: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 8) {
-                FairyEyeMark(size: 30, color: G.accent)
+                FairyEyeMark(size: 28, color: G.violet)
                 Text("Ask \(fairy.fairyName)")
                     .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(G.text)
+                    .foregroundStyle(G.textPrimary)
                 Text("Inspect containers, read logs, run commands, manage Compose stacks, build images, or switch between Macs. Destructive or high-impact steps ask for Touch ID.")
                     .font(.system(size: 12.5))
-                    .foregroundStyle(G.muted)
+                    .foregroundStyle(G.textMuted)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .padding(14)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .gravitonCard(G.card, radius: 12)
+            .gravitonCard(G.surfaceSubtle, radius: 12)
 
             VStack(alignment: .leading, spacing: 6) {
                 GCaption("Try asking").padding(.horizontal, 4)
@@ -213,17 +204,16 @@ struct FairyPanel: View {
                         HStack(spacing: 8) {
                             Image(systemName: "arrow.up.right")
                                 .font(.system(size: 10.5, weight: .semibold))
-                                .foregroundStyle(G.accent)
+                                .foregroundStyle(G.violet)
                             Text(prompt)
                                 .font(.system(size: 12.5))
-                                .foregroundStyle(G.textSecondary)
+                                .foregroundStyle(G.body)
                                 .multilineTextAlignment(.leading)
                             Spacer(minLength: 0)
                         }
                         .padding(.horizontal, 12)
-                        .padding(.vertical, 9)
-                        .background(G.card, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(G.border))
+                        .padding(.vertical, 10)
+                        .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                     }
                     .buttonStyle(.plain)
                 }
@@ -241,7 +231,7 @@ struct FairyPanel: View {
                         }
                         .buttonStyle(.plain)
                         .font(.system(size: 11.5, weight: .medium))
-                        .foregroundStyle(G.accent)
+                        .foregroundStyle(G.violet)
                     }
                     .padding(.horizontal, 4)
 
@@ -253,31 +243,30 @@ struct FairyPanel: View {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(conv.title)
                                         .font(.system(size: 12.5, weight: .medium))
-                                        .foregroundStyle(G.text)
+                                        .foregroundStyle(G.textPrimary)
                                         .lineLimit(1)
                                     HStack(spacing: 6) {
-                                        GBadge(conv.hostName, color: G.accent)
+                                        GTagPill(conv.hostName, color: G.violet)
                                         Text(conv.updatedAt.formatted(.relative(presentation: .named)))
                                             .font(.system(size: 11))
-                                            .foregroundStyle(G.faint)
+                                            .foregroundStyle(G.textTertiary)
                                     }
                                 }
                                 Spacer(minLength: 4)
                                 Image(systemName: "chevron.right")
                                     .font(.system(size: 10.5, weight: .semibold))
-                                    .foregroundStyle(G.faint)
+                                    .foregroundStyle(G.textTertiary)
                             }
                             .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                            .background(G.card, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                            .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(G.border))
+                            .padding(.vertical, 9)
+                            .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                         }
                         .buttonStyle(.plain)
                     }
                 }
             }
         }
-        .padding(.top, 8)
+        .padding(.top, 6)
     }
 
     // MARK: History View
@@ -289,30 +278,17 @@ struct FairyPanel: View {
     private var historyView: some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
-                GTextField("Search conversations…", text: $historySearch)
-                    .gravitonField(height: 30)
-                if !historySearch.isEmpty {
-                    Button {
-                        historySearch = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(G.faint)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Clear search")
-                }
+                GBorderlessSearchField("Search conversations…", text: $historySearch)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
-
-            Rectangle().fill(G.border).frame(height: 1)
 
             if filteredConversations.isEmpty {
                 VStack(spacing: 8) {
                     Spacer()
                     Image(systemName: fairy.conversations.isEmpty ? "bubble.left.and.bubble.right" : "magnifyingglass")
                         .font(.system(size: 22))
-                        .foregroundStyle(G.faint)
+                        .foregroundStyle(G.textTertiary)
                     Text(fairy.conversations.isEmpty ? "No past conversations yet" : "No matching conversations")
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(G.textSecondary)
@@ -320,7 +296,7 @@ struct FairyPanel: View {
                         ? "Chats with Fairy are automatically saved here on this Mac."
                         : "Try a different keyword or container name.")
                         .font(.system(size: 12))
-                        .foregroundStyle(G.muted)
+                        .foregroundStyle(G.textMuted)
                         .multilineTextAlignment(.center)
                     Spacer()
                 }
@@ -343,12 +319,10 @@ struct FairyPanel: View {
                 }
             }
 
-            Rectangle().fill(G.border).frame(height: 1)
-
             HStack(spacing: 8) {
                 Text("\(fairy.conversations.count) saved")
                     .font(.system(size: 11.5))
-                    .foregroundStyle(G.faint)
+                    .foregroundStyle(G.textTertiary)
 
                 Spacer()
 
@@ -381,7 +355,7 @@ struct FairyPanel: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
-            .background(G.sidebar)
+            .background(G.surfaceSubtle)
         }
     }
 
@@ -393,12 +367,11 @@ struct FairyPanel: View {
                 Spacer(minLength: 36)
                 Text(msg.text)
                     .font(.system(size: 13))
-                    .foregroundStyle(G.text)
+                    .foregroundStyle(G.textPrimary)
                     .textSelection(.enabled)
-                    .padding(.horizontal, 12)
+                    .padding(.horizontal, 13)
                     .padding(.vertical, 9)
-                    .background(G.accent.opacity(0.18), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).strokeBorder(G.accent.opacity(0.3)))
+                    .background(G.surfaceActive, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
 
         case .assistant:
@@ -414,10 +387,10 @@ struct FairyPanel: View {
                     AssistantMessageBubble(text: msg.text)
                 } else if fairy.isAnswering && fairy.messages.last?.id == msg.id {
                     HStack(spacing: 8) {
-                        GSpinner(size: 11)
+                        GSpinner(size: 11, color: G.violet)
                         Text(fairy.isWaking ? "Opening Fairy…" : "Thinking…")
                             .font(.system(size: 12))
-                            .foregroundStyle(G.muted)
+                            .foregroundStyle(G.textMuted)
                     }
                     .padding(.vertical, 2)
                 }
@@ -445,14 +418,14 @@ struct FairyPanel: View {
             if !fairy.fairyInstalled {
                 Text("Install Fairy.app into ~/Applications to connect.")
                     .font(.system(size: 11.5))
-                    .foregroundStyle(G.warning)
+                    .foregroundStyle(G.amber)
             }
             HStack(spacing: 8) {
                 GTextField("Ask Fairy to inspect or act…", text: $draft)
                     .focused($inputFocused)
                     .onSubmit { sendDraft() }
                     .disabled(fairy.isAnswering)
-                    .gravitonField(height: 34)
+                    .gravitonField(height: 36)
 
                 if fairy.isAnswering {
                     Button {
@@ -474,8 +447,8 @@ struct FairyPanel: View {
                 }
             }
         }
-        .padding(12)
-        .background(G.sidebar)
+        .padding(14)
+        .background(G.inspector)
     }
 
     private func sendDraft() {
@@ -507,8 +480,8 @@ private struct AssistantMessageBubble: View {
         ZStack(alignment: .topTrailing) {
             formatted
                 .font(.system(size: 13))
-                .foregroundStyle(G.textSecondary)
-                .tint(G.accent)
+                .foregroundStyle(G.body)
+                .tint(G.indigo)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -526,10 +499,9 @@ private struct AssistantMessageBubble: View {
                 } label: {
                     Image(systemName: copied ? "checkmark" : "doc.on.doc")
                         .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(copied ? G.running : G.muted)
+                        .foregroundStyle(copied ? G.mint : G.textMuted)
                         .padding(5)
-                        .background(G.card, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(G.border))
+                        .background(G.surfacePill, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                 }
                 .buttonStyle(.plain)
                 .help("Copy reply")
@@ -550,28 +522,27 @@ private struct ToolStepRow: View {
                 stepIcon
                 Text(step.title)
                     .font(.system(size: 11.5, weight: .medium))
-                    .foregroundStyle(step.status == .denied || step.status == .failed ? G.danger : G.textSecondary)
+                    .foregroundStyle(step.status == .denied || step.status == .failed ? G.rose : G.textSecondary)
                     .lineLimit(1)
                 Spacer(minLength: 4)
                 if step.touchIDVerified {
                     Label("Touch ID", systemImage: "touchid")
                         .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(G.running)
+                        .foregroundStyle(G.mint)
                 }
             }
             if (step.status == .denied || step.status == .failed),
                let note = step.note, !note.isEmpty {
                 Text(note)
                     .font(.system(size: 10.5))
-                    .foregroundStyle(G.danger.opacity(0.85))
+                    .foregroundStyle(G.rose.opacity(0.85))
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 5)
-        .background(G.card, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(G.border))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .help(step.note ?? step.tool)
     }
 
@@ -579,13 +550,13 @@ private struct ToolStepRow: View {
     private var stepIcon: some View {
         switch step.status {
         case .running:
-            GSpinner(size: 10)
+            GSpinner(size: 10, color: G.violet)
         case .waitingTouchID:
-            Image(systemName: "touchid").font(.system(size: 11)).foregroundStyle(G.warning)
+            Image(systemName: "touchid").font(.system(size: 11)).foregroundStyle(G.amber)
         case .done:
-            Image(systemName: "checkmark.circle.fill").font(.system(size: 11)).foregroundStyle(G.running)
+            Image(systemName: "checkmark.circle.fill").font(.system(size: 11)).foregroundStyle(G.mint)
         case .denied, .failed:
-            Image(systemName: "xmark.circle.fill").font(.system(size: 11)).foregroundStyle(G.danger)
+            Image(systemName: "xmark.circle.fill").font(.system(size: 11)).foregroundStyle(G.rose)
         }
     }
 }
@@ -595,7 +566,7 @@ private struct ApprovalCard: View {
     var pending: FairyPendingApproval
 
     var body: some View {
-        let accent = pending.summary.isDestructive ? G.danger : G.warning
+        let accent = pending.summary.isDestructive ? G.rose : G.amber
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 Image(systemName: "touchid")
@@ -607,29 +578,29 @@ private struct ApprovalCard: View {
                         .foregroundStyle(accent)
                     Text("Host: \(pending.hostName)")
                         .font(.system(size: 11))
-                        .foregroundStyle(G.muted)
+                        .foregroundStyle(G.textMuted)
                 }
                 Spacer()
             }
 
             Text(pending.summary.title)
                 .font(.system(size: 13.5, weight: .semibold))
-                .foregroundStyle(G.text)
+                .foregroundStyle(G.textPrimary)
 
             if !pending.summary.detail.isEmpty {
                 Text(pending.summary.detail)
                     .font(G.mono(11.5))
-                    .foregroundStyle(G.textSecondary)
+                    .foregroundStyle(G.body)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(8)
-                    .background(G.console, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .padding(10)
+                    .background(G.bg, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
 
             if let err = pending.authError {
                 Text(err)
                     .font(.system(size: 11.5))
-                    .foregroundStyle(G.danger)
+                    .foregroundStyle(G.rose)
             }
 
             HStack(spacing: 8) {
@@ -653,8 +624,8 @@ private struct ApprovalCard: View {
             }
         }
         .padding(14)
-        .background(G.card, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(accent.opacity(0.45), lineWidth: 1.2))
+        .background(G.palette, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .shadow(color: accent.opacity(0.18), radius: 14, y: 4)
     }
 }
 
@@ -673,53 +644,49 @@ private struct ConversationHistoryRow: View {
                 HStack(spacing: 6) {
                     if isActive {
                         Circle()
-                            .fill(G.accent)
+                            .fill(G.violet)
                             .frame(width: 6, height: 6)
                     }
                     Text(conversation.title)
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(G.text)
+                        .foregroundStyle(G.textPrimary)
                         .lineLimit(1)
                     Spacer(minLength: 4)
                     if hovered {
                         Button(action: onDelete) {
                             Image(systemName: "trash")
                                 .font(.system(size: 11))
-                                .foregroundStyle(G.danger)
+                                .foregroundStyle(G.rose)
                         }
                         .buttonStyle(.plain)
                         .help("Delete conversation")
                     } else {
                         Text(conversation.updatedAt.formatted(.relative(presentation: .named)))
                             .font(.system(size: 11))
-                            .foregroundStyle(G.faint)
+                            .foregroundStyle(G.textTertiary)
                     }
                 }
 
                 Text(conversation.preview)
                     .font(.system(size: 12))
-                    .foregroundStyle(G.muted)
+                    .foregroundStyle(G.textMuted)
                     .lineLimit(1)
 
                 HStack(spacing: 6) {
-                    GBadge(conversation.hostName, color: G.accent)
+                    GTagPill(conversation.hostName, color: G.violet)
                     Text("\(conversation.messages.count) msgs")
                         .font(.system(size: 11))
-                        .foregroundStyle(G.faint)
+                        .foregroundStyle(G.textTertiary)
                     if conversation.stepCount > 0 {
                         Text("· \(conversation.stepCount) steps")
                             .font(.system(size: 11))
-                            .foregroundStyle(G.faint)
+                            .foregroundStyle(G.textTertiary)
                     }
                 }
             }
             .padding(11)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(isActive ? G.accent.opacity(0.1) : G.card, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(isActive ? G.accent.opacity(0.45) : G.border)
-            )
+            .background(isActive ? G.violet.opacity(0.12) : (hovered ? G.surfaceHover : G.surfaceSubtle), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
         }
         .buttonStyle(.plain)
         .onHover { hovered = $0 }

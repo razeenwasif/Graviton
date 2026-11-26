@@ -1,7 +1,6 @@
 import SwiftUI
 
-// Graviton's own controls, drawn from the design tokens in `G` instead of the
-// system's. One accent, hairline borders, no materials.
+// Graviton's Stratus-inspired borderless precision controls.
 
 // MARK: - Buttons
 
@@ -63,16 +62,8 @@ private struct GButtonBody: View {
             .padding(.horizontal, size.padding)
             .frame(maxWidth: fullWidth ? .infinity : nil, minHeight: size.height)
             .background(background(pressed: pressed), in: RoundedRectangle(cornerRadius: size.radius, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: size.radius, style: .continuous).strokeBorder(border))
-            .overlay(alignment: .top) {
-                // A faint top highlight gives solid buttons some depth.
-                if kind == .primary || kind == .dangerSolid {
-                    RoundedRectangle(cornerRadius: size.radius, style: .continuous)
-                        .strokeBorder(LinearGradient(colors: [.white.opacity(0.28), .clear], startPoint: .top, endPoint: .center), lineWidth: 1)
-                }
-            }
             .scaleEffect(pressed && enabled ? 0.98 : 1)
-            .opacity(enabled ? 1 : 0.45)
+            .opacity(enabled ? 1 : 0.42)
             .contentShape(RoundedRectangle(cornerRadius: size.radius, style: .continuous))
             .onHover { hovering = $0 }
             .animation(.easeOut(duration: 0.12), value: hovering)
@@ -83,28 +74,21 @@ private struct GButtonBody: View {
 
     private var foreground: Color {
         switch kind {
-        case .primary, .dangerSolid: G.onAccent
+        case .primary: .white
+        case .dangerSolid: Color(hex: 0x050507)
         case .secondary: G.text
         case .ghost: active ? G.text : G.textSecondary
-        case .danger: G.danger
+        case .danger: G.rose
         }
     }
 
     private func background(pressed: Bool) -> Color {
         switch kind {
-        case .primary: pressed ? G.accent.opacity(0.8) : (active ? Color(hex: 0x8F9CFF) : G.accent)
-        case .dangerSolid: pressed ? G.danger.opacity(0.8) : (active ? Color(hex: 0xFF9C9C) : G.danger)
-        case .secondary: pressed ? G.raised : (active ? Color(hex: 0x20232A) : G.control)
-        case .ghost: pressed ? Color.white.opacity(0.08) : (active ? Color.white.opacity(0.05) : .clear)
-        case .danger: pressed ? G.danger.opacity(0.18) : (active ? G.danger.opacity(0.12) : G.control)
-        }
-    }
-
-    private var border: Color {
-        switch kind {
-        case .primary, .dangerSolid, .ghost: .clear
-        case .secondary: active ? G.borderStrong.opacity(1.6) : G.borderStrong
-        case .danger: G.danger.opacity(active ? 0.35 : 0.18)
+        case .primary: pressed ? G.indigo.opacity(0.82) : (active ? G.indigoBright : G.indigo)
+        case .dangerSolid: pressed ? G.rose.opacity(0.82) : (active ? Color(hex: 0xFCA5A5) : G.rose)
+        case .secondary: pressed ? G.surfaceActive : (active ? G.controlHover : G.surfacePill)
+        case .ghost: pressed ? G.surfaceActive : (active ? G.surfaceHover : .clear)
+        case .danger: pressed ? G.rose.opacity(0.24) : (active ? G.rose.opacity(0.18) : G.rose.opacity(0.12))
         }
     }
 }
@@ -138,7 +122,6 @@ private struct GIconButtonBody: View {
             .foregroundStyle(hovering && enabled ? G.text : G.muted)
             .frame(width: size, height: size)
             .background(fill, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(bordered ? G.borderStrong : .clear))
             .opacity(enabled ? 1 : 0.4)
             .contentShape(Rectangle())
             .onHover { hovering = $0 }
@@ -146,9 +129,9 @@ private struct GIconButtonBody: View {
     }
 
     private var fill: Color {
-        if configuration.isPressed { return Color.white.opacity(0.1) }
-        if hovering && enabled { return Color.white.opacity(0.06) }
-        return bordered ? G.control : .clear
+        if configuration.isPressed { return G.surfaceActive }
+        if hovering && enabled { return bordered ? G.controlHover : G.surfaceHover }
+        return bordered ? G.surfacePill : .clear
     }
 }
 
@@ -201,10 +184,9 @@ private struct GSwitchBody: View {
                     .foregroundStyle(G.textSecondary)
                 ZStack(alignment: configuration.isOn ? .trailing : .leading) {
                     Capsule()
-                        .fill(configuration.isOn ? G.accent : G.control)
-                        .overlay(Capsule().strokeBorder(configuration.isOn ? .clear : G.borderStrong))
+                        .fill(configuration.isOn ? G.indigo : G.surfacePill)
                     Circle()
-                        .fill(configuration.isOn ? G.onAccent : G.muted)
+                        .fill(configuration.isOn ? .white : G.muted)
                         .padding(3)
                 }
                 .frame(width: 30, height: 18)
@@ -237,20 +219,18 @@ private struct GCheckboxBody: View {
             HStack(spacing: 9) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 5, style: .continuous)
-                        .fill(configuration.isOn ? G.accent : G.background)
-                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                        .strokeBorder(configuration.isOn ? .clear : (hovering ? G.muted : G.faint.opacity(0.7)), lineWidth: 1.2)
+                        .fill(configuration.isOn ? G.indigo : (hovering ? G.surfaceActive : G.surfacePill))
                     if configuration.isOn {
                         Image(systemName: "checkmark")
                             .font(.system(size: 9.5, weight: .heavy))
-                            .foregroundStyle(G.onAccent)
+                            .foregroundStyle(.white)
                             .transition(.scale(scale: 0.5).combined(with: .opacity))
                     }
                 }
                 .frame(width: 16, height: 16)
                 configuration.label
                     .font(.system(size: 13))
-                    .foregroundStyle(G.textSecondary)
+                    .foregroundStyle(G.body)
             }
             .contentShape(Rectangle())
         }
@@ -284,7 +264,7 @@ public struct GFieldModifier: ViewModifier {
     public func body(content: Content) -> some View {
         HStack(spacing: 8) {
             if let icon {
-                Image(systemName: icon).font(.system(size: 12, weight: .medium)).foregroundStyle(focused ? G.accent : G.faint)
+                Image(systemName: icon).font(.system(size: 12, weight: .medium)).foregroundStyle(focused ? G.indigo : G.faint)
             }
             content
                 .textFieldStyle(.plain)
@@ -295,31 +275,21 @@ public struct GFieldModifier: ViewModifier {
         .padding(.horizontal, 11)
         .padding(.vertical, height == nil ? 8 : 0)
         .frame(maxWidth: .infinity, minHeight: height, maxHeight: height)
-        .background(G.background, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).strokeBorder(stroke, lineWidth: focused ? 1.4 : 1))
-        .background {
-            if focused {
-                RoundedRectangle(cornerRadius: radius + 2, style: .continuous)
-                    .fill((invalid ? G.danger : G.accent).opacity(0.14))
-                    .padding(-3)
-            }
-        }
+        .background(focused || hovering ? G.surfaceHover : G.surfaceSubtle, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: radius, style: .continuous)
+                .strokeBorder(invalid ? G.rose.opacity(0.65) : (focused ? G.indigo.opacity(0.45) : .clear), lineWidth: 1)
+        )
         .opacity(enabled ? 1 : 0.55)
         .onHover { hovering = $0 }
         .animation(.easeOut(duration: 0.12), value: focused)
     }
 
-    private var radius: CGFloat { (height ?? 0) >= 40 ? 11 : 8 }
-
-    private var stroke: Color {
-        if invalid { return G.danger.opacity(0.85) }
-        if focused { return G.accent.opacity(0.9) }
-        return hovering ? Color.white.opacity(0.14) : G.borderStrong
-    }
+    private var radius: CGFloat { (height ?? 0) >= 40 ? 10 : 8 }
 }
 
 public extension View {
-    /// Graviton's field chrome for a `TextField` (or `TextEditor`, with `height: nil`).
+    /// Graviton's borderless field chrome for a `TextField` (or `TextEditor`, with `height: nil`).
     func gravitonField(mono: Bool = false, height: CGFloat? = 32, invalid: Bool = false, icon: String? = nil, size: CGFloat = 13) -> some View {
         modifier(GFieldModifier(mono: mono, height: height, invalid: invalid, icon: icon, size: size))
     }
@@ -353,11 +323,11 @@ public struct GFormRow<Content: View>: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(label.uppercased())
                 .font(.system(size: 10.5, weight: .semibold))
-                .kerning(0.6)
+                .kerning(0.65)
                 .foregroundStyle(G.faint)
             content
             if let error {
-                Text(error).font(.system(size: 11.5)).foregroundStyle(G.danger)
+                Text(error).font(.system(size: 11.5)).foregroundStyle(G.rose)
             } else if let hint {
                 Text(hint).font(.system(size: 11.5)).foregroundStyle(G.faint)
             }
@@ -381,7 +351,7 @@ public struct GSegmented<Value: Hashable>: View {
         self.stretch = stretch
     }
 
-    private var height: CGFloat { stretch ? 32 : 24 }
+    private var height: CGFloat { stretch ? 32 : 25 }
 
     public var body: some View {
         HStack(spacing: 2) {
@@ -400,9 +370,7 @@ public struct GSegmented<Value: Hashable>: View {
                         .background {
                             if selected {
                                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                    .fill(Color(hex: 0x262932))
-                                    .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(Color.white.opacity(0.07)))
-                                    .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+                                    .fill(G.surfaceActive)
                                     .matchedGeometryEffect(id: "pill", in: pill)
                             }
                         }
@@ -413,8 +381,7 @@ public struct GSegmented<Value: Hashable>: View {
             }
         }
         .padding(3)
-        .background(G.control, in: RoundedRectangle(cornerRadius: stretch ? 11 : 9, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: stretch ? 11 : 9, style: .continuous).strokeBorder(G.border))
+        .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: stretch ? 10 : 8, style: .continuous))
         .fixedSize(horizontal: !stretch, vertical: true)
     }
 }
@@ -444,8 +411,7 @@ public struct GStepper: View {
             step("plus", enabled: value < range.upperBound) { value += 1 }
         }
         .frame(height: 30)
-        .background(G.background, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(G.borderStrong))
+        .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .fixedSize()
     }
 
@@ -462,8 +428,7 @@ public struct GStepper: View {
 
 // MARK: - Dropdown trigger
 
-/// The face of a dropdown: the current value and a chevron, in field chrome.
-/// Wrap it in a `Menu` with `.menuStyle(.button)` and `.buttonStyle(.plain)`.
+/// The face of a dropdown: the current value and a chevron, in borderless tonal chrome.
 public struct GDropdownLabel: View {
     var text: String
     var icon: String?
@@ -478,15 +443,14 @@ public struct GDropdownLabel: View {
 
     public var body: some View {
         HStack(spacing: 8) {
-            if let icon { Image(systemName: icon).font(.system(size: 12)).foregroundStyle(G.accent) }
+            if let icon { Image(systemName: icon).font(.system(size: 12)).foregroundStyle(G.indigo) }
             Text(text).font(mono ? G.mono(12.5) : .system(size: 12.5, weight: .medium)).foregroundStyle(G.text).lineLimit(1)
             Spacer(minLength: 4)
             Image(systemName: "chevron.up.chevron.down").font(.system(size: 9, weight: .bold)).foregroundStyle(G.faint)
         }
         .padding(.horizontal, 11)
         .frame(height: 30)
-        .background(hovering ? Color(hex: 0x111216) : G.background, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(hovering ? Color.white.opacity(0.14) : G.borderStrong))
+        .background(hovering ? G.surfaceHover : G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
     }
@@ -543,10 +507,10 @@ public struct GStatusLine: View {
             Group {
                 switch tone {
                 case .working: GSpinner(size: 12)
-                case .success: badge("checkmark", G.running)
-                case .failure: badge("xmark", G.danger)
-                case .warning: badge("exclamationmark", G.warning)
-                case .info: badge("info", G.accent)
+                case .success: badge("checkmark", G.mint)
+                case .failure: badge("xmark", G.rose)
+                case .warning: badge("exclamationmark", G.amber)
+                case .info: badge("info", G.indigo)
                 }
             }
             .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
@@ -559,32 +523,31 @@ public struct GStatusLine: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(tint.opacity(0.18)))
+        .background(tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private var tint: Color {
         switch tone {
-        case .working, .info: G.accent
-        case .success: G.running
-        case .failure: G.danger
-        case .warning: G.warning
+        case .working, .info: G.indigo
+        case .success: G.mint
+        case .failure: G.rose
+        case .warning: G.amber
         }
     }
 
     private var color: Color {
         switch tone {
-        case .working, .info: G.textSecondary
-        case .success: G.running
-        case .failure: G.danger
-        case .warning: G.warning
+        case .working, .info: G.body
+        case .success: G.mint
+        case .failure: G.rose
+        case .warning: G.amber
         }
     }
 
     private func badge(_ symbol: String, _ color: Color) -> some View {
         Image(systemName: symbol)
             .font(.system(size: 7.5, weight: .heavy))
-            .foregroundStyle(G.onAccent)
+            .foregroundStyle(Color(hex: 0x050507))
             .frame(width: 13, height: 13)
             .background(color, in: Circle())
     }
@@ -610,12 +573,11 @@ public struct GEmptyState: View {
     public var body: some View {
         VStack(spacing: 14) {
             ZStack {
-                Circle().fill(G.accent.opacity(0.07)).frame(width: 84, height: 84)
+                Circle().fill(G.indigo.opacity(0.08)).frame(width: 78, height: 78)
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(LinearGradient(colors: [Color(hex: 0x1D2029), G.card], startPoint: .top, endPoint: .bottom))
-                    .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(G.borderStrong))
-                    .frame(width: 52, height: 52)
-                Image(systemName: symbol).font(.system(size: 21, weight: .medium)).foregroundStyle(G.accent)
+                    .fill(G.surfacePill)
+                    .frame(width: 48, height: 48)
+                Image(systemName: symbol).font(.system(size: 20, weight: .medium)).foregroundStyle(G.indigo)
             }
             VStack(spacing: 5) {
                 Text(title).font(.system(size: 15, weight: .semibold)).foregroundStyle(G.text)
@@ -653,9 +615,9 @@ public struct GBadge: View {
             .font(.system(size: 10.5, weight: .semibold))
             .monospacedDigit()
             .foregroundStyle(color)
-            .padding(.horizontal, 6)
-            .frame(minWidth: 18, minHeight: 17)
-            .background(color.opacity(0.13), in: Capsule())
+            .padding(.horizontal, 7)
+            .frame(minWidth: 18, minHeight: 18)
+            .background(color.opacity(0.14), in: Capsule())
     }
 }
 
@@ -673,8 +635,6 @@ public struct GCaption: View {
 
 // MARK: - Dialogs
 
-/// In-window dialogs (confirmations and alerts), in place of the system's.
-/// Put `.gravitonDialogs(_:)` on the window's root view and call `confirm` or `alert`.
 @MainActor @Observable
 public final class Dialogs {
     public struct Request: Identifiable {
@@ -711,15 +671,15 @@ private struct DialogHost: ViewModifier {
         content.overlay {
             ZStack {
                 if let request = dialogs.current {
-                    Color.black.opacity(0.5)
+                    Color.black.opacity(0.62)
                         .ignoresSafeArea()
                         .onTapGesture { dialogs.dismiss() }
                         .transition(.opacity)
                     DialogCard(request: request, dialogs: dialogs)
-                        .transition(.scale(scale: 0.94).combined(with: .opacity))
+                        .transition(.scale(scale: 0.95).combined(with: .opacity))
                 }
             }
-            .animation(.snappy(duration: 0.2), value: dialogs.current?.id)
+            .animation(.snappy(duration: 0.18), value: dialogs.current?.id)
         }
     }
 }
@@ -729,19 +689,19 @@ private struct DialogCard: View {
     let dialogs: Dialogs
 
     var body: some View {
-        let tint = request.destructive ? G.danger : (request.action == nil ? G.warning : G.accent)
-        VStack(alignment: .leading, spacing: 16) {
+        let tint = request.destructive ? G.rose : (request.action == nil ? G.amber : G.indigo)
+        VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .top, spacing: 14) {
                 Image(systemName: request.symbol)
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(tint)
                     .frame(width: 36, height: 36)
-                    .background(tint.opacity(0.13), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 VStack(alignment: .leading, spacing: 5) {
                     Text(request.title).font(.system(size: 14.5, weight: .semibold)).foregroundStyle(G.text)
                     Text(request.message)
                         .font(.system(size: 12.5))
-                        .foregroundStyle(G.muted)
+                        .foregroundStyle(G.textSecondary)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -766,11 +726,10 @@ private struct DialogCard: View {
                 }
             }
         }
-        .padding(20)
+        .padding(22)
         .frame(width: 400)
-        .background(Color(hex: 0x17181D), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(G.borderStrong))
-        .shadow(color: .black.opacity(0.5), radius: 30, y: 12)
+        .background(G.palette, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .shadow(color: .black.opacity(0.72), radius: 34, y: 14)
     }
 }
 
@@ -782,7 +741,7 @@ public extension View {
 
 // MARK: - Sheets
 
-/// The frame every sheet shares: a title, a subtitle, the content, and a footer of buttons.
+/// Borderless Stratus-grade sheet container.
 public struct GSheet<Content: View, Footer: View>: View {
     var title: String
     var subtitle: String?
@@ -806,42 +765,40 @@ public struct GSheet<Content: View, Footer: View>: View {
             HStack(alignment: .top, spacing: 14) {
                 Image(systemName: symbol)
                     .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(G.accent)
+                    .foregroundStyle(G.indigo)
                     .frame(width: 36, height: 36)
-                    .background(G.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(G.accent.opacity(0.18)))
+                    .background(G.indigo.opacity(0.14), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 VStack(alignment: .leading, spacing: 3) {
                     Text(title).font(.system(size: 16, weight: .semibold)).kerning(-0.2).foregroundStyle(G.text)
                     if let subtitle {
-                        Text(subtitle).font(.system(size: 12.5)).foregroundStyle(G.muted).fixedSize(horizontal: false, vertical: true)
+                        Text(subtitle).font(.system(size: 12.5)).foregroundStyle(G.textSecondary).fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
-            .padding(.horizontal, 22)
-            .padding(.top, 22)
+            .padding(.horizontal, 24)
+            .padding(.top, 24)
             .padding(.bottom, 18)
 
             VStack(alignment: .leading, spacing: 16) { content }
-                .padding(.horizontal, 22)
-                .padding(.bottom, 20)
+                .padding(.horizontal, 24)
+                .padding(.bottom, 22)
 
             HStack(spacing: 8) { footer }
-                .padding(.horizontal, 22)
-                .padding(.vertical, 14)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 15)
                 .frame(maxWidth: .infinity)
-                .background(Color(hex: 0x111216))
-                .overlay(alignment: .top) { Rectangle().fill(G.border).frame(height: 1) }
+                .background(G.surfaceSubtle)
         }
         .frame(width: width)
-        .background(Color(hex: 0x16171C))
+        .background(G.sheet)
         .preferredColorScheme(.dark)
-        .tint(G.accent)
+        .tint(G.indigo)
     }
 }
 
 // MARK: - Tables
 
-/// A sortable column heading for Graviton's own tables.
+/// A sortable column heading for Graviton's borderless tables.
 public struct GColumnHeader<Key: Hashable>: View {
     var title: String
     var key: Key?
@@ -866,7 +823,7 @@ public struct GColumnHeader<Key: Hashable>: View {
             HStack(spacing: 4) {
                 Text(title.uppercased())
                     .font(.system(size: 10.5, weight: .semibold))
-                    .kerning(0.6)
+                    .kerning(0.65)
                 if active {
                     Image(systemName: ascending ? "arrow.up" : "arrow.down").font(.system(size: 8.5, weight: .bold))
                 }
@@ -880,7 +837,7 @@ public struct GColumnHeader<Key: Hashable>: View {
     }
 }
 
-/// Row background for Graviton's tables: hover and selection.
+/// Borderless row background for Graviton's lists: soft hover and Stratus tonal selection.
 public struct GRowBackground: ViewModifier {
     var selected: Bool
     @State private var hovering = false
@@ -888,16 +845,12 @@ public struct GRowBackground: ViewModifier {
     public func body(content: Content) -> some View {
         content
             .background {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(selected ? G.accent.opacity(0.11) : (hovering ? Color.white.opacity(0.035) : .clear))
-                    .overlay(alignment: .leading) {
-                        if selected {
-                            Capsule().fill(G.accent).frame(width: 3).padding(.vertical, 9)
-                        }
-                    }
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(selected ? G.surfaceActive : (hovering ? G.surfaceHover : .clear))
             }
             .contentShape(Rectangle())
             .onHover { hovering = $0 }
+            .animation(.easeOut(duration: 0.10), value: hovering)
     }
 }
 
@@ -949,7 +902,7 @@ public struct GPullProgressView: View {
             }
 
             if let fraction = state.fraction {
-                progressBar(fraction: fraction, color: G.accent, height: 5)
+                progressBar(fraction: fraction, color: G.indigo, height: 5)
             }
 
             if !state.layers.isEmpty {
@@ -961,10 +914,10 @@ public struct GPullProgressView: View {
                                     .font(G.mono(11))
                                     .foregroundStyle(G.textSecondary)
                                     .frame(width: 86, alignment: .leading)
-                                progressBar(fraction: layer.fraction, color: layer.isComplete ? G.running : G.accent, height: 4)
+                                progressBar(fraction: layer.fraction, color: layer.isComplete ? G.mint : G.indigo, height: 4)
                                 Text(layerStatus(layer))
                                     .font(G.mono(11))
-                                    .foregroundStyle(layer.cached ? G.muted : (layer.isComplete ? G.running : G.textSecondary))
+                                    .foregroundStyle(layer.cached ? G.muted : (layer.isComplete ? G.mint : G.textSecondary))
                                     .frame(width: 78, alignment: .trailing)
                             }
                         }
@@ -973,16 +926,15 @@ public struct GPullProgressView: View {
                 .frame(maxHeight: 150)
             }
         }
-        .padding(12)
-        .background(G.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(G.border))
+        .padding(14)
+        .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     private func progressBar(fraction: Double, color: Color, height: CGFloat) -> some View {
         GeometryReader { geo in
             let w = max(0, min(geo.size.width, geo.size.width * fraction))
             ZStack(alignment: .leading) {
-                Capsule().fill(G.control)
+                Capsule().fill(Color.white.opacity(0.06))
                 Capsule().fill(color).frame(width: w)
                     .animation(.easeOut(duration: 0.14), value: fraction)
             }

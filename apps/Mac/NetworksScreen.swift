@@ -94,7 +94,7 @@ struct NetworksScreen: View {
     var body: some View {
         VStack(spacing: 0) {
             ScreenHeader("Networks", subtitle: subtitle) {
-                HeaderSearch(prompt: "Search networks, containers, IPs or ports", text: $search)
+                HeaderSearch(prompt: "Search networks, IPs or ports", text: $search)
                 Button { Task { await store.refresh() } } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.gIconBordered)
                     .help("Refresh")
@@ -103,14 +103,21 @@ struct NetworksScreen: View {
                     .disabled(!store.canManage && store.connection != .demo)
             }
 
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 18) {
                 summaryCards
 
-                GSegmented(selection: $tab, options: [
-                    (.networks, "Networks  \(userNetworks.count)"),
-                    (.endpoints, "Containers  \(info.endpoints.count)"),
-                    (.ports, "Published Ports  \(totalPortCount)"),
-                ])
+                HStack(spacing: 8) {
+                    GFilterPillButton("Networks", count: userNetworks.count, selected: tab == .networks, accent: G.mint) {
+                        withAnimation(.snappy(duration: 0.18)) { tab = .networks }
+                    }
+                    GFilterPillButton("Containers", count: info.endpoints.count, selected: tab == .endpoints, accent: G.indigo) {
+                        withAnimation(.snappy(duration: 0.18)) { tab = .endpoints }
+                    }
+                    GFilterPillButton("Published Ports", count: totalPortCount, selected: tab == .ports, accent: G.sky) {
+                        withAnimation(.snappy(duration: 0.18)) { tab = .ports }
+                    }
+                    Spacer()
+                }
 
                 switch tab {
                 case .networks: networksContent
@@ -119,11 +126,11 @@ struct NetworksScreen: View {
                 }
             }
             .padding(.horizontal, 28)
-            .padding(.top, 6)
+            .padding(.top, 4)
             .padding(.bottom, 22)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
-        .background(G.background)
+        .background(G.bg)
         .sheet(isPresented: $showCreateNetwork) {
             CreateNetworkSheet { created in
                 networkSelection = created.id
@@ -136,73 +143,70 @@ struct NetworksScreen: View {
 
     private var summaryCards: some View {
         HStack(spacing: 14) {
-            // 1. Container switch + NAT
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     GCaption("Container Switch")
                     Spacer()
-                    GBadge(info.connectedPorts > 0 ? "Active" : "Idle", color: info.connectedPorts > 0 ? G.running : G.muted)
+                    GTagPill(info.connectedPorts > 0 ? "Active" : "Idle", color: info.connectedPorts > 0 ? G.mint : G.textMuted)
                 }
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(info.subnet).font(G.mono(16, weight: .semibold)).foregroundStyle(G.text)
-                    Text("gw \(info.gateway)").font(G.mono(11.5)).foregroundStyle(G.faint)
+                    Text(info.subnet).font(G.mono(17, weight: .semibold)).foregroundStyle(G.textPrimary)
+                    Text("gw \(info.gateway)").font(G.mono(11.5)).foregroundStyle(G.textTertiary)
                 }
                 Text("\(info.driver) · \(info.connectedPorts) \(info.connectedPorts == 1 ? "port" : "ports") · \(info.learnedMacs) MACs · \(Format.bytes(info.bytesForwarded)) forwarded")
                     .font(.system(size: 12))
-                    .foregroundStyle(G.muted)
+                    .foregroundStyle(G.textMuted)
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .gravitonCard(G.card)
+            .gravitonCard(G.surfaceSubtle)
 
-            // 2. Embedded DNS
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     GCaption("Embedded DNS")
                     Spacer()
-                    GBadge(".\(info.dnsDomain)", color: G.accent)
+                    GTagPill(".\(info.dnsDomain)", color: G.indigo)
                 }
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(info.dnsServer).font(G.mono(16, weight: .semibold)).foregroundStyle(G.text)
-                    Text("UDP + TCP").font(.system(size: 11.5)).foregroundStyle(G.faint)
+                    Text(info.dnsServer).font(G.mono(17, weight: .semibold)).foregroundStyle(G.textPrimary)
+                    Text("UDP + TCP").font(.system(size: 11.5)).foregroundStyle(G.textTertiary)
                 }
                 let dnsCount = runningEndpoints.filter { $0.ipAddress != nil }.count
                 Text(dnsCount == 0
                      ? "Resolves running containers by name, .\(info.dnsDomain) and ID"
                      : "\(dnsCount) \(dnsCount == 1 ? "container" : "containers") resolvable by name, .\(info.dnsDomain) & PTR")
                     .font(.system(size: 12))
-                    .foregroundStyle(G.muted)
+                    .foregroundStyle(G.textMuted)
                     .lineLimit(1)
             }
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .gravitonCard(G.card)
+            .gravitonCard(G.surfaceSubtle)
 
-            // 3. Published ports
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     GCaption("Published Ports")
                     Spacer()
-                    GBadge("\(activePortCount) live", color: activePortCount > 0 ? G.running : G.muted)
+                    GTagPill("\(activePortCount) live", color: activePortCount > 0 ? G.mint : G.textMuted)
                 }
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text("\(activeTcpCount) TCP").font(.system(size: 16, weight: .semibold)).foregroundStyle(G.text)
-                    Text("·").foregroundStyle(G.faint)
-                    Text("\(activeUdpCount) UDP").font(.system(size: 16, weight: .semibold)).foregroundStyle(activeUdpCount > 0 ? G.accent : G.muted)
+                    Text("\(activeTcpCount) TCP").font(G.statValue(17)).foregroundStyle(G.textPrimary)
+                    Text("·").foregroundStyle(G.textTertiary)
+                    Text("\(activeUdpCount) UDP").font(G.statValue(17)).foregroundStyle(activeUdpCount > 0 ? G.sky : G.textMuted)
                 }
                 let lanCount = runningEndpoints.flatMap(\.ports).filter { $0.bindIp != "127.0.0.1" }.count
                 Text(lanCount > 0
                      ? "\(lanCount) bound on LAN/all interfaces · \(activePortCount - lanCount) loopback"
                      : "Forwarded on 127.0.0.1 (pass 0.0.0.0:HOST:PORT for LAN)")
                     .font(.system(size: 12))
-                    .foregroundStyle(G.muted)
+                    .foregroundStyle(G.textMuted)
                     .lineLimit(1)
             }
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .gravitonCard(G.card)
+            .gravitonCard(G.surfaceSubtle)
         }
     }
 
@@ -212,10 +216,10 @@ struct NetworksScreen: View {
         if userNetworks.isEmpty {
             GEmptyState("No networks", symbol: "network",
                         detail: "Create an isolated bridge network with New Network or grav network create.")
-                .gravitonCard()
+                .gravitonCard(G.surfaceSubtle)
         } else if filteredNetworks.isEmpty {
             GEmptyState("Nothing matches", symbol: "magnifyingglass", detail: "No network or container matches “\(search)”.")
-                .gravitonCard()
+                .gravitonCard(G.surfaceSubtle)
         } else {
             UserNetworksTable(
                 rows: filteredNetworks,
@@ -234,10 +238,10 @@ struct NetworksScreen: View {
         if info.endpoints.isEmpty {
             GEmptyState("No containers on the network", symbol: "point.3.connected.trianglepath.dotted",
                         detail: "Every container joins a switch network automatically and gets an IP address and DNS name.")
-                .gravitonCard()
+                .gravitonCard(G.surfaceSubtle)
         } else if filteredEndpoints.isEmpty {
             GEmptyState("Nothing matches", symbol: "magnifyingglass", detail: "No container, network, IP or port matches “\(search)”.")
-                .gravitonCard()
+                .gravitonCard(G.surfaceSubtle)
         } else {
             EndpointTable(
                 rows: filteredEndpoints,
@@ -255,10 +259,10 @@ struct NetworksScreen: View {
         if totalPortCount == 0 {
             GEmptyState("No published ports", symbol: "network",
                         detail: "Publish a container's TCP or UDP port with -p [IP:]HOST:CONTAINER[/udp] or in the Run sheet.")
-                .gravitonCard()
+                .gravitonCard(G.surfaceSubtle)
         } else if publishedPorts.isEmpty {
             GEmptyState("Nothing matches", symbol: "magnifyingglass", detail: "No published port matches “\(search)”.")
-                .gravitonCard()
+                .gravitonCard(G.surfaceSubtle)
         } else {
             PublishedPortTable(rows: publishedPorts, onOpen: openContainer)
         }
@@ -342,23 +346,21 @@ private struct EndpointTable: View {
                 GColumnHeader("IP Address", key: Column.ip, sort: $sort, ascending: $ascending).frame(width: 132)
                 GColumnHeader("DNS Names", key: Column.dns, sort: $sort, ascending: $ascending).frame(minWidth: 170, maxWidth: .infinity)
                 GColumnHeader("Published Ports", key: Column.ports, sort: $sort, ascending: $ascending).frame(minWidth: 160, maxWidth: .infinity)
-                GColumnHeader("Status", key: Column.status, sort: $sort, ascending: $ascending).frame(width: 84)
+                GColumnHeader("Status", key: Column.status, sort: $sort, ascending: $ascending).frame(width: 96)
                 Color.clear.frame(width: 28)
             }
-            .padding(.horizontal, 14)
-            .frame(height: 34)
-            .overlay(alignment: .bottom) { Rectangle().fill(G.border).frame(height: 1) }
+            .padding(.horizontal, 12)
+            .frame(height: 30)
 
             ScrollView {
-                LazyVStack(spacing: 2) {
+                LazyVStack(spacing: 3) {
                     ForEach(sorted) { ep in
                         row(ep)
                     }
                 }
-                .padding(6)
+                .padding(.vertical, 4)
             }
         }
-        .gravitonCard(G.surface)
         .focusable()
         .focused($focused)
         .focusEffectDisabled()
@@ -377,57 +379,55 @@ private struct EndpointTable: View {
                 StatusDot(running: ep.isRunning)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
-                        Text(ep.containerName).font(.system(size: 13, weight: .medium)).foregroundStyle(G.text).lineLimit(1)
+                        Text(ep.containerName).font(.system(size: 13.5, weight: .semibold)).foregroundStyle(G.textPrimary).lineLimit(1)
                         ForEach(ep.attachedNetworks, id: \.self) { net in
-                            GBadge(net, color: net == "graviton" ? G.muted : G.accent)
+                            GTagPill(net, color: net == "graviton" ? G.textMuted : G.indigo)
                         }
                     }
-                    Text(ep.image).font(G.mono(11)).foregroundStyle(G.muted).lineLimit(1).truncationMode(.middle)
+                    Text(ep.image).font(G.mono(11)).foregroundStyle(G.textMuted).lineLimit(1).truncationMode(.middle)
                 }
             }
             .frame(minWidth: 160, maxWidth: .infinity, alignment: .leading)
 
             Text(ep.ipAddress ?? "—")
                 .font(G.mono(12))
-                .foregroundStyle(ep.ipAddress != nil ? G.text : G.faint)
+                .foregroundStyle(ep.ipAddress != nil ? G.textPrimary : G.textTertiary)
                 .textSelection(.enabled)
                 .frame(width: 132, alignment: .leading)
 
             Group {
                 if ep.dnsNames.isEmpty {
-                    Text("—").font(G.mono(12)).foregroundStyle(G.faint)
+                    Text("—").font(G.mono(12)).foregroundStyle(G.textTertiary)
                 } else {
-                    HStack(spacing: 6) {
-                        Text(ep.dnsNames.prefix(2).joined(separator: ", "))
-                            .font(G.mono(11.5))
-                            .foregroundStyle(G.textSecondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
+                    Text(ep.dnsNames.prefix(2).joined(separator: ", "))
+                        .font(G.mono(11.5))
+                        .foregroundStyle(G.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
             }
             .frame(minWidth: 170, maxWidth: .infinity, alignment: .leading)
 
             Text(ep.ports.isEmpty ? "—" : ep.ports.map(\.compactLabel).joined(separator: ", "))
                 .font(G.mono(11.5))
-                .foregroundStyle(ep.ports.isEmpty ? G.faint : G.textSecondary)
+                .foregroundStyle(ep.ports.isEmpty ? G.textTertiary : G.textSecondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .frame(minWidth: 160, maxWidth: .infinity, alignment: .leading)
 
-            GBadge(ep.isRunning ? "Connected" : "Stopped", color: ep.isRunning ? G.running : G.muted)
-                .frame(width: 84, alignment: .leading)
+            GTagPill(ep.isRunning ? "Connected" : "Stopped", color: ep.isRunning ? G.mint : G.textMuted)
+                .frame(width: 96, alignment: .leading)
 
             Menu { menuItems(ep) } label: {
-                Image(systemName: "ellipsis").font(.system(size: 12, weight: .bold)).foregroundStyle(G.muted)
+                Image(systemName: "ellipsis").font(.system(size: 12, weight: .bold)).foregroundStyle(G.textMuted)
                     .frame(width: 26, height: 26).contentShape(Rectangle())
             }
             .gravitonMenu()
             .frame(width: 28)
             .accessibilityLabel("More actions for \(ep.containerName)")
         }
-        .padding(.horizontal, 8)
-        .frame(height: 50)
+        .padding(.horizontal, 12)
+        .frame(height: 52)
         .gravitonRow(selected: selection == ep.id)
         .onTapGesture(count: 2) { onOpen(ep.containerId, .inspect) }
         .simultaneousGesture(TapGesture().onEnded {
@@ -531,17 +531,16 @@ private struct PublishedPortTable: View {
                 GColumnHeader("Container", key: Column.container, sort: $sort, ascending: $ascending).frame(minWidth: 160, maxWidth: .infinity)
                 Color.clear.frame(width: 28)
             }
-            .padding(.horizontal, 14)
-            .frame(height: 34)
-            .overlay(alignment: .bottom) { Rectangle().fill(G.border).frame(height: 1) }
+            .padding(.horizontal, 12)
+            .frame(height: 30)
 
             ScrollView {
-                LazyVStack(spacing: 2) {
+                LazyVStack(spacing: 3) {
                     ForEach(sorted) { item in
                         HStack(spacing: 12) {
                             Text(item.hostAddress)
                                 .font(G.mono(12.5, weight: .medium))
-                                .foregroundStyle(item.endpoint.isRunning ? G.text : G.muted)
+                                .foregroundStyle(item.endpoint.isRunning ? G.textPrimary : G.textMuted)
                                 .frame(minWidth: 160, maxWidth: .infinity, alignment: .leading)
 
                             Text("→ \(item.port.containerPort)")
@@ -549,16 +548,16 @@ private struct PublishedPortTable: View {
                                 .foregroundStyle(G.textSecondary)
                                 .frame(width: 120, alignment: .leading)
 
-                            GBadge(item.port.protocol.rawValue.uppercased(), color: item.port.protocol == .udp ? G.accent : G.muted)
+                            GTagPill(item.port.protocol.rawValue.uppercased(), color: item.port.protocol == .udp ? G.indigo : G.textMuted)
                                 .frame(width: 78, alignment: .leading)
 
-                            GBadge(item.isLAN ? "LAN" : "Loopback", color: item.isLAN ? G.warning : G.muted)
+                            GTagPill(item.isLAN ? "LAN" : "Loopback", color: item.isLAN ? G.amber : G.textMuted)
                                 .frame(width: 90, alignment: .leading)
 
                             Button { onOpen(item.endpoint.containerId, .inspect) } label: {
                                 HStack(spacing: 8) {
                                     StatusDot(running: item.endpoint.isRunning, size: 7)
-                                    Text(item.endpoint.containerName).font(.system(size: 12.5, weight: .medium)).foregroundStyle(G.text).lineLimit(1)
+                                    Text(item.endpoint.containerName).font(.system(size: 12.5, weight: .medium)).foregroundStyle(G.textPrimary).lineLimit(1)
                                 }
                             }
                             .buttonStyle(.plain)
@@ -571,22 +570,21 @@ private struct PublishedPortTable: View {
                                     Button("Open in Browser") { NSWorkspace.shared.open(url) }
                                 }
                             } label: {
-                                Image(systemName: "ellipsis").font(.system(size: 12, weight: .bold)).foregroundStyle(G.muted)
+                                Image(systemName: "ellipsis").font(.system(size: 12, weight: .bold)).foregroundStyle(G.textMuted)
                                     .frame(width: 26, height: 26).contentShape(Rectangle())
                             }
                             .gravitonMenu()
                             .frame(width: 28)
                         }
-                        .padding(.horizontal, 8)
-                        .frame(height: 44)
+                        .padding(.horizontal, 12)
+                        .frame(height: 46)
                         .gravitonRow(selected: false)
                         .onTapGesture(count: 2) { onOpen(item.endpoint.containerId, .inspect) }
                     }
                 }
-                .padding(6)
+                .padding(.vertical, 4)
             }
         }
-        .gravitonCard(G.surface)
     }
 }
 
@@ -632,20 +630,18 @@ private struct UserNetworksTable: View {
                 GColumnHeader("Created", key: Column.created, sort: $sort, ascending: $ascending).frame(width: 140)
                 Color.clear.frame(width: 28)
             }
-            .padding(.horizontal, 14)
-            .frame(height: 34)
-            .overlay(alignment: .bottom) { Rectangle().fill(G.border).frame(height: 1) }
+            .padding(.horizontal, 12)
+            .frame(height: 30)
 
             ScrollView {
-                LazyVStack(spacing: 2) {
+                LazyVStack(spacing: 3) {
                     ForEach(sorted) { net in
                         row(net)
                     }
                 }
-                .padding(6)
+                .padding(.vertical, 4)
             }
         }
-        .gravitonCard(G.surface)
     }
 
     private func row(_ net: UserNetwork) -> some View {
@@ -653,15 +649,15 @@ private struct UserNetworksTable: View {
             HStack(spacing: 8) {
                 Image(systemName: net.internalOnly ? "lock.shield" : "network")
                     .font(.system(size: 13))
-                    .foregroundStyle(net.isDefault ? G.muted : G.accent)
+                    .foregroundStyle(net.isDefault ? G.textMuted : G.mint)
                 Text(net.name)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(G.text)
+                    .font(.system(size: 13.5, weight: .semibold))
+                    .foregroundStyle(G.textPrimary)
                     .lineLimit(1)
                 if net.isDefault {
-                    GBadge("Built-in", color: G.muted)
+                    GTagPill("Built-in", color: G.textMuted)
                 } else if net.internalOnly {
-                    GBadge("Internal", color: G.warning)
+                    GTagPill("Internal", color: G.amber)
                 }
             }
             .frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
@@ -677,20 +673,20 @@ private struct UserNetworksTable: View {
 
             Text(net.createdAt == 0 ? "Built-in" : net.createdDate.formatted(.relative(presentation: .named)))
                 .font(.system(size: 12))
-                .foregroundStyle(G.muted)
+                .foregroundStyle(G.textMuted)
                 .lineLimit(1)
                 .frame(width: 140, alignment: .leading)
 
             Menu { menuItems(net) } label: {
-                Image(systemName: "ellipsis").font(.system(size: 12, weight: .bold)).foregroundStyle(G.muted)
+                Image(systemName: "ellipsis").font(.system(size: 12, weight: .bold)).foregroundStyle(G.textMuted)
                     .frame(width: 26, height: 26).contentShape(Rectangle())
             }
             .gravitonMenu()
             .frame(width: 28)
             .accessibilityLabel("More actions for \(net.name)")
         }
-        .padding(.horizontal, 8)
-        .frame(height: 46)
+        .padding(.horizontal, 12)
+        .frame(height: 48)
         .gravitonRow(selected: selection == net.id)
         .onTapGesture { selection = net.id }
         .contextMenu { menuItems(net) }
@@ -699,10 +695,10 @@ private struct UserNetworksTable: View {
     @ViewBuilder
     private func attachedContainersView(_ net: UserNetwork) -> some View {
         if net.containers.isEmpty {
-            Text("—").font(G.mono(12)).foregroundStyle(G.faint)
+            Text("—").font(G.mono(12)).foregroundStyle(G.textTertiary)
         } else {
             HStack(spacing: 6) {
-                GBadge("\(net.containers.count)", color: G.running)
+                GTagPill("\(net.containers.count)", color: G.mint)
                 Text(net.containers.joined(separator: ", "))
                     .font(G.mono(11.5))
                     .foregroundStyle(G.textSecondary)

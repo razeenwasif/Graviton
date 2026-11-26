@@ -26,19 +26,15 @@ struct CleanUpSheet: View {
         GSheet("Clean up", subtitle: "Free disk space on \(store.liveName ?? "this Mac"). Layers a container or an image you keep still needs always stay.",
                symbol: "sparkles") {
             if let u = usage {
-                VStack(spacing: 0) {
+                VStack(spacing: 6) {
                     let snapCount = u.snapshots ?? 0
                     let cacheDetail = snapCount > 0
                         ? "\(u.buildCacheSteps) cached build steps · \(snapCount) VM snapshot\(snapCount == 1 ? "" : "s")"
                         : "\(u.buildCacheSteps) cached build steps"
                     row("Build cache, VM snapshots and unreferenced layers", detail: cacheDetail, bytes: u.alwaysReclaimable, toggle: nil)
-                    Rectangle().fill(G.border).frame(height: 1)
                     row("Unused images", detail: "\(u.unusedImages) of \(u.images) images no container uses", bytes: u.unusedImagesBytes, toggle: $images)
-                    Rectangle().fill(G.border).frame(height: 1)
                     row("Stopped containers", detail: "\(u.stoppedContainers) stopped, with the files on their disks", bytes: u.stoppedDisksBytes, toggle: $containers)
                 }
-                .background(G.background, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(G.border))
 
                 usageBar(u)
             } else if case .failed = phase {
@@ -70,7 +66,6 @@ struct CleanUpSheet: View {
         .onChange(of: spec) { Task { await refreshPreview() } }
     }
 
-    /// What's on disk, and how much of it this clean-up frees.
     private func usageBar(_ u: DiskUsage) -> some View {
         let used = u.blobsBytes + u.containerDisksBytes + (u.snapshotsBytes ?? 0)
         let total = Double(max(used, 1))
@@ -79,15 +74,15 @@ struct CleanUpSheet: View {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color.white.opacity(0.06))
-                    Capsule().fill(G.accent.opacity(0.35)).frame(width: geo.size.width * Double(used) / total)
-                    Capsule().fill(G.accent).frame(width: max(geo.size.width * min(freeing / total, 1), freeing > 0 ? 4 : 0))
+                    Capsule().fill(G.indigo.opacity(0.32)).frame(width: geo.size.width * Double(used) / total)
+                    Capsule().fill(G.indigo).frame(width: max(geo.size.width * min(freeing / total, 1), freeing > 0 ? 4 : 0))
                 }
             }
             .frame(height: 6)
             .animation(.snappy(duration: 0.25), value: preview?.freedBytes)
             HStack(spacing: 14) {
-                legend(G.accent, "Frees \(Format.bytes(preview?.freedBytes ?? 0))")
-                legend(G.accent.opacity(0.35), "Images \(Format.bytes(u.blobsBytes)) · container disks \(Format.bytes(u.containerDisksBytes))")
+                legend(G.indigo, "Frees \(Format.bytes(preview?.freedBytes ?? 0))")
+                legend(G.indigo.opacity(0.35), "Images \(Format.bytes(u.blobsBytes)) · container disks \(Format.bytes(u.containerDisksBytes))")
             }
         }
     }
@@ -95,7 +90,7 @@ struct CleanUpSheet: View {
     private func legend(_ color: Color, _ text: String) -> some View {
         HStack(spacing: 6) {
             Circle().fill(color).frame(width: 7, height: 7)
-            Text(text).font(.system(size: 11.5)).foregroundStyle(G.muted)
+            Text(text).font(.system(size: 11.5)).foregroundStyle(G.textMuted)
         }
     }
 
@@ -104,17 +99,18 @@ struct CleanUpSheet: View {
             if let toggle {
                 Toggle("", isOn: toggle).toggleStyle(.gCheckbox).labelsHidden().disabled(working)
             } else {
-                Image(systemName: "lock.fill").font(.system(size: 9.5, weight: .bold)).foregroundStyle(G.faint).frame(width: 16).help("Always cleaned")
+                Image(systemName: "lock.fill").font(.system(size: 9.5, weight: .bold)).foregroundStyle(G.textTertiary).frame(width: 16).help("Always cleaned")
             }
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.system(size: 13, weight: .medium))
-                Text(detail).font(.system(size: 11.5)).foregroundStyle(G.faint)
+                Text(title).font(.system(size: 13, weight: .medium)).foregroundStyle(G.textPrimary)
+                Text(detail).font(.system(size: 11.5)).foregroundStyle(G.textMuted)
             }
             Spacer()
             Text(Format.bytes(bytes)).font(G.mono(12.5)).foregroundStyle(G.textSecondary)
         }
         .padding(.horizontal, 14)
-        .frame(minHeight: 52)
+        .frame(minHeight: 54)
+        .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     private func summary(_ p: PruneReport) -> String {

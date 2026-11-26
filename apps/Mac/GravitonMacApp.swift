@@ -20,7 +20,6 @@ struct GravitonMacApp: App {
         let shells = ShellSessions()
         let router = AppRouter()
         let updates = UpdateChecker()
-        // Show the Mac picked last time.
         if !demo, let mac = hosts.current {
             store.use(RemoteEngine(host: mac.remoteHost, token: mac.token), named: mac.name)
         }
@@ -30,9 +29,7 @@ struct GravitonMacApp: App {
         _router = State(initialValue: router)
         _fairy = State(initialValue: FairyController(store: store, hosts: hosts, shells: shells, router: router))
         _updates = State(initialValue: updates)
-        // Poll for the app's whole life, not just while a window is open: the menu bar item shows it too.
         Task { await store.run() }
-        // Quiet, non-intrusive background update check (respects opt-out, 6h interval, and offline/private 404).
         Task {
             try? await Task.sleep(for: .seconds(4))
             await updates.checkIfDue()
@@ -50,7 +47,7 @@ struct GravitonMacApp: App {
                 .environment(fairy)
                 .environment(updates)
                 .preferredColorScheme(.dark)
-                .tint(G.accent)
+                .tint(G.indigo)
                 .frame(minWidth: 980, minHeight: 620)
         }
         .defaultSize(width: 1440, height: 900)
@@ -63,12 +60,28 @@ struct GravitonMacApp: App {
                 }
             }
             CommandGroup(after: .toolbar) {
+                Button("Command Palette…") {
+                    withAnimation(.easeOut(duration: 0.14)) {
+                        router.isCommandPaletteOpen.toggle()
+                    }
+                }
+                .keyboardShortcut("k", modifiers: .command)
+
+                Button(router.isSidebarCollapsed ? "Show Sidebar" : "Hide Sidebar") {
+                    withAnimation(.snappy(duration: 0.2)) {
+                        router.isSidebarCollapsed.toggle()
+                    }
+                }
+                .keyboardShortcut("\\", modifiers: .command)
+
                 Button("Refresh") { Task { await store.refresh() } }
                     .keyboardShortcut("r")
+
                 Button(fairy.isOpen ? "Hide Fairy" : "Ask Fairy") {
                     withAnimation(.snappy(duration: 0.22)) { fairy.toggle() }
                 }
                 .keyboardShortcut("i", modifiers: [.command, .option])
+
                 Toggle("Show in Menu Bar", isOn: $showsMenuBarExtra)
             }
             CommandGroup(replacing: .appSettings) {
@@ -99,10 +112,35 @@ enum Section: String, Hashable, CaseIterable, Identifiable {
         switch self {
         case .containers: "shippingbox"
         case .images: "square.stack.3d.up"
-        case .volumes: "cylinder.split.1x2"
-        case .networks: "point.3.connected.trianglepath.dotted"
+        case .volumes: "internaldrive"
+        case .networks: "network"
         case .settings: "gearshape"
         }
+    }
+
+    var accent: Color {
+        switch self {
+        case .containers: G.indigo
+        case .images: G.sky
+        case .volumes: G.amber
+        case .networks: G.mint
+        case .settings: G.slate
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .containers: "Micro-VM containers, Compose stacks, logs & terminals"
+        case .images: "OCI images, builds & layer cache"
+        case .volumes: "Persistent named volumes & host bind mounts"
+        case .networks: "Switch networks, embedded DNS & published ports"
+        case .settings: "Registries, hosts, updates & daemon bridge"
+        }
+    }
+
+    var shortcutLabel: String? {
+        guard let idx = Self.allCases.firstIndex(of: self) else { return nil }
+        return "⌘\(idx + 1)"
     }
 }
 
@@ -111,39 +149,102 @@ struct RootView: View {
     @Environment(AppRouter.self) private var router
     @Environment(Dialogs.self) private var dialogs
     @Environment(FairyController.self) private var fairy
-    @State private var section: Section = .containers
-    @State private var pairing = false
     @Environment(SharedHosts.self) private var hosts
     @Environment(ShellSessions.self) private var shells
 
+    @State private var section: Section = .containers
+    @State private var pairing = false
+    @State private var paletteRunImage: String?
+    @State private var paletteBuild = false
+    @State private var paletteCleanUp = false
+    @State private var palettePull = false
+    @State private var toast: (text: String, isError: Bool)?
+
     var body: some View {
-        HStack(spacing: 0) {
-            Sidebar(selection: $section)
-                .frame(width: 232)
-                .fixedSize(horizontal: true, vertical: false)
-            Rectangle().fill(G.border).frame(width: 1)
-            Group {
-                switch section {
-                case .containers: ContainersScreen()
-                case .images: ImagesScreen()
-                case .volumes: VolumesScreen()
-                case .networks: NetworksScreen()
-                case .settings: SettingsScreen()
+        @Bindable var bindableRouter = router
+        ZStack(alignment: .bottomTrailing) {
+            HStack(spacing: 0) {
+                if !router.isSidebarCollapsed {
+                    Sidebar(selection: $section)
+                        .frame(width: 232)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .transition(.move(edge: .leading).combined(with: .opacity))
+                }
+
+                Group {
+                    switch section {
+                    case .containers: ContainersScreen()
+                    case .images: ImagesScreen()
+                    case .volumes: VolumesScreen()
+                    case .networks: NetworksScreen()
+                    case .settings: SettingsScreen()
+                    }
+                }
+                .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
+                .background(G.bg)
+                .overlay(alignment: .topLeading) {
+                    if router.isSidebarCollapsed {
+                        Button {
+                            withAnimation(.snappy(duration: 0.2)) {
+                                router.isSidebarCollapsed = false
+                            }
+                        } label: {
+                            Image(systemName: "sidebar.left")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(G.textSecondary)
+                                .frame(width: 28, height: 28)
+                                .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.top, 18)
+                        .padding(.leading, 82)
+                        .help("Show Sidebar (⌘\\)")
+                    }
+                }
+
+                if fairy.isOpen {
+                    FairyPanel()
+                        .frame(width: 380)
+                        .transition(.move(edge: .trailing))
                 }
             }
-            .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
-            .clipped()
-            .background(G.background)
+            .animation(.snappy(duration: 0.22), value: fairy.isOpen)
+            .animation(.snappy(duration: 0.2), value: router.isSidebarCollapsed)
+            .background(WindowAccessor())
+            .background(G.bg)
 
-            if fairy.isOpen {
-                Rectangle().fill(G.border).frame(width: 1)
-                FairyPanel()
-                    .frame(width: 390)
-                    .transition(.move(edge: .trailing))
+            if let toast {
+                GToastBanner(message: toast.text, isError: toast.isError) {
+                    withAnimation(.easeOut(duration: 0.15)) { self.toast = nil }
+                }
+                .padding(22)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
+            if router.isCommandPaletteOpen {
+                CommandPaletteView(
+                    isPresented: $bindableRouter.isCommandPaletteOpen,
+                    selection: $section,
+                    onOpenContainer: { id, tab in
+                        router.pending = .container(id, tab)
+                    },
+                    onRunContainer: { img in
+                        paletteRunImage = img
+                    },
+                    onPullImage: { palettePull = true },
+                    onBuildImage: { paletteBuild = true },
+                    onCleanUp: { paletteCleanUp = true },
+                    onPairMac: { pairing = true },
+                    onToggleSidebar: {
+                        withAnimation(.snappy(duration: 0.2)) { router.isSidebarCollapsed.toggle() }
+                    },
+                    onToast: { text, isError in showToast(text, isError: isError) }
+                )
+                .transition(.opacity)
             }
         }
-        .animation(.snappy(duration: 0.22), value: fairy.isOpen)
-        .background(G.background)
+        .background(G.bg)
         .ignoresSafeArea()
         .gravitonDialogs(dialogs)
         .onChange(of: section, initial: true) { _, newValue in
@@ -167,7 +268,7 @@ struct RootView: View {
                 section = .settings
                 router.pending = nil
             case .runContainer, .container:
-                section = .containers // ContainersScreen handles the rest.
+                section = .containers
             case .pairMac:
                 pairing = true
                 router.pending = nil
@@ -178,37 +279,126 @@ struct RootView: View {
         .sheet(isPresented: $pairing) {
             PairMacSheet { mac in switchHost(to: mac, store: store, hosts: hosts, shells: shells) }
         }
+        .sheet(item: Binding(
+            get: { paletteRunImage.map { PaletteImageSelection(ref: $0) } },
+            set: { paletteRunImage = $0?.ref }
+        )) { sel in
+            RunContainerSheet(initialImage: sel.ref) { c in
+                section = .containers
+                router.pending = .container(c.id, .logs)
+            }
+        }
+        .sheet(isPresented: $palettePull) {
+            PullImageSheet()
+        }
+        .sheet(isPresented: $paletteBuild) {
+            BuildImageSheet()
+        }
+        .sheet(isPresented: $paletteCleanUp) {
+            CleanUpSheet()
+        }
         .onChange(of: store.lastError, initial: true) { _, error in
             guard let error else { return }
             dialogs.alert("Something went wrong", message: error)
             store.lastError = nil
         }
     }
+
+    private func showToast(_ text: String, isError: Bool) {
+        withAnimation(.snappy(duration: 0.2)) {
+            toast = (text, isError)
+        }
+        Task {
+            try? await Task.sleep(for: .seconds(3.2))
+            await MainActor.run {
+                if toast?.text == text {
+                    withAnimation(.easeOut(duration: 0.2)) { toast = nil }
+                }
+            }
+        }
+    }
+}
+
+private struct PaletteImageSelection: Identifiable {
+    let id = UUID()
+    let ref: String
 }
 
 struct Sidebar: View {
     @Environment(EngineStore.self) private var store
+    @Environment(AppRouter.self) private var router
     @Environment(FairyController.self) private var fairy
     @Environment(UpdateChecker.self) private var updates
     @Binding var selection: Section
+    @State private var searchHover = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Room for the window's traffic lights, which sit over the sidebar.
-            Color.clear.frame(height: 40).windowDraggable()
+            // Room for the window's traffic lights above the sidebar.
+            Color.clear.frame(height: 38).windowDraggable()
 
             HStack(spacing: 10) {
-                GravitonMark(size: 26)
+                GravitonMark(size: 24)
                 VStack(alignment: .leading, spacing: 0) {
-                    Text("Graviton").font(.system(size: 14, weight: .semibold)).foregroundStyle(G.text)
-                    Text("Containers on your Macs").font(.system(size: 11)).foregroundStyle(G.faint)
+                    Text("Graviton").font(.system(size: 13.5, weight: .semibold)).foregroundStyle(G.textPrimary)
+                    Text("Containers on your Macs").font(.system(size: 10.5)).foregroundStyle(G.textMuted)
                 }
+                Spacer(minLength: 4)
+                Button {
+                    withAnimation(.snappy(duration: 0.2)) {
+                        router.isSidebarCollapsed = true
+                    }
+                } label: {
+                    Image(systemName: "sidebar.left")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(G.textMuted)
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.plain)
+                .help("Hide Sidebar (⌘\\)")
             }
             .padding(.horizontal, 16)
-            .padding(.bottom, 22)
+            .padding(.bottom, 14)
             .windowDraggable()
 
-            GCaption("Workspace").padding(.horizontal, 18).padding(.bottom, 8)
+            // Stratus-style Host Switcher pinned near top of rail.
+            HostMenu()
+                .padding(.horizontal, 12)
+                .padding(.bottom, 10)
+
+            // ⌘K Command Palette quick trigger
+            Button {
+                withAnimation(.easeOut(duration: 0.14)) {
+                    router.isCommandPaletteOpen = true
+                }
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(G.textMuted)
+                    Text("Quick jump…")
+                        .font(.system(size: 12))
+                        .foregroundStyle(G.textTertiary)
+                    Spacer()
+                    Text("⌘K")
+                        .font(G.mono(10))
+                        .foregroundStyle(G.textMuted)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(G.surfacePill, in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                }
+                .padding(.horizontal, 10)
+                .frame(height: 30)
+                .background(searchHover ? G.surfaceHover : G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onHover { searchHover = $0 }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 16)
+            .help("Open Command Palette (⌘K)")
+
+            GCaption("Workspace").padding(.horizontal, 18).padding(.bottom, 7)
             VStack(spacing: 2) {
                 ForEach(Array(Section.allCases.enumerated()), id: \.element) { i, item in
                     SidebarItem(item: item, count: count(for: item), selected: selection == item) {
@@ -227,17 +417,16 @@ struct Sidebar: View {
                     HStack(spacing: 8) {
                         Image(systemName: "arrow.down.circle.fill")
                             .font(.system(size: 12.5, weight: .semibold))
-                            .foregroundStyle(G.accent)
-                        Text("Update v\(release.version.description) available")
+                            .foregroundStyle(G.indigo)
+                        Text("Update v\(release.version.description)")
                             .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(G.text)
+                            .foregroundStyle(G.textPrimary)
                             .lineLimit(1)
                         Spacer(minLength: 0)
                     }
                     .padding(.horizontal, 10)
-                    .padding(.vertical, 7)
-                    .background(G.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(G.accent.opacity(0.32)))
+                    .padding(.vertical, 8)
+                    .background(G.indigo.opacity(0.14), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                 }
                 .buttonStyle(.plain)
                 .padding(.horizontal, 12)
@@ -245,7 +434,7 @@ struct Sidebar: View {
                 .help("Open Settings to review Graviton v\(release.version.description)")
             }
             FairySidebarButton().padding(.horizontal, 12).padding(.bottom, 8)
-            EngineCard().padding(12)
+            EngineCard().padding(.horizontal, 12).padding(.bottom, 12)
         }
         .frame(maxHeight: .infinity, alignment: .top)
         .background(G.sidebar)
@@ -256,7 +445,7 @@ struct Sidebar: View {
         case .containers: store.containers.count
         case .images: store.images.count
         case .volumes: store.volumes.count
-        case .networks: store.runningCount
+        case .networks: store.networks.count
         case .settings: nil
         }
     }
@@ -274,26 +463,27 @@ private struct SidebarItem: View {
             HStack(spacing: 10) {
                 Image(systemName: item.symbol)
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(selected ? G.accent : G.muted)
+                    .foregroundStyle(selected ? item.accent : (hovering ? G.body : G.textMuted))
                     .frame(width: 18)
                 Text(item.rawValue)
                     .font(.system(size: 13, weight: selected ? .semibold : .medium))
-                    .foregroundStyle(selected ? G.text : G.textSecondary)
+                    .foregroundStyle(selected ? G.textPrimary : (hovering ? G.textPrimary : G.textSecondary))
                 Spacer()
-                if let count, count > 0 {
-                    GBadge("\(count)", color: selected ? G.accent : G.muted)
+                if selected {
+                    Circle()
+                        .fill(item.accent)
+                        .frame(width: 5, height: 5)
+                } else if let count, count > 0 {
+                    Text("\(count)")
+                        .font(G.mono(10.5))
+                        .foregroundStyle(G.textMuted)
                 }
             }
             .padding(.horizontal, 10)
             .frame(height: 32)
             .background {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(selected ? Color(hex: 0x1B1D24) : (hovering ? Color.white.opacity(0.035) : .clear))
-                    .overlay {
-                        if selected {
-                            RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.white.opacity(0.06))
-                        }
-                    }
+                    .fill(selected ? G.surfaceActive : (hovering ? G.surfaceHover : .clear))
             }
             .contentShape(Rectangle())
         }
@@ -308,50 +498,63 @@ struct EngineCard: View {
     @Environment(EngineStore.self) private var store
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HostMenu()
+        VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 switch store.connection {
                 case .live:
-                    StatusDot(running: true)
-                    Text(store.isLocal ? "Engine running" : "Connected").fontWeight(.medium)
+                    StatusDot(running: true, size: 7)
+                    Text(store.isLocal ? "Engine running" : "Connected")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(G.textPrimary)
                 case .demo:
-                    Circle().fill(G.warning).frame(width: 8, height: 8)
-                    Text("Demo data").fontWeight(.medium)
+                    Circle().fill(G.amber).frame(width: 7, height: 7)
+                    Text("Demo data")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(G.amber)
                 case .connecting:
                     GSpinner(size: 10)
-                    Text("Connecting…").fontWeight(.medium)
+                    Text("Connecting…")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(G.textSecondary)
                 case .unreachable:
-                    Circle().fill(G.danger).frame(width: 8, height: 8)
-                    Text(store.isLocal ? "Can't reach gravitond" : "Can't reach \(store.liveName ?? "it")").fontWeight(.medium)
+                    Circle().fill(G.rose).frame(width: 7, height: 7)
+                    Text(store.isLocal ? "gravitond offline" : "\(store.liveName ?? "Host") offline")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(G.rose)
+                }
+                Spacer()
+                if let e = store.engine {
+                    Text("\(e.cpus)c")
+                        .font(G.mono(10.5))
+                        .foregroundStyle(G.textMuted)
                 }
             }
             if let e = store.engine, e.memoryBytes > 0 {
-                let hostColor: Color = e.hostMemoryFraction >= 0.93 ? G.danger
-                    : e.hostMemoryFraction >= 0.85 ? G.warning
-                    : Color(hex: 0x646E82)
+                let hostColor: Color = e.hostMemoryFraction >= 0.93 ? G.rose
+                    : e.hostMemoryFraction >= 0.85 ? G.amber
+                    : G.slate
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Text(e.hasHostMemory ? "Memory" : "VM memory")
                         Spacer()
-                        Text("\(Format.bytes(e.totalMemoryUsedBytes)) / \(Format.bytes(e.memoryBytes))").font(G.mono(11))
+                        Text("\(Format.bytes(e.totalMemoryUsedBytes)) / \(Format.bytes(e.memoryBytes))").font(G.mono(10.5))
                     }
-                    .font(.system(size: 12))
-                    .foregroundStyle(G.muted)
+                    .font(.system(size: 11))
+                    .foregroundStyle(G.textMuted)
                     StackedMeterBar([
-                        .init(e.vmMemoryFraction, color: G.accent),
+                        .init(e.vmMemoryFraction, color: G.indigo),
                         .init(e.otherHostMemoryFraction, color: hostColor),
-                    ], height: 5)
+                    ], height: 4)
                     if e.hasHostMemory {
                         HStack(spacing: 8) {
                             HStack(spacing: 4) {
-                                Circle().fill(G.accent).frame(width: 6, height: 6)
+                                Circle().fill(G.indigo).frame(width: 5.5, height: 5.5)
                                 Text("VMs \(Format.bytes(e.vmMemoryUsedBytes))")
                                     .foregroundStyle(e.vmMemoryUsedBytes > 0 ? G.textSecondary : G.faint)
                             }
                             Spacer()
                             HStack(spacing: 4) {
-                                Circle().fill(hostColor).frame(width: 6, height: 6)
+                                Circle().fill(hostColor).frame(width: 5.5, height: 5.5)
                                 Text("macOS \(Format.bytes(e.otherHostMemoryUsedBytes))")
                                     .foregroundStyle(G.faint)
                             }
@@ -359,20 +562,20 @@ struct EngineCard: View {
                         .font(G.mono(10))
                     }
                 }
-                Text("\(e.kernel) · \(e.arch) · \(e.cpus) vCPU")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(G.faint)
+                Text("\(e.kernel) · \(e.arch)")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(G.textTertiary)
+                    .lineLimit(1)
             }
             if store.connection == .demo {
                 Text("Start `gravitond` to connect.")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(G.faint)
+                    .font(.system(size: 11))
+                    .foregroundStyle(G.textTertiary)
             }
         }
-        .font(.system(size: 13))
-        .padding(14)
+        .padding(13)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .gravitonCard(Color(hex: 0x15161A))
+        .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
     }
 }
 
@@ -385,26 +588,24 @@ private struct FairySidebarButton: View {
             withAnimation(.snappy(duration: 0.22)) { fairy.toggle() }
         } label: {
             HStack(spacing: 9) {
-                FairyEyeMark(size: 16, color: fairy.isOpen || fairy.pendingApproval != nil ? G.accent : G.muted)
+                FairyEyeMark(size: 16, color: fairy.isOpen || fairy.pendingApproval != nil ? G.violet : G.textMuted)
                 Text("Ask \(fairy.fairyName)")
                     .font(.system(size: 12.5, weight: fairy.isOpen ? .semibold : .medium))
-                    .foregroundStyle(fairy.isOpen ? G.text : G.textSecondary)
+                    .foregroundStyle(fairy.isOpen ? G.textPrimary : G.textSecondary)
                 Spacer()
                 if fairy.pendingApproval != nil {
-                    Circle().fill(G.warning).frame(width: 7, height: 7)
+                    Circle().fill(G.amber).frame(width: 6.5, height: 6.5)
                 } else {
-                    Text("⌥⌘I").font(G.mono(10.5)).foregroundStyle(G.faint)
+                    Text("⌥⌘I")
+                        .font(G.mono(10))
+                        .foregroundStyle(G.textMuted)
                 }
             }
             .padding(.horizontal, 11)
             .frame(height: 34)
             .background(
                 RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(fairy.isOpen ? G.accent.opacity(0.14) : (hovering ? Color.white.opacity(0.04) : Color(hex: 0x15161A)))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(fairy.isOpen ? G.accent.opacity(0.35) : G.border)
+                    .fill(fairy.isOpen ? G.violet.opacity(0.16) : (hovering ? G.surfaceHover : G.surfaceSubtle))
             )
             .contentShape(Rectangle())
         }

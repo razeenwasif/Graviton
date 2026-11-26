@@ -20,6 +20,7 @@ struct VolumesScreen: View {
 
     private var totalBytes: UInt64 { store.volumes.map(\.sizeBytes).reduce(0, +) }
     private var unusedVolumes: [VolumeInfo] { store.volumes.filter { !$0.isInUse } }
+    private var attachedVolumesCount: Int { store.volumes.count - unusedVolumes.count }
 
     private var shownVolumes: [VolumeInfo] {
         let base = tab == .unused ? unusedVolumes : store.volumes
@@ -63,34 +64,43 @@ struct VolumesScreen: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            ScreenHeader("Volumes", subtitle: subtitle) {
-                HeaderSearch(prompt: "Search volumes", text: $search)
-                Button {
-                    Task { await reload() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                ScreenHeader("Volumes", subtitle: subtitle) {
+                    HeaderSearch(prompt: "Search volumes", text: $search)
+                    Button {
+                        Task { await reload() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.gIconBordered)
+                    .disabled(refreshing)
+                    .help("Recalculate volume sizes")
+                    Button {
+                        showCreate = true
+                    } label: {
+                        Label("New volume", systemImage: "plus")
+                    }
+                    .buttonStyle(.gPrimary)
+                    .keyboardShortcut("n")
+                    .help("Create a named volume (⌘N)")
                 }
-                .buttonStyle(.gIconBordered)
-                .disabled(refreshing)
-                .help("Recalculate volume sizes")
-                Button {
-                    showCreate = true
-                } label: {
-                    Label("New volume", systemImage: "plus")
-                }
-                .buttonStyle(.gPrimary)
-                .keyboardShortcut("n")
-                .help("Create a named volume (⌘N)")
-            }
 
-            HStack(alignment: .top, spacing: 20) {
-                VStack(alignment: .leading, spacing: 14) {
-                    GSegmented(selection: $tab, options: [
-                        (.named, "Named  \(store.volumes.count)"),
-                        (.unused, "Unused  \(unusedVolumes.count)"),
-                        (.bind, "Bind Mounts  \(allBindCount)"),
-                    ])
+                VStack(alignment: .leading, spacing: 18) {
+                    kpiStrip
+
+                    HStack(spacing: 8) {
+                        GFilterPillButton("Named", count: store.volumes.count, selected: tab == .named, accent: G.amber) {
+                            withAnimation(.snappy(duration: 0.18)) { tab = .named }
+                        }
+                        GFilterPillButton("Unused", count: unusedVolumes.count, selected: tab == .unused, accent: G.amber) {
+                            withAnimation(.snappy(duration: 0.18)) { tab = .unused }
+                        }
+                        GFilterPillButton("Bind Mounts", count: allBindCount, selected: tab == .bind, accent: G.indigo) {
+                            withAnimation(.snappy(duration: 0.18)) { tab = .bind }
+                        }
+                        Spacer()
+                    }
 
                     if tab == .bind {
                         bindContent
@@ -98,21 +108,21 @@ struct VolumesScreen: View {
                         namedContent
                     }
                 }
+                .padding(.horizontal, 28)
+                .padding(.top, 4)
+                .padding(.bottom, 22)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-
-                if tab != .bind, width >= 940, let vol = selectedVolume {
-                    VolumeInspector(volume: vol, onRemove: { confirmRemove(vol) }, onOpenContainer: openContainer)
-                        .frame(width: 330)
-                        .transition(.move(edge: .trailing).combined(with: .opacity))
-                }
             }
-            .padding(.horizontal, 28)
-            .padding(.top, 6)
-            .padding(.bottom, 22)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-            .animation(.snappy(duration: 0.2), value: selection)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(G.bg)
+
+            if tab != .bind, width >= 980, let vol = selectedVolume {
+                VolumeInspector(volume: vol, onRemove: { confirmRemove(vol) }, onOpenContainer: openContainer)
+                    .frame(width: 344)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
         }
-        .background(G.background)
+        .animation(.snappy(duration: 0.2), value: selection)
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
         .task { await reload() }
         .onChange(of: store.volumes.map(\.id)) {
@@ -130,6 +140,33 @@ struct VolumesScreen: View {
         }
     }
 
+    private var kpiStrip: some View {
+        HStack(spacing: 36) {
+            GMetricStatColumn(
+                label: "Volumes",
+                value: "\(store.volumes.count)",
+                subtitle: "\(attachedVolumesCount) attached · \(unusedVolumes.count) unused",
+                valueColor: G.amber
+            )
+            GMetricStatColumn(
+                label: "Total Size",
+                value: Format.bytes(totalBytes),
+                subtitle: "persistent storage",
+                valueColor: G.indigo
+            )
+            GMetricStatColumn(
+                label: "Bind Mounts",
+                value: "\(allBindCount)",
+                subtitle: "host directories",
+                valueColor: G.sky
+            )
+            Spacer()
+        }
+        .padding(.vertical, 14)
+        .padding(.horizontal, 18)
+        .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
     private var allBindCount: Int {
         store.containers.reduce(0) { sum, c in
             sum + c.mounts.filter { $0.source.hasPrefix("/") || $0.source.hasPrefix("~") }.count
@@ -138,14 +175,14 @@ struct VolumesScreen: View {
 
     @ViewBuilder private var namedContent: some View {
         if store.volumes.isEmpty {
-            GEmptyState("No named volumes yet", symbol: "cylinder.split.1x2",
+            GEmptyState("No named volumes yet", symbol: "internaldrive",
                         detail: "Named volumes keep data across container restarts and removals (-v name:/path). Create one here or pass one in grav run.",
                         actionTitle: "New volume") { showCreate = true }
-                .gravitonCard()
+                .gravitonCard(G.surfaceSubtle)
         } else if shownVolumes.isEmpty {
             GEmptyState("Nothing matches", symbol: "magnifyingglass",
                         detail: search.isEmpty ? "Every named volume is currently attached to a container." : "No volume matches “\(search)”.")
-                .gravitonCard()
+                .gravitonCard(G.surfaceSubtle)
         } else {
             VolumeTable(rows: shownVolumes, selection: $selection, onRemove: confirmRemove, onOpenContainer: openContainer)
         }
@@ -155,10 +192,10 @@ struct VolumesScreen: View {
         if allBindCount == 0 {
             GEmptyState("No bind mounts", symbol: "folder.badge.gearshape",
                         detail: "Share a Mac folder into a container with -v ~/code:/app or from the Run sheet.")
-                .gravitonCard()
+                .gravitonCard(G.surfaceSubtle)
         } else if bindMounts.isEmpty {
             GEmptyState("Nothing matches", symbol: "magnifyingglass", detail: "No bind mount matches “\(search)”.")
-                .gravitonCard()
+                .gravitonCard(G.surfaceSubtle)
         } else {
             BindMountTable(rows: bindMounts, onOpenContainer: openContainer)
         }
@@ -220,27 +257,25 @@ private struct VolumeTable: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                GColumnHeader("Name", key: Column.name, sort: $sort, ascending: $ascending).frame(minWidth: 140, maxWidth: .infinity)
+                GColumnHeader("Volume", key: Column.name, sort: $sort, ascending: $ascending).frame(minWidth: 140, maxWidth: .infinity)
                 GColumnHeader("Used By", key: Column.usedBy, sort: $sort, ascending: $ascending).frame(minWidth: 140, maxWidth: .infinity)
                 GColumnHeader("Files", key: Column.files, sort: $sort, ascending: $ascending, alignment: .trailing).frame(width: 64)
                 GColumnHeader("Size", key: Column.size, sort: $sort, ascending: $ascending, alignment: .trailing).frame(width: 82)
                 GColumnHeader("Created", key: Column.created, sort: $sort, ascending: $ascending).frame(width: 118)
                 Color.clear.frame(width: 28)
             }
-            .padding(.horizontal, 14)
-            .frame(height: 34)
-            .overlay(alignment: .bottom) { Rectangle().fill(G.border).frame(height: 1) }
+            .padding(.horizontal, 12)
+            .frame(height: 30)
 
             ScrollView {
-                LazyVStack(spacing: 2) {
+                LazyVStack(spacing: 3) {
                     ForEach(sorted) { v in
                         row(v)
                     }
                 }
-                .padding(6)
+                .padding(.vertical, 4)
             }
         }
-        .gravitonCard(G.surface)
         .focusable()
         .focused($focused)
         .focusEffectDisabled()
@@ -251,39 +286,38 @@ private struct VolumeTable: View {
     private func row(_ v: VolumeInfo) -> some View {
         HStack(spacing: 12) {
             HStack(spacing: 10) {
-                Image(systemName: "cylinder.split.1x2")
+                Image(systemName: "internaldrive")
                     .font(.system(size: 13))
-                    .foregroundStyle(v.isInUse ? G.accent : G.muted)
+                    .foregroundStyle(v.isInUse ? G.amber : G.textMuted)
                     .frame(width: 20)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(v.name).font(.system(size: 13, weight: .medium)).foregroundStyle(G.text).lineLimit(1)
-                    Text(v.path).font(G.mono(11)).foregroundStyle(G.faint).lineLimit(1).truncationMode(.middle)
+                    Text(v.name).font(.system(size: 13.5, weight: .semibold)).foregroundStyle(G.textPrimary).lineLimit(1)
+                    Text(v.path).font(G.mono(11)).foregroundStyle(G.textTertiary).lineLimit(1).truncationMode(.middle)
                 }
             }
             .frame(minWidth: 140, maxWidth: .infinity, alignment: .leading)
 
             Group {
                 if v.usedBy.isEmpty {
-                    Text("Unused").font(.system(size: 12)).foregroundStyle(G.faint)
+                    Text("Unused").font(.system(size: 12)).foregroundStyle(G.textTertiary)
                 } else {
                     HStack(spacing: 6) {
                         ForEach(v.usedBy.prefix(2)) { ref in
                             Button { onOpenContainer(ref.containerId) } label: {
                                 HStack(spacing: 5) {
-                                    Circle().fill(ref.running ? G.running : G.stopped).frame(width: 6, height: 6)
+                                    Circle().fill(ref.running ? G.mint : G.slate).frame(width: 5.5, height: 5.5)
                                     Text(ref.containerName).font(.system(size: 11.5, weight: .medium)).lineLimit(1)
                                 }
-                                .foregroundStyle(G.textSecondary)
-                                .padding(.horizontal, 7)
-                                .frame(height: 21)
-                                .background(G.control, in: Capsule())
-                                .overlay(Capsule().strokeBorder(G.border))
+                                .foregroundStyle(G.body)
+                                .padding(.horizontal, 8)
+                                .frame(height: 22)
+                                .background(G.surfacePill, in: Capsule())
                             }
                             .buttonStyle(.plain)
                             .help("\(ref.containerName) → \(ref.target)\(ref.readOnly ? " (read-only)" : "")")
                         }
                         if v.usedBy.count > 2 {
-                            Text("+\(v.usedBy.count - 2)").font(.system(size: 11)).foregroundStyle(G.faint)
+                            Text("+\(v.usedBy.count - 2)").font(.system(size: 11)).foregroundStyle(G.textMuted)
                         }
                     }
                 }
@@ -295,7 +329,7 @@ private struct VolumeTable: View {
             Text(Format.bytes(v.sizeBytes)).font(G.mono(12)).foregroundStyle(G.textSecondary).monospacedDigit()
                 .frame(width: 82, alignment: .trailing)
             Text(v.createdAt > 0 ? v.createdDate.formatted(.dateTime.day().month(.abbreviated).hour().minute()) : "—")
-                .font(.system(size: 12)).foregroundStyle(G.muted).lineLimit(1)
+                .font(.system(size: 12)).foregroundStyle(G.textMuted).lineLimit(1)
                 .frame(width: 118, alignment: .leading)
 
             Menu {
@@ -303,7 +337,7 @@ private struct VolumeTable: View {
             } label: {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(G.muted)
+                    .foregroundStyle(G.textMuted)
                     .frame(width: 26, height: 26)
                     .contentShape(Rectangle())
             }
@@ -311,8 +345,8 @@ private struct VolumeTable: View {
             .frame(width: 28)
             .accessibilityLabel("More actions for \(v.name)")
         }
-        .padding(.horizontal, 8)
-        .frame(height: 50)
+        .padding(.horizontal, 12)
+        .frame(height: 52)
         .gravitonRow(selected: selection == v.id)
         .simultaneousGesture(TapGesture().onEnded {
             selection = v.id
@@ -353,19 +387,19 @@ private struct VolumeInspector: View {
     var onOpenContainer: (String) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .top, spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(volume.name).font(.system(size: 16, weight: .semibold)).foregroundStyle(G.text).lineLimit(1)
-                    Text("Named volume").font(.system(size: 12)).foregroundStyle(G.muted)
+                    Text(volume.name).font(.system(size: 16, weight: .semibold)).foregroundStyle(G.textPrimary).lineLimit(1)
+                    Text("Named volume").font(.system(size: 12)).foregroundStyle(G.textMuted)
                 }
                 Spacer()
-                GBadge(volume.isInUse ? "In use" : "Unused", color: volume.isInUse ? G.running : G.muted)
+                GTagPill(volume.isInUse ? "In use" : "Unused", color: volume.isInUse ? G.mint : G.textMuted)
             }
 
             HStack(spacing: 10) {
-                statTile("Size", Format.bytes(volume.sizeBytes))
-                statTile("Files", "\(volume.fileCount)")
+                statTile("SIZE", Format.bytes(volume.sizeBytes))
+                statTile("FILES", "\(volume.fileCount)")
             }
 
             VStack(alignment: .leading, spacing: 6) {
@@ -373,7 +407,7 @@ private struct VolumeInspector: View {
                 HStack(spacing: 8) {
                     Text("-v \(volume.name):/data")
                         .font(G.mono(12))
-                        .foregroundStyle(G.textSecondary)
+                        .foregroundStyle(G.body)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .textSelection(.enabled)
@@ -382,19 +416,20 @@ private struct VolumeInspector: View {
                         .buttonStyle(GIconButtonStyle(size: 24))
                         .help("Copy mount flag")
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-                .background(G.console, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(G.border))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(G.bg, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                GCaption("Location")
-                Text(volume.path)
-                    .font(G.mono(11.5))
-                    .foregroundStyle(G.muted)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
+            GKeyValueCard("Storage") {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Host Path").font(.system(size: 11)).foregroundStyle(G.textMuted)
+                    Text(volume.path)
+                        .font(G.mono(11.5))
+                        .foregroundStyle(G.textSecondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             VStack(alignment: .leading, spacing: 8) {
@@ -402,7 +437,7 @@ private struct VolumeInspector: View {
                 if volume.usedBy.isEmpty {
                     Text("No containers mount this volume. It can be safely removed.")
                         .font(.system(size: 12.5))
-                        .foregroundStyle(G.faint)
+                        .foregroundStyle(G.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
                     VStack(spacing: 6) {
@@ -411,17 +446,16 @@ private struct VolumeInspector: View {
                                 HStack(spacing: 8) {
                                     StatusDot(running: ref.running, size: 7)
                                     VStack(alignment: .leading, spacing: 1) {
-                                        Text(ref.containerName).font(.system(size: 12.5, weight: .medium)).foregroundStyle(G.text)
+                                        Text(ref.containerName).font(.system(size: 12.5, weight: .medium)).foregroundStyle(G.textPrimary)
                                         Text(ref.target + (ref.readOnly ? " (read-only)" : ""))
-                                            .font(G.mono(11)).foregroundStyle(G.muted).lineLimit(1).truncationMode(.middle)
+                                            .font(G.mono(11)).foregroundStyle(G.textMuted).lineLimit(1).truncationMode(.middle)
                                     }
                                     Spacer()
-                                    Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(G.faint)
+                                    Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(G.textTertiary)
                                 }
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 7)
-                                .background(G.control, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(G.border))
+                                .padding(.horizontal, 11)
+                                .padding(.vertical, 8)
+                                .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                             }
                             .buttonStyle(.plain)
                         }
@@ -445,20 +479,20 @@ private struct VolumeInspector: View {
                     .help(volume.isInUse ? "Remove the containers using this volume first" : "Delete \(volume.name) from disk")
             }
         }
-        .padding(18)
+        .padding(20)
+        .padding(.top, 8)
         .frame(maxHeight: .infinity, alignment: .top)
-        .gravitonCard(G.card)
+        .background(G.inspector)
     }
 
     private func statTile(_ label: String, _ value: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(label).font(.system(size: 11)).foregroundStyle(G.faint)
-            Text(value).font(.system(size: 17, weight: .semibold)).foregroundStyle(G.text).monospacedDigit()
+            Text(label).font(.system(size: 10, weight: .semibold)).tracking(0.55).foregroundStyle(G.textMuted)
+            Text(value).font(G.statValue(18)).foregroundStyle(G.textPrimary)
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(G.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(G.border))
+        .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 }
 
@@ -500,24 +534,23 @@ private struct BindMountTable: View {
                 GColumnHeader("Access", key: Column.access, sort: $sort, ascending: $ascending).frame(width: 90)
                 Color.clear.frame(width: 28)
             }
-            .padding(.horizontal, 14)
-            .frame(height: 34)
-            .overlay(alignment: .bottom) { Rectangle().fill(G.border).frame(height: 1) }
+            .padding(.horizontal, 12)
+            .frame(height: 30)
 
             ScrollView {
-                LazyVStack(spacing: 2) {
+                LazyVStack(spacing: 3) {
                     ForEach(sorted) { item in
                         HStack(spacing: 12) {
                             HStack(spacing: 8) {
-                                Image(systemName: "folder").font(.system(size: 12)).foregroundStyle(G.chartPrimary).frame(width: 16)
-                                Text(item.mount.source).font(G.mono(12)).foregroundStyle(G.text).lineLimit(1).truncationMode(.middle)
+                                Image(systemName: "folder").font(.system(size: 12)).foregroundStyle(G.indigo).frame(width: 16)
+                                Text(item.mount.source).font(G.mono(12)).foregroundStyle(G.textPrimary).lineLimit(1).truncationMode(.middle)
                             }
                             .frame(minWidth: 160, maxWidth: .infinity, alignment: .leading)
 
                             Button { onOpenContainer(item.container.id) } label: {
                                 HStack(spacing: 6) {
                                     StatusDot(running: item.container.isRunning, size: 7)
-                                    Text(item.container.name).font(.system(size: 12.5, weight: .medium)).foregroundStyle(G.text).lineLimit(1)
+                                    Text(item.container.name).font(.system(size: 12.5, weight: .medium)).foregroundStyle(G.textPrimary).lineLimit(1)
                                 }
                             }
                             .buttonStyle(.plain)
@@ -526,7 +559,7 @@ private struct BindMountTable: View {
                             Text(item.mount.target).font(G.mono(12)).foregroundStyle(G.textSecondary).lineLimit(1).truncationMode(.middle)
                                 .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
 
-                            GBadge(item.mount.readOnly ? "Read-only" : "Read-write", color: item.mount.readOnly ? G.warning : G.muted)
+                            GTagPill(item.mount.readOnly ? "Read-only" : "Read-write", color: item.mount.readOnly ? G.amber : G.textSecondary)
                                 .frame(width: 90, alignment: .leading)
 
                             Menu {
@@ -539,22 +572,21 @@ private struct BindMountTable: View {
                                     }
                                 }
                             } label: {
-                                Image(systemName: "ellipsis").font(.system(size: 12, weight: .bold)).foregroundStyle(G.muted)
+                                Image(systemName: "ellipsis").font(.system(size: 12, weight: .bold)).foregroundStyle(G.textMuted)
                                     .frame(width: 26, height: 26).contentShape(Rectangle())
                             }
                             .gravitonMenu()
                             .frame(width: 28)
                         }
-                        .padding(.horizontal, 8)
-                        .frame(height: 44)
+                        .padding(.horizontal, 12)
+                        .frame(height: 46)
                         .gravitonRow(selected: false)
                         .onTapGesture(count: 2) { onOpenContainer(item.container.id) }
                     }
                 }
-                .padding(6)
+                .padding(.vertical, 4)
             }
         }
-        .gravitonCard(G.surface)
     }
 }
 
@@ -569,7 +601,7 @@ private struct CreateVolumeSheet: View {
     @State private var problem: String?
 
     var body: some View {
-        GSheet("New volume", subtitle: "Creates a persistent folder under Graviton's volumes directory. Mount it with -v name:/path.", symbol: "cylinder.split.1x2", width: 460) {
+        GSheet("New volume", subtitle: "Creates a persistent folder under Graviton's volumes directory. Mount it with -v name:/path.", symbol: "internaldrive", width: 460) {
             GFormRow("Name", hint: "Start with a letter or digit; letters, digits, _, . and - are allowed.") {
                 GTextField("e.g. pgdata", text: $name)
                     .disabled(working)

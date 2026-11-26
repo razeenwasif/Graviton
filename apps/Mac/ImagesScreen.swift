@@ -11,13 +11,51 @@ struct ImagesScreen: View {
     @State private var showCleanUp = false
     @State private var runImage: ImageInfo?
     @State private var search = ""
+    @State private var filter: ImageFilter = .all
     @State private var transferring: String?
     @State private var transferBanner: (tone: GStatusLine.Tone, text: String)?
 
+    enum ImageFilter: String, CaseIterable, Identifiable {
+        case all = "All", inUse = "In Use", unused = "Unused"
+        var id: String { rawValue }
+    }
+
     private var totalSize: UInt64 { store.images.map(\.sizeBytes).reduce(0, +) }
+    private var inUseCount: Int { store.images.filter { $0.usedBy > 0 }.count }
+    private var unusedCount: Int { store.images.count - inUseCount }
+
     private var shown: [ImageInfo] {
+        let base: [ImageInfo] = switch filter {
+        case .all: store.images
+        case .inUse: store.images.filter { $0.usedBy > 0 }
+        case .unused: store.images.filter { $0.usedBy == 0 }
+        }
         let q = search.trimmingCharacters(in: .whitespaces).lowercased()
-        return q.isEmpty ? store.images : store.images.filter { "\($0.repository):\($0.tag)".lowercased().contains(q) }
+        return q.isEmpty ? base : base.filter { "\($0.repository):\($0.tag)".lowercased().contains(q) }
+    }
+
+    private var diskSegments: [GBarSegment] {
+        let palette: [Color] = [G.indigo, G.sky, G.mint, G.violet, G.amber]
+        let sorted = store.images.sorted { $0.sizeBytes > $1.sizeBytes }
+        let top = Array(sorted.prefix(4))
+        let restBytes = sorted.dropFirst(4).reduce(UInt64(0)) { $0 + $1.sizeBytes }
+        var segs = top.enumerated().map { idx, img in
+            GBarSegment(
+                label: "\(img.repository):\(img.tag)",
+                value: Double(img.sizeBytes),
+                detail: Format.bytes(img.sizeBytes),
+                color: palette[idx % palette.count]
+            )
+        }
+        if restBytes > 0 {
+            segs.append(GBarSegment(
+                label: "Other (\(sorted.count - 4))",
+                value: Double(restBytes),
+                detail: Format.bytes(restBytes),
+                color: G.slate
+            ))
+        }
+        return segs
     }
 
     var body: some View {
@@ -70,38 +108,92 @@ struct ImagesScreen: View {
                     .padding(.bottom, 8)
             }
 
-            if store.images.isEmpty {
-                GEmptyState("No images yet", symbol: "square.stack.3d.up",
-                            detail: "Pull one from Docker Hub, GHCR or any OCI registry, or build one from a Dockerfile.",
-                            actionTitle: store.canManage ? "Pull an image" : nil) { showPull = true }
-            } else if shown.isEmpty {
-                GEmptyState("Nothing matches", symbol: "magnifyingglass", detail: "No image's name contains “\(search)”.")
-            } else {
-                ScrollView {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 14)], spacing: 14) {
-                        ForEach(shown) { image in
-                            ImageCard(
-                                image: image,
-                                canExport: store.canTransferFiles && transferring == nil,
-                                onRun: { runImage = $0 },
-                                onExport: pickAndExport,
-                                onRemove: confirmRemove
-                            )
+            VStack(alignment: .leading, spacing: 18) {
+                kpiStrip
+
+                HStack(spacing: 8) {
+                    ForEach(ImageFilter.allCases) { f in
+                        let cnt: Int = switch f {
+                        case .all: store.images.count
+                        case .inUse: inUseCount
+                        case .unused: unusedCount
+                        }
+                        GFilterPillButton(f.rawValue, count: cnt, selected: filter == f, accent: G.sky) {
+                            withAnimation(.snappy(duration: 0.18)) { filter = f }
                         }
                     }
-                    .padding(.horizontal, 28)
-                    .padding(.top, 6)
-                    .padding(.bottom, 22)
+                    Spacer()
+                }
+
+                if store.images.isEmpty {
+                    GEmptyState("No images yet", symbol: "square.stack.3d.up",
+                                detail: "Pull one from Docker Hub, GHCR or any OCI registry, or build one from a Dockerfile.",
+                                actionTitle: store.canManage ? "Pull an image" : nil) { showPull = true }
+                        .gravitonCard(G.surfaceSubtle)
+                } else if shown.isEmpty {
+                    GEmptyState("Nothing matches", symbol: "magnifyingglass",
+                                detail: search.isEmpty ? "No \(filter.rawValue.lowercased()) images." : "No image's name contains “\(search)”.")
+                        .gravitonCard(G.surfaceSubtle)
+                } else {
+                    ScrollView {
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 270), spacing: 14)], spacing: 14) {
+                            ForEach(shown) { image in
+                                ImageCard(
+                                    image: image,
+                                    canExport: store.canTransferFiles && transferring == nil,
+                                    onRun: { runImage = $0 },
+                                    onExport: pickAndExport,
+                                    onRemove: confirmRemove
+                                )
+                            }
+                        }
+                        .padding(.bottom, 22)
+                    }
                 }
             }
+            .padding(.horizontal, 28)
+            .padding(.top, 4)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
-        .background(G.background)
+        .background(G.bg)
         .sheet(isPresented: $showPull) { PullImageSheet() }
         .sheet(isPresented: $showBuild) { BuildImageSheet() }
         .sheet(isPresented: $showCleanUp) { CleanUpSheet() }
         .sheet(item: $runImage) { image in
             RunContainerSheet(initialImage: "\(image.repository):\(image.tag)")
         }
+    }
+
+    private var kpiStrip: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 36) {
+                GMetricStatColumn(
+                    label: "Total Images",
+                    value: "\(store.images.count)",
+                    subtitle: "\(inUseCount) attached · \(unusedCount) unused",
+                    valueColor: G.sky
+                )
+                GMetricStatColumn(
+                    label: "Disk Usage",
+                    value: Format.bytes(totalSize),
+                    subtitle: "OCI rootfs & layers",
+                    valueColor: G.indigo
+                )
+                GMetricStatColumn(
+                    label: "In Use",
+                    value: "\(inUseCount)",
+                    subtitle: "active references",
+                    valueColor: inUseCount > 0 ? G.mint : G.textPrimary
+                )
+                Spacer()
+            }
+            if !diskSegments.isEmpty && totalSize > 0 {
+                GSegmentedBar(segments: diskSegments, height: 6)
+            }
+        }
+        .padding(.vertical, 14)
+        .padding(.horizontal, 18)
+        .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
     private func pickAndImport() {
@@ -189,17 +281,23 @@ struct ImageCard: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 12) {
                 Text(image.monogram)
-                    .font(G.mono(13, weight: .medium))
-                    .foregroundStyle(G.accent)
+                    .font(G.mono(13, weight: .semibold))
+                    .foregroundStyle(G.sky)
                     .frame(width: 36, height: 36)
-                    .background(G.control, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(image.repository).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
-                    Text(image.tag).font(G.mono(12)).foregroundStyle(G.muted)
+                    .background(G.sky.opacity(0.12), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(image.repository)
+                        .font(.system(size: 13.5, weight: .semibold))
+                        .foregroundStyle(G.textPrimary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(image.tag)
+                        .font(G.mono(11.5))
+                        .foregroundStyle(G.textMuted)
                 }
                 Spacer(minLength: 0)
                 if hovering {
-                    HStack(spacing: 2) {
+                    HStack(spacing: 3) {
                         Button { onRun(image) } label: { Image(systemName: "play.fill") }
                             .help("Run a container from it")
                         Button { onExport(image) } label: { Image(systemName: "square.and.arrow.up") }
@@ -213,22 +311,26 @@ struct ImageCard: View {
                     .transition(.opacity)
                 }
             }
-            HStack(spacing: 14) {
+            HStack(spacing: 10) {
                 Text(Format.bytes(image.sizeBytes))
-                Text(image.architecture == "amd64" ? "amd64 · Rosetta" : image.architecture.replacingOccurrences(of: ",", with: " · "))
+                    .font(G.mono(12, weight: .medium))
+                    .foregroundStyle(G.textSecondary)
+                GTagPill(
+                    image.architecture == "amd64" ? "amd64 · Rosetta" : image.architecture.replacingOccurrences(of: ",", with: " · "),
+                    color: image.architecture == "amd64" ? G.amber : G.textSecondary
+                )
                 Spacer()
                 if image.usedBy == 0 {
                     Text("Unused")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(G.textTertiary)
                 } else {
-                    GBadge("\(image.usedBy) container\(image.usedBy == 1 ? "" : "s")", color: G.running)
+                    GTagPill("\(image.usedBy) in use", color: G.mint)
                 }
             }
-            .font(.system(size: 12))
-            .foregroundStyle(G.muted)
         }
         .padding(16)
-        .gravitonCard(hovering ? G.card : G.surface)
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(hovering ? Color.white.opacity(0.09) : .clear))
+        .background(hovering ? G.surfaceHover : G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .onHover { hovering = $0 }
         .animation(.easeOut(duration: 0.12), value: hovering)
         .contextMenu {

@@ -2,7 +2,7 @@ import AppKit
 import GravitonKit
 import SwiftUI
 
-/// What the menu bar panel asks the main window to show.
+/// What the menu bar panel or Command Palette asks the main window to show.
 @MainActor
 @Observable
 final class AppRouter {
@@ -23,6 +23,9 @@ final class AppRouter {
     /// Updated by the main window so Fairy knows the active screen and selected container.
     var activeSection: String = "Containers"
     var selectedContainerID: String?
+    /// Global shell chrome state.
+    var isCommandPaletteOpen = false
+    var isSidebarCollapsed = false
 }
 
 /// The menu bar item: the Graviton glyph, plus the running count if that's turned on.
@@ -42,8 +45,7 @@ struct MenuBarLabel: View {
     }
 }
 
-/// The window that drops down from the menu bar: engine status, live totals,
-/// every container with quick actions, and shortcuts into the main window.
+/// Pitch-black Stratus-style popover window from the menu bar.
 struct MenuBarPanel: View {
     @Environment(EngineStore.self) private var store
     @Environment(AppRouter.self) private var router
@@ -67,47 +69,44 @@ struct MenuBarPanel: View {
                 .padding(.horizontal, 14)
                 .padding(.bottom, 12)
 
-            Divider().overlay(G.border)
-
             containerList
-
-            Divider().overlay(G.border)
 
             PanelFooter(run: { show(.runContainer) }, images: { show(.images) })
                 .padding(.horizontal, 10)
-                .padding(.vertical, 8)
+                .padding(.vertical, 9)
+                .background(G.inspector)
         }
-        .frame(width: 340)
-        .background(G.surface)
+        .frame(width: 348)
+        .background(G.palette)
         .preferredColorScheme(.dark)
-        .tint(G.accent)
+        .tint(G.indigo)
     }
 
     @ViewBuilder private var containerList: some View {
         if store.containers.isEmpty {
             VStack(spacing: 8) {
-                Image(systemName: "shippingbox").font(.system(size: 22)).foregroundStyle(G.faint)
+                Image(systemName: "shippingbox").font(.system(size: 20)).foregroundStyle(G.textTertiary)
                 Text(store.connection == .connecting ? "Connecting…" : "No containers yet")
                     .font(.system(size: 12.5, weight: .medium)).foregroundStyle(G.textSecondary)
                 if store.canManage {
                     Button("Run a container…") { show(.runContainer) }
                         .buttonStyle(.plain)
                         .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(G.accent)
+                        .foregroundStyle(G.indigo)
                 }
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 26)
         } else {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Containers")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(G.faint)
-                    .padding(.horizontal, 8)
-                    .padding(.top, 8)
-                    .padding(.bottom, 2)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("CONTAINERS")
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.65)
+                    .foregroundStyle(G.textMuted)
+                    .padding(.horizontal, 10)
+                    .padding(.top, 4)
                 ScrollView {
-                    VStack(spacing: 1) {
+                    VStack(spacing: 2) {
                         ForEach(sorted) { c in
                             ContainerQuickRow(container: c) { tab in show(.container(c.id, tab)) }
                         }
@@ -116,12 +115,11 @@ struct MenuBarPanel: View {
                 .scrollIndicators(.automatic)
                 .frame(maxHeight: min(CGFloat(sorted.count) * 46, 46 * 6.5))
             }
-            .padding(.horizontal, 6)
-            .padding(.bottom, 6)
+            .padding(.horizontal, 8)
+            .padding(.bottom, 10)
         }
     }
 
-    /// Bring the main window forward (opening one if it was closed), then hand it the request.
     private func show(_ request: AppRouter.Request?) {
         NSApp.activate()
         if let window = NSApp.windows.first(where: { $0.identifier?.rawValue.hasPrefix("main") == true }) {
@@ -141,12 +139,12 @@ private struct PanelHeader: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            GravitonMark(size: 30)
+            GravitonMark(size: 28)
             VStack(alignment: .leading, spacing: 2) {
-                Text("Graviton").font(.system(size: 13.5, weight: .semibold)).foregroundStyle(G.text)
+                Text("Graviton").font(.system(size: 13.5, weight: .semibold)).foregroundStyle(G.textPrimary)
                 HStack(spacing: 6) {
                     statusDot
-                    Text(statusText).font(.system(size: 11.5)).foregroundStyle(G.muted).lineLimit(1)
+                    Text(statusText).font(.system(size: 11.5)).foregroundStyle(G.textMuted).lineLimit(1)
                 }
             }
             Spacer(minLength: 8)
@@ -158,9 +156,9 @@ private struct PanelHeader: View {
     @ViewBuilder private var statusDot: some View {
         switch store.connection {
         case .live: StatusDot(running: true, size: 6)
-        case .demo: Circle().fill(G.warning).frame(width: 6, height: 6)
-        case .unreachable: Circle().fill(G.danger).frame(width: 6, height: 6)
-        case .connecting: GSpinner(size: 8, color: G.warning)
+        case .demo: Circle().fill(G.amber).frame(width: 6, height: 6)
+        case .unreachable: Circle().fill(G.rose).frame(width: 6, height: 6)
+        case .connecting: GSpinner(size: 8, color: G.amber)
         }
     }
 
@@ -176,11 +174,9 @@ private struct PanelHeader: View {
     }
 }
 
-/// Three small tiles: how many are running, total CPU (with a sparkline), engine memory.
 private struct Totals: View {
     @Environment(EngineStore.self) private var store
 
-    /// The containers' CPU histories added up, newest samples aligned.
     private var cpuSeries: [Double] {
         let series = store.containers.compactMap { store.cpuHistory[$0.id] }
         let n = series.map(\.count).max() ?? 0
@@ -194,32 +190,32 @@ private struct Totals: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            tile("Running") {
+            tile("RUNNING") {
                 HStack(alignment: .firstTextBaseline, spacing: 3) {
                     Text("\(store.runningCount)").font(.system(size: 17, weight: .semibold)).monospacedDigit()
                     Text("/ \(store.containers.count)").font(.system(size: 11.5)).foregroundStyle(G.faint)
                 }
             } footer: {
                 MeterBar(store.containers.isEmpty ? 0 : Double(store.runningCount) / Double(store.containers.count),
-                         color: G.running, height: 3)
+                         color: G.mint, height: 3)
             }
 
             tile("CPU") {
                 Text(Format.percent(store.totalCPU)).font(.system(size: 17, weight: .semibold)).monospacedDigit()
             } footer: {
-                Sparkline(cpuSeries, color: G.accent, filled: true, lineWidth: 1.2).frame(height: 12)
+                Sparkline(cpuSeries, color: G.indigo, filled: true, lineWidth: 1.2).frame(height: 12)
             }
 
-            tile("Memory") {
+            tile("MEMORY") {
                 Text(Format.bytes(store.engine?.totalMemoryUsedBytes ?? store.totalMemory))
                     .font(.system(size: 17, weight: .semibold)).monospacedDigit()
             } footer: {
                 if let e = store.engine, e.memoryBytes > 0 {
-                    let hostColor: Color = e.hostMemoryFraction >= 0.93 ? G.danger
-                        : e.hostMemoryFraction >= 0.85 ? G.warning
-                        : Color(hex: 0x646E82)
+                    let hostColor: Color = e.hostMemoryFraction >= 0.93 ? G.rose
+                        : e.hostMemoryFraction >= 0.85 ? G.amber
+                        : G.slate
                     StackedMeterBar([
-                        .init(e.vmMemoryFraction, color: G.accent),
+                        .init(e.vmMemoryFraction, color: G.indigo),
                         .init(e.otherHostMemoryFraction, color: hostColor),
                     ], height: 3)
                     .help("Total \(Format.bytes(e.totalMemoryUsedBytes)) / \(Format.bytes(e.memoryBytes)) · VMs \(Format.bytes(e.vmMemoryUsedBytes)) · macOS \(Format.bytes(e.otherHostMemoryUsedBytes))")
@@ -232,18 +228,17 @@ private struct Totals: View {
 
     private func tile(_ title: String, @ViewBuilder value: () -> some View, @ViewBuilder footer: () -> some View) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text(title).font(.system(size: 10.5, weight: .medium)).foregroundStyle(G.faint)
-            value().foregroundStyle(G.text).lineLimit(1).minimumScaleFactor(0.7)
+            Text(title).font(.system(size: 9.5, weight: .semibold)).tracking(0.55).foregroundStyle(G.textMuted)
+            value().foregroundStyle(G.textPrimary).lineLimit(1).minimumScaleFactor(0.7)
             footer().frame(height: 12, alignment: .bottom)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 9)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .gravitonCard(G.card, radius: 9)
+        .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
     }
 }
 
-/// One container: status, name, image and usage; quick actions appear on hover.
 private struct ContainerQuickRow: View {
     @Environment(EngineStore.self) private var store
     var container: Container
@@ -257,8 +252,8 @@ private struct ContainerQuickRow: View {
         HStack(spacing: 10) {
             StatusDot(status: container.status, size: 7)
             VStack(alignment: .leading, spacing: 1) {
-                Text(container.name).font(.system(size: 12.5, weight: .medium)).foregroundStyle(G.text).lineLimit(1)
-                Text(container.image).font(G.mono(10.5)).foregroundStyle(G.muted).lineLimit(1).truncationMode(.middle)
+                Text(container.name).font(.system(size: 12.5, weight: .medium)).foregroundStyle(G.textPrimary).lineLimit(1)
+                Text(container.image).font(G.mono(10.5)).foregroundStyle(G.textMuted).lineLimit(1).truncationMode(.middle)
             }
             Spacer(minLength: 6)
             if hovering || busy {
@@ -267,9 +262,9 @@ private struct ContainerQuickRow: View {
                 usage
             }
         }
-        .padding(.horizontal, 8)
-        .frame(height: 45)
-        .background(hovering ? Color.white.opacity(0.05) : .clear, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .padding(.horizontal, 9)
+        .frame(height: 44)
+        .background(hovering ? G.surfaceHover : .clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .onTapGesture { open(.logs) }
@@ -284,7 +279,7 @@ private struct ContainerQuickRow: View {
                 Text(container.memoryBytes.map(Format.bytes) ?? container.statusText())
                     .font(G.mono(10.5)).foregroundStyle(G.faint)
             } else if container.isPaused {
-                Text("Paused").font(.system(size: 11, weight: .medium)).foregroundStyle(G.warning)
+                Text("Paused").font(.system(size: 11, weight: .medium)).foregroundStyle(G.amber)
             } else {
                 Text(container.statusText()).font(.system(size: 11)).foregroundStyle(G.faint)
             }
@@ -303,13 +298,13 @@ private struct ContainerQuickRow: View {
                 IconButton("terminal", help: "Open a shell") { open(.terminal) }
                 IconButton("pause.fill", help: "Pause") { lifecycle { await store.pause(container) } }
                 IconButton("arrow.counterclockwise", help: "Restart") { lifecycle { await store.restart(container) } }
-                IconButton("stop.fill", help: "Stop", tint: G.danger) { lifecycle { await store.stop(container) } }
+                IconButton("stop.fill", help: "Stop", tint: G.rose) { lifecycle { await store.stop(container) } }
             } else if container.isPaused {
-                IconButton("play.fill", help: "Resume", tint: G.running) { lifecycle { await store.unpause(container) } }
+                IconButton("play.fill", help: "Resume", tint: G.mint) { lifecycle { await store.unpause(container) } }
                 IconButton("arrow.counterclockwise", help: "Restart") { lifecycle { await store.restart(container) } }
-                IconButton("stop.fill", help: "Stop", tint: G.danger) { lifecycle { await store.stop(container) } }
+                IconButton("stop.fill", help: "Stop", tint: G.rose) { lifecycle { await store.stop(container) } }
             } else {
-                IconButton("play.fill", help: "Start", tint: G.running) { lifecycle { await store.start(container) } }
+                IconButton("play.fill", help: "Start", tint: G.mint) { lifecycle { await store.start(container) } }
             }
         }
     }
@@ -385,7 +380,7 @@ private struct PanelFooter: View {
             } label: {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(G.muted)
+                    .foregroundStyle(G.textMuted)
                     .frame(width: 26, height: 24)
                     .contentShape(Rectangle())
             }
@@ -415,14 +410,13 @@ private struct FooterButton: View {
                 .foregroundStyle(enabled ? G.textSecondary : G.faint)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 5)
-                .background(hovering && enabled ? Color.white.opacity(0.07) : .clear, in: RoundedRectangle(cornerRadius: 6))
+                .background(hovering && enabled ? G.surfaceHover : .clear, in: RoundedRectangle(cornerRadius: 6))
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
     }
 }
 
-/// A small borderless icon button with a hover highlight.
 private struct IconButton: View {
     var symbol: String
     var help: String
@@ -441,9 +435,9 @@ private struct IconButton: View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 11.5, weight: .medium))
-                .foregroundStyle(hovering ? tint : G.muted)
+                .foregroundStyle(hovering ? tint : G.textMuted)
                 .frame(width: 24, height: 24)
-                .background(hovering ? Color.white.opacity(0.08) : .clear, in: RoundedRectangle(cornerRadius: 6))
+                .background(hovering ? G.surfaceHover : .clear, in: RoundedRectangle(cornerRadius: 6))
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }

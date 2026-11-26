@@ -37,7 +37,7 @@ struct SettingsScreen: View {
             }
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 20) {
                     if let banner = statusBanner {
                         GStatusLine(banner.tone, banner.text)
                     }
@@ -45,13 +45,14 @@ struct SettingsScreen: View {
                     loginsCard
                     updatesCard
                     generalCard
+                    aboutCard
                 }
-                .frame(maxWidth: 820, alignment: .leading)
+                .frame(maxWidth: 780, alignment: .leading)
                 .padding(.horizontal, 28)
                 .padding(.vertical, 16)
             }
         }
-        .background(G.background)
+        .background(G.bg)
         .task(id: "\(hostLabel)-\(store.connection == .live)") {
             await store.loadRegistryLogins()
         }
@@ -67,26 +68,26 @@ struct SettingsScreen: View {
             HStack(spacing: 8) {
                 GCaption("OCI Registry Logins")
                 if !store.registryLogins.isEmpty {
-                    GBadge("\(store.registryLogins.count)", color: G.accent)
+                    GTagPill("\(store.registryLogins.count)", color: G.indigo)
                 }
                 Spacer()
             }
             Text("Usernames are stored in registries.json (mode 0600) on \(hostLabel); passwords and tokens live in \(store.isLocal ? "this Mac's" : "\(hostLabel)'s") login Keychain under service dev.graviton.registry.")
                 .font(.system(size: 12.5))
-                .foregroundStyle(G.muted)
+                .foregroundStyle(G.textMuted)
 
             if store.registryLogins.isEmpty {
                 HStack(spacing: 12) {
                     Image(systemName: "key")
                         .font(.system(size: 16))
-                        .foregroundStyle(G.faint)
+                        .foregroundStyle(G.textTertiary)
                     VStack(alignment: .leading, spacing: 2) {
                         Text("No saved registry logins")
                             .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(G.textSecondary)
+                            .foregroundStyle(G.textPrimary)
                         Text("Sign in to push images or pull private repositories.")
                             .font(.system(size: 12))
-                            .foregroundStyle(G.faint)
+                            .foregroundStyle(G.textMuted)
                     }
                     Spacer()
                     Button("Sign In…") { showLogin = true }
@@ -94,26 +95,22 @@ struct SettingsScreen: View {
                         .disabled(!store.canManage)
                 }
                 .padding(14)
-                .background(G.background.opacity(0.6), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(G.border))
+                .background(G.bg, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             } else {
-                VStack(spacing: 0) {
-                    ForEach(Array(store.registryLogins.enumerated()), id: \.element.id) { idx, login in
-                        if idx > 0 {
-                            Rectangle().fill(G.border).frame(height: 1)
-                        }
+                VStack(spacing: 6) {
+                    ForEach(store.registryLogins) { login in
                         HStack(spacing: 12) {
                             Image(systemName: "lock.shield")
                                 .font(.system(size: 14))
-                                .foregroundStyle(G.accent)
+                                .foregroundStyle(G.indigo)
                                 .frame(width: 24)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(login.registry)
                                     .font(G.mono(13, weight: .medium))
-                                    .foregroundStyle(G.text)
+                                    .foregroundStyle(G.textPrimary)
                                 Text(login.username)
                                     .font(G.mono(11.5))
-                                    .foregroundStyle(G.muted)
+                                    .foregroundStyle(G.textMuted)
                             }
                             Spacer()
                             Button {
@@ -130,15 +127,14 @@ struct SettingsScreen: View {
                         }
                         .padding(.horizontal, 14)
                         .padding(.vertical, 11)
+                        .background(G.bg, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                     }
                 }
-                .background(G.background.opacity(0.6), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(G.border))
             }
         }
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .gravitonCard()
+        .gravitonCard(G.surfaceSubtle)
     }
 
     private var updatesCard: some View {
@@ -146,7 +142,7 @@ struct SettingsScreen: View {
         return VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 10) {
                 GCaption("Updates")
-                GBadge("v\(updates.currentVersion)", color: G.muted)
+                GTagPill("v\(updates.currentVersion)", color: G.textSecondary)
                 Spacer()
                 Button {
                     Task { await updates.checkNow(userInitiated: true) }
@@ -176,11 +172,11 @@ struct SettingsScreen: View {
             if let checkedAt = updates.lastCheckedAt {
                 Text("Last checked \(checkedAt.formatted(date: .abbreviated, time: .shortened)) against GitHub Releases.")
                     .font(.system(size: 12))
-                    .foregroundStyle(G.faint)
+                    .foregroundStyle(G.textTertiary)
             } else {
                 Text("Checks GitHub Releases (razeenwasif/Graviton) for new signed DMG releases.")
                     .font(.system(size: 12))
-                    .foregroundStyle(G.faint)
+                    .foregroundStyle(G.textTertiary)
             }
 
             switch updates.state {
@@ -194,10 +190,10 @@ struct SettingsScreen: View {
                     HStack(spacing: 8) {
                         Text(info.title)
                             .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(G.text)
-                        GBadge("v\(info.version)", color: G.accent)
+                            .foregroundStyle(G.textPrimary)
+                        GTagPill("v\(info.version)", color: G.indigo)
                         if skipped {
-                            GBadge("Skipped", color: G.muted)
+                            GTagPill("Skipped", color: G.textMuted)
                         }
                         Spacer()
                     }
@@ -230,8 +226,7 @@ struct SettingsScreen: View {
                     }
                 }
                 .padding(14)
-                .background(G.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(G.accent.opacity(0.28)))
+                .background(G.indigo.opacity(0.10), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             case let .unavailable(message):
                 GStatusLine(.info, message)
             case let .failed(message):
@@ -240,7 +235,7 @@ struct SettingsScreen: View {
         }
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .gravitonCard()
+        .gravitonCard(G.surfaceSubtle)
     }
 
     private static func trimmedReleaseNotes(_ notes: String) -> String {
@@ -264,27 +259,26 @@ struct SettingsScreen: View {
                 .toggleStyle(.gSwitch)
                 .disabled(!showsMenuBarExtra)
 
-            Rectangle().fill(G.border).frame(height: 1)
-
-            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 10) {
                 GridRow(alignment: .firstTextBaseline) {
-                    Text("Active host").foregroundStyle(G.muted).frame(width: 150, alignment: .leading)
-                    Text(hostLabel).font(G.mono(12))
+                    Text("Active host").foregroundStyle(G.textMuted).frame(width: 150, alignment: .leading)
+                    Text(hostLabel).font(G.mono(12)).foregroundStyle(G.body)
                 }
                 if let e = store.engine {
                     GridRow(alignment: .firstTextBaseline) {
-                        Text("Guest kernel").foregroundStyle(G.muted).frame(width: 150, alignment: .leading)
-                        Text(e.kernel).font(G.mono(12))
+                        Text("Guest kernel").foregroundStyle(G.textMuted).frame(width: 150, alignment: .leading)
+                        Text(e.kernel).font(G.mono(12)).foregroundStyle(G.body)
                     }
                     GridRow(alignment: .firstTextBaseline) {
-                        Text("Rosetta (amd64)").foregroundStyle(G.muted).frame(width: 150, alignment: .leading)
-                        Text(e.rosetta == true ? "Available" : "Not installed").font(G.mono(12))
-                            .foregroundStyle(e.rosetta == true ? G.running : G.muted)
+                        Text("Rosetta (amd64)").foregroundStyle(G.textMuted).frame(width: 150, alignment: .leading)
+                        Text(e.rosetta == true ? "Available" : "Not installed")
+                            .font(G.mono(12))
+                            .foregroundStyle(e.rosetta == true ? G.mint : G.textMuted)
                     }
                 }
                 if store.isLocal {
                     GridRow(alignment: .center) {
-                        Text("Docker CLI bridge").foregroundStyle(G.muted).frame(width: 150, alignment: .leading)
+                        Text("Docker CLI bridge").foregroundStyle(G.textMuted).frame(width: 150, alignment: .leading)
                         HStack(spacing: 10) {
                             Text("eval \"$(grav docker-env)\"")
                                 .font(G.mono(12))
@@ -304,11 +298,30 @@ struct SettingsScreen: View {
                     }
                 }
             }
+            .padding(.top, 6)
             .font(.system(size: 13))
         }
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .gravitonCard()
+        .gravitonCard(G.surfaceSubtle)
+    }
+
+    private var aboutCard: some View {
+        HStack(spacing: 14) {
+            GravitonMark(size: 40)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Graviton")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(G.textPrimary)
+                Text("Native Apple-silicon micro-VM container runtime · Version \(updates.currentVersion)")
+                    .font(.system(size: 12))
+                    .foregroundStyle(G.textMuted)
+            }
+            Spacer()
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .gravitonCard(G.surfaceSubtle)
     }
 
     private func confirmLogout(_ login: RegistryLoginInfo) {
@@ -394,7 +407,7 @@ struct RegistryLoginSheet: View {
                     } label: {
                         Image(systemName: revealPassword ? "eye.slash" : "eye")
                             .font(.system(size: 12))
-                            .foregroundStyle(G.muted)
+                            .foregroundStyle(G.textMuted)
                     }
                     .buttonStyle(.plain)
                     .help(revealPassword ? "Hide secret" : "Show secret")

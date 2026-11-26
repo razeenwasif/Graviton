@@ -3,8 +3,7 @@ import GravitonKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// The Files tab: browse a running container's filesystem (volumes included),
-/// preview files, and upload or download files and folders.
+/// The Files tab: Stratus-style borderless two-column container filesystem browser & live preview.
 struct FilesPanel: View {
     @Environment(EngineStore.self) private var store
     var container: Container
@@ -43,7 +42,6 @@ struct FilesPanel: View {
             }
             return ascending ? out : out.reversed()
         }
-        // Folders stay first whichever column sorts.
         return ordered(all.filter(\.isDirectory)) + ordered(all.filter { !$0.isDirectory })
     }
 
@@ -66,24 +64,27 @@ struct FilesPanel: View {
                         }
                 }
                 HSplitView {
-                    list.frame(minWidth: 380, maxHeight: .infinity)
-                    previewPane.frame(minWidth: 280, idealWidth: 420, maxHeight: .infinity)
+                    list
+                        .frame(minWidth: 380, maxHeight: .infinity)
+                        .background(G.inspector)
+                    previewPane
+                        .frame(minWidth: 280, idealWidth: 420, maxHeight: .infinity)
+                        .background(G.console)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .gravitonCard()
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 .overlay {
                     if dropTargeted {
                         RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .strokeBorder(G.accent, lineWidth: 2)
-                            .background(G.accent.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .strokeBorder(G.indigo, lineWidth: 2)
+                            .background(G.indigo.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                             .overlay(alignment: .bottom) {
                                 Label("Drop to upload into \(path)", systemImage: "square.and.arrow.up")
                                     .font(.system(size: 12.5, weight: .medium))
-                                    .foregroundStyle(G.text)
+                                    .foregroundStyle(G.textPrimary)
                                     .padding(.horizontal, 14)
                                     .padding(.vertical, 8)
-                                    .background(G.raised, in: Capsule())
-                                    .overlay(Capsule().strokeBorder(G.accent.opacity(0.5)))
+                                    .background(G.surfacePill, in: Capsule())
                                     .padding(.bottom, 16)
                             }
                             .allowsHitTesting(false)
@@ -92,7 +93,7 @@ struct FilesPanel: View {
                 .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { handleDrop($0) }
             }
             .padding(.horizontal, 28)
-            .padding(.vertical, 18)
+            .padding(.vertical, 16)
             .task(id: "\(container.id)|\(path)") { await load() }
         }
     }
@@ -110,14 +111,13 @@ struct FilesPanel: View {
                     Button(crumb.name) { open(crumb.path) }
                         .buttonStyle(.plain)
                         .font(G.mono(12.5, weight: i == crumbs.count - 1 ? .medium : .regular))
-                        .foregroundStyle(i == crumbs.count - 1 ? G.text : G.muted)
+                        .foregroundStyle(i == crumbs.count - 1 ? G.textPrimary : G.textMuted)
                         .padding(.horizontal, 4)
                 }
             }
-            .padding(.horizontal, 8)
+            .padding(.horizontal, 10)
             .frame(height: 32)
-            .background(G.surface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(G.border))
+            .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             Spacer()
             GTextField("Go to path", text: $goTo)
                 .onSubmit {
@@ -162,7 +162,6 @@ struct FilesPanel: View {
             }
             .padding(.horizontal, 16)
             .frame(height: 32)
-            .overlay(alignment: .bottom) { Rectangle().fill(G.border).frame(height: 1) }
 
             ScrollView {
                 LazyVStack(spacing: 1) {
@@ -203,20 +202,20 @@ struct FilesPanel: View {
             HStack(spacing: 8) {
                 Image(systemName: icon(e))
                     .font(.system(size: 12))
-                    .foregroundStyle(e.isDirectory ? G.chartPrimary : G.muted)
+                    .foregroundStyle(e.isDirectory ? G.indigo : G.textMuted)
                     .frame(width: 16)
-                Text(e.name).font(.system(size: 12.5)).foregroundStyle(G.text).lineLimit(1)
+                Text(e.name).font(.system(size: 12.5)).foregroundStyle(G.textPrimary).lineLimit(1)
                 if let target = e.linkTarget {
-                    Text("→ \(target)").font(.system(size: 12)).foregroundStyle(G.faint).lineLimit(1).truncationMode(.middle)
+                    Text("→ \(target)").font(.system(size: 12)).foregroundStyle(G.textTertiary).lineLimit(1).truncationMode(.middle)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            Text(e.isDirectory ? "—" : Format.bytes(e.size)).font(.system(size: 12)).foregroundStyle(G.muted).monospacedDigit()
+            Text(e.isDirectory ? "—" : Format.bytes(e.size)).font(.system(size: 12)).foregroundStyle(G.textMuted).monospacedDigit()
                 .frame(width: 64, alignment: .trailing)
             Text(e.modifiedDate, format: .dateTime.day().month(.abbreviated).year().hour().minute())
-                .font(.system(size: 12)).foregroundStyle(G.muted).lineLimit(1)
+                .font(.system(size: 12)).foregroundStyle(G.textMuted).lineLimit(1)
                 .frame(width: 130, alignment: .leading)
-            Text(e.permissions).font(G.mono(11.5)).foregroundStyle(G.faint)
+            Text(e.permissions).font(G.mono(11.5)).foregroundStyle(G.textTertiary)
                 .frame(width: 84, alignment: .leading)
         }
         .padding(.horizontal, 10)
@@ -252,9 +251,11 @@ struct FilesPanel: View {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 8) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(preview.path.split(separator: "/").last.map(String.init) ?? preview.path).font(.system(size: 13, weight: .medium))
+                        Text(preview.path.split(separator: "/").last.map(String.init) ?? preview.path)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(G.textPrimary)
                         Text(preview.truncated ? "First \(Format.bytes(UInt64(preview.data.count))) of \(Format.bytes(preview.size))" : Format.bytes(preview.size))
-                            .font(.system(size: 11.5)).foregroundStyle(G.faint)
+                            .font(.system(size: 11.5)).foregroundStyle(G.textMuted)
                     }
                     Spacer()
                     Button("Download", systemImage: "square.and.arrow.down") {
@@ -267,15 +268,16 @@ struct FilesPanel: View {
                         Button("Copy", systemImage: "doc.on.doc") { copy(text) }.buttonStyle(.g(.secondary, size: .small))
                     }
                 }
-                .padding(12)
-                Rectangle().fill(G.border).frame(height: 1)
+                .padding(14)
+                .background(G.surfaceSubtle)
+
                 ScrollView([.vertical, .horizontal]) {
                     Text(preview.text ?? hexDump(preview.data))
                         .font(G.mono(12))
-                        .foregroundStyle(preview.text == nil ? G.muted : G.textSecondary)
+                        .foregroundStyle(preview.text == nil ? G.textMuted : G.body)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .topLeading)
-                        .padding(12)
+                        .padding(14)
                 }
                 .background(G.console)
             }
@@ -291,7 +293,6 @@ struct FilesPanel: View {
         switch e.kind {
         case .directory: open(join(path, e.name))
         case .symlink:
-            // A link may point at a folder: try listing it, else preview it.
             let target = join(path, e.name)
             Task {
                 if (try? await store.listFiles(in: container.id, path: target)) != nil { open(target) } else { await loadPreview(target) }
@@ -471,7 +472,6 @@ private func parent(of path: String) -> String {
     return "/" + parts.joined(separator: "/")
 }
 
-/// `xxd`-style dump of the first 512 bytes.
 private func hexDump(_ bytes: [UInt8]) -> String {
     let shown = bytes.prefix(512)
     var lines: [String] = ["Binary file. First \(shown.count) bytes:", ""]

@@ -2,9 +2,37 @@ import AppKit
 import GravitonKit
 import SwiftUI
 
-/// The top of every screen, in place of the window's title bar: a title, a
-/// subtitle, and the screen's actions. Dragging it moves the window and a
-/// double-click zooms it, as a title bar would.
+/// Configures the NSWindow so pitch-black sidebars and canvases extend cleanly
+/// beneath transparent macOS titlebars and traffic lights, matching Stratus.
+struct WindowAccessor: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async { [weak view] in
+            guard let window = view?.window else { return }
+            configure(window)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async { [weak nsView] in
+            guard let window = nsView?.window else { return }
+            configure(window)
+        }
+    }
+
+    @MainActor
+    private func configure(_ window: NSWindow) {
+        window.backgroundColor = .black
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.styleMask.insert(.fullSizeContentView)
+        window.isMovableByWindowBackground = true
+    }
+}
+
+/// Top header of every screen: Stratus page title, muted subtitle, and right-aligned actions.
 struct ScreenHeader<Actions: View>: View {
     var title: String
     var subtitle: String?
@@ -30,27 +58,30 @@ struct ScreenHeader<Actions: View>: View {
                 Button(back.title, action: back.action)
                     .buttonStyle(.plain)
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(G.muted)
+                    .foregroundStyle(G.textSecondary)
                 Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(G.faint)
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                    .font(.system(size: 19, weight: .semibold))
+                    .font(G.pageTitle())
                     .kerning(-0.4)
-                    .foregroundStyle(G.text)
+                    .foregroundStyle(G.textPrimary)
                     .lineLimit(1)
                 if let subtitle {
-                    Text(subtitle).font(.system(size: 12)).foregroundStyle(G.muted).lineLimit(1)
+                    Text(subtitle)
+                        .font(.system(size: 12))
+                        .foregroundStyle(G.textMuted)
+                        .lineLimit(1)
                 }
             }
             Spacer(minLength: 16)
             HStack(spacing: 8) { actions }
         }
         .padding(.horizontal, 28)
-        .padding(.top, 18)
+        .padding(.top, 20)
         .padding(.bottom, 14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(G.background)
+        .background(G.bg)
         .windowDraggable()
     }
 }
@@ -65,22 +96,13 @@ extension View {
     }
 }
 
-/// A search field for a screen header.
+/// Borderless search field for a screen header.
 struct HeaderSearch: View {
     var prompt: String
     @Binding var text: String
 
     var body: some View {
-        HStack(spacing: 0) {
-            GTextField(prompt, text: $text)
-            if !text.isEmpty {
-                Button { text = "" } label: { Image(systemName: "xmark.circle.fill") }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(G.faint)
-                    .help("Clear")
-            }
-        }
-        .gravitonField(height: 32, icon: "magnifyingglass")
-        .frame(width: 220)
+        GBorderlessSearchField(prompt, text: $text)
+            .frame(width: 224)
     }
 }

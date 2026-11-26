@@ -69,8 +69,7 @@ struct RunContainerSheet: View {
                         .foregroundStyle(G.textSecondary)
                         .padding(.horizontal, 12)
                         .frame(height: 34)
-                        .background(G.control, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(G.borderStrong))
+                        .background(G.surfacePill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                     }
                     .gravitonMenu()
                     .help("Images already pulled")
@@ -99,7 +98,7 @@ struct RunContainerSheet: View {
                 HStack(spacing: 14) {
                     GStepper(value: $cpus, in: 1...maxCPUs) { "\($0) vCPU" }
                     GSegmented(selection: $memoryMib, options: Self.memoryChoices.map { ($0, $0 < 1024 ? "\($0) MB" : "\($0 / 1024) GB") })
-                    Text("memory").font(.system(size: 12)).foregroundStyle(G.faint)
+                    Text("memory").font(.system(size: 12)).foregroundStyle(G.textTertiary)
                 }
             }
             GFormRow("Restart", hint: "Bring it back on failure or when gravitond starts.") {
@@ -113,15 +112,15 @@ struct RunContainerSheet: View {
                     HStack(spacing: 8) {
                         Image(systemName: showSecurity ? "chevron.down" : "chevron.right")
                             .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(G.muted)
+                            .foregroundStyle(G.textMuted)
                             .frame(width: 12)
                         Text("Security & Runtime")
                             .font(.system(size: 12.5, weight: .medium))
                             .foregroundStyle(G.textSecondary)
                         if securityActiveCount > 0 {
-                            GBadge("\(securityActiveCount)", color: G.accent)
+                            GTagPill("\(securityActiveCount)", color: G.indigo)
                         } else if badTmpfs != nil {
-                            GBadge("!", color: G.danger)
+                            GTagPill("!", color: G.rose)
                         }
                         Spacer()
                     }
@@ -152,9 +151,8 @@ struct RunContainerSheet: View {
                                 .gravitonField(mono: true, height: nil, invalid: badTmpfs != nil)
                         }
                     }
-                    .padding(12)
-                    .background(G.background.opacity(0.6), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(G.border))
+                    .padding(14)
+                    .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
             }
 

@@ -46,16 +46,15 @@ struct BuildImageSheet: View {
             GFormRow("Folder", error: !folder.isEmpty && !hasDockerfile ? "No \(dockerfile.isEmpty ? "Dockerfile" : dockerfile) in this folder." : nil) {
                 HStack(spacing: 8) {
                     HStack(spacing: 8) {
-                        Image(systemName: "folder").font(.system(size: 12)).foregroundStyle(folder.isEmpty ? G.faint : G.accent)
+                        Image(systemName: "folder").font(.system(size: 12)).foregroundStyle(folder.isEmpty ? G.faint : G.indigo)
                         Text(folder.isEmpty ? "Choose a folder…" : (folder as NSString).abbreviatingWithTildeInPath)
                             .font(G.mono(12.5))
-                            .foregroundStyle(folder.isEmpty ? G.faint : G.text)
+                            .foregroundStyle(folder.isEmpty ? G.faint : G.textPrimary)
                             .lineLimit(1).truncationMode(.middle)
                     }
                     .padding(.horizontal, 11)
                     .frame(maxWidth: .infinity, minHeight: 32, alignment: .leading)
-                    .background(G.background, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(G.borderStrong))
+                    .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                     .contentShape(Rectangle())
                     .onTapGesture { if !building { choose() } }
                     Button("Choose…", action: choose).buttonStyle(.gSecondary).disabled(building)
@@ -90,21 +89,20 @@ struct BuildImageSheet: View {
                                 .id(i)
                         }
                         if lines.isEmpty {
-                            Text("The build log shows here.").font(G.mono(11.5)).foregroundStyle(G.faint)
+                            Text("The build log shows here.").font(G.mono(11.5)).foregroundStyle(G.textTertiary)
                         }
                     }
                     .padding(12)
                 }
                 .frame(height: 210)
                 .background(G.console, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(G.border))
                 .onChange(of: lines.count) { proxy.scrollTo(lines.count - 1, anchor: .bottom) }
             }
 
             status
         } footer: {
             if building {
-                Text("Closing this window stops watching; the build carries on.").font(.system(size: 11.5)).foregroundStyle(G.faint)
+                Text("Closing this window stops watching; the build carries on.").font(.system(size: 11.5)).foregroundStyle(G.textTertiary)
             }
             Spacer()
             Button("Close") {
@@ -143,11 +141,10 @@ struct BuildImageSheet: View {
             .gravitonField(mono: true)
     }
 
-    /// Step headers stand out; Graviton's own notes are dimmer than the program's output.
     private func style(_ line: String) -> Color {
-        if line.hasPrefix("Step ") { return G.text }
-        if line.hasPrefix(" --->") || line.hasPrefix("Building ") || line.hasPrefix("Built ") { return G.faint }
-        return G.textSecondary
+        if line.hasPrefix("Step ") { return G.textPrimary }
+        if line.hasPrefix(" --->") || line.hasPrefix("Building ") || line.hasPrefix("Built ") { return G.textTertiary }
+        return G.body
     }
 
     private func choose() {

@@ -23,76 +23,76 @@ struct ContainerDetailScreen: View {
     var body: some View {
         if let c = store.container(containerID) {
             VStack(alignment: .leading, spacing: 0) {
-                VStack(alignment: .leading, spacing: 0) {
-                    ScreenHeader(c.name, subtitle: c.image, back: ("Containers", onBack)) {
-                        StatusPill(c, showUptime: true)
-                        Rectangle().fill(G.border).frame(width: 1, height: 20).padding(.horizontal, 4)
-                        Button {
-                            tab = .terminal
-                        } label: {
-                            Label("Terminal", systemImage: "terminal")
-                        }
-                        .buttonStyle(.gSecondary)
-                        .disabled(!c.isRunning)
-                        Button {
-                            showCommit = true
-                        } label: {
-                            Label("Commit", systemImage: "camera.aperture")
-                        }
-                        .buttonStyle(.gSecondary)
-                        .disabled(!store.canManage)
-                        .help(store.canManage ? "Snapshot this container into a new local image" : "Start gravitond to commit containers")
-                        if c.isRunning {
-                            Button {
-                                Task { await store.pause(c) }
-                            } label: {
-                                Label("Pause", systemImage: "pause.fill")
-                            }
-                            .buttonStyle(.gSecondary)
-                            Button {
-                                Task { await store.restart(c) }
-                            } label: {
-                                Label("Restart", systemImage: "arrow.clockwise")
-                            }
-                            .buttonStyle(.gSecondary)
-                            Button {
-                                Task { await store.stop(c) }
-                            } label: {
-                                Label("Stop", systemImage: "stop.fill")
-                            }
-                            .buttonStyle(.gDanger)
-                        } else if c.isPaused {
-                            Button {
-                                Task { await store.unpause(c) }
-                            } label: {
-                                Label("Resume", systemImage: "play.fill")
-                            }
-                            .buttonStyle(.gPrimary)
-                            Button {
-                                Task { await store.restart(c) }
-                            } label: {
-                                Label("Restart", systemImage: "arrow.clockwise")
-                            }
-                            .buttonStyle(.gSecondary)
-                            Button {
-                                Task { await store.stop(c) }
-                            } label: {
-                                Label("Stop", systemImage: "stop.fill")
-                            }
-                            .buttonStyle(.gDanger)
-                        } else {
-                            Button {
-                                Task { await store.start(c) }
-                            } label: {
-                                Label("Start", systemImage: "play.fill")
-                            }
-                            .buttonStyle(.gPrimary)
-                        }
+                ScreenHeader(c.name, subtitle: c.image, back: ("Containers", onBack)) {
+                    StatusPill(c, showUptime: true)
+                    Button {
+                        tab = .terminal
+                    } label: {
+                        Label("Terminal", systemImage: "terminal")
                     }
-                    TabStrip(selection: $tab)
-                        .padding(.horizontal, 28)
+                    .buttonStyle(.gSecondary)
+                    .disabled(!c.isRunning)
+
+                    Button {
+                        showCommit = true
+                    } label: {
+                        Label("Commit", systemImage: "camera.aperture")
+                    }
+                    .buttonStyle(.gSecondary)
+                    .disabled(!store.canManage)
+                    .help(store.canManage ? "Snapshot this container into a new local image" : "Start gravitond to commit containers")
+
+                    if c.isRunning {
+                        Button {
+                            Task { await store.pause(c) }
+                        } label: {
+                            Label("Pause", systemImage: "pause.fill")
+                        }
+                        .buttonStyle(.gSecondary)
+                        Button {
+                            Task { await store.restart(c) }
+                        } label: {
+                            Label("Restart", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.gSecondary)
+                        Button {
+                            Task { await store.stop(c) }
+                        } label: {
+                            Label("Stop", systemImage: "stop.fill")
+                        }
+                        .buttonStyle(.gDanger)
+                    } else if c.isPaused {
+                        Button {
+                            Task { await store.unpause(c) }
+                        } label: {
+                            Label("Resume", systemImage: "play.fill")
+                        }
+                        .buttonStyle(.gPrimary)
+                        Button {
+                            Task { await store.restart(c) }
+                        } label: {
+                            Label("Restart", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.gSecondary)
+                        Button {
+                            Task { await store.stop(c) }
+                        } label: {
+                            Label("Stop", systemImage: "stop.fill")
+                        }
+                        .buttonStyle(.gDanger)
+                    } else {
+                        Button {
+                            Task { await store.start(c) }
+                        } label: {
+                            Label("Start", systemImage: "play.fill")
+                        }
+                        .buttonStyle(.gPrimary)
+                    }
                 }
-                .overlay(alignment: .bottom) { Rectangle().fill(G.border).frame(height: 1) }
+
+                TabStrip(selection: $tab)
+                    .padding(.horizontal, 28)
+                    .padding(.bottom, 8)
 
                 Group {
                     switch tab {
@@ -106,7 +106,7 @@ struct ContainerDetailScreen: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .background(G.background)
+            .background(G.bg)
             .sheet(isPresented: $showCommit) {
                 CommitContainerSheet(container: c)
             }
@@ -116,37 +116,22 @@ struct ContainerDetailScreen: View {
                 GEmptyState("Container not found", symbol: "shippingbox", detail: "It may have been removed.",
                             actionTitle: "Back to Containers", action: onBack)
             }
+            .background(G.bg)
         }
     }
 }
 
 struct TabStrip: View {
     @Binding var selection: DetailTab
-    @Namespace private var underline
 
     var body: some View {
-        HStack(spacing: 22) {
+        HStack(spacing: 6) {
             ForEach(DetailTab.allCases) { tab in
-                Button {
-                    selection = tab
-                } label: {
-                    Text(tab.rawValue)
-                        .font(.system(size: 13, weight: selection == tab ? .medium : .regular))
-                        .foregroundStyle(selection == tab ? G.text : G.muted)
-                        .padding(.top, 8)
-                        .padding(.bottom, 12)
-                        .overlay(alignment: .bottom) {
-                            if selection == tab {
-                                Rectangle().fill(G.accent).frame(height: 2).matchedGeometryEffect(id: "tab", in: underline)
-                            }
-                        }
-                        .contentShape(Rectangle())
+                GFilterPillButton(tab.rawValue, selected: selection == tab, accent: G.indigo) {
+                    withAnimation(.snappy(duration: 0.18)) { selection = tab }
                 }
-                .buttonStyle(.plain)
-                .accessibilityAddTraits(selection == tab ? .isSelected : [])
             }
         }
-        .animation(.snappy(duration: 0.2), value: selection)
     }
 }
 
@@ -159,6 +144,7 @@ struct LogsPanel: View {
     @State private var showTimestamps = true
     @State private var window: LogTimeWindow = .all
     @State private var loadedWindow: LogTimeWindow?
+    @State private var copiedAll = false
 
     private struct StreamKey: Equatable {
         var id: String
@@ -201,19 +187,28 @@ struct LogsPanel: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
-                GTextField("Filter logs (regex supported)", text: $query)
-                    .gravitonField(mono: true, icon: "line.3.horizontal.decrease")
+                GBorderlessSearchField("Filter logs (regex supported)", text: $query)
 
                 GSegmented(selection: $level, options: [(nil, "All"), (.info, "Info"), (.warn, "Warn"), (.error, "Error")])
 
                 Toggle("Follow", isOn: $follow).toggleStyle(.gSwitch)
             }
 
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 GSegmented(selection: $window, options: LogTimeWindow.allCases.map { ($0, $0.rawValue) })
                 Spacer()
+                GActionPillButton(copiedAll ? "Copied" : "Copy All", icon: copiedAll ? "checkmark" : "doc.on.doc") {
+                    let dump = lines.map { "[\(Format.clock($0.date))] [\($0.level.label)] \($0.message)" }.joined(separator: "\n")
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(dump, forType: .string)
+                    copiedAll = true
+                    Task {
+                        try? await Task.sleep(for: .seconds(1.5))
+                        copiedAll = false
+                    }
+                }
                 Toggle("Timestamps", isOn: $showTimestamps).toggleStyle(.gSwitch)
             }
 
@@ -222,18 +217,18 @@ struct LogsPanel: View {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(lines) { LogRow($0, showTimestamp: showTimestamps) }
                         HStack(spacing: 8) {
-                            Rectangle().fill(follow && containerActive ? G.running : G.accent.opacity(0.8)).frame(width: 7, height: 14)
+                            Rectangle().fill(follow && containerActive ? G.mint : G.indigo.opacity(0.8)).frame(width: 7, height: 14)
                             Text(footerLabel)
                         }
                         .font(G.mono(12))
-                        .foregroundStyle(G.faint)
+                        .foregroundStyle(G.textMuted)
                         .padding(.leading, 68)
-                        .padding(.top, 8)
+                        .padding(.top, 10)
                         .id("end")
                     }
                     .padding(.vertical, 14)
                 }
-                .gravitonCard(G.console)
+                .background(G.console, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 .onChange(of: lines.last?.id) {
                     if follow { withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("end", anchor: .bottom) } }
                 }
@@ -241,7 +236,7 @@ struct LogsPanel: View {
             }
         }
         .padding(.horizontal, 28)
-        .padding(.vertical, 18)
+        .padding(.vertical, 16)
         .task(id: streamKey) {
             if follow {
                 loadedWindow = window
@@ -369,25 +364,67 @@ struct OverviewPanel: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
+                HStack(spacing: 34) {
+                    GMetricStatColumn(
+                        label: "CPU",
+                        value: Format.percent(container.cpuPercent),
+                        subtitle: "current utilization",
+                        valueColor: G.indigo
+                    )
+                    GMetricStatColumn(
+                        label: "Memory",
+                        value: container.memoryBytes.map(Format.bytes) ?? "—",
+                        subtitle: container.memoryLimitBytes.map { "limit \(Format.bytes($0))" } ?? "VM working set",
+                        valueColor: G.sky
+                    )
+                    GMetricStatColumn(
+                        label: "Published Ports",
+                        value: "\(container.ports.count)",
+                        subtitle: "TCP / UDP bindings",
+                        valueColor: G.mint
+                    )
+                    GMetricStatColumn(
+                        label: "Mounts",
+                        value: "\(container.mounts.count)",
+                        subtitle: "volumes & binds",
+                        valueColor: G.amber
+                    )
+                    Spacer()
+                }
+                .padding(.vertical, 14)
+                .padding(.horizontal, 18)
+                .background(G.surfaceSubtle, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+
                 HStack(spacing: 12) {
-                    MetricTile(title: "CPU", value: container.cpuPercent.map { String(format: "%.1f", $0) } ?? "—",
-                               unit: container.cpuPercent == nil ? "" : "%", history: store.cpuHistory[container.id] ?? [], color: G.accent)
-                    MetricTile(title: "Memory", value: container.memoryBytes.map(Format.bytes) ?? "—", unit: "",
-                               history: store.memoryHistory[container.id] ?? [], color: G.running)
+                    MetricTile(
+                        title: "CPU History",
+                        value: container.cpuPercent.map { String(format: "%.1f", $0) } ?? "—",
+                        unit: container.cpuPercent == nil ? "" : "%",
+                        history: store.cpuHistory[container.id] ?? [],
+                        color: G.indigo
+                    )
+                    MetricTile(
+                        title: "Memory History",
+                        value: container.memoryBytes.map(Format.bytes) ?? "—",
+                        unit: "",
+                        history: store.memoryHistory[container.id] ?? [],
+                        color: G.sky
+                    )
                 }
-                Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
-                    DetailRow("ID", container.id)
-                    DetailRow("Image", container.image)
-                    DetailRow("Ports", container.ports.isEmpty ? "—" : container.ports.map(\.label).joined(separator: "\n"))
-                    DetailRow("IP address", container.ipAddress ?? "—")
-                    DetailRow("Mounts", container.mounts.isEmpty ? "—" : container.mounts.map { "\($0.source) → \($0.target)" }.joined(separator: "\n"))
-                    DetailRow("Memory limit", container.memoryLimitBytes.map(Format.bytes) ?? "—")
+
+                GKeyValueCard("Configuration & Networking") {
+                    GKeyValueRow("Container ID", container.id)
+                    GKeyValueRow("Image", container.image)
+                    if let project = container.project {
+                        GKeyValueRow("Compose Stack", container.service.map { "\(project) / \($0)" } ?? project)
+                    }
+                    GKeyValueRow("IP Address", container.ipAddress ?? "—")
+                    GKeyValueRow("Ports", container.ports.isEmpty ? "—" : container.ports.map(\.label).joined(separator: ", "))
+                    GKeyValueRow("Mounts", container.mounts.isEmpty ? "—" : container.mounts.map { "\($0.source) → \($0.target)" }.joined(separator: ", "))
+                    GKeyValueRow("Memory Limit", container.memoryLimitBytes.map(Format.bytes) ?? "—")
                 }
-                .padding(20)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .gravitonCard()
             }
-            .frame(maxWidth: 760, alignment: .leading)
+            .frame(maxWidth: 820, alignment: .leading)
             .padding(.horizontal, 28)
             .padding(.vertical, 20)
         }
@@ -408,14 +445,13 @@ struct TerminalPanel: View {
                 VStack(alignment: .leading, spacing: 10) {
                     header(shell)
                     TerminalHost(session: shell)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 12)
                         .background(G.console)
                         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(G.border))
                 }
                 .padding(.horizontal, 28)
-                .padding(.vertical, 18)
+                .padding(.vertical, 16)
             } else if !container.isRunning {
                 GEmptyState("Not running", symbol: "terminal", detail: "Start \(container.name) to open a shell in it.",
                             actionTitle: "Start \(container.name)") { Task { await store.start(container) } }
@@ -433,7 +469,7 @@ struct TerminalPanel: View {
     private func header(_ shell: ShellSession) -> some View {
         HStack(spacing: 10) {
             Circle().fill(dot(shell.phase)).frame(width: 7, height: 7)
-            Text(status(shell)).font(.system(size: 12.5)).foregroundStyle(G.muted).lineLimit(1)
+            Text(status(shell)).font(.system(size: 12.5)).foregroundStyle(G.textSecondary).lineLimit(1)
             Spacer()
             Button(copied ? "Copied" : "Copy grav command", systemImage: copied ? "checkmark" : "doc.on.doc") {
                 NSPasteboard.general.clearContents()
@@ -463,10 +499,10 @@ struct TerminalPanel: View {
 
     private func dot(_ phase: ShellSession.Phase) -> Color {
         switch phase {
-        case .running: G.running
-        case .connecting: G.warning
-        case .exited: G.stopped
-        case .failed: G.danger
+        case .running: G.mint
+        case .connecting: G.amber
+        case .exited: G.slate
+        case .failed: G.rose
         }
     }
 }
