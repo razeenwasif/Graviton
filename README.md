@@ -14,7 +14,7 @@ Native Linux containers for Apple Silicon macOS — one lightweight `Virtualizat
 - **Fast cold starts with `.vzsave` snapshots:** Lock-aware per-shape VM snapshot pool (up to 8 slots per `(cpus, memory, rosetta)` shape) with unique identity and live volume/clock/cache synchronization.
 - **`linux/amd64` via Rosetta:** Seamless x86_64 execution through Apple Rosetta for Linux (`binfmt_misc` with `OCF` flags) when `--platform linux/amd64` is requested or required.
 - **Docker Compose & Docker API compatible:** Run multi-service `compose.yaml` stacks natively with `grav compose`, or point standard `docker`, Compose, Dev Containers, and Testcontainers at Graviton's Docker Engine REST API v1.47 socket.
-- **Native macOS & iOS apps:** Manage containers, live stats, logs, interactive terminals ([SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)), files, volumes, and networks locally or across paired Macs over pinned TLS.
+- **Native macOS & iOS apps:** Stratus-aligned pitch-black UI with command palette (`⌘K`), managing containers, live stats, logs, interactive terminals ([SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)), files, volumes, networks, and macOS/iOS WidgetKit widgets locally or across paired Macs over pinned TLS.
 
 ---
 
@@ -216,7 +216,7 @@ grav hosts
 grav devices                                                  # inspect/revoke paired devices on server
 ```
 
-On iOS, pair by Bonjour discovery, manual host + code, `graviton://pair` link, or QR camera scan. The phone pins the Mac's TLS certificate and stores auth tokens in Keychain (`gravitond` stores only salted hashes). The iOS app provides Containers, Logs, Shell, Stats, Files, Inspect, an Activity feed (`events.jsonl`), and APNs push notifications (`grav push setup|status|test`).
+On iOS, pair by Bonjour discovery, manual host + code, `graviton://pair` link, or QR camera scan. The phone pins the Mac's TLS certificate and stores auth tokens in Keychain (`gravitond` stores only salted hashes). The iOS app provides Containers, Logs, Shell, Stats, Files, Inspect, an Activity feed (`events.jsonl`), APNs push notifications (`grav push setup|status|test`), and Home Screen (`small`, `medium`, `large`) + Lock Screen (`circular`, `rectangular`, `inline`) WidgetKit widgets backed by App Group `group.dev.graviton.shared` and `graviton://` deep links (`graviton://containers`, `graviton://container/<id>`, `graviton://images`, `graviton://resources`, `graviton://activity`, `graviton://hosts`).
 
 To build `GravitonIOS` for your own device, set `GRAVITON_TEAM_ID` in `apps/Config/Signing.local.xcconfig` (`cp apps/Config/Signing.local.xcconfig.example apps/Config/Signing.local.xcconfig`):
 
@@ -249,8 +249,9 @@ apps/
   Config/           Release, iOS, and local signing xcconfig templates
   GravitonKit/      Shared Swift package (models, socket/TLS client, demo engine, design tokens)
   Shared/           Cross-platform SwiftUI views and SwiftTerm terminal integration
-  Mac/              macOS app (menu bar, containers, compose stacks, builds, volumes, networks, Fairy panel)
-  iOS/              iOS companion app (remote hosts, shell, stats, files, activity, APNs push alerts)
+  Mac/              macOS app (menu bar, Stratus UI, command palette, containers, compose stacks, builds, volumes, networks, Fairy panel)
+  iOS/              iOS companion app (remote hosts, shell, stats, files, activity, APNs push alerts, deep links)
+  Widget/           macOS & iOS WidgetKit extension (runtime status, container KPIs, Lock Screen widgets)
 scripts/
   build-kernel.sh   Builds slim custom Linux 6.12 arm64 kernel inside Graviton and caches it
   kernel.config     Zero-module minimal arm64 kernel Kconfig
@@ -261,7 +262,7 @@ scripts/
   release.sh        Builds, hardens, signs, notarizes, staples, and packages DMG/ZIP releases
 Casks/
   graviton.rb       Homebrew Cask definition
-design/             App icon and menu bar vector sources + generator script
+design/             Graviton-cube app icon and menu bar vector sources + generator script
 docs/               Architecture & status overview page
 ```
 
