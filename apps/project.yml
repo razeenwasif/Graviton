@@ -106,6 +106,8 @@ targets:
     info:
       path: iOS/Info.plist
       properties:
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSLocalNetworkUsageDescription: Graviton looks for Macs running gravitond on your network so you can pair with them and see their containers.
         NSBonjourServices: [_graviton._tcp]
         CFBundleURLTypes:
@@ -135,6 +137,8 @@ targets:
     info:
       path: Widget/Info-iOS.plist
       properties:
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         CFBundleDisplayName: Graviton Widget
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension

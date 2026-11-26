@@ -43,7 +43,7 @@ struct GravitonStatusWidget: Widget {
         .configurationDisplayName("Graviton Runtime")
         .description("Live container VMs, CPU load, and memory usage across your Macs.")
         #if os(iOS)
-        .supportedFamilies([.systemSmall, .systemMedium, .systemLarge, .accessoryCircular, .accessoryRectangular])
+        .supportedFamilies([.systemSmall, .systemMedium, .systemLarge, .accessoryCircular, .accessoryRectangular, .accessoryInline])
         #else
         .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
         #endif
@@ -71,6 +71,8 @@ private struct GravitonWidgetRoot: View {
                 LockCircularWidget(snap: snap)
             case .accessoryRectangular:
                 LockRectangularWidget(snap: snap)
+            case .accessoryInline:
+                LockInlineWidget(snap: snap)
             #endif
             default:
                 SmallRuntimeWidget(snap: snap)
@@ -78,7 +80,7 @@ private struct GravitonWidgetRoot: View {
         }
         .containerBackground(for: .widget) {
             #if os(iOS)
-            if family == .accessoryCircular || family == .accessoryRectangular {
+            if family == .accessoryCircular || family == .accessoryRectangular || family == .accessoryInline {
                 Color.clear
             } else {
                 obsidianBackground
@@ -228,7 +230,11 @@ private struct MediumRuntimeWidget: View {
                     statChip("MEM", Format.bytes(snap.vmMemoryUsedBytes), G.sky)
                 }
             }
+            #if os(iOS)
+            .frame(width: 116, alignment: .leading)
+            #else
             .frame(width: 132, alignment: .leading)
+            #endif
 
             VStack(alignment: .leading, spacing: 5) {
                 if snap.containers.isEmpty {
@@ -243,7 +249,12 @@ private struct MediumRuntimeWidget: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 } else {
-                    ForEach(snap.containers.prefix(4)) { item in
+                    #if os(iOS)
+                    let mediumLimit = 3
+                    #else
+                    let mediumLimit = 4
+                    #endif
+                    ForEach(snap.containers.prefix(mediumLimit)) { item in
                         Link(destination: URL(string: "graviton://container/\(item.id)") ?? URL(string: "graviton://containers")!) {
                             containerRow(item)
                         }
@@ -382,7 +393,12 @@ private struct LargeRuntimeWidget: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 } else {
-                    ForEach(snap.containers.prefix(5)) { c in
+                    #if os(iOS)
+                    let largeLimit = 4
+                    #else
+                    let largeLimit = 5
+                    #endif
+                    ForEach(snap.containers.prefix(largeLimit)) { c in
                         Link(destination: URL(string: "graviton://container/\(c.id)") ?? URL(string: "graviton://containers")!) {
                             largeContainerRow(c)
                         }
@@ -489,6 +505,18 @@ private struct LockRectangularWidget: View {
             }
         }
         .widgetURL(URL(string: "graviton://containers"))
+    }
+}
+
+private struct LockInlineWidget: View {
+    let snap: GravitonWidgetSnapshot
+
+    var body: some View {
+        let text = snap.online
+            ? "\(snap.runningCount)/\(snap.totalContainers) VMs · \(Format.percent(snap.totalCPU))"
+            : "Graviton · \(snap.isDemo ? "Demo" : "Offline")"
+        Label(text, systemImage: "shippingbox.fill")
+            .widgetURL(URL(string: "graviton://containers"))
     }
 }
 #endif

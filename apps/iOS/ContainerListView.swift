@@ -4,11 +4,17 @@ import SwiftUI
 struct ContainerListView: View {
     @Environment(EngineStore.self) private var store
     var openHosts: () -> Void = {}
+    @Binding var deepLinkContainerID: String?
     @State private var filter: ContainerFilter = .all
     @State private var search = ""
     @State private var running = false
     @State private var path: [String] = []
     @State private var collapsed: Set<String> = []
+
+    init(openHosts: @escaping () -> Void = {}, deepLinkContainerID: Binding<String?> = .constant(nil)) {
+        self.openHosts = openHosts
+        _deepLinkContainerID = deepLinkContainerID
+    }
 
     private var rows: [Container] { filter.apply(store.containers, search: search) }
     private var grouped: (stacks: [ContainerStack], standalone: [Container]) { ContainerStack.group(rows) }
@@ -91,6 +97,18 @@ struct ContainerListView: View {
             .refreshable { await store.refresh() }
             .mobileScreen(pushed: false)
             .navigationDestination(for: String.self) { ContainerDetailView(containerID: $0) }
+            .onAppear {
+                if let id = deepLinkContainerID {
+                    path = [id]
+                    deepLinkContainerID = nil
+                }
+            }
+            .onChange(of: deepLinkContainerID) { _, id in
+                if let id {
+                    path = [id]
+                    deepLinkContainerID = nil
+                }
+            }
             .sheet(isPresented: $running) {
                 MobileRunSheet { c in path = [c.id] }
             }

@@ -4,6 +4,7 @@ import SwiftUI
 @main
 struct GravitonIOSApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @Environment(\.scenePhase) private var scenePhase
     @State private var push = PushManager.shared
     // The phone talks to a paired Mac's gravitond over TLS, or shows demo data.
     @State private var store = EngineStore(useDaemon: false)
@@ -11,6 +12,7 @@ struct GravitonIOSApp: App {
     @State private var browser = HostBrowser()
     @State private var shells = ShellSessions()
     @State private var pairTarget: PairingTarget?
+    @State private var deepLinkContainerID: String?
     @State private var dialogs = Dialogs()
     @State private var tab: AppTab = .containers
 
@@ -35,6 +37,31 @@ struct GravitonIOSApp: App {
                 if let target = PairingTarget(link: url.absoluteString) {
                     tab = .hosts
                     pairTarget = target
+                    return
+                }
+                guard url.scheme == "graviton" else { return }
+                switch url.host {
+                case "containers":
+                    tab = .containers
+                case "container":
+                    tab = .containers
+                    let id = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                    if !id.isEmpty { deepLinkContainerID = id }
+                case "images":
+                    tab = .images
+                case "resources":
+                    tab = .resources
+                case "activity":
+                    tab = .activity
+                case "hosts":
+                    tab = .hosts
+                default:
+                    break
+                }
+            }
+            .onChange(of: scenePhase) { _, now in
+                if now == .active {
+                    Task { await store.refresh() }
                 }
             }
             .onAppear {
@@ -66,7 +93,7 @@ struct GravitonIOSApp: App {
 
     @ViewBuilder private func screen(for tab: AppTab) -> some View {
         switch tab {
-        case .containers: ContainerListView(openHosts: { self.tab = .hosts })
+        case .containers: ContainerListView(openHosts: { self.tab = .hosts }, deepLinkContainerID: $deepLinkContainerID)
         case .images: ImageListView()
         case .resources: MobileResourcesView()
         case .activity: ActivityView()
