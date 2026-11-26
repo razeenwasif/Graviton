@@ -35,6 +35,8 @@ public final class EngineStore {
     public private(set) var liveError: String?
 
     private var volumesLoaded = false
+    private var lastWidgetSignature: String?
+    private var lastWidgetWrite = Date.distantPast
 
     public static let historyLength = 40
 
@@ -160,8 +162,10 @@ public final class EngineStore {
             }
             recordHistory()
             await refreshEvents(from: service)
+            publishWidgetSnapshot()
         } catch {
             lastError = error.localizedDescription
+            publishWidgetSnapshot()
         }
     }
 
@@ -653,6 +657,49 @@ public final class EngineStore {
         for c in containers {
             append(&cpuHistory, c.id, c.cpuPercent ?? 0)
             append(&memoryHistory, c.id, Double(c.memoryBytes ?? 0))
+        }
+    }
+
+    private func publishWidgetSnapshot() {
+        let sorted = containers.sorted { a, b in
+            if a.isRunning != b.isRunning { return a.isRunning }
+            return a.name.localizedStandardCompare(b.name) == .orderedAscending
+        }
+        let items = sorted.prefix(8).map { c in
+            WidgetContainerItem(
+                id: c.id,
+                name: c.name,
+                image: c.image,
+                status: c.status,
+                cpuPercent: c.cpuPercent,
+                memoryBytes: c.memoryBytes,
+                portLabel: c.ports.first.map { ":\($0.hostPort)" },
+                stack: c.project
+            )
+        }
+        let snap = GravitonWidgetSnapshot(
+            hostName: liveName ?? "This Mac",
+            online: connection == .live,
+            isDemo: connection == .demo,
+            runningCount: runningCount,
+            pausedCount: pausedCount,
+            totalContainers: containers.count,
+            imageCount: images.count,
+            volumeCount: volumes.count,
+            networkCount: networks.count,
+            totalCPU: totalCPU,
+            vmMemoryUsedBytes: engine?.vmMemoryUsedBytes ?? totalMemory,
+            hostMemoryBytes: engine?.memoryBytes ?? 0,
+            vmMemoryFraction: engine?.vmMemoryFraction ?? 0,
+            otherHostMemoryFraction: engine?.otherHostMemoryFraction ?? 0,
+            containers: items
+        )
+        let signature = "\(snap.hostName)|\(snap.online)|\(snap.runningCount)/\(snap.totalContainers)|\(snap.imageCount)|\(snap.volumeCount)|\(items.map { "\($0.id):\($0.status)" }.joined(separator: ","))"
+        let elapsed = Date.now.timeIntervalSince(lastWidgetWrite)
+        if signature != lastWidgetSignature || elapsed >= 15 {
+            lastWidgetSignature = signature
+            lastWidgetWrite = .now
+            GravitonWidgetStore.save(snap)
         }
     }
 

@@ -36,6 +36,26 @@ struct GravitonMacApp: App {
         }
     }
 
+    @MainActor
+    private func handleWidgetURL(_ url: URL) {
+        guard url.scheme?.lowercased() == "graviton" else { return }
+        let host = url.host?.lowercased() ?? ""
+        let segments = url.pathComponents.filter { $0 != "/" }
+        switch host {
+        case "container":
+            if let id = segments.first, !id.isEmpty {
+                router.pending = .container(id, .logs)
+            } else {
+                router.pending = .containers
+            }
+        case "images": router.pending = .images
+        case "volumes": router.pending = .volumes
+        case "networks": router.pending = .networks
+        case "settings": router.pending = .settings
+        default: router.pending = .containers
+        }
+    }
+
     var body: some Scene {
         WindowGroup("Graviton", id: "main") {
             RootView()
@@ -46,9 +66,12 @@ struct GravitonMacApp: App {
                 .environment(dialogs)
                 .environment(fairy)
                 .environment(updates)
-                .preferredColorScheme(.dark)
-                .tint(G.indigo)
-                .frame(minWidth: 980, minHeight: 620)
+            .preferredColorScheme(.dark)
+            .tint(G.indigo)
+            .frame(minWidth: 980, minHeight: 620)
+            .onOpenURL { url in
+                handleWidgetURL(url)
+            }
         }
         .defaultSize(width: 1440, height: 900)
         .windowStyle(.hiddenTitleBar)

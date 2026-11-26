@@ -34,6 +34,15 @@ targets:
     dependencies:
       - package: GravitonKit
       - package: SwiftTerm
+      - target: GravitonWidgetMac
+        embed: true
+    info:
+      path: Mac/Info.plist
+      properties:
+        CFBundleDisplayName: Graviton
+        CFBundleURLTypes:
+          - CFBundleURLName: dev.graviton.url
+            CFBundleURLSchemes: [graviton]
     # Debug signs ad hoc; Release signs with Developer ID (Config/Release.xcconfig).
     configFiles:
       Release: Config/Release.xcconfig
@@ -53,6 +62,34 @@ targets:
         Debug:
           CODE_SIGN_IDENTITY: "-"
 
+  GravitonWidgetMac:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Widget/GravitonWidget.swift
+    dependencies:
+      - package: GravitonKit
+    info:
+      path: Widget/Info-macOS.plist
+      properties:
+        CFBundleDisplayName: Graviton Widget
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    configFiles:
+      Release: Config/Release.xcconfig
+    settings:
+      base:
+        PRODUCT_NAME: GravitonWidgetMac
+        PRODUCT_BUNDLE_IDENTIFIER: dev.graviton.mac.widget
+        CODE_SIGN_ENTITLEMENTS: Widget/GravitonWidgetMac.entitlements
+        ENABLE_HARDENED_RUNTIME: YES
+        ENABLE_APP_SANDBOX: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+      configs:
+        Debug:
+          CODE_SIGN_STYLE: Automatic
+          DEVELOPMENT_TEAM: YOUR_TEAM_ID
+
   GravitonIOS:
     type: application
     platform: iOS
@@ -60,6 +97,8 @@ targets:
     dependencies:
       - package: GravitonKit
       - package: SwiftTerm
+      - target: GravitonWidgetIOS
+        embed: true
     # Automatic signing with your team (Config/iOS.xcconfig).
     configFiles:
       Debug: Config/iOS.xcconfig
@@ -83,14 +122,42 @@ targets:
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
         INFOPLIST_KEY_UIUserInterfaceStyle: Dark
 
+  GravitonWidgetIOS:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Widget/GravitonWidget.swift
+    dependencies:
+      - package: GravitonKit
+    configFiles:
+      Debug: Config/iOS.xcconfig
+      Release: Config/iOS.xcconfig
+    info:
+      path: Widget/Info-iOS.plist
+      properties:
+        CFBundleDisplayName: Graviton Widget
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_NAME: GravitonWidgetIOS
+        PRODUCT_BUNDLE_IDENTIFIER: dev.graviton.ios.widget
+        CODE_SIGN_ENTITLEMENTS: Widget/GravitonWidgetIOS.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+
 schemes:
   GravitonMac:
     build:
-      targets: { GravitonMac: all }
+      targets:
+        GravitonMac: all
+        GravitonWidgetMac: all
     run:
       config: Debug
   GravitonIOS:
     build:
-      targets: { GravitonIOS: all }
+      targets:
+        GravitonIOS: all
+        GravitonWidgetIOS: all
     run:
       config: Debug

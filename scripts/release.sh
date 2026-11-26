@@ -113,6 +113,10 @@ step "Signing with ${identity}"
 codesign $sign_flags --sign "$identity" --identifier dev.graviton.gravitond --entitlements "$repo/crates/gravitond/gravitond.entitlements" "$app/Contents/MacOS/gravitond"
 # shellcheck disable=SC2086
 codesign $sign_flags --sign "$identity" --identifier dev.graviton.grav "$app/Contents/MacOS/grav"
+if [ -d "$app/Contents/PlugIns/GravitonWidgetMac.appex" ]; then
+  # shellcheck disable=SC2086
+  codesign $sign_flags --sign "$identity" --entitlements "$repo/apps/Widget/GravitonWidgetMac.entitlements" "$app/Contents/PlugIns/GravitonWidgetMac.appex"
+fi
 # shellcheck disable=SC2086
 codesign $sign_flags --sign "$identity" --entitlements "$repo/apps/Mac/Graviton.entitlements" "$app"
 

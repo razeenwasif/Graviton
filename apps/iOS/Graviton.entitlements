@@ -5,5 +5,9 @@
 	<!-- Push alerts from paired Macs (failed containers, finished builds). -->
 	<key>aps-environment</key>
 	<string>development</string>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.dev.graviton.shared</string>
+	</array>
 </dict>
 </plist>
