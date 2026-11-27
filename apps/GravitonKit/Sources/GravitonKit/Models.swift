@@ -877,7 +877,7 @@ public struct NetworkRate: Identifiable, Sendable {
 /// Something that happened on the engine (`EngineEvent` in `graviton-proto`).
 public struct EngineEvent: Codable, Identifiable, Hashable, Sendable {
     public enum Kind: String, Codable, Sendable {
-        case started, stopped, paused, unpaused, forked, failed, healthy, unhealthy, pulled, pushed, built, buildFailed = "build_failed", removed
+        case started, stopped, paused, unpaused, forked, migrated, failed, healthy, unhealthy, pulled, pushed, built, buildFailed = "build_failed", removed
     }
 
     public var seq: UInt64
@@ -1735,5 +1735,123 @@ public enum LogTimeWindow: String, CaseIterable, Identifiable, Sendable, Hashabl
         case .oneHour: seconds = 60 * 60
         }
         return UInt64(max(0, (now.timeIntervalSince1970 - seconds) * 1000))
+    }
+}
+
+// MARK: - Wave 6: Cross-Mac Teleportation & Burst Offloading
+
+public struct MigrationPrepareResult: Codable, Hashable, Sendable {
+    public var hasImage: Bool
+    public var nameAvailable: Bool
+    public var targetArch: String
+    public var targetRosetta: Bool
+
+    public init(hasImage: Bool, nameAvailable: Bool, targetArch: String, targetRosetta: Bool) {
+        self.hasImage = hasImage
+        self.nameAvailable = nameAvailable
+        self.targetArch = targetArch
+        self.targetRosetta = targetRosetta
+    }
+}
+
+public struct MigrationBundleInfo: Codable, Hashable, Sendable {
+    public var containerName: String
+    public var image: String
+    public var digest: String
+    public var architecture: String
+    public var diskLogicalBytes: UInt64
+    public var diskExtentBytes: UInt64
+    public var hasVmState: Bool
+    public var ports: [PortMapping]
+
+    public init(
+        containerName: String,
+        image: String,
+        digest: String,
+        architecture: String,
+        diskLogicalBytes: UInt64,
+        diskExtentBytes: UInt64,
+        hasVmState: Bool,
+        ports: [PortMapping] = []
+    ) {
+        self.containerName = containerName
+        self.image = image
+        self.digest = digest
+        self.architecture = architecture
+        self.diskLogicalBytes = diskLogicalBytes
+        self.diskExtentBytes = diskExtentBytes
+        self.hasVmState = hasVmState
+        self.ports = ports
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case containerName, image, digest, architecture, diskLogicalBytes, diskExtentBytes, hasVmState, ports
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        containerName = try c.decode(String.self, forKey: .containerName)
+        image = try c.decode(String.self, forKey: .image)
+        digest = try c.decode(String.self, forKey: .digest)
+        architecture = try c.decode(String.self, forKey: .architecture)
+        diskLogicalBytes = try c.decode(UInt64.self, forKey: .diskLogicalBytes)
+        diskExtentBytes = try c.decode(UInt64.self, forKey: .diskExtentBytes)
+        hasVmState = try c.decode(Bool.self, forKey: .hasVmState)
+        ports = try c.decodeIfPresent([PortMapping].self, forKey: .ports) ?? []
+    }
+}
+
+public struct PowerStatus: Codable, Hashable, Sendable {
+    public var onBattery: Bool
+    public var batteryPercent: UInt8?
+    public var source: String
+
+    public init(onBattery: Bool = false, batteryPercent: UInt8? = nil, source: String = "AC Power") {
+        self.onBattery = onBattery
+        self.batteryPercent = batteryPercent
+        self.source = source
+    }
+}
+
+public struct OffloadPolicy: Codable, Hashable, Sendable {
+    public var enabled: Bool
+    public var preferredHost: String?
+    public var batteryThreshold: UInt8
+    public var offloadMultiArch: Bool
+    public var offloadBuilds: Bool
+    public var offloadCompose: Bool
+
+    public init(
+        enabled: Bool = false,
+        preferredHost: String? = nil,
+        batteryThreshold: UInt8 = 50,
+        offloadMultiArch: Bool = true,
+        offloadBuilds: Bool = true,
+        offloadCompose: Bool = true
+    ) {
+        self.enabled = enabled
+        self.preferredHost = preferredHost
+        self.batteryThreshold = batteryThreshold
+        self.offloadMultiArch = offloadMultiArch
+        self.offloadBuilds = offloadBuilds
+        self.offloadCompose = offloadCompose
+    }
+}
+
+public struct ActiveTunnel: Codable, Hashable, Sendable, Identifiable {
+    public var id: String
+    public var containerName: String
+    public var remoteHost: String
+    public var remoteAddr: String
+    public var localPort: UInt16
+    public var remotePort: UInt16
+
+    public init(id: String, containerName: String, remoteHost: String, remoteAddr: String, localPort: UInt16, remotePort: UInt16) {
+        self.id = id
+        self.containerName = containerName
+        self.remoteHost = remoteHost
+        self.remoteAddr = remoteAddr
+        self.localPort = localPort
+        self.remotePort = remotePort
     }
 }

@@ -4,6 +4,7 @@ import SwiftUI
 
 struct SettingsScreen: View {
     @Environment(EngineStore.self) private var store
+    @Environment(SharedHosts.self) private var hosts
     @Environment(Dialogs.self) private var dialogs
     @Environment(UpdateChecker.self) private var updates
     @AppStorage("showsMenuBarExtra") private var showsMenuBarExtra = true
@@ -12,6 +13,10 @@ struct SettingsScreen: View {
     @State private var busyRegistry: String?
     @State private var statusBanner: (tone: GStatusLine.Tone, text: String)?
     @State private var copiedDockerEnv = false
+    @State private var powerStatus = PowerStatus()
+    @State private var offloadPolicy = OffloadPolicy()
+    @State private var activeTunnels: [ActiveTunnel] = []
+    @State private var savingOffload = false
 
     private var hostLabel: String { store.liveName ?? "This Mac" }
 
@@ -43,6 +48,7 @@ struct SettingsScreen: View {
                     }
 
                     loginsCard
+                    offloadCard
                     updatesCard
                     generalCard
                     aboutCard
@@ -55,6 +61,7 @@ struct SettingsScreen: View {
         .background(G.bg)
         .task(id: "\(hostLabel)-\(store.connection == .live)") {
             await store.loadRegistryLogins()
+            await loadOffloadAndTunnels()
         }
         .sheet(isPresented: $showLogin) {
             RegistryLoginSheet { info in
@@ -135,6 +142,145 @@ struct SettingsScreen: View {
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
         .gravitonCard(G.surfaceSubtle)
+    }
+
+    private var offloadCard: some View {
+        let battLabel = powerStatus.batteryPercent.map { "\(powerStatus.source) · \($0)%" } ?? powerStatus.source
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                GCaption("Battery-Aware Burst Offloading & Tunnels")
+                GTagPill(battLabel, color: powerStatus.onBattery ? G.amber : G.mint)
+                Spacer()
+                if savingOffload {
+                    GSpinner(size: 11)
+                }
+            }
+
+            Text("Automatically burst heavy builds, cross-arch (`amd64`) jobs, and Compose stacks to a paired Mac when battery falls below the threshold.")
+                .font(.system(size: 12.5))
+                .foregroundStyle(G.textMuted)
+
+            Toggle("Enable burst offloading", isOn: Binding(
+                get: { offloadPolicy.enabled },
+                set: { val in offloadPolicy.enabled = val; Task { await saveOffloadPolicy() } }
+            ))
+            .toggleStyle(.gSwitch)
+            .disabled(!store.canManage)
+
+            HStack(spacing: 12) {
+                Text("Preferred Mac")
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(G.textMuted)
+                    .frame(width: 110, alignment: .leading)
+                Picker("Preferred Mac", selection: Binding(
+                    get: { offloadPolicy.preferredHost ?? "" },
+                    set: { val in
+                        offloadPolicy.preferredHost = val.isEmpty ? nil : val
+                        Task { await saveOffloadPolicy() }
+                    }
+                )) {
+                    Text("None configured").tag("")
+                    ForEach(hosts.hosts) { mac in
+                        Text("\(mac.name) (\(mac.address))").tag(mac.name)
+                    }
+                }
+                .labelsHidden()
+                .disabled(!store.canManage)
+            }
+
+            HStack(spacing: 12) {
+                Text("Battery threshold")
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(G.textMuted)
+                    .frame(width: 110, alignment: .leading)
+                Slider(
+                    value: Binding(
+                        get: { Double(offloadPolicy.batteryThreshold) },
+                        set: { offloadPolicy.batteryThreshold = UInt8($0.rounded()) }
+                    ),
+                    in: 15...90,
+                    step: 5
+                ) {
+                    EmptyView()
+                } onEditingChanged: { editing in
+                    if !editing { Task { await saveOffloadPolicy() } }
+                }
+                .disabled(!store.canManage)
+                Text("≤ \(offloadPolicy.batteryThreshold)%")
+                    .font(G.mono(12))
+                    .foregroundStyle(G.textPrimary)
+                    .frame(width: 52, alignment: .trailing)
+            }
+
+            HStack(spacing: 18) {
+                Toggle("Builds", isOn: Binding(
+                    get: { offloadPolicy.offloadBuilds },
+                    set: { val in offloadPolicy.offloadBuilds = val; Task { await saveOffloadPolicy() } }
+                ))
+                Toggle("Compose stacks", isOn: Binding(
+                    get: { offloadPolicy.offloadCompose },
+                    set: { val in offloadPolicy.offloadCompose = val; Task { await saveOffloadPolicy() } }
+                ))
+                Toggle("Cross-arch (amd64)", isOn: Binding(
+                    get: { offloadPolicy.offloadMultiArch },
+                    set: { val in offloadPolicy.offloadMultiArch = val; Task { await saveOffloadPolicy() } }
+                ))
+            }
+            .toggleStyle(.checkbox)
+            .disabled(!store.canManage)
+
+            if !activeTunnels.isEmpty {
+                Divider()
+                GCaption("Active Migration Port Tunnels")
+                VStack(spacing: 6) {
+                    ForEach(activeTunnels) { tun in
+                        HStack(spacing: 10) {
+                            Image(systemName: "arrow.left.arrow.right")
+                                .font(.system(size: 12))
+                                .foregroundStyle(G.sky)
+                            Text(tun.containerName)
+                                .font(.system(size: 12.5, weight: .medium))
+                            Text("127.0.0.1:\(tun.localPort) → \(tun.remoteHost):\(tun.remotePort)")
+                                .font(G.mono(11.5))
+                                .foregroundStyle(G.textMuted)
+                            Spacer()
+                            Button("Stop") {
+                                Task {
+                                    _ = try? await store.stopPortTunnel(id: tun.id)
+                                    await loadOffloadAndTunnels()
+                                }
+                            }
+                            .buttonStyle(.g(.danger, size: .small))
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(G.bg, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                }
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .gravitonCard(G.surfaceSubtle)
+    }
+
+    private func loadOffloadAndTunnels() async {
+        if let res = try? await store.powerAndOffload() {
+            powerStatus = res.power
+            offloadPolicy = res.policy
+        }
+        if let tuns = try? await store.listPortTunnels() {
+            activeTunnels = tuns
+        }
+    }
+
+    private func saveOffloadPolicy() async {
+        savingOffload = true
+        defer { savingOffload = false }
+        if let res = try? await store.setOffloadPolicy(offloadPolicy) {
+            powerStatus = res.power
+            offloadPolicy = res.policy
+        }
     }
 
     private var updatesCard: some View {

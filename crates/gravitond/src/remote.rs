@@ -458,6 +458,12 @@ impl Remote {
                 (Request::LoadImage { size }, crate::Backend::Engine(engine)) => {
                     crate::load_image_stream(Arc::clone(engine), *size, &mut lines, &mut write).await?;
                 }
+                (Request::ExportMigration { id, include_vm_state }, crate::Backend::Engine(engine)) => {
+                    return crate::export_migration_stream(Arc::clone(engine), id.clone(), *include_vm_state, write).await;
+                }
+                (Request::ImportMigration { size, name, start }, crate::Backend::Engine(engine)) => {
+                    crate::import_migration_stream(Arc::clone(engine), *size, name.clone(), *start, &mut lines, &mut write).await?;
+                }
                 (Request::Exec(spec), crate::Backend::Engine(engine)) => {
                     if spec.tty {
                         // The connection becomes a terminal session.

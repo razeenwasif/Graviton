@@ -351,6 +351,38 @@ public actor DemoEngine: EngineService {
     }
 
     public func deleteWarmTemplate(key: String) -> String { key }
+    public func prepareMigration(image: String, digest _: String, name: String) -> MigrationPrepareResult {
+        MigrationPrepareResult(
+            hasImage: imageList.contains { $0.reference == image },
+            nameAvailable: !list.contains { $0.name == name },
+            targetArch: "arm64",
+            targetRosetta: true
+        )
+    }
+    private var demoPower = PowerStatus(onBattery: false, batteryPercent: 92, source: "AC Power")
+    private var demoOffloadPolicy = OffloadPolicy()
+    private var demoTunnels: [ActiveTunnel] = []
+
+    public func getPowerAndOffload() -> (power: PowerStatus, policy: OffloadPolicy) {
+        (demoPower, demoOffloadPolicy)
+    }
+    public func setOffloadPolicy(_ policy: OffloadPolicy) -> (power: PowerStatus, policy: OffloadPolicy) {
+        demoOffloadPolicy = policy
+        return (demoPower, demoOffloadPolicy)
+    }
+    public func startPortTunnel(containerName: String, remoteHost: String, remoteAddr: String, localPort: UInt16, remotePort: UInt16) -> ActiveTunnel {
+        let tun = ActiveTunnel(id: "tun-\(demoTunnels.count + 1)", containerName: containerName, remoteHost: remoteHost, remoteAddr: remoteAddr, localPort: localPort, remotePort: remotePort)
+        demoTunnels.append(tun)
+        return tun
+    }
+    public func listPortTunnels() -> [ActiveTunnel] { demoTunnels }
+    public func stopPortTunnel(id: String) throws -> String {
+        guard let idx = demoTunnels.firstIndex(where: { $0.id == id }) else {
+            throw EngineError.daemon("no active port tunnel `\(id)`")
+        }
+        demoTunnels.remove(at: idx)
+        return id
+    }
 
     public func diff(id: String) throws -> [DiffEntry] {
         _ = try resolve(id)

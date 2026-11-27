@@ -137,6 +137,26 @@ impl Target {
         matches!(self, Target::Remote(_))
     }
 
+    /// Resolve a migration destination (`unix:<path>`, `local`, or paired host name).
+    pub fn resolve_migration_dest(dest: &str, default_socket: PathBuf) -> Result<Self> {
+        if let Some(sock) = dest.strip_prefix("unix:") {
+            return Ok(Target::Local(PathBuf::from(sock)));
+        }
+        Self::resolve(Some(dest), default_socket)
+    }
+
+    /// Primary reachable address for TCP port tunneling to this target (`None` for local).
+    pub fn tunnel_host(&self) -> Option<String> {
+        match self {
+            Target::Local(_) => None,
+            Target::Remote(h) => h
+                .candidate_addresses()
+                .into_iter()
+                .next()
+                .or_else(|| h.service_name.as_ref().map(|s| format!("{s}.local"))),
+        }
+    }
+
     pub fn describe(&self) -> String {
         match self {
             Target::Local(_) => "this Mac".into(),

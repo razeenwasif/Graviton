@@ -21,8 +21,9 @@ use std::sync::{Arc, Mutex};
 use graviton_proto::frame::{Decoder, Frame};
 use remote::Target;
 use graviton_proto::{
-    BuildSecret, BuildSpec, CommitSpec, ContainerStatus, ContainerSummary, ExecSpec, FileKind, ImagePushProgress, LogLine, LogStream, PullProgress,
-    Request, Response, RestartPolicy, RunSpec, decode_line, encode_line,
+    BuildSecret, BuildSpec, CommitSpec, ContainerStatus, ContainerSummary, ExecSpec, FileKind, ImagePushProgress,
+    LogLine, LogStream, OffloadPolicy, PortProtocol, PowerStatus, PullProgress, Request, Response, RestartPolicy,
+    RunSpec, decode_line, encode_line,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +183,39 @@ enum Command {
     WarmTemplate {
         #[command(subcommand)]
         action: WarmTemplateAction,
+    },
+    /// Teleport a container (and its image + sparse disk + named volumes) to another paired Mac.
+    Migrate {
+        /// Container ID, prefix, or name.
+        container: String,
+        /// Destination paired Mac name (from `grav hosts`), `local`, or `unix:<socket>`.
+        #[arg(long)]
+        to: String,
+        /// Keep the source container instead of removing it after verification.
+        #[arg(long)]
+        keep_source: bool,
+        /// Do not register localhost TCP tunnels back to the migrated container's ports.
+        #[arg(long)]
+        no_tunnel: bool,
+        /// Import the container stopped instead of booting it on the destination Mac.
+        #[arg(long)]
+        no_start: bool,
+        /// Override container name on the destination Mac.
+        #[arg(long)]
+        name: Option<String>,
+        /// Skip `.vzsave` VM memory snapshot capture during export.
+        #[arg(long)]
+        no_vm_state: bool,
+    },
+    /// View or configure battery-aware burst offloading to a paired desktop Mac.
+    Offload {
+        #[command(subcommand)]
+        action: Option<OffloadAction>,
+    },
+    /// List or stop localhost TCP tunnels forwarding to migrated containers.
+    Tunnels {
+        #[command(subcommand)]
+        action: Option<TunnelAction>,
     },
     /// Inspect or stream Hypervisor X-Ray telemetry (`dns`, `net`, `file`, `proc`).
     #[command(name = "xray", alias = "x-ray")]
@@ -849,11 +883,45 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     let socket = cli.socket.clone().unwrap_or_else(paths::socket_path);
-    let target = Target::resolve(cli.host.as_deref(), socket)?;
+    let mut target = Target::resolve(cli.host.as_deref(), socket.clone())?;
     if target.is_remote() && matches!(cli.command, Command::Pair | Command::Devices { .. } | Command::Push { action: Some(_), .. }) {
         bail!("pairing and push alerts are managed on the Mac itself: run this there (or with --host local)");
     }
     let mut client = Client::connect(&target)?;
+
+    if cli.host.is_none() && !target.is_remote() {
+        let offload_need = match &cli.command {
+            Command::Build { platform, .. } => {
+                let is_multi_arch = platform
+                    .as_deref()
+                    .is_some_and(|p| p.contains("amd64") || p.contains("x86_64"));
+                Some((OffloadWorkload::Build, is_multi_arch))
+            }
+            Command::Compose(args) if matches!(args.action, compose::ComposeAction::Up { .. }) => {
+                Some((OffloadWorkload::Compose, false))
+            }
+            _ => None,
+        };
+        if let Some((kind, is_multi_arch)) = offload_need {
+            if let Ok(Response::PowerAndOffload { power, policy }) = client.call(&Request::GetPowerAndOffload) {
+                if let Some((host_name, reason)) = decide_burst_offload(kind, is_multi_arch, &power, &policy) {
+                    match Target::resolve(Some(&host_name), socket.clone()).and_then(|rt| {
+                        let c = Client::connect(&rt)?;
+                        Ok((rt, c))
+                    }) {
+                        Ok((remote_target, remote_client)) => {
+                            eprintln!("⚡ Burst-offloading to {host_name} ({reason})");
+                            target = remote_target;
+                            client = remote_client;
+                        }
+                        Err(err) => {
+                            eprintln!("note: burst offload to `{host_name}` unavailable ({err:#}); running locally");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     match cli.command {
         Command::Ping => match client.call(&Request::Ping)? {
@@ -1064,6 +1132,22 @@ fn run(cli: Cli) -> Result<()> {
                 other => unexpected(other)?,
             },
         },
+        Command::Migrate { container, to, keep_source, no_tunnel, no_start, name, no_vm_state } => {
+            run_migrate(
+                &target,
+                &mut client,
+                socket,
+                &container,
+                &to,
+                keep_source,
+                no_tunnel,
+                !no_start,
+                name,
+                !no_vm_state,
+            )?;
+        }
+        Command::Offload { action } => run_offload(&mut client, action)?,
+        Command::Tunnels { action } => run_tunnels(&mut client, action)?,
         Command::XRay { container, follow, limit, enable, disable } => {
             if enable || disable {
                 match client.call(&Request::SetXRay { id: container.clone(), enabled: enable })? {
@@ -1673,7 +1757,8 @@ fn run(cli: Cli) -> Result<()> {
                                 | graviton_proto::EventKind::Built
                                 | graviton_proto::EventKind::Pulled
                                 | graviton_proto::EventKind::Pushed
-                                | graviton_proto::EventKind::Forked => "✓",
+                                | graviton_proto::EventKind::Forked
+                                | graviton_proto::EventKind::Migrated => "✓",
                                 _ => "·",
                             };
                             println!("{}  {marker} {}", clock(e.timestamp_ms), e.message);
@@ -3656,6 +3741,413 @@ mod tests {
         let wt = Cli::try_parse_from(["grav", "warm-template", "save", "tpl-1", "c1"]).unwrap();
         assert!(matches!(wt.command, Command::WarmTemplate { action: WarmTemplateAction::Save { ref key, ref container } } if key == "tpl-1" && container == "c1"));
     }
+
+    #[test]
+    fn parses_migrate_offload_tunnels_and_burst_decision() {
+        let m = Cli::try_parse_from(["grav", "migrate", "api", "--to", "studio-m4", "--keep-source", "--no-tunnel"]).unwrap();
+        assert!(matches!(
+            m.command,
+            Command::Migrate { ref container, ref to, keep_source: true, no_tunnel: true, no_start: false, .. }
+                if container == "api" && to == "studio-m4"
+        ));
+
+        let off = Cli::try_parse_from(["grav", "offload", "set", "--enable", "--target", "studio-m4", "--battery-threshold", "40"]).unwrap();
+        assert!(matches!(
+            off.command,
+            Command::Offload {
+                action: Some(OffloadAction::Set { enable: true, disable: false, target: Some(ref h), battery_threshold: Some(40), .. })
+            } if h == "studio-m4"
+        ));
+
+        let tun = Cli::try_parse_from(["grav", "tunnels", "rm", "tun-1"]).unwrap();
+        assert!(matches!(tun.command, Command::Tunnels { action: Some(TunnelAction::Rm { ref id }) } if id == "tun-1"));
+
+        let policy = OffloadPolicy {
+            enabled: true,
+            preferred_host: Some("studio-m4".into()),
+            battery_threshold: 50,
+            offload_multi_arch: true,
+            offload_builds: true,
+            offload_compose: false,
+        };
+        let low_batt = PowerStatus { on_battery: true, battery_percent: Some(32), source: "Battery Power".into() };
+        let ac_power = PowerStatus { on_battery: false, battery_percent: Some(100), source: "AC Power".into() };
+
+        assert!(decide_burst_offload(OffloadWorkload::Build, false, &low_batt, &policy).is_some());
+        assert!(decide_burst_offload(OffloadWorkload::Compose, false, &low_batt, &policy).is_none()); // offload_compose=false
+        assert!(decide_burst_offload(OffloadWorkload::Build, false, &ac_power, &policy).is_none());
+        assert!(decide_burst_offload(OffloadWorkload::Build, true, &ac_power, &policy).is_some()); // multi-arch offload
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffloadWorkload {
+    Build,
+    Compose,
+}
+
+fn decide_burst_offload(
+    kind: OffloadWorkload,
+    is_multi_arch: bool,
+    power: &PowerStatus,
+    policy: &OffloadPolicy,
+) -> Option<(String, String)> {
+    if !policy.enabled {
+        return None;
+    }
+    let host = policy.preferred_host.as_ref()?.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let allowed = match kind {
+        OffloadWorkload::Build => policy.offload_builds || (is_multi_arch && policy.offload_multi_arch),
+        OffloadWorkload::Compose => policy.offload_compose,
+    };
+    if !allowed {
+        return None;
+    }
+    if is_multi_arch && policy.offload_multi_arch {
+        return Some((host.to_string(), "cross-arch build".into()));
+    }
+    if power.on_battery {
+        if let Some(pct) = power.battery_percent {
+            if pct <= policy.battery_threshold {
+                return Some((host.to_string(), format!("battery {pct}% <= {}%", policy.battery_threshold)));
+            }
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_migrate(
+    src_target: &Target,
+    src_client: &mut Client,
+    default_socket: PathBuf,
+    container: &str,
+    dest_host: &str,
+    keep_source: bool,
+    no_tunnel: bool,
+    start: bool,
+    name_override: Option<String>,
+    include_vm_state: bool,
+) -> Result<()> {
+    struct TempFileGuard(PathBuf);
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    let details = match src_client.call(&Request::Inspect { id: container.to_string() })? {
+        Response::Details(d) => d,
+        other => {
+            unexpected(other)?;
+            unreachable!()
+        }
+    };
+    let src_c = &details.container;
+    let target_name = name_override.clone().unwrap_or_else(|| src_c.name.clone());
+
+    let dst_target = Target::resolve_migration_dest(dest_host, default_socket)?;
+    let mut dst_client = Client::connect(&dst_target)?;
+
+    eprintln!("Pre-flighting migration of `{}` -> {}…", src_c.name, dst_target.describe());
+    let ready = match dst_client.call(&Request::PrepareMigration {
+        image: src_c.image.clone(),
+        digest: details.image_digest.clone(),
+        name: target_name.clone(),
+    })? {
+        Response::MigrationReady(r) => r,
+        other => {
+            unexpected(other)?;
+            unreachable!()
+        }
+    };
+
+    if !ready.has_image {
+        eprintln!("Transferring base image `{}` to {}…", src_c.image, dst_target.describe());
+        let img_tmp = std::env::temp_dir().join(format!("grav-mig-img-{}.tar", std::process::id()));
+        let _img_guard = TempFileGuard(img_tmp.clone());
+        {
+            let mut stream = src_target.connect()?;
+            stream.write_all(&encode_line(&Request::SaveImage {
+                references: vec![src_c.image.clone()],
+            }))?;
+            stream.flush()?;
+            let line = read_raw_response_line(&mut stream)?;
+            match decode_line::<Response>(&line)? {
+                Response::ImageArchive => {}
+                Response::Error { message } => bail!(message),
+                other => unexpected(other)?,
+            }
+            let mut file = std::fs::File::create(&img_tmp)?;
+            std::io::copy(&mut stream, &mut file)?;
+            file.flush()?;
+        }
+        let img_size = std::fs::metadata(&img_tmp)?.len();
+        dst_client.writer.write_all(&encode_line(&Request::LoadImage { size: img_size }))?;
+        std::io::copy(&mut std::fs::File::open(&img_tmp)?, &mut dst_client.writer)?;
+        dst_client.writer.flush()?;
+        let mut line = String::new();
+        if dst_client.reader.read_line(&mut line)? == 0 {
+            bail!("destination closed connection during image load");
+        }
+        match decode_line::<Response>(line.as_bytes())? {
+            Response::Images(_) => {}
+            Response::Error { message } => bail!(message),
+            other => unexpected(other)?,
+        }
+    }
+
+    let bundle_tmp = std::env::temp_dir().join(format!("grav-mig-bundle-{}.tar.gz", std::process::id()));
+    let _bundle_guard = TempFileGuard(bundle_tmp.clone());
+    eprintln!("Capturing sparse VM extents & named volumes from `{}`…", src_c.name);
+    let info = {
+        let mut stream = src_target.connect()?;
+        stream.write_all(&encode_line(&Request::ExportMigration {
+            id: src_c.id.clone(),
+            include_vm_state,
+        }))?;
+        stream.flush()?;
+        let line = read_raw_response_line(&mut stream)?;
+        let info = match decode_line::<Response>(&line)? {
+            Response::MigrationArchive(info) => info,
+            Response::Error { message } => bail!(message),
+            other => {
+                unexpected(other)?;
+                unreachable!()
+            }
+        };
+        let mut file = std::fs::File::create(&bundle_tmp)?;
+        std::io::copy(&mut stream, &mut file)?;
+        file.flush()?;
+        info
+    };
+    let bundle_size = std::fs::metadata(&bundle_tmp)?.len();
+    eprintln!(
+        "Streaming {} sparse bundle (extents {} of {} logical disk) -> {}…",
+        bytes(bundle_size),
+        bytes(info.disk_extent_bytes),
+        bytes(info.disk_logical_bytes),
+        dst_target.describe(),
+    );
+
+    dst_client.writer.write_all(&encode_line(&Request::ImportMigration {
+        size: bundle_size,
+        name: name_override,
+        start,
+    }))?;
+    std::io::copy(&mut std::fs::File::open(&bundle_tmp)?, &mut dst_client.writer)?;
+    dst_client.writer.flush()?;
+
+    let mut line = String::new();
+    if dst_client.reader.read_line(&mut line)? == 0 {
+        bail!("destination closed connection while importing container");
+    }
+    let remote_c = match decode_line::<Response>(line.as_bytes())? {
+        Response::MigrationImported(c) => c,
+        Response::Error { message } => bail!(message),
+        other => {
+            unexpected(other)?;
+            unreachable!()
+        }
+    };
+
+    if !keep_source {
+        if matches!(src_c.status, ContainerStatus::Running | ContainerStatus::Paused) {
+            let _ = src_client.call(&Request::Stop { id: src_c.id.clone() });
+        }
+        match src_client.call(&Request::Remove { id: src_c.id.clone() })? {
+            Response::Removed { .. } => {}
+            other => unexpected(other)?,
+        }
+    }
+
+    let mut started_tunnels = Vec::new();
+    if !no_tunnel {
+        if let Some(remote_addr) = dst_target.tunnel_host() {
+            for port in remote_c.ports.iter().filter(|p| p.protocol == PortProtocol::Tcp) {
+                if let Ok(Response::PortTunnels(tuns)) = src_client.call(&Request::StartPortTunnel {
+                    container_name: remote_c.name.clone(),
+                    remote_host: dest_host.to_string(),
+                    remote_addr: remote_addr.clone(),
+                    local_port: port.host_port,
+                    remote_port: port.host_port,
+                }) {
+                    started_tunnels.extend(tuns);
+                }
+            }
+        }
+    }
+
+    println!("Teleported `{}` ({}) -> {} ({})", remote_c.name, remote_c.id, dst_target.describe(), status_label(remote_c.status));
+    if !started_tunnels.is_empty() {
+        for tun in started_tunnels {
+            println!("  tunnel {}: 127.0.0.1:{} -> {}:{}", tun.id, tun.local_port, tun.remote_addr, tun.remote_port);
+        }
+    }
+    Ok(())
+}
+
+fn status_label(st: ContainerStatus) -> &'static str {
+    match st {
+        ContainerStatus::Created => "created",
+        ContainerStatus::Running => "running",
+        ContainerStatus::Paused => "paused",
+        ContainerStatus::Exited => "exited",
+    }
+}
+
+fn run_offload(client: &mut Client, action: Option<OffloadAction>) -> Result<()> {
+    let (power, mut policy) = match client.call(&Request::GetPowerAndOffload)? {
+        Response::PowerAndOffload { power, policy } => (power, policy),
+        other => {
+            unexpected(other)?;
+            unreachable!()
+        }
+    };
+
+    if let Some(OffloadAction::Set {
+        enable,
+        disable,
+        target,
+        clear_host,
+        battery_threshold,
+        multi_arch,
+        no_multi_arch,
+        builds,
+        no_builds,
+        compose,
+        no_compose,
+    }) = action
+    {
+        if enable {
+            policy.enabled = true;
+        }
+        if disable {
+            policy.enabled = false;
+        }
+        if let Some(h) = target {
+            policy.preferred_host = Some(h);
+        }
+        if clear_host {
+            policy.preferred_host = None;
+        }
+        if let Some(t) = battery_threshold {
+            policy.battery_threshold = t.min(100);
+        }
+        if multi_arch {
+            policy.offload_multi_arch = true;
+        }
+        if no_multi_arch {
+            policy.offload_multi_arch = false;
+        }
+        if builds {
+            policy.offload_builds = true;
+        }
+        if no_builds {
+            policy.offload_builds = false;
+        }
+        if compose {
+            policy.offload_compose = true;
+        }
+        if no_compose {
+            policy.offload_compose = false;
+        }
+        let (p2, pol2) = match client.call(&Request::SetOffloadPolicy(policy))? {
+            Response::PowerAndOffload { power, policy } => (power, policy),
+            other => {
+                unexpected(other)?;
+                unreachable!()
+            }
+        };
+        print_offload_status(&p2, &pol2);
+    } else {
+        print_offload_status(&power, &policy);
+    }
+    Ok(())
+}
+
+fn print_offload_status(power: &PowerStatus, policy: &OffloadPolicy) {
+    let batt = power
+        .battery_percent
+        .map_or_else(|| "unknown".into(), |p| format!("{p}%"));
+    println!("Power:      {} ({batt})", power.source);
+    println!("Offload:    {}", if policy.enabled { "enabled" } else { "disabled" });
+    println!(
+        "Host:       {}",
+        policy.preferred_host.as_deref().unwrap_or("(none configured)")
+    );
+    println!("Threshold:  <= {}% battery", policy.battery_threshold);
+    println!(
+        "Workloads:  builds={}  compose={}  cross-arch={}",
+        policy.offload_builds, policy.offload_compose, policy.offload_multi_arch
+    );
+}
+
+fn run_tunnels(client: &mut Client, action: Option<TunnelAction>) -> Result<()> {
+    match action.unwrap_or(TunnelAction::Ls) {
+        TunnelAction::Ls => match client.call(&Request::ListPortTunnels)? {
+            Response::PortTunnels(list) if list.is_empty() => println!("No active migration tunnels."),
+            Response::PortTunnels(list) => {
+                println!("{:<10} {:<18} {:<14} {:<12} TARGET", "ID", "CONTAINER", "HOST", "LOCAL");
+                for t in list {
+                    println!(
+                        "{:<10} {:<18} {:<14} 127.0.0.1:{:<5} {}:{}",
+                        t.id, t.container_name, t.remote_host, t.local_port, t.remote_addr, t.remote_port
+                    );
+                }
+            }
+            other => unexpected(other)?,
+        },
+        TunnelAction::Rm { id } => match client.call(&Request::StopPortTunnel { id })? {
+            Response::PortTunnelStopped { id } => println!("Stopped tunnel {id}."),
+            other => unexpected(other)?,
+        },
+    }
+    Ok(())
+}
+
+#[derive(Subcommand, Debug)]
+enum OffloadAction {
+    /// Show host power status and burst offloading settings.
+    Status,
+    /// Configure burst offloading rules.
+    Set {
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+        /// Preferred paired Mac host name (`grav hosts`).
+        #[arg(long = "target", visible_alias = "preferred-host", conflicts_with = "clear_host")]
+        target: Option<String>,
+        #[arg(long, conflicts_with = "target")]
+        clear_host: bool,
+        /// Battery threshold percentage at or below which builds/stacks burst offload.
+        #[arg(long)]
+        battery_threshold: Option<u8>,
+        #[arg(long, conflicts_with = "no_multi_arch")]
+        multi_arch: bool,
+        #[arg(long, conflicts_with = "multi_arch")]
+        no_multi_arch: bool,
+        #[arg(long, conflicts_with = "no_builds")]
+        builds: bool,
+        #[arg(long, conflicts_with = "builds")]
+        no_builds: bool,
+        #[arg(long, conflicts_with = "no_compose")]
+        compose: bool,
+        #[arg(long, conflicts_with = "compose")]
+        no_compose: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TunnelAction {
+    /// List active migration localhost port tunnels.
+    Ls,
+    /// Stop an active tunnel by ID.
+    Rm { id: String },
 }
 
 #[derive(Subcommand, Debug)]

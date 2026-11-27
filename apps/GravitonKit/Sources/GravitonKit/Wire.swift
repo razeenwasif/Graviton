@@ -55,6 +55,14 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case runFromWarmTemplate(key: String, name: String, workspace: String, cpus: UInt32? = nil, memoryMib: UInt64? = nil, env: [String] = [])
     case listWarmTemplates
     case deleteWarmTemplate(key: String)
+    case prepareMigration(image: String, digest: String, name: String)
+    case exportMigration(id: String, includeVmState: Bool = true)
+    case importMigration(size: UInt64, name: String? = nil, start: Bool = true)
+    case getPowerAndOffload
+    case setOffloadPolicy(OffloadPolicy)
+    case startPortTunnel(containerName: String, remoteHost: String, remoteAddr: String, localPort: UInt16, remotePort: UInt16)
+    case listPortTunnels
+    case stopPortTunnel(id: String)
     case exec(ExecSpec)
     case stats(id: String)
     case listFiles(id: String, path: String)
@@ -141,6 +149,16 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         let memoryMib: UInt64?
         let env: [String]
     }
+    private struct PrepareMigrationParams: Encodable { let image: String; let digest: String; let name: String }
+    private struct ExportMigrationParams: Encodable { let id: String; let includeVmState: Bool }
+    private struct ImportMigrationParams: Encodable { let size: UInt64; let name: String?; let start: Bool }
+    private struct StartPortTunnelParams: Encodable {
+        let containerName: String
+        let remoteHost: String
+        let remoteAddr: String
+        let localPort: UInt16
+        let remotePort: UInt16
+    }
 
     public var method: String {
         switch self {
@@ -197,6 +215,14 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .runFromWarmTemplate: "run_from_warm_template"
         case .listWarmTemplates: "list_warm_templates"
         case .deleteWarmTemplate: "delete_warm_template"
+        case .prepareMigration: "prepare_migration"
+        case .exportMigration: "export_migration"
+        case .importMigration: "import_migration"
+        case .getPowerAndOffload: "get_power_and_offload"
+        case .setOffloadPolicy: "set_offload_policy"
+        case .startPortTunnel: "start_port_tunnel"
+        case .listPortTunnels: "list_port_tunnels"
+        case .stopPortTunnel: "stop_port_tunnel"
         case .exec: "exec"
         case .stats: "stats"
         case .listFiles: "list_files"
@@ -218,7 +244,7 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         var c = encoder.container(keyedBy: Keys.self)
         try c.encode(method, forKey: .method)
         switch self {
-        case .ping, .engineInfo, .listContainers, .listImages, .listVolumes, .networkInfo, .listNetworks, .listLogins, .pairBegin, .listDevices, .snapshotStatus, .snapshotClear, .listStackCheckpoints, .listWarmTemplates: break
+        case .ping, .engineInfo, .listContainers, .listImages, .listVolumes, .networkInfo, .listNetworks, .listLogins, .pairBegin, .listDevices, .snapshotStatus, .snapshotClear, .listStackCheckpoints, .listWarmTemplates, .getPowerAndOffload, .listPortTunnels: break
         case let .createNetwork(name, internalOnly, labels):
             try c.encode(CreateNetworkParams(name: name, internalOnly: internalOnly, labels: labels), forKey: .params)
         case let .removeNetwork(name):
@@ -254,7 +280,17 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
             try c.encode(SaveWarmTemplateParams(key: key, containerId: containerId), forKey: .params)
         case let .runFromWarmTemplate(key, name, workspace, cpus, memoryMib, env):
             try c.encode(RunFromWarmTemplateParams(key: key, name: name, workspace: workspace, cpus: cpus, memoryMib: memoryMib, env: env), forKey: .params)
-        case let .start(id), let .stop(id), let .pause(id), let .unpause(id), let .restart(id), let .remove(id), let .stats(id), let .inspect(id), let .diff(id), let .getNetworkPolicy(id):
+        case let .prepareMigration(image, digest, name):
+            try c.encode(PrepareMigrationParams(image: image, digest: digest, name: name), forKey: .params)
+        case let .exportMigration(id, includeVmState):
+            try c.encode(ExportMigrationParams(id: id, includeVmState: includeVmState), forKey: .params)
+        case let .importMigration(size, name, start):
+            try c.encode(ImportMigrationParams(size: size, name: name, start: start), forKey: .params)
+        case let .setOffloadPolicy(policy):
+            try c.encode(policy, forKey: .params)
+        case let .startPortTunnel(containerName, remoteHost, remoteAddr, localPort, remotePort):
+            try c.encode(StartPortTunnelParams(containerName: containerName, remoteHost: remoteHost, remoteAddr: remoteAddr, localPort: localPort, remotePort: remotePort), forKey: .params)
+        case let .start(id), let .stop(id), let .pause(id), let .unpause(id), let .restart(id), let .remove(id), let .stats(id), let .inspect(id), let .diff(id), let .getNetworkPolicy(id), let .stopPortTunnel(id):
             try c.encode(IDParams(id: id), forKey: .params)
         case let .setNetworkPolicy(id, egress, chaos):
             try c.encode(SetNetworkPolicyParams(id: id, egress: egress, chaos: chaos), forKey: .params)
@@ -333,6 +369,12 @@ public enum EngineResponse: Decodable, Sendable {
     case warmTemplateSaved(WarmTemplateInfo)
     case warmTemplates([WarmTemplateInfo])
     case warmTemplateDeleted(key: String)
+    case migrationReady(MigrationPrepareResult)
+    case migrationArchive(MigrationBundleInfo)
+    case migrationImported(Container)
+    case powerAndOffload(power: PowerStatus, policy: OffloadPolicy)
+    case portTunnels([ActiveTunnel])
+    case portTunnelStopped(id: String)
     case buildLog(String)
     case execOutput(stream: String, data: [UInt8])
     case execExited(code: Int32)
@@ -375,6 +417,7 @@ public enum EngineResponse: Decodable, Sendable {
     private struct XRayStatusData: Decodable { let enabled: Bool }
     private struct StackThawedData: Decodable { let key: String; let project: String; let containers: [Container] }
     private struct KeyData: Decodable { let key: String }
+    private struct PowerAndOffloadData: Decodable { let power: PowerStatus; let policy: OffloadPolicy }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
@@ -435,6 +478,14 @@ public enum EngineResponse: Decodable, Sendable {
         case "warm_template_saved": self = .warmTemplateSaved(try c.decode(WarmTemplateInfo.self, forKey: .data))
         case "warm_templates": self = .warmTemplates(try c.decode([WarmTemplateInfo].self, forKey: .data))
         case "warm_template_deleted": self = .warmTemplateDeleted(key: try c.decode(KeyData.self, forKey: .data).key)
+        case "migration_ready": self = .migrationReady(try c.decode(MigrationPrepareResult.self, forKey: .data))
+        case "migration_archive": self = .migrationArchive(try c.decode(MigrationBundleInfo.self, forKey: .data))
+        case "migration_imported": self = .migrationImported(try c.decode(Container.self, forKey: .data))
+        case "power_and_offload":
+            let po = try c.decode(PowerAndOffloadData.self, forKey: .data)
+            self = .powerAndOffload(power: po.power, policy: po.policy)
+        case "port_tunnels": self = .portTunnels(try c.decode([ActiveTunnel].self, forKey: .data))
+        case "port_tunnel_stopped": self = .portTunnelStopped(id: try c.decode(Removed.self, forKey: .data).id)
         case "attached": self = .attached
         case "exec_output":
             let o = try c.decode(ExecOutputData.self, forKey: .data)

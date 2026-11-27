@@ -52,6 +52,12 @@ public protocol EngineService: Sendable {
     func runFromWarmTemplate(key: String, name: String, workspace: String, cpus: UInt32?, memoryMib: UInt64?, env: [String]) async throws -> Container
     func listWarmTemplates() async throws -> [WarmTemplateInfo]
     func deleteWarmTemplate(key: String) async throws -> String
+    func prepareMigration(image: String, digest: String, name: String) async throws -> MigrationPrepareResult
+    func getPowerAndOffload() async throws -> (power: PowerStatus, policy: OffloadPolicy)
+    func setOffloadPolicy(_ policy: OffloadPolicy) async throws -> (power: PowerStatus, policy: OffloadPolicy)
+    func startPortTunnel(containerName: String, remoteHost: String, remoteAddr: String, localPort: UInt16, remotePort: UInt16) async throws -> ActiveTunnel
+    func listPortTunnels() async throws -> [ActiveTunnel]
+    func stopPortTunnel(id: String) async throws -> String
     func diff(id: String) async throws -> [DiffEntry]
     func getNetworkPolicy(id: String) async throws -> ContainerNetworkPolicy
     func setNetworkPolicy(id: String, egress: EgressPolicy?, chaos: ChaosProfile?) async throws -> ContainerNetworkPolicy
@@ -374,6 +380,57 @@ public final class SocketEngine: EngineService {
             throw EngineError.unexpectedResponse
         }
         return deleted
+    }
+    public func prepareMigration(image: String, digest: String, name: String) async throws -> MigrationPrepareResult {
+        guard case let .migrationReady(ready) = try await call(.prepareMigration(image: image, digest: digest, name: name), timeout: 15) else {
+            throw EngineError.unexpectedResponse
+        }
+        return ready
+    }
+    public func getPowerAndOffload() async throws -> (power: PowerStatus, policy: OffloadPolicy) {
+        guard case let .powerAndOffload(power: power, policy: policy) = try await call(.getPowerAndOffload, timeout: 10) else {
+            throw EngineError.unexpectedResponse
+        }
+        return (power, policy)
+    }
+    public func setOffloadPolicy(_ policy: OffloadPolicy) async throws -> (power: PowerStatus, policy: OffloadPolicy) {
+        guard case let .powerAndOffload(power: power, policy: updated) = try await call(.setOffloadPolicy(policy), timeout: 10) else {
+            throw EngineError.unexpectedResponse
+        }
+        return (power, updated)
+    }
+    public func startPortTunnel(containerName: String, remoteHost: String, remoteAddr: String, localPort: UInt16, remotePort: UInt16) async throws -> ActiveTunnel {
+        guard case let .portTunnels(list) = try await call(
+            .startPortTunnel(containerName: containerName, remoteHost: remoteHost, remoteAddr: remoteAddr, localPort: localPort, remotePort: remotePort),
+            timeout: 15
+        ), let first = list.first else {
+            throw EngineError.unexpectedResponse
+        }
+        return first
+    }
+    public func listPortTunnels() async throws -> [ActiveTunnel] {
+        guard case let .portTunnels(list) = try await call(.listPortTunnels, timeout: 10) else {
+            throw EngineError.unexpectedResponse
+        }
+        return list
+    }
+    public func stopPortTunnel(id: String) async throws -> String {
+        guard case let .portTunnelStopped(removed) = try await call(.stopPortTunnel(id: id), timeout: 10) else {
+            throw EngineError.unexpectedResponse
+        }
+        return removed
+    }
+    public func exportMigration(id: String, includeVmState: Bool = true, to archiveFile: URL) async throws -> MigrationBundleInfo {
+        try await receiveArchive(request: .exportMigration(id: id, includeVmState: includeVmState), to: archiveFile) { response in
+            guard case let .migrationArchive(info) = response else { throw EngineError.unexpectedResponse }
+            return info
+        }
+    }
+    public func importMigration(from archiveFile: URL, size: UInt64, name: String? = nil, start: Bool = true) async throws -> Container {
+        try await sendArchive(request: .importMigration(size: size, name: name, start: start), from: archiveFile) { response in
+            guard case let .migrationImported(c) = response else { throw EngineError.unexpectedResponse }
+            return c
+        }
     }
     public func diff(id: String) async throws -> [DiffEntry] {
         guard case let .diff(entries) = try await call(.diff(id: id), timeout: 30) else { throw EngineError.unexpectedResponse }

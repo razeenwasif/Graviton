@@ -14,6 +14,7 @@ mod docker_api;
 mod egress;
 mod erofs;
 mod events;
+mod migrate;
 mod persistence;
 mod push;
 mod remote;
@@ -335,6 +336,13 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
         }
         if let (Request::LoadImage { size }, Backend::Engine(engine)) = (&request, &backend) {
             load_image_stream(Arc::clone(engine), *size, lines.get_mut(), &mut write).await?;
+            continue;
+        }
+        if let (Request::ExportMigration { id, include_vm_state }, Backend::Engine(engine)) = (&request, &backend) {
+            return export_migration_stream(Arc::clone(engine), id.clone(), *include_vm_state, write).await;
+        }
+        if let (Request::ImportMigration { size, name, start }, Backend::Engine(engine)) = (&request, &backend) {
+            import_migration_stream(Arc::clone(engine), *size, name.clone(), *start, lines.get_mut(), &mut write).await?;
             continue;
         }
         if let (Request::Exec(spec), Backend::Engine(engine)) = (&request, &backend) {
@@ -788,6 +796,117 @@ pub(crate) async fn load_image_stream(
     Ok(())
 }
 
+/// `grav migrate` export half: build sparse migration bundle, send `MigrationArchive`,
+/// then stream `.tar.gz` bytes until EOF.
+pub(crate) async fn export_migration_stream<W>(
+    engine: Arc<Engine>,
+    id: String,
+    include_vm_state: bool,
+    mut write: W,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    struct FileCleanup(Option<PathBuf>);
+    impl Drop for FileCleanup {
+        fn drop(&mut self) {
+            if let Some(p) = self.0.take() {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    let (bundle_path, info) = match tokio::task::spawn_blocking(move || engine.export_migration_to_temp(&id, include_vm_state)).await? {
+        Ok(res) => res,
+        Err(err) => {
+            write.write_all(&encode_line(&Response::Error { message: format!("{err:#}") })).await?;
+            let _ = write.flush().await;
+            return Ok(());
+        }
+    };
+    let _cleanup = FileCleanup(Some(bundle_path.clone()));
+
+    write.write_all(&encode_line(&Response::MigrationArchive(info))).await?;
+    write.flush().await?;
+
+    let mut file = tokio::fs::File::open(&bundle_path).await?;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        if write.write_all(&buf[..n]).await.is_err() {
+            break;
+        }
+    }
+    let _ = write.flush().await;
+    let _ = write.shutdown().await;
+    Ok(())
+}
+
+/// `grav migrate` import half: receive `size` `.tar.gz` bytes, unpack sparse disk + volumes,
+/// register and optionally start the container, and reply with `MigrationImported`.
+pub(crate) async fn import_migration_stream(
+    engine: Arc<Engine>,
+    size: u64,
+    name: Option<String>,
+    start: bool,
+    read: &mut (impl tokio::io::AsyncRead + Unpin),
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    if size > migrate::MAX_MIGRATION_ARCHIVE {
+        write
+            .write_all(&encode_line(&Response::Error {
+                message: format!(
+                    "migration archive is {} GB; limit is {} GB",
+                    size >> 30,
+                    migrate::MAX_MIGRATION_ARCHIVE >> 30
+                ),
+            }))
+            .await?;
+        anyhow::bail!("migration archive too large ({size} bytes)");
+    }
+
+    static NEXT_MIG_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp_path = std::env::temp_dir().join(format!(
+        "graviton-mig-upload-{}-{}.tar.gz",
+        std::process::id(),
+        NEXT_MIG_UP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _guard = Cleanup(tmp_path.clone());
+
+    let mut out = tokio::fs::File::create(&tmp_path).await?;
+    let mut limited = read.take(size);
+    let copied = tokio::io::copy(&mut limited, &mut out).await.context("receiving migration archive")?;
+    out.flush().await?;
+    drop(out);
+    if copied != size {
+        let msg = format!("migration upload ended early ({copied} of {size} bytes)");
+        let _ = write.write_all(&encode_line(&Response::Error { message: msg.clone() })).await;
+        anyhow::bail!(msg);
+    }
+
+    let import_path = tmp_path.clone();
+    let reply = match tokio::task::spawn_blocking(move || engine.import_migration_from_path(&import_path, name, start)).await? {
+        Ok(summary) => Response::MigrationImported(summary),
+        Err(err) => Response::Error { message: format!("{err:#}") },
+    };
+    write.write_all(&encode_line(&reply)).await?;
+    write.flush().await?;
+    Ok(())
+}
+
 fn is_log_active(status: graviton_proto::ContainerStatus) -> bool {
     use graviton_proto::ContainerStatus;
     matches!(status, ContainerStatus::Created | ContainerStatus::Running | ContainerStatus::Paused)
@@ -1164,6 +1283,23 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                 Request::SnapshotStatus => Response::Snapshots(graviton_proto::SnapshotInfo::default()),
                 Request::ListStackCheckpoints => Response::StackCheckpoints(Vec::new()),
                 Request::ListWarmTemplates => Response::WarmTemplates(Vec::new()),
+                Request::PrepareMigration { image, name, .. } => Response::MigrationReady(graviton_proto::MigrationPrepareResult {
+                    has_image: store.images().iter().any(|i| i.reference == image),
+                    name_available: !store.name_taken(&name),
+                    target_arch: "arm64".into(),
+                    target_rosetta: true,
+                }),
+                Request::GetPowerAndOffload => Response::PowerAndOffload {
+                    power: migrate::detect_power_status(),
+                    policy: migrate::load_offload_policy(&migrate::offload_policy_path()),
+                },
+                Request::SetOffloadPolicy(policy) => result(
+                    migrate::save_offload_policy(&migrate::offload_policy_path(), &policy).map(|_| Response::PowerAndOffload {
+                        power: migrate::detect_power_status(),
+                        policy,
+                    }),
+                ),
+                Request::ListPortTunnels => Response::PortTunnels(Vec::new()),
                 _ => Response::Error { message: "gravitond is serving demo data; restart it without --demo to pull, run, exec and browse files".into() },
             }
         }
@@ -1259,6 +1395,33 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                     Request::DeleteWarmTemplate { key } => {
                         Response::WarmTemplateDeleted { key: engine.delete_warm_template(&key)? }
                     }
+                    Request::PrepareMigration { image, digest, name } => {
+                        Response::MigrationReady(engine.prepare_migration(&image, &digest, &name))
+                    }
+                    Request::GetPowerAndOffload => Response::PowerAndOffload {
+                        power: migrate::detect_power_status(),
+                        policy: migrate::load_offload_policy(&migrate::offload_policy_path()),
+                    },
+                    Request::SetOffloadPolicy(policy) => {
+                        migrate::save_offload_policy(&migrate::offload_policy_path(), &policy)?;
+                        Response::PowerAndOffload {
+                            power: migrate::detect_power_status(),
+                            policy,
+                        }
+                    }
+                    Request::StartPortTunnel { container_name, remote_host, remote_addr, local_port, remote_port } => {
+                        let tun = engine.tunnels.start(
+                            &tokio::runtime::Handle::current(),
+                            container_name,
+                            remote_host,
+                            remote_addr,
+                            local_port,
+                            remote_port,
+                        )?;
+                        Response::PortTunnels(vec![tun])
+                    }
+                    Request::ListPortTunnels => Response::PortTunnels(engine.tunnels.list()),
+                    Request::StopPortTunnel { id } => Response::PortTunnelStopped { id: engine.tunnels.stop(&id)? },
                     Request::Stats { id } => Response::Stats(engine.stats(&id)?),
                     Request::ListFiles { id, path } => Response::Files(engine.list_files(&id, &path)?),
                     Request::ReadFile { id, path } => Response::File(engine.read_file(&id, &path)?),
@@ -1269,6 +1432,8 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                     | Request::PutArchive { .. }
                     | Request::SaveImage { .. }
                     | Request::LoadImage { .. }
+                    | Request::ExportMigration { .. }
+                    | Request::ImportMigration { .. }
                     | Request::StatsStream { .. }
                     | Request::XRay { follow: true, .. } => {
                         unreachable!("handled by serve()")

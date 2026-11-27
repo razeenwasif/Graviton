@@ -2315,9 +2315,9 @@
         "note": "Completed in Wave 1B: added opt-in hypervisor X-Ray telemetry (DNS/Net/File/Proc), zero-bypass hardware-isolated egress firewall (NetworkMode::None + vsock host EgressGateway proxy & DNS gateway + grav xray / grav network-policy), and per-port switch chaos (latency/jitter/loss/bandwidth) across graviton-proto, graviton-vmm, graviton-agent, gravitond, grav, GravitonKit (54/54 tests, 36 Fairy tools), GravitonMac XRayPanel, and GravitonIOS MobileXRayView. Verified via cargo test/clippy/musl, Release/Debug Xcode builds, and live VM E2E isolation/allowlist/chaos runs."
     },
     "cross-mac-teleport": {
-        "status": "todo",
-        "updated": "2026-11-26T13:05:00+11:00",
-        "note": "Scheduled in Wave 6 of Graviton × Neutrino Breakthrough Plan."
+        "status": "done",
+        "updated": "2026-11-27T15:35:00+11:00",
+        "note": "Completed in Wave 6: added sparse 64 KiB SEEK_DATA/SEEK_HOLE extent coding, pinned TLS ExportMigration/ImportMigration streaming with auto image transfer and portable named volumes, TunnelManager localhost port forwarders, pmset battery-aware burst offloading policy, grav migrate/offload/tunnels CLI commands, GravitonKit models/wire/RPCs, and GravitonMac TeleportContainerSheet + SettingsScreen Burst Offloading card. Verified via cargo test/clippy, GravitonKit (57/57 tests), GravitonMac/GravitonIOS builds, and live dual-daemon VM teleportation E2E (64 GiB logical disk compressed to 145 KB over pinned TLS)."
     },
     "snapshot-on-fail-runtime": {
         "status": "done",

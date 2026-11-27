@@ -623,6 +623,56 @@ public actor RemoteEngine: EngineService {
         }
         return deleted
     }
+    public func prepareMigration(image: String, digest: String, name: String) async throws -> MigrationPrepareResult {
+        guard case let .migrationReady(ready) = try await call(.prepareMigration(image: image, digest: digest, name: name)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return ready
+    }
+    public func getPowerAndOffload() async throws -> (power: PowerStatus, policy: OffloadPolicy) {
+        guard case let .powerAndOffload(power: power, policy: policy) = try await call(.getPowerAndOffload) else {
+            throw EngineError.unexpectedResponse
+        }
+        return (power, policy)
+    }
+    public func setOffloadPolicy(_ policy: OffloadPolicy) async throws -> (power: PowerStatus, policy: OffloadPolicy) {
+        guard case let .powerAndOffload(power: power, policy: updated) = try await call(.setOffloadPolicy(policy)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return (power, updated)
+    }
+    public func startPortTunnel(containerName: String, remoteHost: String, remoteAddr: String, localPort: UInt16, remotePort: UInt16) async throws -> ActiveTunnel {
+        guard case let .portTunnels(list) = try await call(
+            .startPortTunnel(containerName: containerName, remoteHost: remoteHost, remoteAddr: remoteAddr, localPort: localPort, remotePort: remotePort)
+        ), let first = list.first else {
+            throw EngineError.unexpectedResponse
+        }
+        return first
+    }
+    public func listPortTunnels() async throws -> [ActiveTunnel] {
+        guard case let .portTunnels(list) = try await call(.listPortTunnels) else {
+            throw EngineError.unexpectedResponse
+        }
+        return list
+    }
+    public func stopPortTunnel(id: String) async throws -> String {
+        guard case let .portTunnelStopped(removed) = try await call(.stopPortTunnel(id: id)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return removed
+    }
+    public nonisolated func exportMigration(id: String, includeVmState: Bool = true, to archiveFile: URL) async throws -> MigrationBundleInfo {
+        try await receiveArchive(request: .exportMigration(id: id, includeVmState: includeVmState), to: archiveFile) { response in
+            guard case let .migrationArchive(info) = response else { throw EngineError.unexpectedResponse }
+            return info
+        }
+    }
+    public nonisolated func importMigration(from archiveFile: URL, size: UInt64, name: String? = nil, start: Bool = true) async throws -> Container {
+        try await sendArchive(request: .importMigration(size: size, name: name, start: start), from: archiveFile) { response in
+            guard case let .migrationImported(c) = response else { throw EngineError.unexpectedResponse }
+            return c
+        }
+    }
     public func diff(id: String) async throws -> [DiffEntry] {
         guard case let .diff(entries) = try await call(.diff(id: id)) else { throw EngineError.unexpectedResponse }
         return entries

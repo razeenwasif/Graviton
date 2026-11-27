@@ -1712,4 +1712,43 @@ import Testing
         let demoEvents = try await demo.xrayEvents(id: "web", limit: 2)
         #expect(demoEvents.count == 2 && demoEvents.allSatisfy { $0.kind == .net || $0.kind == .dns ? !$0.allowed : true })
     }
+
+    @Test func wave6MigrateAndOffloadWire() async throws {
+        let line = { (r: EngineRequest) in String(decoding: try Wire.line(r), as: UTF8.self) }
+        #expect(try line(.prepareMigration(image: "alpine:3.22", digest: "sha256:aa", name: "web")).contains(#""method":"prepare_migration""#))
+        #expect(try line(.exportMigration(id: "web", includeVmState: true)).contains(#""method":"export_migration""#))
+        #expect(try line(.importMigration(size: 4096, name: "web-migrated", start: true)).contains(#""method":"import_migration""#))
+        #expect(try line(.getPowerAndOffload) == #"{"method":"get_power_and_offload"}"# + "\n")
+        #expect(try line(.listPortTunnels) == #"{"method":"list_port_tunnels"}"# + "\n")
+        #expect(try line(.stopPortTunnel(id: "tun-1")) == #"{"method":"stop_port_tunnel","params":{"id":"tun-1"}}"# + "\n")
+
+        let policy = OffloadPolicy(enabled: true, preferredHost: "studio-m4", batteryThreshold: 40, offloadMultiArch: true, offloadBuilds: true, offloadCompose: false)
+        #expect(try line(.setOffloadPolicy(policy)).contains(#""battery_threshold":40"#))
+
+        let poJson = #"{"type":"power_and_offload","data":{"power":{"on_battery":true,"battery_percent":38,"source":"Battery Power"},"policy":{"enabled":true,"preferred_host":"studio-m4","battery_threshold":40,"offload_multi_arch":true,"offload_builds":true,"offload_compose":false}}}"#
+        guard case let .powerAndOffload(power, decodedPolicy) = try Wire.decoder.decode(EngineResponse.self, from: Data(poJson.utf8)) else {
+            Issue.record("expected .powerAndOffload"); return
+        }
+        #expect(power.onBattery && power.batteryPercent == 38 && decodedPolicy.preferredHost == "studio-m4" && !decodedPolicy.offloadCompose)
+
+        let readyJson = #"{"type":"migration_ready","data":{"has_image":false,"name_available":true,"target_arch":"arm64","target_rosetta":true}}"#
+        guard case let .migrationReady(ready) = try Wire.decoder.decode(EngineResponse.self, from: Data(readyJson.utf8)) else {
+            Issue.record("expected .migrationReady"); return
+        }
+        #expect(!ready.hasImage && ready.nameAvailable && ready.targetRosetta)
+
+        let tunJson = #"{"type":"port_tunnels","data":[{"id":"tun-1","container_name":"web","remote_host":"studio-m4","remote_addr":"192.0.2.10","local_port":8080,"remote_port":8080}]}"#
+        guard case let .portTunnels(tuns) = try Wire.decoder.decode(EngineResponse.self, from: Data(tunJson.utf8)) else {
+            Issue.record("expected .portTunnels"); return
+        }
+        #expect(tuns.count == 1 && tuns[0].localPort == 8080)
+
+        let demo = DemoEngine()
+        let (_, upd) = await demo.setOffloadPolicy(policy)
+        #expect(upd.enabled && upd.preferredHost == "studio-m4")
+        let tun = await demo.startPortTunnel(containerName: "web", remoteHost: "studio-m4", remoteAddr: "127.0.0.1", localPort: 8080, remotePort: 8080)
+        #expect(await demo.listPortTunnels().count == 1)
+        #expect(try await demo.stopPortTunnel(id: tun.id) == tun.id)
+        #expect(await demo.listPortTunnels().isEmpty)
+    }
 }

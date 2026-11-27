@@ -9,11 +9,13 @@ enum DetailTab: String, CaseIterable, Identifiable {
 
 struct ContainerDetailScreen: View {
     @Environment(EngineStore.self) private var store
+    @Environment(SharedHosts.self) private var hosts
     var containerID: String
     var onBack: () -> Void
     @State private var tab: DetailTab
     @State private var showCommit = false
     @State private var showFork = false
+    @State private var showTeleport = false
 
     init(containerID: String, initialTab: DetailTab = .logs, onBack: @escaping () -> Void) {
         self.containerID = containerID
@@ -42,6 +44,15 @@ struct ContainerDetailScreen: View {
                     .buttonStyle(.gSecondary)
                     .disabled(!store.canManage)
                     .help(store.canManage ? "Clone this container’s live state into isolated forks" : "Start gravitond to fork containers")
+
+                    Button {
+                        showTeleport = true
+                    } label: {
+                        Label("Teleport", systemImage: "paperplane")
+                    }
+                    .buttonStyle(.gSecondary)
+                    .disabled(!store.canManage || (!store.isLocal ? false : hosts.hosts.isEmpty))
+                    .help(hosts.hosts.isEmpty && store.isLocal ? "Pair another Mac (`grav hosts add`) to teleport containers" : "Live-migrate this container to another paired Mac")
 
                     Button {
                         showCommit = true
@@ -124,6 +135,9 @@ struct ContainerDetailScreen: View {
             }
             .sheet(isPresented: $showFork) {
                 ForkContainerSheet(container: c)
+            }
+            .sheet(isPresented: $showTeleport) {
+                TeleportContainerSheet(container: c)
             }
         } else {
             VStack(spacing: 0) {
@@ -522,6 +536,126 @@ struct TerminalPanel: View {
         case .connecting: G.amber
         case .exited: G.slate
         case .failed: G.rose
+        }
+    }
+}
+
+struct TeleportContainerSheet: View {
+    @Environment(EngineStore.self) private var store
+    @Environment(SharedHosts.self) private var hosts
+    @Environment(\.dismiss) private var dismiss
+    var container: Container
+
+    @State private var selectedTargetId = ""
+    @State private var keepSource = false
+    @State private var setupTunnels = true
+    @State private var stageText = ""
+    @State private var busy = false
+    @State private var doneText: String?
+    @State private var error: String?
+
+    private struct TargetChoice: Identifiable {
+        let id: String
+        let label: String
+        let remote: PairedMac?
+    }
+
+    private var choices: [TargetChoice] {
+        var list: [TargetChoice] = []
+        if !store.isLocal {
+            list.append(TargetChoice(id: "__local__", label: "This Mac (local)", remote: nil))
+        }
+        for mac in hosts.hosts where store.isLocal || mac.name != hosts.selected {
+            list.append(TargetChoice(id: mac.name, label: "\(mac.name) (\(mac.address))", remote: mac))
+        }
+        return list
+    }
+
+    var body: some View {
+        GSheet(
+            "Teleport \(container.name)",
+            subtitle: "Migrate sparse filesystem extents, named volumes, and published ports over pinned TLS.",
+            symbol: "paperplane",
+            width: 520
+        ) {
+            if choices.isEmpty {
+                GStatusLine(.info, "No destination Macs paired. Run `grav hosts add` on another Mac first.")
+            } else {
+                GFormRow("Destination Mac") {
+                    Picker("Destination Mac", selection: $selectedTargetId) {
+                        ForEach(choices) { choice in
+                            Text(choice.label).tag(choice.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .disabled(busy || doneText != nil)
+                }
+
+                Toggle("Keep source container on current Mac", isOn: $keepSource)
+                    .toggleStyle(.checkbox)
+                    .disabled(busy || doneText != nil)
+
+                if !container.ports.isEmpty {
+                    Toggle("Forward published ports back to localhost", isOn: $setupTunnels)
+                        .toggleStyle(.checkbox)
+                        .disabled(busy || doneText != nil)
+                }
+            }
+
+            if busy {
+                GStatusLine(.working, stageText.isEmpty ? "Teleporting container…" : stageText)
+            } else if let doneText {
+                GStatusLine(.success, doneText)
+            } else if let error {
+                GStatusLine(.failure, error)
+            }
+        } footer: {
+            Spacer()
+            if doneText != nil {
+                Button("Done") { dismiss() }
+                    .buttonStyle(.gPrimary)
+                    .keyboardShortcut(.defaultAction)
+            } else {
+                Button("Cancel") { dismiss() }
+                    .buttonStyle(.gSecondary)
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(busy)
+                Button("Teleport", action: runTeleport)
+                    .buttonStyle(.gPrimary)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(busy || choices.isEmpty)
+            }
+        }
+        .onAppear {
+            if selectedTargetId.isEmpty {
+                selectedTargetId = choices.first?.id ?? ""
+            }
+        }
+    }
+
+    private func runTeleport() {
+        guard let choice = choices.first(where: { $0.id == selectedTargetId }) else { return }
+        busy = true
+        error = nil
+        Task {
+            defer { busy = false }
+            do {
+                let dstEngine: any EngineService = choice.remote.map { RemoteEngine(host: $0.remoteHost, token: $0.token) } ?? SocketEngine()
+                let res = try await store.teleportContainer(
+                    container,
+                    to: dstEngine,
+                    destinationLabel: choice.label,
+                    destinationAddr: choice.remote?.address,
+                    keepSource: keepSource,
+                    setupTunnels: setupTunnels
+                ) { msg in
+                    stageText = msg
+                }
+                let tunInfo = res.tunnels.isEmpty ? "" : " (\(res.tunnels.count) localhost tunnel(s) active)"
+                doneText = "Teleported \(res.migrated.name) to \(choice.label)\(tunInfo)."
+            } catch {
+                self.error = error.localizedDescription
+            }
         }
     }
 }

@@ -1172,6 +1172,7 @@ pub enum EventKind {
     BuildFailed,
     Removed,
     Forked,
+    Migrated,
 }
 
 impl EventKind {
@@ -1596,6 +1597,83 @@ pub struct WarmTemplateInfo {
     pub created_at: i64,
 }
 
+/// Pre-flight check on the destination Mac before migrating a container (Wave 6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationPrepareResult {
+    pub has_image: bool,
+    pub name_available: bool,
+    pub target_arch: String,
+    pub target_rosetta: bool,
+}
+
+/// Metadata header sent before streaming a `.tar.gz` sparse VM migration bundle (Wave 6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationBundleInfo {
+    pub container_name: String,
+    pub image: String,
+    pub digest: String,
+    pub architecture: String,
+    pub disk_logical_bytes: u64,
+    pub disk_extent_bytes: u64,
+    pub has_vm_state: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PortMapping>,
+}
+
+/// Current host power source & battery level (`pmset -g batt`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PowerStatus {
+    pub on_battery: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_percent: Option<u8>,
+    pub source: String,
+}
+
+fn default_battery_threshold() -> u8 {
+    50
+}
+
+/// Persistent policy for battery-aware burst offloading to a paired desktop Mac (Wave 6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OffloadPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_host: Option<String>,
+    #[serde(default = "default_battery_threshold")]
+    pub battery_threshold: u8,
+    #[serde(default = "default_true")]
+    pub offload_multi_arch: bool,
+    #[serde(default = "default_true")]
+    pub offload_builds: bool,
+    #[serde(default = "default_true")]
+    pub offload_compose: bool,
+}
+
+impl Default for OffloadPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            preferred_host: None,
+            battery_threshold: default_battery_threshold(),
+            offload_multi_arch: true,
+            offload_builds: true,
+            offload_compose: true,
+        }
+    }
+}
+
+/// Active TCP tunnel forwarding `127.0.0.1:<local_port>` to a migrated remote Mac (Wave 6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveTunnel {
+    pub id: String,
+    pub container_name: String,
+    pub remote_host: String,
+    pub remote_addr: String,
+    pub local_port: u16,
+    pub remote_port: u16,
+}
+
 // ---------------------------------------------------------------------------
 // Control API
 // ---------------------------------------------------------------------------
@@ -1785,6 +1863,39 @@ pub enum Request {
     ListWarmTemplates,
     /// Remove a saved warm CI template.
     DeleteWarmTemplate { key: String },
+    /// Pre-flight check before cross-Mac container migration (Wave 6).
+    PrepareMigration { image: String, digest: String, name: String },
+    /// Export a container's sparse disk extents, spec, named volumes, and optional VM state
+    /// as a `.tar.gz` stream (`MigrationArchive` followed by raw bytes until EOF).
+    ExportMigration {
+        id: String,
+        #[serde(default)]
+        include_vm_state: bool,
+    },
+    /// Receive `size` `.tar.gz` bytes of a migration bundle and boot it here.
+    ImportMigration {
+        size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default = "default_true")]
+        start: bool,
+    },
+    /// Read current battery/AC status and burst offloading policy.
+    GetPowerAndOffload,
+    /// Persist burst offloading policy.
+    SetOffloadPolicy(OffloadPolicy),
+    /// Start a local TCP port forwarder to a migrated container on a paired Mac.
+    StartPortTunnel {
+        container_name: String,
+        remote_host: String,
+        remote_addr: String,
+        local_port: u16,
+        remote_port: u16,
+    },
+    /// List active migration port tunnels.
+    ListPortTunnels,
+    /// Stop an active migration port tunnel.
+    StopPortTunnel { id: String },
     /// Run a command in a running container. Without a TTY the daemon answers
     /// with `ExecOutput` lines and a final `ExecExited`; with one it answers
     /// `Attached` and the connection then carries terminal [`frame`]s.
@@ -1913,6 +2024,12 @@ pub enum Response {
     WarmTemplateSaved(WarmTemplateInfo),
     WarmTemplates(Vec<WarmTemplateInfo>),
     WarmTemplateDeleted { key: String },
+    MigrationReady(MigrationPrepareResult),
+    MigrationArchive(MigrationBundleInfo),
+    MigrationImported(ContainerSummary),
+    PowerAndOffload { power: PowerStatus, policy: OffloadPolicy },
+    PortTunnels(Vec<ActiveTunnel>),
+    PortTunnelStopped { id: String },
     Push(PushInfo),
     Pairing(PairingInfo),
     Devices(Vec<PairedDevice>),
@@ -3242,5 +3359,92 @@ mod tests {
             created_at: 1_700_000_001,
         };
         assert_eq!(decode_line::<Response>(&encode_line(&Response::WarmTemplateSaved(wt.clone()))).unwrap(), Response::WarmTemplateSaved(wt));
+    }
+
+    #[test]
+    fn wave6_migration_offload_and_tunnel_round_trip() {
+        let policy = OffloadPolicy {
+            enabled: true,
+            preferred_host: Some("studio-m4".into()),
+            battery_threshold: 45,
+            offload_multi_arch: true,
+            offload_builds: true,
+            offload_compose: false,
+        };
+        for req in [
+            Request::PrepareMigration { image: "alpine:3.22".into(), digest: "sha256:aa".into(), name: "web".into() },
+            Request::ExportMigration { id: "web".into(), include_vm_state: true },
+            Request::ImportMigration { size: 4096, name: Some("web-migrated".into()), start: true },
+            Request::GetPowerAndOffload,
+            Request::SetOffloadPolicy(policy.clone()),
+            Request::StartPortTunnel {
+                container_name: "web".into(),
+                remote_host: "studio-m4".into(),
+                remote_addr: "192.0.2.10".into(),
+                local_port: 8080,
+                remote_port: 8080,
+            },
+            Request::ListPortTunnels,
+            Request::StopPortTunnel { id: "tun-1".into() },
+        ] {
+            assert_eq!(decode_line::<Request>(&encode_line(&req)).unwrap(), req);
+        }
+
+        let summary = ContainerSummary {
+            id: "abcd12345678".into(),
+            name: "web-migrated".into(),
+            image: "alpine:3.22".into(),
+            status: ContainerStatus::Running,
+            exit_code: None,
+            ports: vec![PortMapping { host_ip: None, host_port: 8080, container_port: 80, protocol: PortProtocol::Tcp }],
+            mounts: vec![],
+            ip_address: Some("192.168.64.5".into()),
+            cpu_percent: None,
+            memory_bytes: None,
+            memory_limit_bytes: Some(512 << 20),
+            created_at: 1_700_000_000,
+            started_at: Some(1_700_000_001),
+            project: None,
+            service: None,
+            health: None,
+            forked_from: None,
+        };
+        for resp in [
+            Response::MigrationReady(MigrationPrepareResult {
+                has_image: false,
+                name_available: true,
+                target_arch: "arm64".into(),
+                target_rosetta: true,
+            }),
+            Response::MigrationArchive(MigrationBundleInfo {
+                container_name: "web".into(),
+                image: "alpine:3.22".into(),
+                digest: "sha256:aa".into(),
+                architecture: "arm64".into(),
+                disk_logical_bytes: 4 << 30,
+                disk_extent_bytes: 12 << 20,
+                has_vm_state: false,
+                ports: vec![],
+            }),
+            Response::MigrationImported(summary),
+            Response::PowerAndOffload {
+                power: PowerStatus { on_battery: true, battery_percent: Some(38), source: "Battery Power".into() },
+                policy,
+            },
+            Response::PortTunnels(vec![ActiveTunnel {
+                id: "tun-1".into(),
+                container_name: "web".into(),
+                remote_host: "studio-m4".into(),
+                remote_addr: "192.0.2.10".into(),
+                local_port: 8080,
+                remote_port: 8080,
+            }]),
+            Response::PortTunnelStopped { id: "tun-1".into() },
+        ] {
+            assert_eq!(decode_line::<Response>(&encode_line(&resp)).unwrap(), resp);
+        }
+
+        let ev = EventKind::Migrated;
+        assert_eq!(decode_line::<EventKind>(&encode_line(&ev)).unwrap(), ev);
     }
 }

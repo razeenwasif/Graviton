@@ -552,6 +552,98 @@ public final class EngineStore {
         try await service.snapshotWarm(cpus: cpus, memoryMib: memoryMib, rosetta: rosetta, slots: slots)
     }
     public func snapshotClear() async throws -> SnapshotInfo { try await service.snapshotClear() }
+    public func powerAndOffload() async throws -> (power: PowerStatus, policy: OffloadPolicy) {
+        try await service.getPowerAndOffload()
+    }
+    public func setOffloadPolicy(_ policy: OffloadPolicy) async throws -> (power: PowerStatus, policy: OffloadPolicy) {
+        try await service.setOffloadPolicy(policy)
+    }
+    public func listPortTunnels() async throws -> [ActiveTunnel] {
+        try await service.listPortTunnels()
+    }
+    @discardableResult
+    public func stopPortTunnel(id: String) async throws -> String {
+        try await service.stopPortTunnel(id: id)
+    }
+
+    /// Teleport a container from the active engine to `destination`, transferring the base image if needed.
+    public func teleportContainer(
+        _ container: Container,
+        to destination: any EngineService,
+        destinationLabel: String,
+        destinationAddr: String?,
+        keepSource: Bool,
+        setupTunnels: Bool,
+        onStage: @MainActor (String) -> Void
+    ) async throws -> (migrated: Container, tunnels: [ActiveTunnel]) {
+        guard canTransferFiles else {
+            throw EngineError.daemon("Teleportation needs gravitond running, here or on a paired Mac.")
+        }
+        await MainActor.run { onStage("Pre-flighting \(destinationLabel)…") }
+        let details = try await inspect(container.id)
+        let ready = try await destination.prepareMigration(image: container.image, digest: details.imageDigest, name: container.name)
+
+        let tmpDir = FileManager.default.temporaryDirectory
+        if !ready.hasImage {
+            await MainActor.run { onStage("Transferring image \(container.image) to \(destinationLabel)…") }
+            let imgFile = tmpDir.appending(path: "graviton-mig-img-\(UUID().uuidString).tar")
+            defer { try? FileManager.default.removeItem(at: imgFile) }
+            switch live {
+            case let local as SocketEngine: try await local.saveImage(references: [container.image], to: imgFile)
+            case let remote as RemoteEngine: try await remote.saveImage(references: [container.image], to: imgFile)
+            default: throw EngineError.daemon("Source engine doesn't support streaming images.")
+            }
+            let imgSize = ((try? FileManager.default.attributesOfItem(atPath: imgFile.path)[.size]) as? NSNumber)?.uint64Value ?? 0
+            switch destination {
+            case let local as SocketEngine: _ = try await local.loadImage(from: imgFile, size: imgSize)
+            case let remote as RemoteEngine: _ = try await remote.loadImage(from: imgFile, size: imgSize)
+            default: throw EngineError.daemon("Destination engine doesn't support streaming images.")
+            }
+        }
+
+        await MainActor.run { onStage("Capturing sparse disk & volumes from \(container.name)…") }
+        let bundleFile = tmpDir.appending(path: "graviton-mig-\(UUID().uuidString).tar.gz")
+        defer { try? FileManager.default.removeItem(at: bundleFile) }
+        switch live {
+        case let local as SocketEngine: _ = try await local.exportMigration(id: container.id, includeVmState: true, to: bundleFile)
+        case let remote as RemoteEngine: _ = try await remote.exportMigration(id: container.id, includeVmState: true, to: bundleFile)
+        default: throw EngineError.daemon("Source engine doesn't support migration export.")
+        }
+
+        await MainActor.run { onStage("Booting \(container.name) on \(destinationLabel)…") }
+        let bundleSize = ((try? FileManager.default.attributesOfItem(atPath: bundleFile.path)[.size]) as? NSNumber)?.uint64Value ?? 0
+        let imported: Container
+        switch destination {
+        case let local as SocketEngine: imported = try await local.importMigration(from: bundleFile, size: bundleSize, name: nil, start: true)
+        case let remote as RemoteEngine: imported = try await remote.importMigration(from: bundleFile, size: bundleSize, name: nil, start: true)
+        default: throw EngineError.daemon("Destination engine doesn't support migration import.")
+        }
+
+        if !keepSource {
+            await MainActor.run { onStage("Cleaning up source container…") }
+            if container.isActive {
+                _ = try? await service.stop(id: container.id)
+            }
+            _ = try? await service.remove(id: container.id)
+        }
+
+        var createdTunnels: [ActiveTunnel] = []
+        if setupTunnels, let addr = destinationAddr, !addr.isEmpty {
+            for port in imported.ports where port.protocol == .tcp {
+                if let tun = try? await service.startPortTunnel(
+                    containerName: imported.name,
+                    remoteHost: destinationLabel,
+                    remoteAddr: addr,
+                    localPort: port.hostPort,
+                    remotePort: port.hostPort
+                ) {
+                    createdTunnels.append(tun)
+                }
+            }
+        }
+        await refresh()
+        return (imported, createdTunnels)
+    }
 
     /// File uploads and downloads need a real gravitond (local or remote).
     public var canTransferFiles: Bool { connection == .live && (live is SocketEngine || live is RemoteEngine) }

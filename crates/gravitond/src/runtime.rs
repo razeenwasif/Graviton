@@ -35,10 +35,11 @@ use graviton_proto::{
     AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ChaosProfile, ContainerDetails, ContainerNetworkPolicy,
     ContainerStatRow, ContainerStats, ContainerStatus, ContainerSummary, DEFAULT_NETWORK_NAME, DiffEntry,
     DirectoryListing, EgressPolicy, EngineInfo, ExecSpec, FileContents, ForkSpec, FrozenBundleInfo, FrozenRestoreInfo, GuestMount, GuestStats, HealthLog,
-    HealthState, HealthStatus, Healthcheck, HostEntry, ImageSummary, LogLevel, LogLine, LogStream, Mount,
-    NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy,
-    RunSpec, SnapshotInfo, StackCheckpointInfo, StatSample, TmpfsMount, UlimitSpec, UserNetwork, VolumeMountRef,
-    VolumeSummary, WarmTemplateInfo, XRayEvent, caps, decode_line, encode_line, parse_tmpfs_spec, validate_ulimit,
+    HealthState, HealthStatus, Healthcheck, HostEntry, ImageSummary, LogLevel, LogLine, LogStream,
+    MigrationBundleInfo, MigrationPrepareResult, Mount, NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION, PortMapping,
+    PortProtocol, ProcessInfo, Response, RestartPolicy, RunSpec, SnapshotInfo, StackCheckpointInfo, StatSample,
+    TmpfsMount, UlimitSpec, UserNetwork, VolumeMountRef, VolumeSummary, WarmTemplateInfo, XRayEvent, caps,
+    decode_line, encode_line, parse_tmpfs_spec, validate_ulimit,
 };
 use graviton_vmm::apple::{AppleHypervisor, AppleVm};
 use graviton_vmm::{NetworkMode, SharedDirectory, VmConfig, VmHandle};
@@ -277,6 +278,7 @@ pub struct Engine {
     pulling: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     rt: tokio::runtime::Handle,
     state_path: PathBuf,
+    pub tunnels: Arc<crate::migrate::TunnelManager>,
 }
 
 impl Engine {
@@ -314,6 +316,7 @@ impl Engine {
             pulling: Mutex::new(HashMap::new()),
             rt: tokio::runtime::Handle::current(),
             state_path: paths::support_dir().join("containers.json"),
+            tunnels: Arc::new(crate::migrate::TunnelManager::default()),
         });
         let autostart = engine.restore()?;
         let known: HashSet<String> = engine.store.lock().unwrap().containers().iter().map(|c| c.id.clone()).collect();
@@ -2134,6 +2137,367 @@ impl Engine {
         }
         fs::remove_dir_all(&dir)?;
         Ok(key)
+    }
+
+    /// Pre-flight check on a destination Mac before cross-Mac container migration.
+    pub fn prepare_migration(&self, image: &str, digest: &str, name: &str) -> MigrationPrepareResult {
+        let has_image = (!digest.is_empty() && self.resolve_local_image(digest).is_some())
+            || self.resolve_local_image(image).is_some();
+        let name_available = !self.store.lock().unwrap().name_taken(name.trim());
+        MigrationPrepareResult {
+            has_image,
+            name_available,
+            target_arch: graviton_image::guest_arch().into(),
+            target_rosetta: AppleHypervisor::rosetta_available(),
+        }
+    }
+
+    /// Quiesce a container, encode its sparse `disk.img` extents, named volumes, and
+    /// optional `.vzsave` state into a `.tar.gz` bundle in temp, then return `(bundle_path, metadata)`.
+    pub fn export_migration_to_temp(&self, key: &str, include_vm_state: bool) -> Result<(PathBuf, MigrationBundleInfo)> {
+        let (src, source_spec) = {
+            let store = self.store.lock().unwrap();
+            let src = store.container(key)?.clone();
+            let spec = self
+                .specs
+                .lock()
+                .unwrap()
+                .get(&src.id)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing spec for container `{}`", src.name))?;
+            (src, spec)
+        };
+
+        struct PauseGuard<'a> {
+            engine: &'a Engine,
+            id: String,
+            active: bool,
+        }
+        impl Drop for PauseGuard<'_> {
+            fn drop(&mut self) {
+                if self.active {
+                    let _ = self.engine.unpause(&self.id);
+                }
+            }
+        }
+
+        let was_running = src.status == ContainerStatus::Running;
+        let mut resume_guard = PauseGuard { engine: self, id: src.id.clone(), active: false };
+        if was_running {
+            match self.agent_call(&src.id, |_| AgentRequest::SyncFs)? {
+                AgentEvent::Synced => {}
+                AgentEvent::Error { message } => bail!("syncing `{}` before migration export: {message}", src.name),
+                other => bail!("unexpected sync response from `{}`: {other:?}", src.name),
+            }
+            self.pause(&src.id)?;
+            resume_guard.active = true;
+        }
+
+        static NEXT_MIG: AtomicU64 = AtomicU64::new(0);
+        let seq = NEXT_MIG.fetch_add(1, Ordering::Relaxed);
+        let work_dir = std::env::temp_dir().join(format!("graviton-mig-export-{}-{seq}", std::process::id()));
+        fs::create_dir_all(&work_dir)?;
+        struct DirCleanup(PathBuf);
+        impl Drop for DirCleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _work_guard = DirCleanup(work_dir.clone());
+
+        let src_disk_path = paths::vms_dir().join(&src.id).join(SCRATCH_DISK);
+        let ext_path = work_dir.join("disk.extents");
+        let (disk_logical_bytes, disk_extent_bytes) = if src_disk_path.is_file() {
+            let mut ext_file = fs::File::create(&ext_path)?;
+            crate::migrate::encode_sparse_extents(&src_disk_path, &mut ext_file)?
+        } else {
+            (0, 0)
+        };
+
+        let mut has_vm_state = false;
+        let vz_path = work_dir.join("state.vzsave");
+        if include_vm_state && was_running && AppleHypervisor::session_unlocked() {
+            let vm_opt = {
+                let running = self.running.lock().unwrap();
+                running.get(&src.id).filter(|r| r._snapshot.is_some()).map(|r| Arc::clone(&r.vm))
+            };
+            if let Some(vm) = vm_opt {
+                if vm.save_state(&vz_path).is_ok() {
+                    has_vm_state = true;
+                } else {
+                    let _ = fs::remove_file(&vz_path);
+                }
+            }
+        }
+
+        let mut named_volumes = Vec::new();
+        let mut volume_dirs = Vec::new();
+        for v in &source_spec.volumes {
+            if let Some(vn) = &v.name {
+                named_volumes.push(crate::migrate::PortableVolume {
+                    name: vn.clone(),
+                    target: v.target.clone(),
+                    read_only: v.read_only,
+                });
+                let dir = paths::volumes_dir().join(vn);
+                if dir.is_dir() {
+                    volume_dirs.push((vn.clone(), dir));
+                }
+            }
+        }
+
+        let manifest = crate::migrate::MigrationManifest {
+            version: 1,
+            source_id: source_spec.disk_source_id.clone().unwrap_or_else(|| src.id.clone()),
+            name: src.name.clone(),
+            image_ref: src.image.clone(),
+            image_digest: source_spec.image.manifest_digest.clone(),
+            architecture: source_spec.image.architecture.clone(),
+            was_running,
+            has_vm_state,
+            argv: source_spec.argv.clone(),
+            env: source_spec.env.clone(),
+            cwd: source_spec.cwd.clone(),
+            user: source_spec.user.clone(),
+            cpus: source_spec.cpus,
+            memory_mib: source_spec.memory_mib,
+            ports: source_spec.ports.clone(),
+            named_volumes,
+            restart: source_spec.restart,
+            hostname: source_spec.hostname.clone(),
+            project: source_spec.project.clone(),
+            service: source_spec.service.clone(),
+            labels: source_spec.labels.clone(),
+            dns_aliases: source_spec.dns_aliases.clone(),
+            healthcheck: source_spec.healthcheck.clone(),
+            read_only: source_spec.read_only,
+            cap_add: source_spec.cap_add.clone(),
+            cap_drop: source_spec.cap_drop.clone(),
+            tmpfs: source_spec.tmpfs.clone(),
+            init: source_spec.init,
+            networks: source_spec.networks.clone(),
+            shm_size_bytes: source_spec.shm_size_bytes,
+            ulimits: source_spec.ulimits.clone(),
+            egress: source_spec.egress.clone(),
+            chaos: source_spec.chaos,
+        };
+
+        let bundle_tar_gz = std::env::temp_dir().join(format!("graviton-mig-bundle-{}-{seq}.tar.gz", std::process::id()));
+        crate::migrate::pack_migration_tar_gz(
+            &bundle_tar_gz,
+            &crate::migrate::BundledPaths {
+                manifest: &manifest,
+                sparse_extents: (disk_logical_bytes > 0).then_some(ext_path.as_path()),
+                vm_state: has_vm_state.then_some(vz_path.as_path()),
+                volume_dirs: &volume_dirs,
+            },
+        )?;
+
+        if resume_guard.active {
+            resume_guard.active = false;
+            self.unpause(&src.id)?;
+        }
+
+        let info = MigrationBundleInfo {
+            container_name: src.name,
+            image: src.image,
+            digest: source_spec.image.manifest_digest,
+            architecture: source_spec.image.architecture,
+            disk_logical_bytes,
+            disk_extent_bytes,
+            has_vm_state,
+            ports: source_spec.ports,
+        };
+        Ok((bundle_tar_gz, info))
+    }
+
+    /// Unpack a migration `.tar.gz` bundle, recreate the sparse container disk + named volumes,
+    /// register the container, and boot it (when `start == true`).
+    pub fn import_migration_from_path(
+        self: &Arc<Self>,
+        archive_path: &Path,
+        name_override: Option<String>,
+        start: bool,
+    ) -> Result<ContainerSummary> {
+        static NEXT_IMP: AtomicU64 = AtomicU64::new(0);
+        let seq = NEXT_IMP.fetch_add(1, Ordering::Relaxed);
+        let work_dir = std::env::temp_dir().join(format!("graviton-mig-import-{}-{seq}", std::process::id()));
+        struct DirCleanup(PathBuf);
+        impl Drop for DirCleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _work_guard = DirCleanup(work_dir.clone());
+
+        crate::migrate::unpack_migration_tar_gz(archive_path, &work_dir)?;
+
+        let manifest_path = work_dir.join("manifest.json");
+        if !manifest_path.is_file() {
+            bail!("migration archive missing manifest.json");
+        }
+        let manifest: crate::migrate::MigrationManifest =
+            serde_json::from_slice(&fs::read(&manifest_path)?).context("parsing migration manifest")?;
+
+        let local_image = self
+            .resolve_local_image(&manifest.image_digest)
+            .or_else(|| self.resolve_local_image(&manifest.image_ref))
+            .ok_or_else(|| {
+                anyhow!(
+                    "image `{}` ({}) is not present on this Mac — transfer or pull it first",
+                    manifest.image_ref,
+                    manifest.image_digest
+                )
+            })?;
+
+        let new_id = new_id();
+        let container_name = match name_override {
+            Some(n) => {
+                let n = n.trim().to_string();
+                if n.is_empty() || n.contains('/') || n.contains('\0') {
+                    bail!("invalid container name `{n}`");
+                }
+                if self.store.lock().unwrap().name_taken(&n) {
+                    bail!("container name `{n}` is already in use");
+                }
+                n
+            }
+            None => {
+                let store = self.store.lock().unwrap();
+                if store.name_taken(&manifest.name) {
+                    format!("{}-{}", manifest.name, &new_id[..4])
+                } else {
+                    manifest.name.clone()
+                }
+            }
+        };
+
+        let dst_vm_dir = paths::vms_dir().join(&new_id);
+        fs::create_dir_all(&dst_vm_dir)?;
+        let cleanup_on_err = || {
+            let _ = fs::remove_dir_all(&dst_vm_dir);
+        };
+
+        let ext_path = work_dir.join("disk.extents");
+        let has_disk = ext_path.is_file();
+        if has_disk {
+            let mut ext_file = fs::File::open(&ext_path)?;
+            if let Err(err) = crate::migrate::decode_sparse_extents(&mut ext_file, &dst_vm_dir.join(SCRATCH_DISK)) {
+                cleanup_on_err();
+                return Err(err);
+            }
+        }
+
+        let mut restored_volumes = Vec::with_capacity(manifest.named_volumes.len());
+        for pv in &manifest.named_volumes {
+            if !is_valid_volume_name(&pv.name) {
+                continue;
+            }
+            let vol_dst = paths::volumes_dir().join(&pv.name);
+            fs::create_dir_all(&vol_dst)?;
+            let vol_src = work_dir.join("volumes").join(&pv.name);
+            if vol_src.is_dir() {
+                if let Err(err) = clone_dir_cow(&vol_src, &vol_dst) {
+                    cleanup_on_err();
+                    return Err(err);
+                }
+            }
+            restored_volumes.push(Volume {
+                source: vol_dst,
+                target: pv.target.clone(),
+                read_only: pv.read_only,
+                name: Some(pv.name.clone()),
+            });
+        }
+
+        let networks = if manifest.networks.is_empty() {
+            vec![DEFAULT_NETWORK_NAME.to_string()]
+        } else {
+            manifest.networks.clone()
+        };
+        let cs = ContainerSpec {
+            image: local_image,
+            argv: manifest.argv,
+            env: manifest.env,
+            cwd: if manifest.cwd.is_empty() { "/".into() } else { manifest.cwd },
+            user: manifest.user,
+            cpus: manifest.cpus.max(1),
+            memory_mib: manifest.memory_mib.max(128),
+            ports: manifest.ports.clone(),
+            volumes: restored_volumes,
+            restart: manifest.restart,
+            want_running: start,
+            auto_remove: false,
+            hostname: manifest.hostname.or_else(|| Some(container_name.clone())),
+            project: manifest.project.clone(),
+            service: manifest.service.clone(),
+            labels: manifest.labels,
+            dns_aliases: manifest.dns_aliases,
+            healthcheck: manifest.healthcheck,
+            read_only: manifest.read_only,
+            cap_add: manifest.cap_add,
+            cap_drop: manifest.cap_drop,
+            tmpfs: manifest.tmpfs,
+            init: manifest.init,
+            networks,
+            shm_size_bytes: manifest.shm_size_bytes,
+            ulimits: manifest.ulimits,
+            forked_from: Some(manifest.source_id.clone()),
+            disk_source_id: has_disk.then_some(manifest.source_id.clone()),
+            egress: manifest.egress,
+            chaos: manifest.chaos,
+        };
+
+        let summary = ContainerSummary {
+            id: new_id.clone(),
+            name: container_name.clone(),
+            image: manifest.image_ref.clone(),
+            status: ContainerStatus::Created,
+            exit_code: None,
+            ports: cs.ports.clone(),
+            mounts: cs
+                .volumes
+                .iter()
+                .map(|v| Mount {
+                    source: v.name.clone().unwrap_or_else(|| v.source.display().to_string()),
+                    target: v.target.clone(),
+                    read_only: v.read_only,
+                })
+                .collect(),
+            ip_address: None,
+            cpu_percent: None,
+            memory_bytes: None,
+            memory_limit_bytes: Some(cs.memory_mib << 20),
+            created_at: now_secs(),
+            started_at: None,
+            project: cs.project.clone(),
+            service: cs.service.clone(),
+            health: None,
+            forked_from: Some(manifest.source_id),
+        };
+
+        {
+            let mut store = self.store.lock().unwrap();
+            if let Err(err) = store.insert(summary.clone()) {
+                cleanup_on_err();
+                return Err(err.into());
+            }
+            self.specs.lock().unwrap().insert(new_id.clone(), cs);
+        }
+        self.save();
+        self.refresh_images();
+        self.events.record(
+            graviton_proto::EventKind::Migrated,
+            Some((&summary.id, &summary.name)),
+            Some(&summary.image),
+            format!("{} teleported onto this Mac", summary.name),
+        );
+
+        if start {
+            self.launch(&new_id)
+        } else {
+            Ok(summary)
+        }
     }
 
     /// Send a POSIX signal to a running container's main process.
@@ -5385,6 +5749,7 @@ mod tests {
             pulling: Mutex::new(HashMap::new()),
             rt: rt.handle().clone(),
             state_path: state_path.clone(),
+            tunnels: Arc::new(crate::migrate::TunnelManager::default()),
         };
 
         let created = engine.create_network("frontend", false, BTreeMap::from([("tier".into(), "web".into())])).unwrap();
