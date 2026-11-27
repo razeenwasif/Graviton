@@ -15,7 +15,7 @@ clap_complete = "4"
 libc = "0.2"
 qrcode = { version = "0.14", default-features = false }
 serde.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 tar = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

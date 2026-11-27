@@ -15,4 +15,4 @@ ruzstd = "0.9"
 libc = "0.2"
 tar = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-sha2 = "0.10"
+sha2 = "0.11"
