@@ -1231,6 +1231,39 @@ import Testing
         #expect(info.sourceContainerName == "ntr-9-test" && info.hasWorkspace && info.exitCode == 1)
     }
 
+    @Test func wave4StacksAndWarmTemplatesWire() throws {
+        let line = { (r: EngineRequest) in String(decoding: try Wire.line(r), as: UTF8.self) }
+        #expect(
+            try line(.hibernateStack(key: "feat-auth", project: "demo-app"))
+                == #"{"method":"hibernate_stack","params":{"key":"feat-auth","project":"demo-app"}}"# + "\n"
+        )
+        #expect(
+            try line(.thawStack(key: "feat-auth", stopConflicts: true))
+                == #"{"method":"thaw_stack","params":{"key":"feat-auth","stop_conflicts":true}}"# + "\n"
+        )
+        #expect(try line(.listStackCheckpoints) == #"{"method":"list_stack_checkpoints"}"# + "\n")
+        #expect(
+            try line(.saveWarmTemplate(key: "tpl-1", containerId: "ntr-9-test"))
+                == #"{"method":"save_warm_template","params":{"container_id":"ntr-9-test","key":"tpl-1"}}"# + "\n"
+        )
+        #expect(
+            try line(.runFromWarmTemplate(key: "tpl-1", name: "ntr-10-test", workspace: "/tmp/ws", cpus: 2, memoryMib: 1024, env: ["CI=1"]))
+                == #"{"method":"run_from_warm_template","params":{"cpus":2,"env":["CI=1"],"key":"tpl-1","memory_mib":1024,"name":"ntr-10-test","workspace":"/tmp/ws"}}"# + "\n"
+        )
+
+        let stackJson = #"{"type":"stack_hibernated","data":{"key":"feat-auth","project":"demo-app","services":["db","api"],"volumes":["pgdata"],"size_bytes":4096,"created_at":1700000000}}"#
+        guard case let .stackHibernated(cp) = try Wire.decoder.decode(EngineResponse.self, from: Data(stackJson.utf8)) else {
+            Issue.record("expected stack_hibernated"); return
+        }
+        #expect(cp.key == "feat-auth" && cp.project == "demo-app" && cp.volumes == ["pgdata"])
+
+        let warmJson = #"{"type":"warm_template_saved","data":{"key":"tpl-1","image":"alpine:3.22","size_bytes":8192,"created_at":1700000001}}"#
+        guard case let .warmTemplateSaved(tpl) = try Wire.decoder.decode(EngineResponse.self, from: Data(warmJson.utf8)) else {
+            Issue.record("expected warm_template_saved"); return
+        }
+        #expect(tpl.key == "tpl-1" && tpl.image == "alpine:3.22")
+    }
+
     @Test func streamingLogsCommitAndArchivesWireAndHelpers() async throws {
         let line = { (r: EngineRequest) in String(decoding: try Wire.line(r), as: UTF8.self) }
 

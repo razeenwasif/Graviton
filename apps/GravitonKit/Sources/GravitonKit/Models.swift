@@ -1314,6 +1314,40 @@ public struct FrozenRestoreInfo: Codable, Hashable, Sendable {
     }
 }
 
+/// Saved Compose stack checkpoint bound to a branch/workspace key (Wave 4A).
+public struct StackCheckpointInfo: Codable, Hashable, Sendable {
+    public var key: String
+    public var project: String
+    public var services: [String]
+    public var volumes: [String]
+    public var sizeBytes: UInt64
+    public var createdAt: Int64
+
+    public init(key: String, project: String, services: [String], volumes: [String], sizeBytes: UInt64, createdAt: Int64) {
+        self.key = key
+        self.project = project
+        self.services = services
+        self.volumes = volumes
+        self.sizeBytes = sizeBytes
+        self.createdAt = createdAt
+    }
+}
+
+/// Pre-warmed CI template captured after toolchain/service setup (Wave 4B).
+public struct WarmTemplateInfo: Codable, Hashable, Sendable {
+    public var key: String
+    public var image: String
+    public var sizeBytes: UInt64
+    public var createdAt: Int64
+
+    public init(key: String, image: String, sizeBytes: UInt64, createdAt: Int64) {
+        self.key = key
+        self.image = image
+        self.sizeBytes = sizeBytes
+        self.createdAt = createdAt
+    }
+}
+
 /// Result of pushing a local OCI image to a registry (`grav push IMAGE`).
 public struct ImagePushResult: Codable, Hashable, Sendable {
     public var reference: String

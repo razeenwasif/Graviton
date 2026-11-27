@@ -172,6 +172,17 @@ enum Command {
         #[arg(long, default_value = "/bin/sh")]
         shell: String,
     },
+    /// Hibernate, thaw, or inspect branch-bound Compose stack checkpoints.
+    Stack {
+        #[command(subcommand)]
+        action: StackAction,
+    },
+    /// Manage warm-to-commit CI templates.
+    #[command(name = "warm-template")]
+    WarmTemplate {
+        #[command(subcommand)]
+        action: WarmTemplateAction,
+    },
     /// Inspect or stream Hypervisor X-Ray telemetry (`dns`, `net`, `file`, `proc`).
     #[command(name = "xray", alias = "x-ray")]
     XRay {
@@ -1003,6 +1014,56 @@ fn run(cli: Cli) -> Result<()> {
                 other => unexpected(other)?,
             }
         }
+        Command::Stack { action } => match action {
+            StackAction::Hibernate { key, project } => match client.call(&Request::HibernateStack { key, project })? {
+                Response::StackHibernated(cp) => {
+                    println!("hibernated {} ({}) -> {} ({} KB)", cp.project, cp.services.join(", "), cp.key, cp.size_bytes.div_ceil(1024));
+                }
+                other => unexpected(other)?,
+            },
+            StackAction::Thaw { key, no_stop_conflicts } => {
+                match client.call(&Request::ThawStack { key, stop_conflicts: !no_stop_conflicts })? {
+                    Response::StackThawed { key, project, containers } => {
+                        println!("thawed {} ({}) -> {} container(s)", project, key, containers.len());
+                    }
+                    other => unexpected(other)?,
+                }
+            }
+            StackAction::Ls => match client.call(&Request::ListStackCheckpoints)? {
+                Response::StackCheckpoints(list) => {
+                    for cp in list {
+                        println!("{}  project={}  services={}  {} KB", cp.key, cp.project, cp.services.join(","), cp.size_bytes.div_ceil(1024));
+                    }
+                }
+                other => unexpected(other)?,
+            },
+            StackAction::Rm { key } => match client.call(&Request::DeleteStackCheckpoint { key })? {
+                Response::StackCheckpointDeleted { key } => println!("deleted stack checkpoint {key}"),
+                other => unexpected(other)?,
+            },
+        },
+        Command::WarmTemplate { action } => match action {
+            WarmTemplateAction::Save { key, container } => {
+                match client.call(&Request::SaveWarmTemplate { key, container_id: container })? {
+                    Response::WarmTemplateSaved(info) => {
+                        println!("saved warm template {} ({}, {} KB)", info.key, info.image, info.size_bytes.div_ceil(1024));
+                    }
+                    other => unexpected(other)?,
+                }
+            }
+            WarmTemplateAction::Ls => match client.call(&Request::ListWarmTemplates)? {
+                Response::WarmTemplates(list) => {
+                    for t in list {
+                        println!("{}  {}  {} KB", t.key, t.image, t.size_bytes.div_ceil(1024));
+                    }
+                }
+                other => unexpected(other)?,
+            },
+            WarmTemplateAction::Rm { key } => match client.call(&Request::DeleteWarmTemplate { key })? {
+                Response::WarmTemplateDeleted { key } => println!("deleted warm template {key}"),
+                other => unexpected(other)?,
+            },
+        },
         Command::XRay { container, follow, limit, enable, disable } => {
             if enable || disable {
                 match client.call(&Request::SetXRay { id: container.clone(), enabled: enable })? {
@@ -3589,5 +3650,40 @@ mod tests {
             att.command,
             Command::AttachFrozen { ref name, no_attach: true, keep: false, .. } if name.as_deref() == Some("dbg")
         ));
+
+        let hb = Cli::try_parse_from(["grav", "stack", "hibernate", "branch-a", "--project", "app"]).unwrap();
+        assert!(matches!(hb.command, Command::Stack { action: StackAction::Hibernate { ref key, ref project } } if key == "branch-a" && project == "app"));
+        let wt = Cli::try_parse_from(["grav", "warm-template", "save", "tpl-1", "c1"]).unwrap();
+        assert!(matches!(wt.command, Command::WarmTemplate { action: WarmTemplateAction::Save { ref key, ref container } } if key == "tpl-1" && container == "c1"));
     }
+}
+
+#[derive(Subcommand, Debug)]
+enum StackAction {
+    /// Save containers & volumes of a Compose project into a checkpoint and stop them.
+    Hibernate {
+        key: String,
+        #[arg(short, long)]
+        project: String,
+    },
+    /// Restore a saved stack checkpoint, stopping conflicting running containers.
+    Thaw {
+        key: String,
+        #[arg(long)]
+        no_stop_conflicts: bool,
+    },
+    /// List saved stack checkpoints.
+    Ls,
+    /// Delete a saved stack checkpoint.
+    Rm { key: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum WarmTemplateAction {
+    /// Save a pre-warmed CI container template.
+    Save { key: String, container: String },
+    /// List saved warm CI templates.
+    Ls,
+    /// Delete a saved warm CI template.
+    Rm { key: String },
 }

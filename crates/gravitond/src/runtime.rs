@@ -37,8 +37,8 @@ use graviton_proto::{
     DirectoryListing, EgressPolicy, EngineInfo, ExecSpec, FileContents, ForkSpec, FrozenBundleInfo, FrozenRestoreInfo, GuestMount, GuestStats, HealthLog,
     HealthState, HealthStatus, Healthcheck, HostEntry, ImageSummary, LogLevel, LogLine, LogStream, Mount,
     NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy,
-    RunSpec, SnapshotInfo, StatSample, TmpfsMount, UlimitSpec, UserNetwork, VolumeMountRef, VolumeSummary,
-    XRayEvent, caps, decode_line, encode_line, parse_tmpfs_spec, validate_ulimit,
+    RunSpec, SnapshotInfo, StackCheckpointInfo, StatSample, TmpfsMount, UlimitSpec, UserNetwork, VolumeMountRef,
+    VolumeSummary, WarmTemplateInfo, XRayEvent, caps, decode_line, encode_line, parse_tmpfs_spec, validate_ulimit,
 };
 use graviton_vmm::apple::{AppleHypervisor, AppleVm};
 use graviton_vmm::{NetworkMode, SharedDirectory, VmConfig, VmHandle};
@@ -1659,6 +1659,481 @@ impl Engine {
             source_container_name: manifest.source_container_name,
             has_vm_state: manifest.has_vm_state,
         })
+    }
+
+    /// Hibernate all containers and named volumes in `project` under a branch checkpoint `key`.
+    pub fn hibernate_stack(self: &Arc<Self>, key: &str, project: &str) -> Result<StackCheckpointInfo> {
+        let key = validate_checkpoint_key(key)?;
+        let project = project.trim();
+        if project.is_empty() {
+            bail!("project name cannot be empty");
+        }
+        let targets: Vec<(ContainerSummary, ContainerSpec)> = {
+            let store = self.store.lock().unwrap();
+            let specs = self.specs.lock().unwrap();
+            store
+                .containers()
+                .iter()
+                .filter(|c| c.project.as_deref() == Some(project))
+                .filter_map(|c| specs.get(&c.id).cloned().map(|s| (c.clone(), s)))
+                .collect()
+        };
+        if targets.is_empty() {
+            bail!("no containers found in Compose project `{project}`");
+        }
+
+        let root = paths::stacks_dir();
+        fs::create_dir_all(&root)?;
+        let tmp_dir = root.join(format!("{key}.{}.tmp", std::process::id()));
+        let final_dir = root.join(&key);
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(tmp_dir.join("services"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o700));
+        }
+
+        let mut services = Vec::with_capacity(targets.len());
+        let mut volume_names = HashSet::new();
+        for (idx, (c, spec)) in targets.iter().enumerate() {
+            if c.status == ContainerStatus::Running {
+                let _ = self.agent_call(&c.id, |_| AgentRequest::SyncFs);
+                let _ = self.pause(&c.id);
+            }
+            let svc_dir = tmp_dir.join("services").join(idx.to_string());
+            fs::create_dir_all(&svc_dir)?;
+            let src_disk = paths::vms_dir().join(&c.id).join(SCRATCH_DISK);
+            if src_disk.is_file() {
+                clone_sparse_file(&src_disk, &svc_dir.join(SCRATCH_DISK))?;
+            }
+            for v in &spec.volumes {
+                if let Some(vn) = &v.name {
+                    volume_names.insert(vn.clone());
+                }
+            }
+            let mut saved_spec = spec.clone();
+            saved_spec.want_running = false;
+            saved_spec.disk_source_id = Some(spec.disk_source_id.clone().unwrap_or_else(|| c.id.clone()));
+            services.push(StackServiceCheckpoint {
+                name: c.name.clone(),
+                service: c.service.clone(),
+                image_ref: c.image.clone(),
+                source_id: c.id.clone(),
+                spec: saved_spec,
+            });
+        }
+
+        let mut sorted_vols: Vec<String> = volume_names.into_iter().collect();
+        sorted_vols.sort();
+        if !sorted_vols.is_empty() {
+            fs::create_dir_all(tmp_dir.join("volumes"))?;
+            for vn in &sorted_vols {
+                let vsrc = paths::volumes_dir().join(vn);
+                if vsrc.is_dir() {
+                    clone_dir_cow(&vsrc, &tmp_dir.join("volumes").join(vn))?;
+                }
+            }
+        }
+
+        let created_at = now_secs() as i64;
+        let service_names: Vec<String> = services.iter().map(|s| s.service.clone().unwrap_or_else(|| s.name.clone())).collect();
+        let manifest = StackCheckpointManifest {
+            version: 1,
+            key: key.clone(),
+            project: project.to_string(),
+            created_at,
+            services,
+            volumes: sorted_vols.clone(),
+        };
+        let bytes = serde_json::to_vec_pretty(&manifest)?;
+        let mpath = tmp_dir.join("manifest.json");
+        fs::write(&mpath, bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&mpath, fs::Permissions::from_mode(0o600));
+        }
+
+        if final_dir.exists() {
+            let _ = fs::remove_dir_all(&final_dir);
+        }
+        fs::rename(&tmp_dir, &final_dir)?;
+
+        for (c, _) in &targets {
+            if matches!(c.status, ContainerStatus::Running | ContainerStatus::Paused) {
+                let _ = self.stop(&c.id);
+            }
+        }
+
+        let size_bytes = dir_size_bytes(&final_dir);
+        self.events.record(
+            graviton_proto::EventKind::Forked,
+            None,
+            None,
+            format!("hibernated stack `{project}` -> checkpoint `{key}` ({} KB)", size_bytes.div_ceil(1024)),
+        );
+        Ok(StackCheckpointInfo {
+            key,
+            project: project.to_string(),
+            services: service_names,
+            volumes: sorted_vols,
+            size_bytes,
+            created_at,
+        })
+    }
+
+    /// Restore a saved branch stack checkpoint, stopping conflicting project containers first.
+    pub fn thaw_stack(self: &Arc<Self>, key: &str, stop_conflicts: bool) -> Result<(String, Vec<ContainerSummary>)> {
+        let key = validate_checkpoint_key(key)?;
+        let cp_dir = paths::stacks_dir().join(&key);
+        let manifest_path = cp_dir.join("manifest.json");
+        if !manifest_path.is_file() {
+            bail!("stack checkpoint `{key}` not found");
+        }
+        let manifest: StackCheckpointManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+
+        if stop_conflicts {
+            let running_project: Vec<String> = {
+                let store = self.store.lock().unwrap();
+                store
+                    .containers()
+                    .iter()
+                    .filter(|c| c.project.as_deref() == Some(&manifest.project) && matches!(c.status, ContainerStatus::Running | ContainerStatus::Paused))
+                    .map(|c| c.id.clone())
+                    .collect()
+            };
+            for cid in running_project {
+                let _ = self.stop(&cid);
+            }
+        }
+
+        for vn in &manifest.volumes {
+            let vsrc = cp_dir.join("volumes").join(vn);
+            if vsrc.is_dir() {
+                clone_dir_cow(&vsrc, &paths::volumes_dir().join(vn))?;
+            }
+        }
+
+        let mut launched = Vec::with_capacity(manifest.services.len());
+        for (idx, svc) in manifest.services.iter().enumerate() {
+            let existing = {
+                let store = self.store.lock().unwrap();
+                store.containers().iter().find(|c| c.name == svc.name).map(|c| (c.id.clone(), c.status))
+            };
+            if let Some((eid, st)) = existing {
+                if matches!(st, ContainerStatus::Running | ContainerStatus::Paused) {
+                    let _ = self.stop(&eid);
+                }
+                let _ = self.remove(&eid);
+            }
+
+            let new_cid = new_id();
+            let dst_vm_dir = paths::vms_dir().join(&new_cid);
+            fs::create_dir_all(&dst_vm_dir)?;
+            let src_disk = cp_dir.join("services").join(idx.to_string()).join(SCRATCH_DISK);
+            if src_disk.is_file() {
+                clone_sparse_file(&src_disk, &dst_vm_dir.join(SCRATCH_DISK))?;
+            }
+            let mut cs = svc.spec.clone();
+            cs.want_running = true;
+            cs.hostname = Some(svc.name.clone());
+            cs.disk_source_id = src_disk.is_file().then(|| svc.spec.disk_source_id.clone().unwrap_or_else(|| svc.source_id.clone()));
+
+            let summary = ContainerSummary {
+                id: new_cid.clone(),
+                name: svc.name.clone(),
+                image: svc.image_ref.clone(),
+                status: ContainerStatus::Created,
+                exit_code: None,
+                ports: cs.ports.clone(),
+                mounts: cs
+                    .volumes
+                    .iter()
+                    .map(|v| Mount {
+                        source: v.name.clone().unwrap_or_else(|| v.source.display().to_string()),
+                        target: v.target.clone(),
+                        read_only: v.read_only,
+                    })
+                    .collect(),
+                ip_address: None,
+                cpu_percent: None,
+                memory_bytes: None,
+                memory_limit_bytes: Some(cs.memory_mib << 20),
+                created_at: now_secs(),
+                started_at: None,
+                project: cs.project.clone(),
+                service: cs.service.clone(),
+                health: None,
+                forked_from: Some(svc.source_id.clone()),
+            };
+            {
+                let mut store = self.store.lock().unwrap();
+                store.insert(summary)?;
+                self.specs.lock().unwrap().insert(new_cid.clone(), cs);
+            }
+            self.save();
+            launched.push(self.launch(&new_cid)?);
+        }
+        self.refresh_images();
+        self.events.record(
+            graviton_proto::EventKind::Forked,
+            None,
+            None,
+            format!("thawed stack `{}` from checkpoint `{key}`", manifest.project),
+        );
+        Ok((manifest.project, launched))
+    }
+
+    pub fn list_stack_checkpoints(&self) -> Vec<StackCheckpointInfo> {
+        let Ok(entries) = fs::read_dir(paths::stacks_dir()) else { return Vec::new() };
+        let mut out = Vec::new();
+        for e in entries.flatten() {
+            let p = e.path();
+            let mp = p.join("manifest.json");
+            let Ok(raw) = fs::read(&mp) else { continue };
+            let Ok(m) = serde_json::from_slice::<StackCheckpointManifest>(&raw) else { continue };
+            out.push(StackCheckpointInfo {
+                key: m.key,
+                project: m.project,
+                services: m.services.into_iter().map(|s| s.service.unwrap_or(s.name)).collect(),
+                volumes: m.volumes,
+                size_bytes: dir_size_bytes(&p),
+                created_at: m.created_at,
+            });
+        }
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.key.cmp(&b.key)));
+        out
+    }
+
+    pub fn delete_stack_checkpoint(&self, key: &str) -> Result<String> {
+        let key = validate_checkpoint_key(key)?;
+        let dir = paths::stacks_dir().join(&key);
+        if !dir.exists() {
+            bail!("stack checkpoint `{key}` not found");
+        }
+        fs::remove_dir_all(&dir)?;
+        Ok(key)
+    }
+
+    /// Save a secret-free warm CI template from a container after `setup:` steps.
+    pub fn save_warm_template(self: &Arc<Self>, key: &str, container_key: &str) -> Result<WarmTemplateInfo> {
+        let key = validate_checkpoint_key(key)?;
+        let (src, source_spec) = {
+            let store = self.store.lock().unwrap();
+            let src = store.container(container_key)?.clone();
+            let spec = self
+                .specs
+                .lock()
+                .unwrap()
+                .get(&src.id)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing spec for container `{}`", src.name))?;
+            (src, spec)
+        };
+
+        struct PauseGuard<'a> {
+            engine: &'a Engine,
+            id: String,
+            active: bool,
+        }
+        impl Drop for PauseGuard<'_> {
+            fn drop(&mut self) {
+                if self.active {
+                    let _ = self.engine.unpause(&self.id);
+                }
+            }
+        }
+        let mut resume_guard = PauseGuard { engine: self, id: src.id.clone(), active: false };
+        if src.status == ContainerStatus::Running {
+            match self.agent_call(&src.id, |_| AgentRequest::SyncFs)? {
+                AgentEvent::Synced => {}
+                AgentEvent::Error { message } => bail!("syncing `{}` before warm save: {message}", src.name),
+                other => bail!("unexpected sync response: {other:?}"),
+            }
+            self.pause(&src.id)?;
+            resume_guard.active = true;
+        }
+
+        let root = paths::warm_templates_dir();
+        fs::create_dir_all(&root)?;
+        let tmp_dir = root.join(format!("{key}.{}.tmp", std::process::id()));
+        let final_dir = root.join(&key);
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o700));
+        }
+
+        let src_disk = paths::vms_dir().join(&src.id).join(SCRATCH_DISK);
+        if src_disk.is_file() {
+            clone_sparse_file(&src_disk, &tmp_dir.join(SCRATCH_DISK))?;
+        }
+
+        let mut clean_spec = source_spec.clone();
+        clean_spec.want_running = false;
+        clean_spec.ports.clear();
+        clean_spec.volumes.clear();
+        clean_spec.restart = RestartPolicy::No;
+        clean_spec.env = sanitize_frozen_env(&source_spec.env);
+        clean_spec.disk_source_id = Some(source_spec.disk_source_id.clone().unwrap_or_else(|| src.id.clone()));
+
+        let created_at = now_secs() as i64;
+        let manifest = WarmTemplateManifest {
+            version: 1,
+            key: key.clone(),
+            image_ref: src.image.clone(),
+            source_container_id: clean_spec.disk_source_id.clone().unwrap_or_else(|| src.id.clone()),
+            spec: clean_spec,
+            created_at,
+        };
+        let mpath = tmp_dir.join("manifest.json");
+        fs::write(&mpath, serde_json::to_vec_pretty(&manifest)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&mpath, fs::Permissions::from_mode(0o600));
+        }
+
+        if final_dir.exists() {
+            let _ = fs::remove_dir_all(&final_dir);
+        }
+        fs::rename(&tmp_dir, &final_dir)?;
+
+        if resume_guard.active {
+            resume_guard.active = false;
+            self.unpause(&src.id)?;
+        }
+
+        Ok(WarmTemplateInfo {
+            key,
+            image: src.image,
+            size_bytes: dir_size_bytes(&final_dir),
+            created_at,
+        })
+    }
+
+    /// Launch a warm CI container from a saved template with a newly mounted commit `/workspace` and fresh env.
+    pub fn run_from_warm_template(
+        self: &Arc<Self>,
+        key: &str,
+        name: String,
+        workspace: PathBuf,
+        cpus: Option<u32>,
+        memory_mib: Option<u64>,
+        env: Vec<String>,
+    ) -> Result<ContainerSummary> {
+        let key = validate_checkpoint_key(key)?;
+        let tpl_dir = paths::warm_templates_dir().join(&key);
+        let manifest_path = tpl_dir.join("manifest.json");
+        if !manifest_path.is_file() {
+            bail!("warm template `{key}` not found");
+        }
+        if !workspace.is_dir() {
+            bail!("workspace `{}` does not exist", workspace.display());
+        }
+        let name = name.trim().to_string();
+        if name.is_empty() || name.contains('/') || name.contains('\0') {
+            bail!("invalid container name `{name}`");
+        }
+        {
+            let store = self.store.lock().unwrap();
+            if store.name_taken(&name) {
+                bail!("container name `{name}` is already in use");
+            }
+        }
+        let manifest: WarmTemplateManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+
+        let cid = new_id();
+        let vm_dir = paths::vms_dir().join(&cid);
+        fs::create_dir_all(&vm_dir)?;
+        let tpl_disk = tpl_dir.join(SCRATCH_DISK);
+        if tpl_disk.is_file() {
+            clone_sparse_file(&tpl_disk, &vm_dir.join(SCRATCH_DISK))?;
+        }
+
+        let mut cs = manifest.spec;
+        if let Some(c) = cpus {
+            cs.cpus = c.max(1);
+        }
+        if let Some(m) = memory_mib {
+            cs.memory_mib = m.max(128);
+        }
+        cs.env = merge_env_vars(&cs.env, &env)?;
+        cs.argv = vec!["sh".into(), "-c".into(), "while :; do sleep 3600; done".into()];
+        cs.volumes = vec![Volume {
+            source: workspace,
+            target: "/workspace".into(),
+            read_only: false,
+            name: None,
+        }];
+        cs.want_running = true;
+        cs.hostname = Some(name.clone());
+        cs.forked_from = Some(manifest.source_container_id.clone());
+        cs.disk_source_id = tpl_disk.is_file().then(|| manifest.source_container_id.clone());
+
+        let summary = ContainerSummary {
+            id: cid.clone(),
+            name,
+            image: manifest.image_ref,
+            status: ContainerStatus::Created,
+            exit_code: None,
+            ports: vec![],
+            mounts: vec![Mount {
+                source: cs.volumes[0].source.display().to_string(),
+                target: "/workspace".into(),
+                read_only: false,
+            }],
+            ip_address: None,
+            cpu_percent: None,
+            memory_bytes: None,
+            memory_limit_bytes: Some(cs.memory_mib << 20),
+            created_at: now_secs(),
+            started_at: None,
+            project: cs.project.clone(),
+            service: cs.service.clone(),
+            health: None,
+            forked_from: Some(manifest.source_container_id),
+        };
+        {
+            let mut store = self.store.lock().unwrap();
+            store.insert(summary)?;
+            self.specs.lock().unwrap().insert(cid.clone(), cs);
+        }
+        self.save();
+        self.refresh_images();
+        self.launch(&cid)
+    }
+
+    pub fn list_warm_templates(&self) -> Vec<WarmTemplateInfo> {
+        let Ok(entries) = fs::read_dir(paths::warm_templates_dir()) else { return Vec::new() };
+        let mut out = Vec::new();
+        for e in entries.flatten() {
+            let p = e.path();
+            let mp = p.join("manifest.json");
+            let Ok(raw) = fs::read(&mp) else { continue };
+            let Ok(m) = serde_json::from_slice::<WarmTemplateManifest>(&raw) else { continue };
+            out.push(WarmTemplateInfo {
+                key: m.key,
+                image: m.image_ref,
+                size_bytes: dir_size_bytes(&p),
+                created_at: m.created_at,
+            });
+        }
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.key.cmp(&b.key)));
+        out
+    }
+
+    pub fn delete_warm_template(&self, key: &str) -> Result<String> {
+        let key = validate_checkpoint_key(key)?;
+        let dir = paths::warm_templates_dir().join(&key);
+        if !dir.exists() {
+            bail!("warm template `{key}` not found");
+        }
+        fs::remove_dir_all(&dir)?;
+        Ok(key)
     }
 
     /// Send a POSIX signal to a running container's main process.
@@ -4231,6 +4706,46 @@ fn ensure_ext4_template() -> Result<Option<PathBuf>> {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+struct StackServiceCheckpoint {
+    name: String,
+    service: Option<String>,
+    image_ref: String,
+    source_id: String,
+    spec: ContainerSpec,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StackCheckpointManifest {
+    version: u32,
+    key: String,
+    project: String,
+    created_at: i64,
+    services: Vec<StackServiceCheckpoint>,
+    volumes: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct WarmTemplateManifest {
+    version: u32,
+    key: String,
+    image_ref: String,
+    source_container_id: String,
+    spec: ContainerSpec,
+    created_at: i64,
+}
+
+fn validate_checkpoint_key(key: &str) -> Result<String> {
+    let k = key.trim();
+    if k.is_empty() || k.len() > 128 || k.starts_with('.') || k.starts_with('-') || k.contains("..") {
+        bail!("invalid checkpoint key `{key}`");
+    }
+    if !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') {
+        bail!("invalid checkpoint key `{key}` (use letters, digits, '.', '_', '-')");
+    }
+    Ok(k.to_string())
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct FrozenBundleManifest {
     version: u32,
     source_container_id: String,
@@ -5074,5 +5589,11 @@ mod tests {
         ]);
         assert_eq!(filtered, vec!["CI=true", "PATH=/usr/bin", "RUST_LOG=info"]);
         assert_eq!(sanitize_frozen_name("ntr/12 test!"), "ntr-12-test");
+
+        assert!(validate_checkpoint_key("ntr-app-main").is_ok());
+        assert!(validate_checkpoint_key("branch_v1.2").is_ok());
+        assert!(validate_checkpoint_key("../escape").is_err());
+        assert!(validate_checkpoint_key("-flag").is_err());
+        assert!(validate_checkpoint_key("a/b").is_err());
     }
 }

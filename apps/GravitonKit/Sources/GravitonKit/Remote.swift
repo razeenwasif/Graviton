@@ -575,6 +575,54 @@ public actor RemoteEngine: EngineService {
         }
         return info
     }
+    public func hibernateStack(key: String, project: String) async throws -> StackCheckpointInfo {
+        guard case let .stackHibernated(info) = try await separately(.hibernateStack(key: key, project: project)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return info
+    }
+    public func thawStack(key: String, stopConflicts: Bool = true) async throws -> (key: String, project: String, containers: [Container]) {
+        guard case let .stackThawed(key: restoredKey, project: project, containers: containers) = try await separately(.thawStack(key: key, stopConflicts: stopConflicts)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return (restoredKey, project, containers)
+    }
+    public func listStackCheckpoints() async throws -> [StackCheckpointInfo] {
+        guard case let .stackCheckpoints(list) = try await call(.listStackCheckpoints) else {
+            throw EngineError.unexpectedResponse
+        }
+        return list
+    }
+    public func deleteStackCheckpoint(key: String) async throws -> String {
+        guard case let .stackCheckpointDeleted(deleted) = try await call(.deleteStackCheckpoint(key: key)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return deleted
+    }
+    public func saveWarmTemplate(key: String, containerId: String) async throws -> WarmTemplateInfo {
+        guard case let .warmTemplateSaved(info) = try await separately(.saveWarmTemplate(key: key, containerId: containerId)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return info
+    }
+    public func runFromWarmTemplate(key: String, name: String, workspace: String, cpus: UInt32? = nil, memoryMib: UInt64? = nil, env: [String] = []) async throws -> Container {
+        guard case let .container(c) = try await separately(.runFromWarmTemplate(key: key, name: name, workspace: workspace, cpus: cpus, memoryMib: memoryMib, env: env)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return c
+    }
+    public func listWarmTemplates() async throws -> [WarmTemplateInfo] {
+        guard case let .warmTemplates(list) = try await call(.listWarmTemplates) else {
+            throw EngineError.unexpectedResponse
+        }
+        return list
+    }
+    public func deleteWarmTemplate(key: String) async throws -> String {
+        guard case let .warmTemplateDeleted(deleted) = try await call(.deleteWarmTemplate(key: key)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return deleted
+    }
     public func diff(id: String) async throws -> [DiffEntry] {
         guard case let .diff(entries) = try await call(.diff(id: id)) else { throw EngineError.unexpectedResponse }
         return entries

@@ -90,6 +90,16 @@ pub fn snapshots_dir() -> PathBuf {
     support_dir().join("snapshots")
 }
 
+/// Branch-bound Compose stack checkpoints (`grav stack hibernate|thaw`).
+pub fn stacks_dir() -> PathBuf {
+    support_dir().join("stack-checkpoints")
+}
+
+/// Warm-to-commit CI container templates (`grav warm-template save|ls|rm`).
+pub fn warm_templates_dir() -> PathBuf {
+    support_dir().join("warm-templates")
+}
+
 #[cfg(test)]
 mod bundle_tests {
     use super::*;

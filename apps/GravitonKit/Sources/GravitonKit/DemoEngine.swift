@@ -293,6 +293,65 @@ public actor DemoEngine: EngineService {
         return FrozenRestoreInfo(container: c, workdir: "/workspace", exitCode: 1, failedStep: "test", sourceContainerName: "demo", hasVmState: false)
     }
 
+    public func hibernateStack(key: String, project: String) -> StackCheckpointInfo {
+        StackCheckpointInfo(
+            key: key,
+            project: project,
+            services: ["postgres", "api-gateway"],
+            volumes: ["pgdata"],
+            sizeBytes: 16 * 1024 * 1024,
+            createdAt: Int64(Date.now.timeIntervalSince1970)
+        )
+    }
+
+    public func thawStack(key: String, stopConflicts _: Bool = true) throws -> (key: String, project: String, containers: [Container]) {
+        let c = try fork(ForkSpec(source: list.first?.id ?? "web", names: ["\(key)-api"], start: true)).first
+            ?? Container(id: "thawed-demo", name: "\(key)-api", image: "alpine:3.22", status: .running, ports: [], mounts: [], createdAt: 0)
+        return (key, "demo-app", [c])
+    }
+
+    public func listStackCheckpoints() -> [StackCheckpointInfo] {
+        [
+            StackCheckpointInfo(
+                key: "demo-app__main",
+                project: "demo-app",
+                services: ["postgres", "api-gateway"],
+                volumes: ["pgdata"],
+                sizeBytes: 16 * 1024 * 1024,
+                createdAt: Int64(Date.now.timeIntervalSince1970) - 3600
+            )
+        ]
+    }
+
+    public func deleteStackCheckpoint(key: String) -> String { key }
+
+    public func saveWarmTemplate(key: String, containerId _: String) -> WarmTemplateInfo {
+        WarmTemplateInfo(
+            key: key,
+            image: "alpine:3.22",
+            sizeBytes: 8 * 1024 * 1024,
+            createdAt: Int64(Date.now.timeIntervalSince1970)
+        )
+    }
+
+    public func runFromWarmTemplate(key _: String, name: String, workspace _: String, cpus _: UInt32? = nil, memoryMib _: UInt64? = nil, env _: [String] = []) throws -> Container {
+        try fork(ForkSpec(source: list.first?.id ?? "web", names: [name], start: true)).first
+            ?? Container(id: "warm-demo", name: name, image: "alpine:3.22", status: .running, ports: [], mounts: [], createdAt: 0)
+    }
+
+    public func listWarmTemplates() -> [WarmTemplateInfo] {
+        [
+            WarmTemplateInfo(
+                key: "warm-rust-demo",
+                image: "rust:1.86-alpine",
+                sizeBytes: 32 * 1024 * 1024,
+                createdAt: Int64(Date.now.timeIntervalSince1970) - 7200
+            )
+        ]
+    }
+
+    public func deleteWarmTemplate(key: String) -> String { key }
+
     public func diff(id: String) throws -> [DiffEntry] {
         _ = try resolve(id)
         return [

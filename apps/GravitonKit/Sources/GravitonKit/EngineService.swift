@@ -44,6 +44,14 @@ public protocol EngineService: Sendable {
     func fork(_ spec: ForkSpec) async throws -> [Container]
     func freezeAndExport(id: String, destBundleDir: String, keepPaused: Bool, exitCode: Int32?, failedStep: String?) async throws -> FrozenBundleInfo
     func restoreFrozen(bundleDir: String, name: String?, ephemeral: Bool) async throws -> FrozenRestoreInfo
+    func hibernateStack(key: String, project: String) async throws -> StackCheckpointInfo
+    func thawStack(key: String, stopConflicts: Bool) async throws -> (key: String, project: String, containers: [Container])
+    func listStackCheckpoints() async throws -> [StackCheckpointInfo]
+    func deleteStackCheckpoint(key: String) async throws -> String
+    func saveWarmTemplate(key: String, containerId: String) async throws -> WarmTemplateInfo
+    func runFromWarmTemplate(key: String, name: String, workspace: String, cpus: UInt32?, memoryMib: UInt64?, env: [String]) async throws -> Container
+    func listWarmTemplates() async throws -> [WarmTemplateInfo]
+    func deleteWarmTemplate(key: String) async throws -> String
     func diff(id: String) async throws -> [DiffEntry]
     func getNetworkPolicy(id: String) async throws -> ContainerNetworkPolicy
     func setNetworkPolicy(id: String, egress: EgressPolicy?, chaos: ChaosProfile?) async throws -> ContainerNetworkPolicy
@@ -318,6 +326,54 @@ public final class SocketEngine: EngineService {
             throw EngineError.unexpectedResponse
         }
         return info
+    }
+    public func hibernateStack(key: String, project: String) async throws -> StackCheckpointInfo {
+        guard case let .stackHibernated(info) = try await call(.hibernateStack(key: key, project: project), timeout: 300) else {
+            throw EngineError.unexpectedResponse
+        }
+        return info
+    }
+    public func thawStack(key: String, stopConflicts: Bool = true) async throws -> (key: String, project: String, containers: [Container]) {
+        guard case let .stackThawed(key: restoredKey, project: project, containers: containers) = try await call(.thawStack(key: key, stopConflicts: stopConflicts), timeout: 300) else {
+            throw EngineError.unexpectedResponse
+        }
+        return (restoredKey, project, containers)
+    }
+    public func listStackCheckpoints() async throws -> [StackCheckpointInfo] {
+        guard case let .stackCheckpoints(list) = try await call(.listStackCheckpoints, timeout: 30) else {
+            throw EngineError.unexpectedResponse
+        }
+        return list
+    }
+    public func deleteStackCheckpoint(key: String) async throws -> String {
+        guard case let .stackCheckpointDeleted(deleted) = try await call(.deleteStackCheckpoint(key: key), timeout: 30) else {
+            throw EngineError.unexpectedResponse
+        }
+        return deleted
+    }
+    public func saveWarmTemplate(key: String, containerId: String) async throws -> WarmTemplateInfo {
+        guard case let .warmTemplateSaved(info) = try await call(.saveWarmTemplate(key: key, containerId: containerId), timeout: 300) else {
+            throw EngineError.unexpectedResponse
+        }
+        return info
+    }
+    public func runFromWarmTemplate(key: String, name: String, workspace: String, cpus: UInt32? = nil, memoryMib: UInt64? = nil, env: [String] = []) async throws -> Container {
+        guard case let .container(c) = try await call(.runFromWarmTemplate(key: key, name: name, workspace: workspace, cpus: cpus, memoryMib: memoryMib, env: env), timeout: 300) else {
+            throw EngineError.unexpectedResponse
+        }
+        return c
+    }
+    public func listWarmTemplates() async throws -> [WarmTemplateInfo] {
+        guard case let .warmTemplates(list) = try await call(.listWarmTemplates, timeout: 30) else {
+            throw EngineError.unexpectedResponse
+        }
+        return list
+    }
+    public func deleteWarmTemplate(key: String) async throws -> String {
+        guard case let .warmTemplateDeleted(deleted) = try await call(.deleteWarmTemplate(key: key), timeout: 30) else {
+            throw EngineError.unexpectedResponse
+        }
+        return deleted
     }
     public func diff(id: String) async throws -> [DiffEntry] {
         guard case let .diff(entries) = try await call(.diff(id: id), timeout: 30) else { throw EngineError.unexpectedResponse }

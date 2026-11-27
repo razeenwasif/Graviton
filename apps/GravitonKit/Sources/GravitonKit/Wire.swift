@@ -47,6 +47,14 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case snapshotClear
     case freezeAndExport(id: String, destBundleDir: String, keepPaused: Bool = false, exitCode: Int32? = nil, failedStep: String? = nil)
     case restoreFrozen(bundleDir: String, name: String? = nil, ephemeral: Bool = true)
+    case hibernateStack(key: String, project: String)
+    case thawStack(key: String, stopConflicts: Bool = true)
+    case listStackCheckpoints
+    case deleteStackCheckpoint(key: String)
+    case saveWarmTemplate(key: String, containerId: String)
+    case runFromWarmTemplate(key: String, name: String, workspace: String, cpus: UInt32? = nil, memoryMib: UInt64? = nil, env: [String] = [])
+    case listWarmTemplates
+    case deleteWarmTemplate(key: String)
     case exec(ExecSpec)
     case stats(id: String)
     case listFiles(id: String, path: String)
@@ -121,6 +129,18 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         let name: String?
         let ephemeral: Bool
     }
+    private struct KeyParams: Encodable { let key: String }
+    private struct HibernateStackParams: Encodable { let key: String; let project: String }
+    private struct ThawStackParams: Encodable { let key: String; let stopConflicts: Bool }
+    private struct SaveWarmTemplateParams: Encodable { let key: String; let containerId: String }
+    private struct RunFromWarmTemplateParams: Encodable {
+        let key: String
+        let name: String
+        let workspace: String
+        let cpus: UInt32?
+        let memoryMib: UInt64?
+        let env: [String]
+    }
 
     public var method: String {
         switch self {
@@ -169,6 +189,14 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .snapshotClear: "snapshot_clear"
         case .freezeAndExport: "freeze_and_export"
         case .restoreFrozen: "restore_frozen"
+        case .hibernateStack: "hibernate_stack"
+        case .thawStack: "thaw_stack"
+        case .listStackCheckpoints: "list_stack_checkpoints"
+        case .deleteStackCheckpoint: "delete_stack_checkpoint"
+        case .saveWarmTemplate: "save_warm_template"
+        case .runFromWarmTemplate: "run_from_warm_template"
+        case .listWarmTemplates: "list_warm_templates"
+        case .deleteWarmTemplate: "delete_warm_template"
         case .exec: "exec"
         case .stats: "stats"
         case .listFiles: "list_files"
@@ -190,7 +218,7 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         var c = encoder.container(keyedBy: Keys.self)
         try c.encode(method, forKey: .method)
         switch self {
-        case .ping, .engineInfo, .listContainers, .listImages, .listVolumes, .networkInfo, .listNetworks, .listLogins, .pairBegin, .listDevices, .snapshotStatus, .snapshotClear: break
+        case .ping, .engineInfo, .listContainers, .listImages, .listVolumes, .networkInfo, .listNetworks, .listLogins, .pairBegin, .listDevices, .snapshotStatus, .snapshotClear, .listStackCheckpoints, .listWarmTemplates: break
         case let .createNetwork(name, internalOnly, labels):
             try c.encode(CreateNetworkParams(name: name, internalOnly: internalOnly, labels: labels), forKey: .params)
         case let .removeNetwork(name):
@@ -216,6 +244,16 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
             try c.encode(FreezeAndExportParams(id: id, destBundleDir: destBundleDir, keepPaused: keepPaused, exitCode: exitCode, failedStep: failedStep), forKey: .params)
         case let .restoreFrozen(bundleDir, name, ephemeral):
             try c.encode(RestoreFrozenParams(bundleDir: bundleDir, name: name, ephemeral: ephemeral), forKey: .params)
+        case let .hibernateStack(key, project):
+            try c.encode(HibernateStackParams(key: key, project: project), forKey: .params)
+        case let .thawStack(key, stopConflicts):
+            try c.encode(ThawStackParams(key: key, stopConflicts: stopConflicts), forKey: .params)
+        case let .deleteStackCheckpoint(key), let .deleteWarmTemplate(key):
+            try c.encode(KeyParams(key: key), forKey: .params)
+        case let .saveWarmTemplate(key, containerId):
+            try c.encode(SaveWarmTemplateParams(key: key, containerId: containerId), forKey: .params)
+        case let .runFromWarmTemplate(key, name, workspace, cpus, memoryMib, env):
+            try c.encode(RunFromWarmTemplateParams(key: key, name: name, workspace: workspace, cpus: cpus, memoryMib: memoryMib, env: env), forKey: .params)
         case let .start(id), let .stop(id), let .pause(id), let .unpause(id), let .restart(id), let .remove(id), let .stats(id), let .inspect(id), let .diff(id), let .getNetworkPolicy(id):
             try c.encode(IDParams(id: id), forKey: .params)
         case let .setNetworkPolicy(id, egress, chaos):
@@ -288,6 +326,13 @@ public enum EngineResponse: Decodable, Sendable {
     case snapshots(SnapshotInfo)
     case frozenExported(FrozenBundleInfo)
     case frozenRestored(FrozenRestoreInfo)
+    case stackHibernated(StackCheckpointInfo)
+    case stackThawed(key: String, project: String, containers: [Container])
+    case stackCheckpoints([StackCheckpointInfo])
+    case stackCheckpointDeleted(key: String)
+    case warmTemplateSaved(WarmTemplateInfo)
+    case warmTemplates([WarmTemplateInfo])
+    case warmTemplateDeleted(key: String)
     case buildLog(String)
     case execOutput(stream: String, data: [UInt8])
     case execExited(code: Int32)
@@ -328,6 +373,8 @@ public enum EngineResponse: Decodable, Sendable {
     private struct ForkedData: Decodable { let containers: [Container] }
     private struct DiffData: Decodable { let entries: [DiffEntry] }
     private struct XRayStatusData: Decodable { let enabled: Bool }
+    private struct StackThawedData: Decodable { let key: String; let project: String; let containers: [Container] }
+    private struct KeyData: Decodable { let key: String }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
@@ -379,6 +426,15 @@ public enum EngineResponse: Decodable, Sendable {
         case "snapshots": self = .snapshots(try c.decode(SnapshotInfo.self, forKey: .data))
         case "frozen_exported": self = .frozenExported(try c.decode(FrozenBundleInfo.self, forKey: .data))
         case "frozen_restored": self = .frozenRestored(try c.decode(FrozenRestoreInfo.self, forKey: .data))
+        case "stack_hibernated": self = .stackHibernated(try c.decode(StackCheckpointInfo.self, forKey: .data))
+        case "stack_thawed":
+            let t = try c.decode(StackThawedData.self, forKey: .data)
+            self = .stackThawed(key: t.key, project: t.project, containers: t.containers)
+        case "stack_checkpoints": self = .stackCheckpoints(try c.decode([StackCheckpointInfo].self, forKey: .data))
+        case "stack_checkpoint_deleted": self = .stackCheckpointDeleted(key: try c.decode(KeyData.self, forKey: .data).key)
+        case "warm_template_saved": self = .warmTemplateSaved(try c.decode(WarmTemplateInfo.self, forKey: .data))
+        case "warm_templates": self = .warmTemplates(try c.decode([WarmTemplateInfo].self, forKey: .data))
+        case "warm_template_deleted": self = .warmTemplateDeleted(key: try c.decode(KeyData.self, forKey: .data).key)
         case "attached": self = .attached
         case "exec_output":
             let o = try c.decode(ExecOutputData.self, forKey: .data)

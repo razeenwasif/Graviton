@@ -1576,6 +1576,26 @@ pub struct FrozenRestoreInfo {
     pub has_vm_state: bool,
 }
 
+/// Saved Compose stack checkpoint bound to a branch/workspace key (Wave 4A).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackCheckpointInfo {
+    pub key: String,
+    pub project: String,
+    pub services: Vec<String>,
+    pub volumes: Vec<String>,
+    pub size_bytes: u64,
+    pub created_at: i64,
+}
+
+/// Pre-warmed CI template captured after toolchain/service setup (Wave 4B).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WarmTemplateInfo {
+    pub key: String,
+    pub image: String,
+    pub size_bytes: u64,
+    pub created_at: i64,
+}
+
 // ---------------------------------------------------------------------------
 // Control API
 // ---------------------------------------------------------------------------
@@ -1735,6 +1755,36 @@ pub enum Request {
         #[serde(default)]
         ephemeral: bool,
     },
+    /// Hibernate a Compose project's containers + volumes under a branch checkpoint key.
+    HibernateStack { key: String, project: String },
+    /// Restore (thaw) a previously hibernated stack checkpoint.
+    ThawStack {
+        key: String,
+        #[serde(default = "default_true")]
+        stop_conflicts: bool,
+    },
+    /// List saved branch stack checkpoints.
+    ListStackCheckpoints,
+    /// Remove a saved branch stack checkpoint.
+    DeleteStackCheckpoint { key: String },
+    /// Save a pre-warmed CI template from a container after setup steps.
+    SaveWarmTemplate { key: String, container_id: String },
+    /// Launch a CI container from a warm template with a fresh `/workspace` mount and env.
+    RunFromWarmTemplate {
+        key: String,
+        name: String,
+        workspace: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cpus: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory_mib: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<String>,
+    },
+    /// List saved warm CI templates.
+    ListWarmTemplates,
+    /// Remove a saved warm CI template.
+    DeleteWarmTemplate { key: String },
     /// Run a command in a running container. Without a TTY the daemon answers
     /// with `ExecOutput` lines and a final `ExecExited`; with one it answers
     /// `Attached` and the connection then carries terminal [`frame`]s.
@@ -1852,6 +1902,17 @@ pub enum Response {
     Events(Vec<EngineEvent>),
     FrozenExported(FrozenBundleInfo),
     FrozenRestored(FrozenRestoreInfo),
+    StackHibernated(StackCheckpointInfo),
+    StackThawed {
+        key: String,
+        project: String,
+        containers: Vec<ContainerSummary>,
+    },
+    StackCheckpoints(Vec<StackCheckpointInfo>),
+    StackCheckpointDeleted { key: String },
+    WarmTemplateSaved(WarmTemplateInfo),
+    WarmTemplates(Vec<WarmTemplateInfo>),
+    WarmTemplateDeleted { key: String },
     Push(PushInfo),
     Pairing(PairingInfo),
     Devices(Vec<PairedDevice>),
@@ -3140,5 +3201,46 @@ mod tests {
             created_at: 1_700_000_000,
         });
         assert_eq!(decode_line::<Response>(&encode_line(&resp_export)).unwrap(), resp_export);
+    }
+
+    #[test]
+    fn wave4_stacks_and_warm_templates_round_trip() {
+        for req in [
+            Request::HibernateStack { key: "ntr-app-main".into(), project: "app".into() },
+            Request::ThawStack { key: "ntr-app-main".into(), stop_conflicts: true },
+            Request::ListStackCheckpoints,
+            Request::DeleteStackCheckpoint { key: "ntr-app-main".into() },
+            Request::SaveWarmTemplate { key: "warm-rust-1".into(), container_id: "ntr-1".into() },
+            Request::RunFromWarmTemplate {
+                key: "warm-rust-1".into(),
+                name: "ntr-2".into(),
+                workspace: PathBuf::from("/tmp/ws"),
+                cpus: Some(4),
+                memory_mib: Some(2048),
+                env: vec!["CI=true".into()],
+            },
+            Request::ListWarmTemplates,
+            Request::DeleteWarmTemplate { key: "warm-rust-1".into() },
+        ] {
+            assert_eq!(decode_line::<Request>(&encode_line(&req)).unwrap(), req);
+        }
+
+        let cp = StackCheckpointInfo {
+            key: "ntr-app-main".into(),
+            project: "app".into(),
+            services: vec!["postgres".into(), "redis".into()],
+            volumes: vec!["pgdata".into()],
+            size_bytes: 8192,
+            created_at: 1_700_000_000,
+        };
+        assert_eq!(decode_line::<Response>(&encode_line(&Response::StackHibernated(cp.clone()))).unwrap(), Response::StackHibernated(cp));
+
+        let wt = WarmTemplateInfo {
+            key: "warm-rust-1".into(),
+            image: "rust:1.85".into(),
+            size_bytes: 16384,
+            created_at: 1_700_000_001,
+        };
+        assert_eq!(decode_line::<Response>(&encode_line(&Response::WarmTemplateSaved(wt.clone()))).unwrap(), Response::WarmTemplateSaved(wt));
     }
 }

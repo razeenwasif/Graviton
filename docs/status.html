@@ -2325,9 +2325,9 @@
         "note": "Completed in Wave 3: added FreezeAndExport / RestoreFrozen RPCs, APFS-cloned disk.img + /workspace + sanitized manifest + best-effort .vzsave bundle export and non-destructive restore across graviton-proto, gravitond, grav (freeze / attach-frozen), GravitonKit (55/55 tests), and GravitonMac deep linking terminals (graviton://container/<id>/terminal). Verified via cargo test/clippy, Release/Debug Xcode builds, and live VM freeze/restore E2E."
     },
     "branch-stacks-warm-ci": {
-        "status": "todo",
-        "updated": "2026-11-26T13:05:00+11:00",
-        "note": "Scheduled in Wave 4 of Graviton × Neutrino Breakthrough Plan."
+        "status": "done",
+        "updated": "2026-11-27T14:37:00+11:00",
+        "note": "Completed in Wave 4: added branch-bound Compose stack checkpoints (HibernateStack / ThawStack / ListStackCheckpoints / DeleteStackCheckpoint + grav stack hibernate|thaw|ls|rm) and secret-free Warm-to-Commit CI templates (SaveWarmTemplate / RunFromWarmTemplate / ListWarmTemplates / DeleteWarmTemplate + grav warm-template save|ls|rm), plus GravitonKit models/wire/RPCs. Verified via cargo test/clippy, GravitonKit (56 tests), Release/Debug Xcode builds, and live VM E2E checks for both Compose stack volumes and warm template reuse."
     }
 };
   var state = {}, loaded = false, readOnly = false;

@@ -1162,6 +1162,8 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                 Request::NetworkInfo => Response::Network(demo_network(&store)),
                 Request::ListNetworks => Response::Networks(demo_network(&store).networks),
                 Request::SnapshotStatus => Response::Snapshots(graviton_proto::SnapshotInfo::default()),
+                Request::ListStackCheckpoints => Response::StackCheckpoints(Vec::new()),
+                Request::ListWarmTemplates => Response::WarmTemplates(Vec::new()),
                 _ => Response::Error { message: "gravitond is serving demo data; restart it without --demo to pull, run, exec and browse files".into() },
             }
         }
@@ -1235,6 +1237,27 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                     }
                     Request::RestoreFrozen { bundle_dir, name, ephemeral } => {
                         Response::FrozenRestored(engine.restore_frozen(bundle_dir, name, ephemeral)?)
+                    }
+                    Request::HibernateStack { key, project } => {
+                        Response::StackHibernated(engine.hibernate_stack(&key, &project)?)
+                    }
+                    Request::ThawStack { key, stop_conflicts } => {
+                        let (project, containers) = engine.thaw_stack(&key, stop_conflicts)?;
+                        Response::StackThawed { key, project, containers }
+                    }
+                    Request::ListStackCheckpoints => Response::StackCheckpoints(engine.list_stack_checkpoints()),
+                    Request::DeleteStackCheckpoint { key } => {
+                        Response::StackCheckpointDeleted { key: engine.delete_stack_checkpoint(&key)? }
+                    }
+                    Request::SaveWarmTemplate { key, container_id } => {
+                        Response::WarmTemplateSaved(engine.save_warm_template(&key, &container_id)?)
+                    }
+                    Request::RunFromWarmTemplate { key, name, workspace, cpus, memory_mib, env } => {
+                        Response::Container(engine.run_from_warm_template(&key, name, workspace, cpus, memory_mib, env)?)
+                    }
+                    Request::ListWarmTemplates => Response::WarmTemplates(engine.list_warm_templates()),
+                    Request::DeleteWarmTemplate { key } => {
+                        Response::WarmTemplateDeleted { key: engine.delete_warm_template(&key)? }
                     }
                     Request::Stats { id } => Response::Stats(engine.stats(&id)?),
                     Request::ListFiles { id, path } => Response::Files(engine.list_files(&id, &path)?),
