@@ -3,7 +3,7 @@ import GravitonKit
 import SwiftUI
 
 enum DetailTab: String, CaseIterable, Identifiable {
-    case overview = "Overview", logs = "Logs", terminal = "Terminal", files = "Files", diff = "Diff", stats = "Stats", inspect = "Inspect"
+    case overview = "Overview", logs = "Logs", terminal = "Terminal", files = "Files", diff = "Diff", xray = "X-Ray", stats = "Stats", inspect = "Inspect"
     var id: String { rawValue }
 }
 
@@ -111,6 +111,7 @@ struct ContainerDetailScreen: View {
                     case .terminal: TerminalPanel(container: c)
                     case .files: FilesPanel(container: c)
                     case .diff: DiffPanel(container: c)
+                    case .xray: XRayPanel(container: c)
                     case .stats: StatsPanel(container: c)
                     case .inspect: InspectPanel(container: c)
                     }

@@ -882,6 +882,208 @@ pub struct RunSpec {
     /// POSIX resource limits applied inside the container (`--ulimit`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ulimits: Vec<UlimitSpec>,
+    /// Host-enforced egress firewall policy (`Unrestricted` by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressPolicy>,
+    /// Host-enforced latency, jitter, loss, and bandwidth chaos profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chaos: Option<ChaosProfile>,
+}
+
+/// Host-enforced container egress firewall mode (zero-bypass: restricted modes omit the NAT NIC).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum EgressPolicy {
+    /// Full Virtualization.framework NAT + switch access (default).
+    #[default]
+    Unrestricted,
+    /// Air-gapped: no external NAT NIC and host denies all external connections.
+    Offline,
+    /// Only allow listed domains (`example.com`, `*.pypi.org`) and CIDRs (`10.0.0.0/8`).
+    Allowlist {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        hosts: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cidrs: Vec<String>,
+    },
+}
+
+impl EgressPolicy {
+    pub fn is_restricted(&self) -> bool {
+        !matches!(self, Self::Unrestricted)
+    }
+
+    /// Parse `--egress`: `unrestricted`, `offline`, or `allow:host1,*.host2,1.2.3.0/24`.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if matches!(lower.as_str(), "unrestricted" | "open" | "default") {
+            return Ok(Self::Unrestricted);
+        }
+        if matches!(lower.as_str(), "offline" | "none" | "block" | "airgap") {
+            return Ok(Self::Offline);
+        }
+        let targets_raw = trimmed
+            .strip_prefix("allow:")
+            .or_else(|| trimmed.strip_prefix("allowlist:"))
+            .ok_or_else(|| format!("invalid egress policy `{raw}` (use unrestricted, offline, or allow:host1,host2)"))?;
+        let mut hosts = Vec::new();
+        let mut cidrs = Vec::new();
+        for part in targets_raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if is_valid_cidr_or_ip(part) {
+                if !cidrs.iter().any(|c| c == part) {
+                    cidrs.push(part.to_string());
+                }
+            } else {
+                let norm = part.trim_end_matches('.').to_ascii_lowercase();
+                if norm.is_empty() || norm.chars().any(char::is_whitespace) || norm.contains('/') {
+                    return Err(format!("invalid allowlist entry `{part}`"));
+                }
+                if !hosts.iter().any(|h| h == &norm) {
+                    hosts.push(norm);
+                }
+            }
+        }
+        if hosts.is_empty() && cidrs.is_empty() {
+            return Err("allowlist requires at least one host or CIDR target".into());
+        }
+        Ok(Self::Allowlist { hosts, cidrs })
+    }
+
+    pub fn allows_host(&self, host: &str) -> bool {
+        match self {
+            Self::Unrestricted => true,
+            Self::Offline => false,
+            Self::Allowlist { hosts, .. } => {
+                let target = host.trim().trim_end_matches('.').to_ascii_lowercase();
+                hosts.iter().any(|rule| {
+                    if let Some(suffix) = rule.strip_prefix("*.") {
+                        target == suffix || target.ends_with(&format!(".{suffix}"))
+                    } else {
+                        target == *rule
+                    }
+                })
+            }
+        }
+    }
+
+    pub fn allows_ip(&self, ip: std::net::IpAddr) -> bool {
+        match self {
+            Self::Unrestricted => true,
+            Self::Offline => false,
+            Self::Allowlist { cidrs, .. } => cidrs.iter().any(|c| cidr_contains(c, ip)),
+        }
+    }
+}
+
+fn is_valid_cidr_or_ip(raw: &str) -> bool {
+    if raw.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    let Some((addr, prefix)) = raw.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match addr.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => prefix <= 32,
+        Ok(std::net::IpAddr::V6(_)) => prefix <= 128,
+        Err(_) => false,
+    }
+}
+
+pub fn cidr_contains(cidr: &str, ip: std::net::IpAddr) -> bool {
+    let (addr_str, prefix_opt) = match cidr.split_once('/') {
+        Some((a, p)) => (a, p.parse::<u8>().ok()),
+        None => (cidr, None),
+    };
+    let Ok(net_ip) = addr_str.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match (net_ip, ip) {
+        (std::net::IpAddr::V4(net), std::net::IpAddr::V4(target)) => {
+            let prefix = prefix_opt.unwrap_or(32);
+            if prefix > 32 {
+                return false;
+            }
+            let mask = if prefix == 0 { 0u32 } else { u32::MAX << (32 - prefix) };
+            (u32::from(net) & mask) == (u32::from(target) & mask)
+        }
+        (std::net::IpAddr::V6(net), std::net::IpAddr::V6(target)) => {
+            let prefix = prefix_opt.unwrap_or(128);
+            if prefix > 128 {
+                return false;
+            }
+            let mask = if prefix == 0 { 0u128 } else { u128::MAX << (128 - prefix) };
+            (u128::from(net) & mask) == (u128::from(target) & mask)
+        }
+        _ => false,
+    }
+}
+
+/// Host-enforced per-container fault injection (`latency`, `jitter`, `loss`, bandwidth cap).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChaosProfile {
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub latency_ms: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub jitter_ms: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub loss_percent: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bandwidth_kbps: Option<u32>,
+}
+
+impl ChaosProfile {
+    pub fn is_active(&self) -> bool {
+        self.latency_ms > 0 || self.jitter_ms > 0 || self.loss_percent > 0 || self.bandwidth_kbps.is_some()
+    }
+}
+
+/// Active firewall + chaos policy for a container.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerNetworkPolicy {
+    #[serde(default)]
+    pub egress: EgressPolicy,
+    #[serde(default)]
+    pub chaos: ChaosProfile,
+    /// True when the VM is booted with `NetworkMode::None` (zero host NAT interface).
+    #[serde(default)]
+    pub hardware_isolated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum XRayEventKind {
+    Dns,
+    Net,
+    File,
+    Proc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct XRayEvent {
+    #[serde(default)]
+    pub seq: u64,
+    pub timestamp_ms: u64,
+    pub kind: XRayEventKind,
+    pub action: String,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default = "default_true")]
+    pub allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_us: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+}
+
+fn is_zero_u8(n: &u8) -> bool {
+    *n == 0
 }
 
 fn is_zero_u16(n: &u16) -> bool {
@@ -1290,6 +1492,12 @@ pub struct ContainerDetails {
     /// POSIX resource limits applied inside the container (`--ulimit`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ulimits: Vec<UlimitSpec>,
+    /// Active egress firewall & chaos policy for this container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_policy: Option<ContainerNetworkPolicy>,
+    /// Whether live Hypervisor X-Ray collection is currently enabled.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub xray_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1433,6 +1641,26 @@ pub enum Request {
     Fork(Box<ForkSpec>),
     /// Inspect overlay filesystem changes (`Added`, `Modified`, `Deleted`) inside a container.
     Diff { id: String },
+    /// Inspect active egress firewall & chaos policy on a container.
+    GetNetworkPolicy { id: String },
+    /// Update active egress firewall and/or chaos policy on a container.
+    SetNetworkPolicy {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        egress: Option<EgressPolicy>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chaos: Option<ChaosProfile>,
+    },
+    /// Enable or disable Hypervisor X-Ray event collection on a container.
+    SetXRay { id: String, enabled: bool },
+    /// Fetch buffered X-Ray events, or stream live events (`follow: true`).
+    XRay {
+        id: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        follow: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
     /// Remove a stopped container.
     Remove { id: String },
     /// Where the disk space goes.
@@ -1538,6 +1766,10 @@ pub enum Response {
     Container(ContainerSummary),
     Forked { containers: Vec<ContainerSummary> },
     Diff { entries: Vec<DiffEntry> },
+    NetworkPolicy(ContainerNetworkPolicy),
+    XRayStatus { enabled: bool },
+    XRayEvents(Vec<XRayEvent>),
+    XRayEvent(XRayEvent),
     Image(ImageSummary),
     PullProgress(PullProgress),
     ImagePushProgress(ImagePushProgress),
@@ -1789,6 +2021,16 @@ pub enum AgentRequest {
     SyncFs,
     /// Collect overlayfs upperdir diff entries (`Added`, `Modified`, `Deleted`) for `container`.
     Diff { container: String },
+    /// Enable or disable guest X-Ray collection (file, process, net).
+    SetXRay { container: String, enabled: bool },
+    /// Stream batched `AgentEvent::XRayBatch` frames on this dedicated vsock connection.
+    WatchXRay { container: String },
+    /// Control plane connection between host `EgressGateway` and guest `egress_proxy` (`eth0`-free VMs).
+    EgressBridge,
+    /// Bidirectional byte tunnel paired with a waiting host dial in `egress_proxy`.
+    EgressStream { id: u64 },
+    /// Remove the guest's `eth0` default route on live downgrade from Unrestricted to Offline/Allowlist.
+    DropDefaultRoute,
     Shutdown,
 }
 
@@ -1831,7 +2073,37 @@ pub enum AgentEvent {
     Synced,
     /// Reply to `AgentRequest::Diff`.
     Diff { entries: Vec<DiffEntry> },
+    /// Reply to `AgentRequest::SetXRay`.
+    XRayStatus { enabled: bool },
+    /// Streamed batch on `AgentRequest::WatchXRay`.
+    XRayBatch { events: Vec<XRayEvent> },
     Error { message: String },
+}
+
+/// Control messages sent by guest `egress_proxy` to host `EgressGateway` over `AgentRequest::EgressBridge`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum EgressBridgeRequest {
+    Dns { id: u64, name: String, qtype: u16 },
+    Dial { id: u64, host: String, port: u16 },
+}
+
+/// Replies sent by host `EgressGateway` to guest `egress_proxy` over `AgentRequest::EgressBridge`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum EgressBridgeReply {
+    DnsResult {
+        id: u64,
+        allowed: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ips: Vec<String>,
+    },
+    DialResult {
+        id: u64,
+        allowed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// A layer the agent wrote to the `out` share.
@@ -2041,6 +2313,8 @@ mod tests {
             networks: vec![],
             shm_size_bytes: None,
             ulimits: vec![],
+            egress: None,
+            chaos: None,
         }));
         assert_eq!(decode_line::<Request>(&encode_line(&compose_run)).unwrap(), compose_run);
         assert_eq!("always".parse::<RestartPolicy>().unwrap(), RestartPolicy::Always);
@@ -2676,8 +2950,60 @@ mod tests {
             networks: vec![],
             shm_size_bytes: Some(128 * 1024 * 1024),
             ulimits: vec![UlimitSpec { name: "nofile".into(), soft: 2048, hard: 4096 }],
+            egress: None,
+            chaos: None,
         }));
         assert_eq!(decode_line::<Request>(&encode_line(&run)).unwrap(), run);
+    }
+
+    #[test]
+    fn egress_policy_chaos_and_xray_round_trip() {
+        assert_eq!(EgressPolicy::parse("offline").unwrap(), EgressPolicy::Offline);
+        assert_eq!(EgressPolicy::parse("unrestricted").unwrap(), EgressPolicy::Unrestricted);
+        let allow = EgressPolicy::parse("allow:api.stripe.com,*.pypi.org,10.0.0.0/8").unwrap();
+        assert!(allow.allows_host("api.stripe.com"));
+        assert!(allow.allows_host("files.pypi.org"));
+        assert!(allow.allows_host("pypi.org"));
+        assert!(!allow.allows_host("evil.com"));
+        assert!(allow.allows_ip("10.1.2.3".parse().unwrap()));
+        assert!(!allow.allows_ip("8.8.8.8".parse().unwrap()));
+        assert!(EgressPolicy::parse("allow:").is_err());
+
+        let policy_req = Request::SetNetworkPolicy {
+            id: "web".into(),
+            egress: Some(allow.clone()),
+            chaos: Some(ChaosProfile {
+                latency_ms: 120,
+                jitter_ms: 20,
+                loss_percent: 5,
+                bandwidth_kbps: Some(1024),
+            }),
+        };
+        assert_eq!(decode_line::<Request>(&encode_line(&policy_req)).unwrap(), policy_req);
+
+        let xray_ev = Response::XRayEvent(XRayEvent {
+            seq: 1,
+            timestamp_ms: 1700000000123,
+            kind: XRayEventKind::Net,
+            action: "GET".into(),
+            target: "api.stripe.com:443".into(),
+            detail: Some("/v1/charges 200".into()),
+            allowed: true,
+            latency_us: Some(4200),
+            bytes: Some(1024),
+            pid: Some(42),
+        });
+        assert_eq!(decode_line::<Response>(&encode_line(&xray_ev)).unwrap(), xray_ev);
+
+        for req in [
+            AgentRequest::SetXRay { container: "c1".into(), enabled: true },
+            AgentRequest::WatchXRay { container: "c1".into() },
+            AgentRequest::EgressBridge,
+            AgentRequest::EgressStream { id: 7 },
+            AgentRequest::DropDefaultRoute,
+        ] {
+            assert_eq!(decode_line::<AgentRequest>(&encode_line(&req)).unwrap(), req);
+        }
     }
 
     #[test]

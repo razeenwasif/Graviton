@@ -11,6 +11,7 @@ mod boot_check;
 mod build;
 mod cleanup;
 mod docker_api;
+mod egress;
 mod erofs;
 mod events;
 mod persistence;
@@ -353,6 +354,12 @@ async fn serve(stream: UnixStream, backend: Backend, remote: Option<Arc<remote::
         }
         if let Request::StatsStream { ids, all, follow } = &request {
             if !stats_stream(&backend, ids.clone(), *all, *follow, lines.get_mut(), &mut write).await? {
+                return Ok(());
+            }
+            continue;
+        }
+        if let Request::XRay { id, follow: true, limit } = &request {
+            if !xray_stream(&backend, id.clone(), *limit, lines.get_mut(), &mut write).await? {
                 return Ok(());
             }
             continue;
@@ -1144,6 +1151,13 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                 Request::Unpause { id } => result(store.unpause(&id).map(Response::Container)),
                 Request::Fork(spec) => demo_fork(&mut store, *spec),
                 Request::Diff { id } => demo_diff(&store, &id),
+                Request::GetNetworkPolicy { id } => demo_get_policy(&store, &id),
+                Request::SetNetworkPolicy { id, egress, chaos } => demo_set_policy(&store, &id, egress, chaos),
+                Request::SetXRay { id, enabled } => match store.container(&id) {
+                    Ok(_) => Response::XRayStatus { enabled },
+                    Err(e) => Response::Error { message: e.to_string() },
+                },
+                Request::XRay { id, limit, .. } => demo_xray(&store, &id, limit),
                 Request::ListVolumes => Response::Volumes(demo_volumes(&store)),
                 Request::NetworkInfo => Response::Network(demo_network(&store)),
                 Request::ListNetworks => Response::Networks(demo_network(&store).networks),
@@ -1193,6 +1207,12 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                     Request::Run(spec) => Response::Container(engine.run(*spec)?),
                     Request::Fork(spec) => Response::Forked { containers: engine.fork(*spec)? },
                     Request::Diff { id } => Response::Diff { entries: engine.diff(&id)? },
+                    Request::GetNetworkPolicy { id } => Response::NetworkPolicy(engine.get_network_policy(&id)?),
+                    Request::SetNetworkPolicy { id, egress, chaos } => {
+                        Response::NetworkPolicy(engine.set_network_policy(&id, egress, chaos)?)
+                    }
+                    Request::SetXRay { id, enabled } => Response::XRayStatus { enabled: engine.set_xray(&id, enabled)? },
+                    Request::XRay { id, follow: false, limit } => Response::XRayEvents(engine.xray_events(&id, limit)?),
                     Request::Start { id } => Response::Container(engine.start(&id)?),
                     Request::Stop { id } => Response::Container(engine.stop(&id)?),
                     Request::Restart { id } => Response::Container(engine.restart(&id)?),
@@ -1220,7 +1240,8 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                     | Request::PutArchive { .. }
                     | Request::SaveImage { .. }
                     | Request::LoadImage { .. }
-                    | Request::StatsStream { .. } => {
+                    | Request::StatsStream { .. }
+                    | Request::XRay { follow: true, .. } => {
                         unreachable!("handled by serve()")
                     }
                     Request::Build(_) => Response::Error { message: "builds run on the Mac itself: use grav build there".into() },
@@ -1355,6 +1376,161 @@ fn demo_diff(store: &Store, id: &str) -> Response {
             graviton_proto::DiffEntry { kind: graviton_proto::DiffKind::Modified, path: "/etc/hosts".into(), size_bytes: Some(184) },
             graviton_proto::DiffEntry { kind: graviton_proto::DiffKind::Added, path: "/tmp/session.lock".into(), size_bytes: Some(32) },
         ],
+    }
+}
+
+fn demo_get_policy(store: &Store, id: &str) -> Response {
+    if store.container(id).is_err() {
+        return Response::Error { message: format!("no such container `{id}`") };
+    }
+    Response::NetworkPolicy(graviton_proto::ContainerNetworkPolicy::default())
+}
+
+fn demo_set_policy(
+    store: &Store,
+    id: &str,
+    egress: Option<graviton_proto::EgressPolicy>,
+    chaos: Option<graviton_proto::ChaosProfile>,
+) -> Response {
+    if store.container(id).is_err() {
+        return Response::Error { message: format!("no such container `{id}`") };
+    }
+    let e = egress.unwrap_or_default();
+    let hardware_isolated = e.is_restricted();
+    Response::NetworkPolicy(graviton_proto::ContainerNetworkPolicy {
+        egress: e,
+        chaos: chaos.unwrap_or_default(),
+        hardware_isolated,
+    })
+}
+
+fn demo_xray_sample() -> Vec<graviton_proto::XRayEvent> {
+    let now = runtime::now_ms();
+    vec![
+        graviton_proto::XRayEvent {
+            seq: 1,
+            timestamp_ms: now.saturating_sub(2400),
+            kind: graviton_proto::XRayEventKind::Dns,
+            action: "resolve".into(),
+            target: "api.stripe.com".into(),
+            detail: Some("52.27.14.12".into()),
+            allowed: true,
+            latency_us: Some(1820),
+            bytes: None,
+            pid: None,
+        },
+        graviton_proto::XRayEvent {
+            seq: 2,
+            timestamp_ms: now.saturating_sub(2100),
+            kind: graviton_proto::XRayEventKind::Net,
+            action: "GET".into(),
+            target: "api.stripe.com:443".into(),
+            detail: Some("sni=api.stripe.com".into()),
+            allowed: true,
+            latency_us: Some(18400),
+            bytes: Some(4120),
+            pid: None,
+        },
+        graviton_proto::XRayEvent {
+            seq: 3,
+            timestamp_ms: now.saturating_sub(900),
+            kind: graviton_proto::XRayEventKind::File,
+            action: "write".into(),
+            target: "/tmp/checkout.lock".into(),
+            detail: None,
+            allowed: true,
+            latency_us: None,
+            bytes: Some(64),
+            pid: None,
+        },
+    ]
+}
+
+fn demo_xray(store: &Store, id: &str, limit: Option<usize>) -> Response {
+    if store.container(id).is_err() {
+        return Response::Error { message: format!("no such container `{id}`") };
+    }
+    let mut events = demo_xray_sample();
+    if let Some(lim) = limit {
+        let start = events.len().saturating_sub(lim);
+        events = events[start..].to_vec();
+    }
+    Response::XRayEvents(events)
+}
+
+/// Stream live Hypervisor X-Ray events (`Response::XRayEvent`) after sending history.
+pub(crate) async fn xray_stream<R, W>(
+    backend: &Backend,
+    key: String,
+    limit: Option<usize>,
+    read: &mut BufReader<R>,
+    write: &mut W,
+) -> Result<bool>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let Backend::Engine(engine) = backend else {
+        let resp = match backend {
+            Backend::Demo(store) => demo_xray(&store.lock().unwrap(), &key, limit),
+            Backend::Engine(_) => unreachable!(),
+        };
+        if write.write_all(&encode_line(&resp)).await.is_err() || write.flush().await.is_err() {
+            return Ok(false);
+        }
+        return Ok(true);
+    };
+
+    let (cid, history, mut rx) = match engine.subscribe_xray(&key, limit) {
+        Ok(v) => v,
+        Err(err) => {
+            if write.write_all(&encode_line(&Response::Error { message: err.to_string() })).await.is_err()
+                || write.flush().await.is_err()
+            {
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+    };
+    let e_clone = Arc::clone(engine);
+    let cid_clone = cid.clone();
+    let _ = tokio::task::spawn_blocking(move || e_clone.set_xray(&cid_clone, true)).await;
+
+    let mut last_seq = 0u64;
+    for ev in history {
+        last_seq = last_seq.max(ev.seq);
+        if write.write_all(&encode_line(&Response::XRayEvent(ev))).await.is_err() {
+            return Ok(false);
+        }
+    }
+    if write.flush().await.is_err() {
+        return Ok(false);
+    }
+
+    loop {
+        let check_eof = read.buffer().is_empty();
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                Ok((ev_cid, ev)) if ev_cid == cid && ev.seq > last_seq => {
+                    last_seq = ev.seq;
+                    if write.write_all(&encode_line(&Response::XRayEvent(ev))).await.is_err()
+                        || write.flush().await.is_err()
+                    {
+                        return Ok(false);
+                    }
+                }
+                Ok(_) => {}
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => return Ok(true),
+            },
+            res = read.fill_buf(), if check_eof => match res {
+                Ok([]) | Err(_) => return Ok(false),
+                Ok(_) => {}
+            }
+        }
     }
 }
 

@@ -111,6 +111,7 @@ public enum FairyApprovalPolicy {
         "status", "events", "switch_host", "navigate",
         "containers", "inspect", "logs", "stats",
         "container_action", "run", "exec", "fork_container", "diff_container", "commit_container", "stack_action", "compose",
+        "xray_events", "set_xray", "set_network_policy",
         "list_files", "read_file", "copy_files",
         "images", "pull", "build", "tag_image", "push_image", "save_image", "load_image", "remove_image",
         "volumes", "volume_action", "network", "disk_and_prune", "snapshots", "list_logins",
@@ -124,7 +125,7 @@ public enum FairyApprovalPolicy {
         let action = args["action"]?.stringValue ?? ""
         switch tool {
         case "status", "events", "containers", "inspect", "logs", "stats",
-             "list_files", "read_file", "diff_container", "images", "volumes", "network", "list_logins",
+             "list_files", "read_file", "diff_container", "xray_events", "set_xray", "images", "volumes", "network", "list_logins",
              "navigate", "switch_host", "pull", "tag_image":
             return false
         case "container_action":
@@ -139,7 +140,7 @@ public enum FairyApprovalPolicy {
             return action != "status"
         case "compose":
             return !["config", "ps", "logs", "start", "restart"].contains(action)
-        case "run", "exec", "fork_container", "commit_container", "build", "push_image", "save_image", "load_image", "remove_image", "copy_files":
+        case "run", "exec", "fork_container", "commit_container", "set_network_policy", "build", "push_image", "save_image", "load_image", "remove_image", "copy_files":
             return true
         default:
             return true
@@ -293,6 +294,33 @@ public enum FairyApprovalPolicy {
             title = "Push image \(ref)"
             detail = reasonArg.isEmpty ? ref : "\(ref) — \(reasonArg)"
             macReason = "let Fairy push image \(ref) to its registry\(suffix)"
+        case "xray_events":
+            let target = str("container")
+            destructive = false
+            title = "Read X-Ray events for \(target)"
+            detail = reasonArg.isEmpty ? "Container: \(target)" : "\(target) — \(reasonArg)"
+            macReason = "let Fairy read X-Ray events for \(target)\(suffix)"
+        case "set_xray":
+            let target = str("container")
+            let enable = args["enabled"]?.boolValue ?? true
+            destructive = false
+            title = "\(enable ? "Enable" : "Disable") X-Ray for \(target)"
+            detail = reasonArg.isEmpty ? "Container: \(target)" : "\(target) — \(reasonArg)"
+            macReason = "let Fairy \(enable ? "enable" : "disable") X-Ray for \(target)\(suffix)"
+        case "set_network_policy":
+            let target = str("container")
+            let egress = str("egress")
+            let lat = args["latency_ms"]?.intValue ?? 0
+            let loss = args["loss_percent"]?.intValue ?? 0
+            destructive = egress == "offline" || loss > 0
+            title = "Update network policy for \(target)"
+            var parts = ["Container: \(target)"]
+            if !egress.isEmpty { parts.append("Egress: \(egress)") }
+            if lat > 0 { parts.append("Latency: \(lat)ms") }
+            if loss > 0 { parts.append("Loss: \(loss)%") }
+            if !reasonArg.isEmpty { parts.append(reasonArg) }
+            detail = parts.joined(separator: "\n")
+            macReason = "let Fairy update network policy for \(target)\(suffix)"
         case "fork_container":
             let source = str("source")
             let count = args["count"]?.intValue ?? 1

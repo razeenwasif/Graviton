@@ -169,7 +169,7 @@ impl SnapshotPool {
     /// and `balloon = true`. Returns `Ok(None)` when no idle slot is ready or
     /// when a stale `.vzsave` fails to restore (after discarding the stale file).
     pub fn try_restore(&self, config: &VmConfig) -> Result<Option<(AppleVm, SnapshotLease)>> {
-        if !self.enabled() {
+        if !self.enabled() || config.network != NetworkMode::Nat {
             return Ok(None);
         }
         if let Some(reason) = self.pause_reason() {

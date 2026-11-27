@@ -306,6 +306,57 @@ public final class EngineStore {
         try await service.diff(id: id)
     }
 
+    /// Query the container's egress firewall & chaos policy.
+    public func getNetworkPolicy(id: String) async throws -> ContainerNetworkPolicy {
+        try await service.getNetworkPolicy(id: id)
+    }
+
+    /// Update the container's egress firewall & chaos policy on the fly.
+    @discardableResult
+    public func setNetworkPolicy(id: String, egress: EgressPolicy?, chaos: ChaosProfile?) async throws -> ContainerNetworkPolicy {
+        let policy = try await service.setNetworkPolicy(id: id, egress: egress, chaos: chaos)
+        await refresh()
+        return policy
+    }
+
+    /// Toggle hypervisor X-Ray event tracing for a container.
+    @discardableResult
+    public func setXRay(id: String, enabled: Bool) async throws -> Bool {
+        let active = try await service.setXRay(id: id, enabled: enabled)
+        await refresh()
+        return active
+    }
+
+    /// Fetch recent X-Ray telemetry events for a container.
+    public func xrayEvents(id: String, limit: Int? = nil) async throws -> [XRayEvent] {
+        try await service.xrayEvents(id: id, limit: limit)
+    }
+
+    /// Stream live X-Ray telemetry events for a container.
+    public func xrayStream(id: String, limit: Int? = nil) -> AsyncThrowingStream<XRayEvent, Error> {
+        switch live {
+        case let local as SocketEngine where canManage:
+            return local.xrayStream(id: id, limit: limit)
+        case let remote as RemoteEngine where canManage:
+            return remote.xrayStream(id: id, limit: limit)
+        default:
+            let svc = service
+            return AsyncThrowingStream { continuation in
+                let task = Task {
+                    do {
+                        for event in try await svc.xrayEvents(id: id, limit: limit) {
+                            continuation.yield(event)
+                        }
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+                continuation.onTermination = { _ in task.cancel() }
+            }
+        }
+    }
+
     /// Pull an image with streamed per-layer progress. Refreshes the image list when done.
     public func pullStream(_ reference: String, platform: String? = nil) -> AsyncThrowingStream<PullEvent, Error> {
         let upstream: AsyncThrowingStream<PullEvent, Error>

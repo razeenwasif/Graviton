@@ -27,6 +27,16 @@ pub fn bring_up_links() {
 }
 
 #[cfg(target_os = "linux")]
+pub fn is_no_nat_boot() -> bool {
+    sys::no_nat_boot()
+}
+
+#[cfg(target_os = "linux")]
+pub fn drop_default_route() -> Result<(), String> {
+    sys::drop_default_route()
+}
+
+#[cfg(target_os = "linux")]
 pub fn start() {
     sys::start();
 }
@@ -258,13 +268,29 @@ mod sys {
         if Path::new("/sys/class/net/eth0").exists() {
             let _ = set_link_up("eth0");
         }
+        if Path::new("/sys/class/net/eth1").exists() {
+            let _ = set_link_up("eth1");
+        }
+    }
+
+    pub(super) fn no_nat_boot() -> bool {
+        fs::read_to_string("/proc/cmdline")
+            .map(|s| s.split_whitespace().any(|tok| tok == "graviton.no_nat=1"))
+            .unwrap_or(false)
     }
 
     pub fn start() {
         if STARTED.swap(true, Ordering::SeqCst) {
             return;
         }
-        if !Path::new("/sys/class/net/eth0").exists() {
+        if no_nat_boot() || !Path::new("/sys/class/net/eth0").exists() {
+            let _ = set_link_up("lo");
+            if Path::new("/sys/class/net/eth1").exists() {
+                let _ = set_link_up("eth1");
+            }
+            if !Path::new("/etc/resolv.conf").exists() {
+                let _ = fs::write("/etc/resolv.conf", "nameserver 127.0.0.11\n");
+            }
             let _ = ADDRESS.set(None);
             return;
         }
@@ -554,6 +580,75 @@ mod sys {
         // SAFETY: `SIOCSIFNETMASK` reads `ifru_netmask`.
         if unsafe { libc::ioctl(sock, libc::SIOCSIFNETMASK as _, &raw const mask_ifr) } != 0 {
             return Err(io::Error::last_os_error().to_string());
+        }
+        Ok(())
+    }
+
+    pub fn drop_default_route() -> Result<(), String> {
+        // SAFETY: netlink route socket.
+        let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        // SAFETY: fresh fd owned here.
+        let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        #[repr(C)]
+        struct RtMsg {
+            rtm_family: u8,
+            rtm_dst_len: u8,
+            rtm_src_len: u8,
+            rtm_tos: u8,
+            rtm_table: u8,
+            rtm_protocol: u8,
+            rtm_scope: u8,
+            rtm_type: u8,
+            rtm_flags: u32,
+        }
+
+        let mut msg = vec![0u8; std::mem::size_of::<libc::nlmsghdr>() + std::mem::size_of::<RtMsg>()];
+        let hdr = libc::nlmsghdr {
+            nlmsg_len: msg.len() as u32,
+            nlmsg_type: libc::RTM_DELROUTE,
+            nlmsg_flags: (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+            nlmsg_seq: 2,
+            nlmsg_pid: 0,
+        };
+        let rt = RtMsg {
+            rtm_family: libc::AF_INET as u8,
+            rtm_dst_len: 0,
+            rtm_src_len: 0,
+            rtm_tos: 0,
+            rtm_table: libc::RT_TABLE_MAIN,
+            rtm_protocol: libc::RTPROT_UNSPEC,
+            rtm_scope: libc::RT_SCOPE_UNIVERSE,
+            rtm_type: libc::RTN_UNICAST,
+            rtm_flags: 0,
+        };
+        // SAFETY: copying POD headers into `msg`.
+        unsafe {
+            std::ptr::copy_nonoverlapping((&raw const hdr).cast::<u8>(), msg.as_mut_ptr(), std::mem::size_of::<libc::nlmsghdr>());
+            std::ptr::copy_nonoverlapping(
+                (&raw const rt).cast::<u8>(),
+                msg.as_mut_ptr().add(std::mem::size_of::<libc::nlmsghdr>()),
+                std::mem::size_of::<RtMsg>(),
+            );
+        }
+        let sent = unsafe { libc::send(sock.as_raw_fd(), msg.as_ptr().cast(), msg.len(), 0) };
+        if sent < 0 {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        let mut resp = [0u8; 256];
+        let n = unsafe { libc::recv(sock.as_raw_fd(), resp.as_mut_ptr().cast(), resp.len(), 0) };
+        if n >= (std::mem::size_of::<libc::nlmsghdr>() + 4) as isize {
+            let hdr_sz = std::mem::size_of::<libc::nlmsghdr>();
+            let nlmsg_type = u16::from_ne_bytes([resp[4], resp[5]]);
+            if nlmsg_type == libc::NLMSG_ERROR as u16 {
+                let err = i32::from_ne_bytes([resp[hdr_sz], resp[hdr_sz + 1], resp[hdr_sz + 2], resp[hdr_sz + 3]]);
+                if err != 0 && err != -libc::ESRCH {
+                    return Err(io::Error::from_raw_os_error(-err).to_string());
+                }
+            }
         }
         Ok(())
     }

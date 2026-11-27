@@ -567,6 +567,74 @@ public actor RemoteEngine: EngineService {
         guard case let .diff(entries) = try await call(.diff(id: id)) else { throw EngineError.unexpectedResponse }
         return entries
     }
+    public func getNetworkPolicy(id: String) async throws -> ContainerNetworkPolicy {
+        guard case let .networkPolicy(policy) = try await call(.getNetworkPolicy(id: id)) else { throw EngineError.unexpectedResponse }
+        return policy
+    }
+    public func setNetworkPolicy(id: String, egress: EgressPolicy?, chaos: ChaosProfile?) async throws -> ContainerNetworkPolicy {
+        guard case let .networkPolicy(policy) = try await call(.setNetworkPolicy(id: id, egress: egress, chaos: chaos)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return policy
+    }
+    public func setXRay(id: String, enabled: Bool) async throws -> Bool {
+        guard case let .xrayStatus(active) = try await call(.setXRay(id: id, enabled: enabled)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return active
+    }
+    public func xrayEvents(id: String, limit: Int?) async throws -> [XRayEvent] {
+        guard case let .xrayEvents(events) = try await call(.xray(id: id, follow: false, limit: limit)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return events
+    }
+
+    /// Stream live X-Ray syscall/network events (`follow: true`) over TLS from the paired Mac.
+    public nonisolated func xrayStream(id: String, limit: Int? = nil) -> AsyncThrowingStream<XRayEvent, Error> {
+        let host = self.host, token = self.token
+        return AsyncThrowingStream { continuation in
+            let task = Task.detached {
+                do {
+                    let c = try await LineConnection.open(host.endpoints, pin: host.fingerprint)
+                    defer { c.cancel() }
+                    try Task.checkCancellation()
+                    try await withTaskCancellationHandler {
+                        guard case .authenticated = try await c.call(.auth(token: token)) else {
+                            throw EngineError.unexpectedResponse
+                        }
+                        try await c.send(Wire.line(.xray(id: id, follow: true, limit: limit)))
+                        while true {
+                            try Task.checkCancellation()
+                            switch try Wire.decoder.decode(EngineResponse.self, from: try await c.readLine()) {
+                            case let .xrayEvent(event):
+                                continuation.yield(event)
+                            case let .xrayEvents(list):
+                                for item in list { continuation.yield(item) }
+                                continuation.finish()
+                                return
+                            case let .error(message):
+                                throw EngineError.daemon(message)
+                            default:
+                                throw EngineError.unexpectedResponse
+                            }
+                        }
+                    } onCancel: {
+                        c.cancel()
+                    }
+                } catch is CancellationError {
+                    continuation.finish()
+                } catch {
+                    if Task.isCancelled {
+                        continuation.finish()
+                    } else {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
     public func restart(id: String) async throws -> Container { try await container(.restart(id: id)) }
     /// Runs and pulls can take minutes (a pull, a VM boot): they get a connection
     /// of their own so the shared one keeps answering the list and logs meanwhile.

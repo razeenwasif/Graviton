@@ -83,6 +83,8 @@ struct ContainerDetailView: View {
                         RowDivider()
                         DetailLink(title: "Files", symbol: "folder", detail: c.isRunning ? "Browse and preview" : "Start it to browse", enabled: c.isRunning) { MobileFilesView(container: c) }
                         RowDivider()
+                        DetailLink(title: "X-Ray & Firewall", symbol: "waveform.path.ecg", detail: "DNS, egress policy, switch chaos") { MobileXRayView(container: c) }
+                        RowDivider()
                         DetailLink(title: "Inspect", symbol: "info.circle", detail: "Command, image, VM, environment") { MobileInspectView(container: c) }
                     }
                     .mobileCard()

@@ -16,6 +16,8 @@ public actor DemoEngine: EngineService {
     private var cacheSteps: UInt32 = 23
     private var cacheBytes: UInt64 = 412 << 20
     private var tick = 0
+    private var policies: [String: ContainerNetworkPolicy] = [:]
+    private var xrayEnabled: Set<String> = []
 
     public init() {
         let now = UInt64(Date.now.timeIntervalSince1970)
@@ -273,6 +275,45 @@ public actor DemoEngine: EngineService {
             DiffEntry(kind: .modified, path: "/etc/hosts", sizeBytes: 184),
             DiffEntry(kind: .added, path: "/tmp/session.lock", sizeBytes: 32),
         ]
+    }
+
+    public func getNetworkPolicy(id: String) throws -> ContainerNetworkPolicy {
+        let c = list[try resolve(id)]
+        return policies[c.id] ?? ContainerNetworkPolicy()
+    }
+
+    public func setNetworkPolicy(id: String, egress: EgressPolicy?, chaos: ChaosProfile?) throws -> ContainerNetworkPolicy {
+        let c = list[try resolve(id)]
+        var current = policies[c.id] ?? ContainerNetworkPolicy()
+        if let egress {
+            current.egress = egress
+            current.hardwareIsolated = egress.isRestricted
+        }
+        if let chaos {
+            current.chaos = chaos
+        }
+        policies[c.id] = current
+        return current
+    }
+
+    public func setXRay(id: String, enabled: Bool) throws -> Bool {
+        let c = list[try resolve(id)]
+        if enabled { xrayEnabled.insert(c.id) } else { xrayEnabled.remove(c.id) }
+        return enabled
+    }
+
+    public func xrayEvents(id: String, limit: Int?) throws -> [XRayEvent] {
+        let c = list[try resolve(id)]
+        let now = UInt64(Date.now.timeIntervalSince1970 * 1000)
+        let policy = policies[c.id] ?? ContainerNetworkPolicy()
+        let allowed = !policy.egress.isRestricted
+        let all = [
+            XRayEvent(seq: 1, timestampMs: now - 4800, kind: .proc, action: "spawn", target: "/usr/local/bin/server", detail: "pid=18", allowed: true, pid: 18),
+            XRayEvent(seq: 2, timestampMs: now - 4100, kind: .file, action: "open", target: "/etc/ssl/certs/ca-certificates.crt", detail: "O_RDONLY", allowed: true, pid: 18),
+            XRayEvent(seq: 3, timestampMs: now - 3200, kind: .dns, action: "query", target: "api.github.com", detail: allowed ? "A -> 140.82.114.6" : "REFUSED by egress firewall", allowed: allowed, latencyUs: 420),
+            XRayEvent(seq: 4, timestampMs: now - 2100, kind: .net, action: "connect", target: "api.github.com:443", detail: allowed ? "HTTP 200 OK" : "Blocked by egress policy", allowed: allowed, latencyUs: allowed ? 18_400 : 120, bytes: allowed ? 4096 : 0),
+        ]
+        return Array(all.suffix(limit ?? all.count))
     }
 
     public func restart(id: String) throws -> Container {
@@ -572,13 +613,16 @@ public actor DemoEngine: EngineService {
                 HealthState(status: .healthy, failingStreak: 0, log: [HealthLog(start: now - 8, end: now - 8, exitCode: 0, output: "/var/run/postgresql:5432 - accepting connections")])
             )
             : (nil, nil)
-        return ContainerDetails(container: c, imageReference: image?.reference ?? c.image, imageDigest: image?.digest ?? "sha256:…",
-                                command: command, env: ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "APP_ENV=development", "LOG_LEVEL=info"],
-                                workingDir: c.name == "web" ? "/srv" : "/app", user: c.name == "postgres" ? "postgres" : nil,
-                                hostname: c.name, cpus: 2, memoryMib: (c.memoryLimitBytes ?? 1 << 30) >> 20,
-                                kernel: "Linux 6.12 (demo)", vmDir: "~/Library/Application Support/Graviton/vms/\(c.id)", restart: restart,
-                                project: c.project, service: c.service, labels: labels.isEmpty ? nil : labels,
-                                healthcheck: hc, health: healthState, networks: attachedNetworks(for: c.name))
+        var details = ContainerDetails(container: c, imageReference: image?.reference ?? c.image, imageDigest: image?.digest ?? "sha256:…",
+                                         command: command, env: ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "APP_ENV=development", "LOG_LEVEL=info"],
+                                         workingDir: c.name == "web" ? "/srv" : "/app", user: c.name == "postgres" ? "postgres" : nil,
+                                         hostname: c.name, cpus: 2, memoryMib: (c.memoryLimitBytes ?? 1 << 30) >> 20,
+                                         kernel: "Linux 6.12 (demo)", vmDir: "~/Library/Application Support/Graviton/vms/\(c.id)", restart: restart,
+                                         project: c.project, service: c.service, labels: labels.isEmpty ? nil : labels,
+                                         healthcheck: hc, health: healthState, networks: attachedNetworks(for: c.name))
+        details.networkPolicy = policies[c.id] ?? ContainerNetworkPolicy()
+        details.xrayEnabled = xrayEnabled.contains(c.id)
+        return details
     }
 
     public func openTerminal(_ spec: ExecSpec) throws -> any TerminalSession {

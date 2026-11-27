@@ -366,6 +366,10 @@ public struct RunSpec: Codable, Hashable, Sendable {
     public var shmSizeBytes: UInt64? = nil
     /// POSIX resource limits (`--ulimit`).
     public var ulimits: [UlimitSpec]? = nil
+    /// Host-enforced egress firewall policy.
+    public var egress: EgressPolicy? = nil
+    /// Host-enforced chaos fault-injection profile.
+    public var chaos: ChaosProfile? = nil
 
     public init(image: String, name: String? = nil, command: [String]? = nil, env: [String] = [], cpus: UInt32? = nil,
                 memoryMib: UInt64? = nil, ports: [String] = [], volumes: [String] = [], restart: RestartPolicy? = nil,
@@ -374,7 +378,8 @@ public struct RunSpec: Codable, Hashable, Sendable {
                 dnsAliases: [String]? = nil, healthcheck: Healthcheck? = nil,
                 readOnly: Bool? = nil, capAdd: [String]? = nil, capDrop: [String]? = nil,
                 tmpfs: [TmpfsMount]? = nil, initProcess: Bool? = nil, networks: [String]? = nil,
-                shmSizeBytes: UInt64? = nil, ulimits: [UlimitSpec]? = nil) {
+                shmSizeBytes: UInt64? = nil, ulimits: [UlimitSpec]? = nil,
+                egress: EgressPolicy? = nil, chaos: ChaosProfile? = nil) {
         self.image = image
         self.name = name
         self.command = command
@@ -402,6 +407,8 @@ public struct RunSpec: Codable, Hashable, Sendable {
         self.networks = networks
         self.shmSizeBytes = shmSizeBytes
         self.ulimits = ulimits
+        self.egress = egress
+        self.chaos = chaos
     }
 
     /// Split a list typed as "8080:80, 5432" or one per line.
@@ -661,6 +668,8 @@ public struct ContainerDetails: Codable, Hashable, Sendable {
     public var networks: [String]? = nil
     public var shmSizeBytes: UInt64? = nil
     public var ulimits: [UlimitSpec]? = nil
+    public var networkPolicy: ContainerNetworkPolicy? = nil
+    public var xrayEnabled: Bool? = nil
 
     public var usesInit: Bool { self.`init` ?? false }
     public var attachedNetworks: [String] { (networks?.isEmpty == false) ? networks! : ["graviton"] }
@@ -1418,6 +1427,208 @@ public struct DiffEntry: Codable, Hashable, Sendable, Identifiable {
         self.kind = kind
         self.path = path
         self.sizeBytes = sizeBytes
+    }
+}
+
+public enum EgressPolicy: Codable, Hashable, Sendable {
+    case unrestricted
+    case offline
+    case allowlist(hosts: [String], cidrs: [String])
+
+    enum CodingKeys: String, CodingKey { case mode, hosts, cidrs }
+
+    public var isRestricted: Bool {
+        if case .unrestricted = self { return false }
+        return true
+    }
+
+    public var label: String {
+        switch self {
+        case .unrestricted: "Unrestricted"
+        case .offline: "Offline"
+        case let .allowlist(hosts, cidrs):
+            "Allowlist (\(hosts.count + cidrs.count))"
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let mode = try c.decodeIfPresent(String.self, forKey: .mode) ?? "unrestricted"
+        switch mode {
+        case "offline":
+            self = .offline
+        case "allowlist":
+            let hosts = try c.decodeIfPresent([String].self, forKey: .hosts) ?? []
+            let cidrs = try c.decodeIfPresent([String].self, forKey: .cidrs) ?? []
+            self = .allowlist(hosts: hosts, cidrs: cidrs)
+        default:
+            self = .unrestricted
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .unrestricted:
+            try c.encode("unrestricted", forKey: .mode)
+        case .offline:
+            try c.encode("offline", forKey: .mode)
+        case let .allowlist(hosts, cidrs):
+            try c.encode("allowlist", forKey: .mode)
+            if !hosts.isEmpty { try c.encode(hosts, forKey: .hosts) }
+            if !cidrs.isEmpty { try c.encode(cidrs, forKey: .cidrs) }
+        }
+    }
+
+    public static func parse(_ raw: String) -> EgressPolicy? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+        if lower == "unrestricted" || lower == "open" { return .unrestricted }
+        if lower == "offline" || lower == "none" || lower == "block" { return .offline }
+        let body: String
+        if let r = trimmed.range(of: "allow:", options: .anchored) {
+            body = String(trimmed[r.upperBound...])
+        } else if let r = trimmed.range(of: "allowlist:", options: .anchored) {
+            body = String(trimmed[r.upperBound...])
+        } else {
+            return nil
+        }
+        var hosts: [String] = []
+        var cidrs: [String] = []
+        for token in body.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }).filter({ !$0.isEmpty }) {
+            if token.contains("/") || token.split(separator: ".").count == 4 && token.allSatisfy({ $0.isNumber || $0 == "." }) {
+                if !cidrs.contains(token) { cidrs.append(token) }
+            } else {
+                let norm = token.lowercased()
+                if !hosts.contains(norm) { hosts.append(norm) }
+            }
+        }
+        guard !hosts.isEmpty || !cidrs.isEmpty else { return nil }
+        return .allowlist(hosts: hosts, cidrs: cidrs)
+    }
+}
+
+public struct ChaosProfile: Codable, Hashable, Sendable {
+    public var latencyMs: UInt32
+    public var jitterMs: UInt32
+    public var lossPercent: UInt8
+    public var bandwidthKbps: UInt32?
+
+    public init(latencyMs: UInt32 = 0, jitterMs: UInt32 = 0, lossPercent: UInt8 = 0, bandwidthKbps: UInt32? = nil) {
+        self.latencyMs = latencyMs
+        self.jitterMs = jitterMs
+        self.lossPercent = lossPercent
+        self.bandwidthKbps = bandwidthKbps
+    }
+
+    public var isActive: Bool { latencyMs > 0 || jitterMs > 0 || lossPercent > 0 || bandwidthKbps != nil }
+
+    enum CodingKeys: String, CodingKey { case latencyMs, jitterMs, lossPercent, bandwidthKbps }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        latencyMs = try c.decodeIfPresent(UInt32.self, forKey: .latencyMs) ?? 0
+        jitterMs = try c.decodeIfPresent(UInt32.self, forKey: .jitterMs) ?? 0
+        lossPercent = try c.decodeIfPresent(UInt8.self, forKey: .lossPercent) ?? 0
+        bandwidthKbps = try c.decodeIfPresent(UInt32.self, forKey: .bandwidthKbps)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        if latencyMs > 0 { try c.encode(latencyMs, forKey: .latencyMs) }
+        if jitterMs > 0 { try c.encode(jitterMs, forKey: .jitterMs) }
+        if lossPercent > 0 { try c.encode(lossPercent, forKey: .lossPercent) }
+        try c.encodeIfPresent(bandwidthKbps, forKey: .bandwidthKbps)
+    }
+}
+
+public struct ContainerNetworkPolicy: Codable, Hashable, Sendable {
+    public var egress: EgressPolicy
+    public var chaos: ChaosProfile
+    public var hardwareIsolated: Bool
+
+    public init(egress: EgressPolicy = .unrestricted, chaos: ChaosProfile = ChaosProfile(), hardwareIsolated: Bool = false) {
+        self.egress = egress
+        self.chaos = chaos
+        self.hardwareIsolated = hardwareIsolated
+    }
+
+    enum CodingKeys: String, CodingKey { case egress, chaos, hardwareIsolated }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        egress = try c.decodeIfPresent(EgressPolicy.self, forKey: .egress) ?? .unrestricted
+        chaos = try c.decodeIfPresent(ChaosProfile.self, forKey: .chaos) ?? ChaosProfile()
+        hardwareIsolated = try c.decodeIfPresent(Bool.self, forKey: .hardwareIsolated) ?? false
+    }
+}
+
+public enum XRayEventKind: String, Codable, Hashable, Sendable, CaseIterable {
+    case dns, net, file, proc
+
+    public var label: String {
+        switch self {
+        case .dns: "DNS"
+        case .net: "Net"
+        case .file: "File"
+        case .proc: "Proc"
+        }
+    }
+}
+
+public struct XRayEvent: Codable, Hashable, Sendable, Identifiable {
+    public var seq: UInt64
+    public var timestampMs: UInt64
+    public var kind: XRayEventKind
+    public var action: String
+    public var target: String
+    public var detail: String?
+    public var allowed: Bool
+    public var latencyUs: UInt64?
+    public var bytes: UInt64?
+    public var pid: Int32?
+
+    public var id: UInt64 { seq }
+    public var date: Date { Date(timeIntervalSince1970: Double(timestampMs) / 1000) }
+
+    public init(
+        seq: UInt64 = 0,
+        timestampMs: UInt64,
+        kind: XRayEventKind,
+        action: String,
+        target: String,
+        detail: String? = nil,
+        allowed: Bool = true,
+        latencyUs: UInt64? = nil,
+        bytes: UInt64? = nil,
+        pid: Int32? = nil
+    ) {
+        self.seq = seq
+        self.timestampMs = timestampMs
+        self.kind = kind
+        self.action = action
+        self.target = target
+        self.detail = detail
+        self.allowed = allowed
+        self.latencyUs = latencyUs
+        self.bytes = bytes
+        self.pid = pid
+    }
+
+    enum CodingKeys: String, CodingKey { case seq, timestampMs, kind, action, target, detail, allowed, latencyUs, bytes, pid }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        seq = try c.decodeIfPresent(UInt64.self, forKey: .seq) ?? 0
+        timestampMs = try c.decode(UInt64.self, forKey: .timestampMs)
+        kind = try c.decode(XRayEventKind.self, forKey: .kind)
+        action = try c.decode(String.self, forKey: .action)
+        target = try c.decode(String.self, forKey: .target)
+        detail = try c.decodeIfPresent(String.self, forKey: .detail)
+        allowed = try c.decodeIfPresent(Bool.self, forKey: .allowed) ?? true
+        latencyUs = try c.decodeIfPresent(UInt64.self, forKey: .latencyUs)
+        bytes = try c.decodeIfPresent(UInt64.self, forKey: .bytes)
+        pid = try c.decodeIfPresent(Int32.self, forKey: .pid)
     }
 }
 

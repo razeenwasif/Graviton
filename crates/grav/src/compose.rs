@@ -725,6 +725,8 @@ fn service_to_run_spec(proj: &ComposeProject, svc: &ComposeService) -> RunSpec {
         networks: svc.networks.clone(),
         shm_size_bytes: svc.shm_size_bytes,
         ulimits: svc.ulimits.clone(),
+        egress: None,
+        chaos: None,
     }
 }
 

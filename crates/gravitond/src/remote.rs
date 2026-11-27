@@ -475,6 +475,11 @@ impl Remote {
                         return Ok(());
                     }
                 }
+                (Request::XRay { id, follow: true, limit }, _) => {
+                    if !crate::xray_stream(&backend, id.clone(), *limit, &mut lines, &mut write).await? {
+                        return Ok(());
+                    }
+                }
                 _ => {
                     let response = crate::handle(request, &backend).await;
                     write.write_all(&encode_line(&response)).await?;

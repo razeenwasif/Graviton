@@ -25,19 +25,20 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use graviton_core::{ImageReference, Store, paths};
 use graviton_image::{BlobStore, Credentials, HealthcheckConfig, ImageError, ImageIndex, LocalImage, Progress, PullOptions, PushProgress, Registry};
 use graviton_proto::{
-    AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ContainerDetails, ContainerStatRow, ContainerStats, ContainerStatus,
-    ContainerSummary, DEFAULT_NETWORK_NAME, DiffEntry, DirectoryListing, EngineInfo, ExecSpec, FileContents, ForkSpec,
-    GuestMount, GuestStats, HealthLog, HealthState, HealthStatus, Healthcheck, HostEntry, ImageSummary, LogLevel,
-    LogLine, LogStream, Mount, NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo,
-    Response, RestartPolicy, RunSpec, SnapshotInfo, StatSample, TmpfsMount, UlimitSpec, UserNetwork, VolumeMountRef,
-    VolumeSummary, caps, decode_line, encode_line, parse_tmpfs_spec, validate_ulimit,
+    AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ChaosProfile, ContainerDetails, ContainerNetworkPolicy,
+    ContainerStatRow, ContainerStats, ContainerStatus, ContainerSummary, DEFAULT_NETWORK_NAME, DiffEntry,
+    DirectoryListing, EgressPolicy, EngineInfo, ExecSpec, FileContents, ForkSpec, GuestMount, GuestStats, HealthLog,
+    HealthState, HealthStatus, Healthcheck, HostEntry, ImageSummary, LogLevel, LogLine, LogStream, Mount,
+    NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy,
+    RunSpec, SnapshotInfo, StatSample, TmpfsMount, UlimitSpec, UserNetwork, VolumeMountRef, VolumeSummary,
+    XRayEvent, caps, decode_line, encode_line, parse_tmpfs_spec, validate_ulimit,
 };
 use graviton_vmm::apple::{AppleHypervisor, AppleVm};
 use graviton_vmm::{NetworkMode, SharedDirectory, VmConfig, VmHandle};
@@ -129,6 +130,12 @@ pub(crate) struct ContainerSpec {
     /// Container folder name inside `/run/containers/` on a cloned ext4 disk before first boot renames it.
     #[serde(default)]
     pub(crate) disk_source_id: Option<String>,
+    /// Host-enforced egress firewall policy.
+    #[serde(default)]
+    pub(crate) egress: EgressPolicy,
+    /// Host-enforced network chaos profile.
+    #[serde(default)]
+    pub(crate) chaos: ChaosProfile,
 }
 
 /// Interactive `grav run -it` handle returned to the control connection.
@@ -197,6 +204,23 @@ struct Running {
     port: Option<crate::switch::Port>,
     /// Exclusive lease on the snapshot slot this VM restored from; released after the VM stops.
     _snapshot: Option<crate::snapshot::SnapshotLease>,
+    /// Live firewall & chaos policy shared with host `EgressGateway`.
+    network_policy: Arc<RwLock<ContainerNetworkPolicy>>,
+    /// Guard so at most one `WatchXRay` vsock consumer runs per VM boot.
+    xray_watcher_started: Arc<AtomicBool>,
+    /// Guard so at most one `EgressBridge` host gateway runs per VM boot.
+    egress_bridge_started: Arc<AtomicBool>,
+}
+
+const MAX_XRAY_EVENTS: usize = 2048;
+
+pub type XRaySubscription = (String, Vec<XRayEvent>, tokio::sync::broadcast::Receiver<(String, XRayEvent)>);
+
+#[derive(Default)]
+struct ContainerXRay {
+    enabled: bool,
+    next_seq: u64,
+    events: VecDeque<XRayEvent>,
 }
 
 #[derive(Default)]
@@ -233,6 +257,8 @@ pub struct Engine {
     log_io: Mutex<()>,
     log_tx: tokio::sync::broadcast::Sender<LogEvent>,
     stats_tx: tokio::sync::broadcast::Sender<StatsEvent>,
+    xray: Mutex<HashMap<String, ContainerXRay>>,
+    xray_tx: tokio::sync::broadcast::Sender<(String, XRayEvent)>,
     switch: crate::switch::Switch,
     /// Serialises guest DNS table broadcasts so concurrent starts/stops never reorder.
     hosts_sync: Mutex<()>,
@@ -261,6 +287,7 @@ impl Engine {
         let index = ImageIndex::load(paths::support_dir().join("images.json"))?;
         let (log_tx, _) = tokio::sync::broadcast::channel(1024);
         let (stats_tx, _) = tokio::sync::broadcast::channel(256);
+        let (xray_tx, _) = tokio::sync::broadcast::channel(512);
         let engine = Arc::new(Self {
             store: Arc::new(Mutex::new(Store::new())),
             blobs,
@@ -274,6 +301,8 @@ impl Engine {
             log_io: Mutex::new(()),
             log_tx,
             stats_tx,
+            xray: Mutex::new(HashMap::new()),
+            xray_tx,
             switch: crate::switch::Switch::new(),
             hosts_sync: Mutex::new(()),
             hosts_gen: AtomicU64::new(0),
@@ -874,6 +903,8 @@ impl Engine {
             ulimits,
             forked_from: None,
             disk_source_id: None,
+            egress: spec.egress.unwrap_or_default(),
+            chaos: spec.chaos.unwrap_or_default(),
         };
 
         let id = new_id();
@@ -1636,7 +1667,8 @@ impl Engine {
         config.image_disk = Some(erofs_disk);
         config.cpus = spec.cpus;
         config.memory_mib = spec.memory_mib;
-        config.network = NetworkMode::Nat;
+        let hardware_isolated = spec.egress.is_restricted();
+        config.network = if hardware_isolated { NetworkMode::None } else { NetworkMode::Nat };
         config.console_log = Some(vm_dir.join("console.log"));
         config.rosetta = rosetta;
         config.balloon = true;
@@ -1656,6 +1688,9 @@ impl Engine {
 
         // A second network device on the container network, so containers reach each other.
         let port = self.switch.attach_to(spec.networks.iter().cloned()).context("joining the container network")?;
+        if spec.chaos.is_active() {
+            self.switch.set_port_chaos(port.id(), spec.chaos);
+        }
         config.switch_port = Some(port.vm_fd());
         let (vm, snapshot_lease, from_snapshot) = match self.snapshots.try_restore(&config)? {
             Some((restored, lease)) => (Arc::new(restored), Some(lease), true),
@@ -1669,6 +1704,13 @@ impl Engine {
             other => bail!("expected ready from the agent, got {other:?}"),
         }
         let paused = Arc::new(AtomicBool::new(false));
+        let policy = Arc::new(RwLock::new(ContainerNetworkPolicy {
+            egress: spec.egress.clone(),
+            chaos: spec.chaos,
+            hardware_isolated,
+        }));
+        let xray_watcher_started = Arc::new(AtomicBool::new(false));
+        let egress_bridge_started = Arc::new(AtomicBool::new(false));
         self.running.lock().unwrap().insert(
             id.to_string(),
             Running {
@@ -1687,8 +1729,17 @@ impl Engine {
                 healthcheck: None,
                 port: Some(port),
                 _snapshot: snapshot_lease,
+                network_policy: Arc::clone(&policy),
+                xray_watcher_started: Arc::clone(&xray_watcher_started),
+                egress_bridge_started: Arc::clone(&egress_bridge_started),
             },
         );
+        if hardware_isolated {
+            self.start_egress_bridge(id, Arc::clone(&vm), Arc::clone(&policy), &egress_bridge_started)?;
+        }
+        if self.is_xray_enabled(id) {
+            self.start_xray_watcher(id, Arc::clone(&vm), &xray_watcher_started);
+        }
         let booted = t0.elapsed();
         let host_name = spec.hostname.clone().unwrap_or_else(|| name.clone());
 
@@ -1769,6 +1820,7 @@ impl Engine {
             }
         }
 
+        let exec_env = inject_proxy_env(&spec.env, hardware_isolated);
         if let (Some((rows, cols, ready_tx)), Some(exit_rx)) = (tty_ready, tty_exit) {
             // Interactive `grav run -it`: launch the main process on a dedicated PTY
             // vsock connection so `agent` stays free for SetHosts, Stats, Signal, and Shutdown.
@@ -1779,7 +1831,7 @@ impl Engine {
             }
             tty_conn.write_all(&encode_line(&AgentRequest::Exec {
                 argv: spec.argv.clone(),
-                env: spec.env.clone(),
+                env: exec_env.clone(),
                 cwd: spec.cwd.clone(),
                 tty: true,
                 container: Some(id.into()),
@@ -1824,7 +1876,7 @@ impl Engine {
 
         send(&agent, &AgentRequest::Exec {
             argv: spec.argv.clone(),
-            env: spec.env.clone(),
+            env: exec_env,
             cwd: spec.cwd.clone(),
             tty: false,
             container: Some(id.into()),
@@ -2461,6 +2513,18 @@ impl Engine {
         let container = self.store.lock().unwrap().container(key)?.clone();
         let spec = self.specs.lock().unwrap().get(&container.id).cloned().ok_or_else(|| anyhow!("container {key} has no saved settings"))?;
         let health = self.health.lock().unwrap().get(&container.id).cloned();
+        let network_policy = self
+            .running
+            .lock()
+            .unwrap()
+            .get(&container.id)
+            .map(|r| r.network_policy.read().unwrap().clone())
+            .unwrap_or_else(|| ContainerNetworkPolicy {
+                egress: spec.egress.clone(),
+                chaos: spec.chaos,
+                hardware_isolated: false,
+            });
+        let xray_enabled = self.is_xray_enabled(&container.id);
         Ok(ContainerDetails {
             image_reference: spec.image.reference.clone(),
             image_digest: spec.image.manifest_digest.clone(),
@@ -2489,8 +2553,190 @@ impl Engine {
             networks: spec.networks,
             shm_size_bytes: spec.shm_size_bytes,
             ulimits: spec.ulimits,
+            network_policy: Some(network_policy),
+            xray_enabled,
             container,
         })
+    }
+
+    // -- Hypervisor X-Ray, Egress Firewall & Chaos --------------------------
+
+    fn is_xray_enabled(&self, id: &str) -> bool {
+        self.xray.lock().unwrap().get(id).is_some_and(|x| x.enabled)
+    }
+
+    pub(crate) fn push_xray_event(&self, id: &str, mut ev: XRayEvent) {
+        let mut map = self.xray.lock().unwrap();
+        let entry = map.entry(id.to_string()).or_default();
+        if !entry.enabled && ev.allowed {
+            return;
+        }
+        entry.next_seq += 1;
+        ev.seq = entry.next_seq;
+        if entry.events.len() >= MAX_XRAY_EVENTS {
+            entry.events.pop_front();
+        }
+        entry.events.push_back(ev.clone());
+        drop(map);
+        let _ = self.xray_tx.send((id.to_string(), ev));
+    }
+
+    fn start_egress_bridge(
+        self: &Arc<Self>,
+        id: &str,
+        vm: Arc<AppleVm>,
+        policy: Arc<RwLock<ContainerNetworkPolicy>>,
+        started: &AtomicBool,
+    ) -> Result<()> {
+        if started.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let mut bridge_conn = File::from(vm.connect(AGENT_VSOCK_PORT).context("connecting egress bridge")?);
+        match read_event_unbuffered(&mut bridge_conn)? {
+            AgentEvent::Ready { .. } => {}
+            other => bail!("expected ready on egress bridge, got {other:?}"),
+        }
+        bridge_conn.write_all(&encode_line(&AgentRequest::EgressBridge))?;
+        bridge_conn.flush()?;
+        let engine = Arc::clone(self);
+        let cid = id.to_string();
+        let emit: Arc<dyn Fn(XRayEvent) + Send + Sync> = Arc::new(move |ev| engine.push_xray_event(&cid, ev));
+        crate::egress::spawn_gateway(vm, OwnedFd::from(bridge_conn), policy, emit);
+        Ok(())
+    }
+
+    fn start_xray_watcher(self: &Arc<Self>, id: &str, vm: Arc<AppleVm>, started: &AtomicBool) {
+        if started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let engine = Arc::clone(self);
+        let cid = id.to_string();
+        let _ = std::thread::Builder::new().name(format!("xray-watch-{id}")).spawn(move || {
+            let Ok(fd) = vm.connect(AGENT_VSOCK_PORT) else { return };
+            let mut conn = File::from(fd);
+            if !matches!(read_event_unbuffered(&mut conn), Ok(AgentEvent::Ready { .. })) {
+                return;
+            }
+            if conn.write_all(&encode_line(&AgentRequest::WatchXRay { container: cid.clone() })).is_err()
+                || conn.flush().is_err()
+            {
+                return;
+            }
+            let mut events = Events::new(BufReader::new(conn));
+            while let Ok(ev) = events.next() {
+                match ev {
+                    AgentEvent::XRayBatch { events } => {
+                        for item in events {
+                            engine.push_xray_event(&cid, item);
+                        }
+                    }
+                    AgentEvent::Error { .. } => break,
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    pub fn get_network_policy(&self, key: &str) -> Result<ContainerNetworkPolicy> {
+        let c = self.store.lock().unwrap().container(key)?.clone();
+        if let Some(r) = self.running.lock().unwrap().get(&c.id) {
+            return Ok(r.network_policy.read().unwrap().clone());
+        }
+        let spec = self.specs.lock().unwrap().get(&c.id).cloned().ok_or_else(|| anyhow!("missing spec for {}", c.name))?;
+        Ok(ContainerNetworkPolicy { egress: spec.egress, chaos: spec.chaos, hardware_isolated: false })
+    }
+
+    pub fn set_network_policy(
+        self: &Arc<Self>,
+        key: &str,
+        egress: Option<EgressPolicy>,
+        chaos: Option<ChaosProfile>,
+    ) -> Result<ContainerNetworkPolicy> {
+        let id = self.store.lock().unwrap().container(key)?.id.clone();
+        let (new_egress, new_chaos) = {
+            let mut specs = self.specs.lock().unwrap();
+            let spec = specs.get_mut(&id).ok_or_else(|| anyhow!("missing spec for {key}"))?;
+            if let Some(e) = egress {
+                spec.egress = e;
+            }
+            if let Some(ch) = chaos {
+                spec.chaos = ch;
+            }
+            (spec.egress.clone(), spec.chaos)
+        };
+        self.save();
+
+        let running_entry = {
+            let running = self.running.lock().unwrap();
+            running.get(&id).map(|r| {
+                (
+                    Arc::clone(&r.vm),
+                    Arc::clone(&r.network_policy),
+                    r.port.as_ref().map(|p| p.id()),
+                    Arc::clone(&r.egress_bridge_started),
+                    r.paused.load(Ordering::Acquire),
+                )
+            })
+        };
+        if let Some((vm, pol_lock, port_id, bridge_started, paused)) = running_entry {
+            let was_isolated = pol_lock.read().unwrap().hardware_isolated;
+            {
+                let mut g = pol_lock.write().unwrap();
+                g.egress = new_egress.clone();
+                g.chaos = new_chaos;
+            }
+            if let Some(pid) = port_id {
+                self.switch.set_port_chaos(pid, new_chaos);
+            }
+            if new_egress.is_restricted() && !paused {
+                let _ = self.start_egress_bridge(&id, vm, Arc::clone(&pol_lock), &bridge_started);
+                if !was_isolated {
+                    let _ = self.agent_call(&id, |_| AgentRequest::DropDefaultRoute);
+                }
+            }
+            return Ok(pol_lock.read().unwrap().clone());
+        }
+        Ok(ContainerNetworkPolicy { egress: new_egress, chaos: new_chaos, hardware_isolated: false })
+    }
+
+    pub fn set_xray(self: &Arc<Self>, key: &str, enabled: bool) -> Result<bool> {
+        let id = self.store.lock().unwrap().container(key)?.id.clone();
+        {
+            let mut map = self.xray.lock().unwrap();
+            map.entry(id.clone()).or_default().enabled = enabled;
+        }
+        let running = self.running.lock().unwrap().get(&id).map(|r| {
+            (Arc::clone(&r.vm), Arc::clone(&r.xray_watcher_started), r.paused.load(Ordering::Acquire))
+        });
+        if let Some((vm, started, paused)) = running {
+            if !paused {
+                if enabled {
+                    self.start_xray_watcher(&id, vm, &started);
+                }
+                let _ = self.agent_call(&id, |cid| AgentRequest::SetXRay { container: cid, enabled });
+            }
+        }
+        Ok(enabled)
+    }
+
+    pub fn xray_events(&self, key: &str, limit: Option<usize>) -> Result<Vec<XRayEvent>> {
+        let id = self.store.lock().unwrap().container(key)?.id.clone();
+        let map = self.xray.lock().unwrap();
+        let all: Vec<XRayEvent> = map.get(&id).map(|x| x.events.iter().cloned().collect()).unwrap_or_default();
+        let take = limit.unwrap_or(200);
+        let start = all.len().saturating_sub(take);
+        Ok(all[start..].to_vec())
+    }
+
+    pub fn subscribe_xray(
+        &self,
+        key: &str,
+        limit: Option<usize>,
+    ) -> Result<XRaySubscription> {
+        let id = self.store.lock().unwrap().container(key)?.id.clone();
+        let rx = self.xray_tx.subscribe();
+        let history = self.xray_events(&id, limit)?;
+        Ok((id, history, rx))
     }
 
     // -- volumes & network ------------------------------------------------
@@ -2895,7 +3141,13 @@ impl Engine {
         if spec.command.is_empty() {
             bail!("give a command to run");
         }
-        let mut env = cs.env.clone();
+        let hardware_isolated = self
+            .running
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|r| r.network_policy.read().unwrap().hardware_isolated);
+        let mut env = inject_proxy_env(&cs.env, hardware_isolated);
         env.extend(spec.env.iter().cloned());
         let cwd = spec
             .working_dir
@@ -3180,6 +3432,29 @@ fn merge_env_vars(base: &[String], overrides: &[String]) -> Result<Vec<String>> 
         merged.push(item.clone());
     }
     Ok(merged)
+}
+
+fn inject_proxy_env(base: &[String], isolated: bool) -> Vec<String> {
+    if !isolated {
+        return base.to_vec();
+    }
+    let mut env = base.to_vec();
+    let defaults = [
+        ("HTTP_PROXY", "http://127.0.0.1:18080"),
+        ("HTTPS_PROXY", "http://127.0.0.1:18080"),
+        ("ALL_PROXY", "socks5h://127.0.0.1:18080"),
+        ("NO_PROXY", "localhost,127.0.0.1,::1,.graviton"),
+        ("http_proxy", "http://127.0.0.1:18080"),
+        ("https_proxy", "http://127.0.0.1:18080"),
+        ("all_proxy", "socks5h://127.0.0.1:18080"),
+        ("no_proxy", "localhost,127.0.0.1,::1,.graviton"),
+    ];
+    for (k, v) in defaults {
+        if !env.iter().any(|e| e.split_once('=').is_some_and(|(ek, _)| ek == k)) {
+            env.push(format!("{k}={v}"));
+        }
+    }
+    env
 }
 
 /// IPv6 bind addresses use brackets, e.g. `[::]:8080:80` or `[::1]:5353:53/udp`.
@@ -3823,7 +4098,7 @@ fn exec_probe_on_vm(
     }
     conn.write_all(&encode_line(&AgentRequest::Exec {
         argv: argv.to_vec(),
-        env: cs.env.clone(),
+        env: inject_proxy_env(&cs.env, cs.egress.is_restricted()),
         cwd: cs.cwd.clone(),
         tty: false,
         container: Some(id.to_string()),
@@ -4163,6 +4438,8 @@ mod tests {
             log_io: Mutex::new(()),
             log_tx: tokio::sync::broadcast::channel(8).0,
             stats_tx: tokio::sync::broadcast::channel(8).0,
+            xray: Mutex::new(HashMap::new()),
+            xray_tx: tokio::sync::broadcast::channel(8).0,
             switch: crate::switch::Switch::new(),
             hosts_sync: Mutex::new(()),
             hosts_gen: AtomicU64::new(0),
@@ -4240,6 +4517,8 @@ mod tests {
             ulimits: vec![],
             forked_from: None,
             disk_source_id: None,
+            egress: EgressPolicy::default(),
+            chaos: ChaosProfile::default(),
         });
 
         engine.connect_network("frontend", "web").unwrap();

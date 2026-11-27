@@ -632,14 +632,15 @@ import Testing
     }
 
     @Test func approvalPolicyMatchesTieredRules() {
-        #expect(FairyApprovalPolicy.supportedTools.count == 33)
+        #expect(FairyApprovalPolicy.supportedTools.count == 36)
 
         // Auto-run reads & reversible operations
         for readTool in ["status", "events", "containers", "inspect", "logs", "stats",
-                         "list_files", "read_file", "images", "volumes", "network", "list_logins",
+                         "list_files", "read_file", "diff_container", "xray_events", "set_xray", "images", "volumes", "network", "list_logins",
                          "navigate", "switch_host", "pull", "tag_image"] {
             #expect(!FairyApprovalPolicy.requiresTouchID(tool: readTool, args: [:]), "\(readTool) should not need Touch ID")
         }
+        #expect(FairyApprovalPolicy.requiresTouchID(tool: "set_network_policy", args: ["container": .string("api"), "egress": .string("offline")]))
         #expect(!FairyApprovalPolicy.requiresTouchID(tool: "container_action", args: ["action": .string("start")]))
         #expect(!FairyApprovalPolicy.requiresTouchID(tool: "container_action", args: ["action": .string("restart")]))
         #expect(!FairyApprovalPolicy.requiresTouchID(tool: "container_action", args: ["action": .string("unpause")]))
@@ -1623,5 +1624,41 @@ import Testing
         let details = try Wire.decoder.decode(ContainerDetails.self, from: Data(detailsJson.utf8))
         #expect(details.shmSizeBytes == 134_217_728)
         #expect(details.ulimits == [UlimitSpec(name: "nofile", soft: 2048, hard: 4096)])
+    }
+
+    @Test func egressChaosAndXRayWireAndDemoRoundTrip() async throws {
+        #expect(EgressPolicy.parse("offline") == .offline)
+        #expect(EgressPolicy.parse("unrestricted") == .unrestricted)
+        #expect(EgressPolicy.parse("allow:api.github.com,10.0.0.0/8") == .allowlist(hosts: ["api.github.com"], cidrs: ["10.0.0.0/8"]))
+
+        let line = { (r: EngineRequest) in String(decoding: try Wire.line(r), as: UTF8.self) }
+        #expect(try line(.getNetworkPolicy(id: "web")) == #"{"method":"get_network_policy","params":{"id":"web"}}"# + "\n")
+        #expect(try line(.setXRay(id: "web", enabled: true)) == #"{"method":"set_x_ray","params":{"enabled":true,"id":"web"}}"# + "\n")
+        #expect(try line(.xray(id: "web", follow: true, limit: 50)).contains(#""method":"x_ray""#))
+        let setReq = try line(.setNetworkPolicy(id: "web", egress: .allowlist(hosts: ["example.com"], cidrs: []), chaos: ChaosProfile(latencyMs: 120, lossPercent: 5)))
+        #expect(setReq.contains(#""method":"set_network_policy""#))
+        #expect(setReq.contains(#""latency_ms":120"#))
+
+        let polJson = #"{"type":"network_policy","data":{"egress":{"mode":"allowlist","hosts":["example.com"]},"chaos":{"latency_ms":120,"jitter_ms":10,"loss_percent":5},"hardware_isolated":true}}"#
+        guard case let .networkPolicy(pol) = try Wire.decoder.decode(EngineResponse.self, from: Data(polJson.utf8)) else {
+            Issue.record("expected .networkPolicy"); return
+        }
+        #expect(pol.hardwareIsolated && pol.chaos.latencyMs == 120 && pol.chaos.lossPercent == 5)
+        #expect(pol.egress == .allowlist(hosts: ["example.com"], cidrs: []))
+
+        let evJson = #"{"type":"x_ray_events","data":[{"seq":7,"timestamp_ms":1700000000000,"kind":"dns","action":"query","target":"example.com","detail":"A -> 93.184.216.34","allowed":true,"latency_us":350}]}"#
+        guard case let .xrayEvents(events) = try Wire.decoder.decode(EngineResponse.self, from: Data(evJson.utf8)) else {
+            Issue.record("expected .xrayEvents"); return
+        }
+        #expect(events.count == 1 && events[0].kind == .dns && events[0].target == "example.com" && events[0].allowed)
+
+        let demo = DemoEngine()
+        let updated = try await demo.setNetworkPolicy(id: "web", egress: .offline, chaos: ChaosProfile(latencyMs: 80, lossPercent: 2))
+        #expect(updated.hardwareIsolated && updated.egress == .offline && updated.chaos.latencyMs == 80)
+        #expect(try await demo.setXRay(id: "web", enabled: true) == true)
+        let inspected = try await demo.inspect(id: "web")
+        #expect(inspected.xrayEnabled == true && inspected.networkPolicy?.egress == .offline)
+        let demoEvents = try await demo.xrayEvents(id: "web", limit: 2)
+        #expect(demoEvents.count == 2 && demoEvents.allSatisfy { $0.kind == .net || $0.kind == .dns ? !$0.allowed : true })
     }
 }

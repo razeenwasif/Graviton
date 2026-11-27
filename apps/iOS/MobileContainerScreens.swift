@@ -377,6 +377,15 @@ struct MobileInspectView: View {
                         row("Networks", d.attachedNetworks.joined(separator: ", "))
                         row("IP address", d.container.ipAddress ?? "—")
                         row("Ports", d.container.ports.isEmpty ? "—" : d.container.ports.map(\.fullLabel).joined(separator: "\n"))
+                        if let policy = d.networkPolicy {
+                            row("Egress firewall", policy.egress.label + (policy.hardwareIsolated ? " · hardware isolated" : ""))
+                            if policy.chaos.isActive {
+                                row("Switch chaos", "\(policy.chaos.latencyMs)ms delay · ±\(policy.chaos.jitterMs)ms · \(policy.chaos.lossPercent)% loss")
+                            }
+                        }
+                        if let xray = d.xrayEnabled {
+                            row("X-Ray telemetry", xray ? "Recording" : "Off")
+                        }
                     }
                     if !d.container.mounts.isEmpty {
                         section("Volumes") {
@@ -510,5 +519,211 @@ struct MobileInspectView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 11)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+// MARK: - X-Ray & Egress Firewall
+
+struct MobileXRayView: View {
+    @Environment(EngineStore.self) private var store
+    var container: Container
+    @State private var events: [XRayEvent] = []
+    @State private var policy = ContainerNetworkPolicy()
+    @State private var xrayEnabled = false
+    @State private var filterKind: XRayEventKind?
+    @State private var loading = true
+    @State private var problem: String?
+
+    private var visibleEvents: [XRayEvent] {
+        events.reversed().filter { filterKind == nil || $0.kind == filterKind }
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                if let problem {
+                    GStatusLine(.failure, problem)
+                }
+
+                VStack(spacing: 0) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("X-Ray Tracing").font(.system(size: 14, weight: .semibold)).foregroundStyle(G.text)
+                            Text(xrayEnabled ? "Streaming DNS, net, file & proc" : "Tap to record live events")
+                                .font(.system(size: 12)).foregroundStyle(G.muted)
+                        }
+                        Spacer()
+                        Toggle("", isOn: Binding(
+                            get: { xrayEnabled },
+                            set: { next in Task { await toggleXRay(next) } }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.gSwitch)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                    RowDivider()
+                    HStack {
+                        Text("Egress Firewall").font(.system(size: 13)).foregroundStyle(G.muted)
+                        Spacer()
+                        Text(policy.egress.label + (policy.hardwareIsolated ? " · No NAT" : ""))
+                            .font(G.mono(12.5)).foregroundStyle(policy.egress.isRestricted ? G.warning : G.running)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 11)
+                    if policy.chaos.isActive {
+                        RowDivider()
+                        HStack {
+                            Text("Switch Chaos").font(.system(size: 13)).foregroundStyle(G.muted)
+                            Spacer()
+                            Text("\(policy.chaos.latencyMs)ms · ±\(policy.chaos.jitterMs)ms · \(policy.chaos.lossPercent)% loss")
+                                .font(G.mono(12.5)).foregroundStyle(G.danger)
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 11)
+                    }
+                }
+                .mobileCard()
+
+                HStack(spacing: 8) {
+                    Button {
+                        Task { await setQuickPolicy(.offline) }
+                    } label: {
+                        Text("Lock Offline").font(.system(size: 12, weight: .semibold)).frame(maxWidth: .infinity).padding(.vertical, 9)
+                            .background(G.danger.opacity(0.14), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            .foregroundStyle(G.danger)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!store.canManage)
+
+                    Button {
+                        Task { await setQuickPolicy(.unrestricted) }
+                    } label: {
+                        Text("Allow All").font(.system(size: 12, weight: .semibold)).frame(maxWidth: .infinity).padding(.vertical, 9)
+                            .background(G.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            .foregroundStyle(G.accent)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!store.canManage)
+                }
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        filterChip("All", selected: filterKind == nil) { filterKind = nil }
+                        ForEach(XRayEventKind.allCases, id: \.self) { kind in
+                            filterChip(kind.label, selected: filterKind == kind) {
+                                filterKind = (filterKind == kind) ? nil : kind
+                            }
+                        }
+                    }
+                }
+
+                if loading && events.isEmpty {
+                    GSpinner(size: 22).frame(maxWidth: .infinity, minHeight: 220)
+                } else if visibleEvents.isEmpty {
+                    GEmptyState(xrayEnabled ? "Waiting for events" : "No X-Ray events", symbol: "waveform.path.ecg", detail: "Enable X-Ray tracing to inspect DNS queries, outbound traffic, and process activity.")
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(Array(visibleEvents.enumerated()), id: \.element.id) { idx, ev in
+                            if idx > 0 { RowDivider() }
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack(spacing: 8) {
+                                    Text(ev.kind.label.uppercased())
+                                        .font(G.mono(10, weight: .bold))
+                                        .foregroundStyle(G.accent)
+                                        .padding(.horizontal, 6).padding(.vertical, 2)
+                                        .background(G.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                                    Text(ev.action).font(G.mono(12, weight: .medium)).foregroundStyle(G.text)
+                                    Spacer()
+                                    Text(ev.allowed ? "ALLOW" : "BLOCK")
+                                        .font(G.mono(10, weight: .bold))
+                                        .foregroundStyle(ev.allowed ? G.running : G.danger)
+                                }
+                                Text(ev.target).font(G.mono(12.5)).foregroundStyle(G.text).lineLimit(2)
+                                if let detail = ev.detail, !detail.isEmpty {
+                                    Text(detail).font(G.mono(11)).foregroundStyle(G.muted).lineLimit(2)
+                                }
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .mobileCard()
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 24)
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            MobileHeader("X-Ray & Firewall", subtitle: container.name).background(G.background)
+        }
+        .mobileScreen()
+        .task(id: "\(container.id)|\(container.isRunning)") {
+            await loadAndStream()
+        }
+    }
+
+    private func filterChip(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(selected ? G.onAccent : G.muted)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(selected ? G.accent : G.surface, in: Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func loadAndStream() async {
+        loading = true
+        do {
+            let details = try await store.inspect(container.id)
+            xrayEnabled = details.xrayEnabled ?? false
+            if let pol = details.networkPolicy {
+                policy = pol
+            } else {
+                policy = try await store.getNetworkPolicy(id: container.id)
+            }
+            events = try await store.xrayEvents(id: container.id, limit: 150)
+            problem = nil
+        } catch {
+            problem = error.localizedDescription
+        }
+        loading = false
+        guard container.isRunning || xrayEnabled else { return }
+        do {
+            for try await ev in store.xrayStream(id: container.id, limit: 150) {
+                if Task.isCancelled { break }
+                if !events.contains(where: { $0.seq == ev.seq && ev.seq > 0 }) {
+                    events.append(ev)
+                    if events.count > 400 { events.removeFirst(events.count - 400) }
+                }
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            if !Task.isCancelled { problem = error.localizedDescription }
+        }
+    }
+
+    private func toggleXRay(_ enabled: Bool) async {
+        do {
+            xrayEnabled = try await store.setXRay(id: container.id, enabled: enabled)
+            if enabled { await loadAndStream() }
+            problem = nil
+        } catch {
+            problem = error.localizedDescription
+        }
+    }
+
+    private func setQuickPolicy(_ egress: EgressPolicy) async {
+        do {
+            policy = try await store.setNetworkPolicy(id: container.id, egress: egress, chaos: nil)
+            problem = nil
+        } catch {
+            problem = error.localizedDescription
+        }
     }
 }

@@ -13,10 +13,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use graviton_proto::HostEntry;
-use graviton_proto::dns::{HostTable, answer, parse_resolv_conf, servfail};
+use graviton_proto::dns::{HostTable, answer, build_ip_reply, parse_question, parse_resolv_conf, refused, servfail};
+use graviton_proto::{HostEntry, XRayEvent, XRayEventKind};
 
 /// Loopback address the guest DNS resolver binds (matches Docker's convention
 /// so it doesn't collide with anything a container binds on `127.0.0.1:53`).
@@ -94,6 +94,75 @@ fn answer_local(pkt: &[u8]) -> Option<Vec<u8>> {
     answer(pkt, &guard.1)
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+fn record_dns_xray(target: &str, detail: &str, allowed: bool, latency_us: u64) {
+    crate::xray::emit(XRayEvent {
+        seq: 0,
+        timestamp_ms: now_ms(),
+        kind: XRayEventKind::Dns,
+        action: "resolve".into(),
+        target: target.to_string(),
+        detail: Some(detail.to_string()),
+        allowed,
+        latency_us: Some(latency_us),
+        bytes: None,
+        pid: None,
+    });
+}
+
+fn resolve_external_udp(query: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
+    let t0 = Instant::now();
+    let q = parse_question(query);
+    if crate::egress_proxy::is_active() {
+        if let Some((ref name, qtype)) = q {
+            match crate::egress_proxy::dns_lookup(name, qtype) {
+                Ok(Some(ips)) => {
+                    record_dns_xray(name, &ips.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "), true, t0.elapsed().as_micros() as u64);
+                    return build_ip_reply(query, &ips);
+                }
+                Ok(None) => {
+                    record_dns_xray(name, "blocked by egress policy", false, t0.elapsed().as_micros() as u64);
+                    return refused(query);
+                }
+                Err(_) => return servfail(query),
+            }
+        }
+    }
+    let reply = forward_udp(query, upstreams);
+    if let Some((ref name, _)) = q {
+        record_dns_xray(name, if reply.is_some() { "upstream" } else { "timeout" }, true, t0.elapsed().as_micros() as u64);
+    }
+    reply.or_else(|| servfail(query))
+}
+
+fn resolve_external_tcp(query: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
+    let t0 = Instant::now();
+    let q = parse_question(query);
+    if crate::egress_proxy::is_active() {
+        if let Some((ref name, qtype)) = q {
+            match crate::egress_proxy::dns_lookup(name, qtype) {
+                Ok(Some(ips)) => {
+                    record_dns_xray(name, &ips.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "), true, t0.elapsed().as_micros() as u64);
+                    return build_ip_reply(query, &ips);
+                }
+                Ok(None) => {
+                    record_dns_xray(name, "blocked by egress policy", false, t0.elapsed().as_micros() as u64);
+                    return refused(query);
+                }
+                Err(_) => return servfail(query),
+            }
+        }
+    }
+    let reply = forward_tcp(query, upstreams);
+    if let Some((ref name, _)) = q {
+        record_dns_xray(name, if reply.is_some() { "upstream" } else { "timeout" }, true, t0.elapsed().as_micros() as u64);
+    }
+    reply.or_else(|| servfail(query))
+}
+
 fn serve_udp(sock: Arc<UdpSocket>, upstreams: Arc<Vec<SocketAddr>>) {
     let mut buf = [0u8; MAX_UDP_PACKET];
     loop {
@@ -107,6 +176,9 @@ fn serve_udp(sock: Arc<UdpSocket>, upstreams: Arc<Vec<SocketAddr>>) {
         };
         let pkt = &buf[..n];
         if let Some(reply) = answer_local(pkt) {
+            if let Some((name, _)) = parse_question(pkt) {
+                record_dns_xray(&name, "local container table", true, 0);
+            }
             let _ = sock.send_to(&reply, src);
             continue;
         }
@@ -122,8 +194,7 @@ fn serve_udp(sock: Arc<UdpSocket>, upstreams: Arc<Vec<SocketAddr>>) {
         if thread::Builder::new()
             .spawn(move || {
                 let _guard = guard;
-                let reply = forward_udp(&query, &upstreams).or_else(|| servfail(&query));
-                if let Some(reply) = reply {
+                if let Some(reply) = resolve_external_udp(&query, &upstreams) {
                     let _ = reply_sock.send_to(&reply, src);
                 }
             })
@@ -178,9 +249,14 @@ fn handle_tcp(mut client: TcpStream, upstreams: &[SocketAddr]) {
     let _ = client.set_write_timeout(Some(TCP_IO_TIMEOUT));
     loop {
         let Some(query) = read_tcp_msg(&mut client) else { return };
-        let reply = answer_local(&query)
-            .or_else(|| forward_tcp(&query, upstreams))
-            .or_else(|| servfail(&query));
+        let reply = if let Some(local) = answer_local(&query) {
+            if let Some((name, _)) = parse_question(&query) {
+                record_dns_xray(&name, "local container table", true, 0);
+            }
+            Some(local)
+        } else {
+            resolve_external_tcp(&query, upstreams)
+        };
         let Some(reply) = reply else { return };
         if write_tcp_msg(&mut client, &reply).is_err() {
             return;

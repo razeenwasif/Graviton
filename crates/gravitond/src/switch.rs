@@ -10,12 +10,15 @@
 //! gateway), so containers reach each other at the addresses `grav ps` shows,
 //! TCP and UDP alike, while the internet and the Mac stay on `eth0`.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
+
+use graviton_proto::ChaosProfile;
 
 /// Live counters for the container switch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -35,6 +38,147 @@ const DEFAULT_NET: &str = "graviton";
 struct PortEntry {
     fd: Arc<OwnedFd>,
     networks: HashSet<String>,
+    chaos: Arc<Mutex<PortChaosState>>,
+}
+
+struct PortChaosState {
+    profile: ChaosProfile,
+    tokens_bytes: f64,
+    last_refill: Instant,
+    rng: u64,
+}
+
+impl Default for PortChaosState {
+    fn default() -> Self {
+        Self { profile: ChaosProfile::default(), tokens_bytes: 65536.0, last_refill: Instant::now(), rng: 0x9E37_79B9_7F4A_7C15 }
+    }
+}
+
+impl PortChaosState {
+    fn next_u32(&mut self) -> u32 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        (self.rng >> 32) as u32
+    }
+
+    fn evaluate(&mut self, frame_len: usize) -> Option<Duration> {
+        if !self.profile.is_active() {
+            return Some(Duration::ZERO);
+        }
+        if self.profile.loss_percent >= 100 {
+            return None;
+        }
+        if self.profile.loss_percent > 0 && (self.next_u32() % 100) < u32::from(self.profile.loss_percent) {
+            return None;
+        }
+        if let Some(kbps) = self.profile.bandwidth_kbps {
+            let now = Instant::now();
+            let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+            self.last_refill = now;
+            let rate_bps = (kbps.max(1) as f64) * 125.0;
+            let burst = (rate_bps * 0.5).max(16_384.0);
+            self.tokens_bytes = (self.tokens_bytes + elapsed * rate_bps).min(burst);
+            if self.tokens_bytes < frame_len as f64 {
+                return None;
+            }
+            self.tokens_bytes -= frame_len as f64;
+        }
+        let mut delay_ms = u64::from(self.profile.latency_ms);
+        if self.profile.jitter_ms > 0 {
+            let span = u64::from(self.profile.jitter_ms);
+            let offset = u64::from(self.next_u32()) % (span * 2 + 1);
+            delay_ms = delay_ms.saturating_add(offset).saturating_sub(span);
+        }
+        Some(Duration::from_millis(delay_ms))
+    }
+}
+
+struct DelayedFrame {
+    due: Instant,
+    seq: u64,
+    target: Arc<OwnedFd>,
+    data: Vec<u8>,
+}
+
+impl PartialEq for DelayedFrame {
+    fn eq(&self, other: &Self) -> bool {
+        self.due == other.due && self.seq == other.seq
+    }
+}
+impl Eq for DelayedFrame {}
+impl PartialOrd for DelayedFrame {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for DelayedFrame {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.due.cmp(&other.due).then_with(|| self.seq.cmp(&other.seq))
+    }
+}
+
+fn enqueue_delayed(
+    target: Arc<OwnedFd>,
+    data: Vec<u8>,
+    due: Instant,
+    frames_forwarded: &Arc<AtomicU64>,
+    bytes_forwarded: &Arc<AtomicU64>,
+) {
+    struct Queue {
+        heap: Mutex<BinaryHeap<Reverse<DelayedFrame>>>,
+        cv: Condvar,
+        next_seq: AtomicU64,
+        frames: Arc<AtomicU64>,
+        bytes: Arc<AtomicU64>,
+    }
+    static DELAYER: OnceLock<(Arc<Queue>, mpsc::Sender<()>)> = OnceLock::new();
+    let (q, _) = DELAYER.get_or_init(|| {
+        let q = Arc::new(Queue {
+            heap: Mutex::new(BinaryHeap::new()),
+            cv: Condvar::new(),
+            next_seq: AtomicU64::new(0),
+            frames: Arc::clone(frames_forwarded),
+            bytes: Arc::clone(bytes_forwarded),
+        });
+        let (tx, _rx) = mpsc::channel();
+        let worker = Arc::clone(&q);
+        let _ = std::thread::Builder::new().name("switch-chaos".into()).spawn(move || {
+            let mut guard = worker.heap.lock().unwrap();
+            loop {
+                let now = Instant::now();
+                while let Some(Reverse(top)) = guard.peek() {
+                    if top.due > now {
+                        break;
+                    }
+                    let Reverse(frame) = guard.pop().unwrap();
+                    drop(guard);
+                    // SAFETY: send(2) of delayed Ethernet frame to valid port fd.
+                    let sent = unsafe { libc::send(frame.target.as_raw_fd(), frame.data.as_ptr().cast(), frame.data.len(), libc::MSG_DONTWAIT) };
+                    if sent > 0 {
+                        worker.frames.fetch_add(1, Ordering::Relaxed);
+                        worker.bytes.fetch_add(sent as u64, Ordering::Relaxed);
+                    }
+                    guard = worker.heap.lock().unwrap();
+                }
+                match guard.peek() {
+                    Some(Reverse(top)) => {
+                        let wait = top.due.saturating_duration_since(Instant::now());
+                        let (next_g, _) = worker.cv.wait_timeout(guard, wait).unwrap();
+                        guard = next_g;
+                    }
+                    None => guard = worker.cv.wait(guard).unwrap(),
+                }
+            }
+        });
+        (q, tx)
+    });
+    let seq = q.next_seq.fetch_add(1, Ordering::Relaxed);
+    let mut heap = q.heap.lock().unwrap();
+    if heap.len() < 4096 {
+        heap.push(Reverse(DelayedFrame { due, seq, target, data }));
+        q.cv.notify_one();
+    }
 }
 
 #[derive(Default)]
@@ -137,7 +281,7 @@ impl Switch {
             let mut inner = self.inner.lock().unwrap();
             inner.next_id += 1;
             let id = inner.next_id;
-            inner.ports.insert(id, PortEntry { fd: Arc::clone(&ours), networks: nets });
+            inner.ports.insert(id, PortEntry { fd: Arc::clone(&ours), networks: nets, chaos: Arc::new(Mutex::new(PortChaosState::default())) });
             id
         };
         let switch = self.clone();
@@ -159,6 +303,17 @@ impl Switch {
         }
     }
 
+    /// Live-update the fault-injection chaos profile on an active switch port.
+    pub fn set_port_chaos(&self, port_id: u64, chaos: ChaosProfile) {
+        let state = {
+            let inner = self.inner.lock().unwrap();
+            inner.ports.get(&port_id).map(|e| Arc::clone(&e.chaos))
+        };
+        if let Some(state) = state {
+            state.lock().unwrap().profile = chaos;
+        }
+    }
+
     /// Read frames from one port and pass them on, until the port is unplugged.
     fn serve(&self, id: u64, fd: &OwnedFd) {
         let mut buf = [0u8; FRAME_MAX];
@@ -175,29 +330,54 @@ impl Switch {
             if frame.len() < 14 {
                 continue;
             }
-            for target in self.route(id, frame) {
-                // A full receiver drops the frame, as a real switch would.
-                // SAFETY: send(2) of a buffer we own on a descriptor the switch holds.
-                let sent = unsafe { libc::send(target.as_raw_fd(), frame.as_ptr().cast(), frame.len(), libc::MSG_DONTWAIT) };
-                if sent > 0 {
-                    self.frames_forwarded.fetch_add(1, Ordering::Relaxed);
-                    self.bytes_forwarded.fetch_add(sent as u64, Ordering::Relaxed);
+            let (src_chaos, targets) = self.route(id, frame);
+            let src_delay = if let Some(sc) = src_chaos {
+                match sc.lock().unwrap().evaluate(frame.len()) {
+                    Some(d) => d,
+                    None => continue,
+                }
+            } else {
+                Duration::ZERO
+            };
+            for (target, dst_chaos) in targets {
+                let dst_delay = match dst_chaos.lock().unwrap().evaluate(frame.len()) {
+                    Some(d) => d,
+                    None => continue,
+                };
+                let delay = src_delay.max(dst_delay);
+                if delay.is_zero() {
+                    // A full receiver drops the frame, as a real switch would.
+                    // SAFETY: send(2) of a buffer we own on a descriptor the switch holds.
+                    let sent = unsafe { libc::send(target.as_raw_fd(), frame.as_ptr().cast(), frame.len(), libc::MSG_DONTWAIT) };
+                    if sent > 0 {
+                        self.frames_forwarded.fetch_add(1, Ordering::Relaxed);
+                        self.bytes_forwarded.fetch_add(sent as u64, Ordering::Relaxed);
+                    }
+                } else {
+                    enqueue_delayed(
+                        target,
+                        frame.to_vec(),
+                        Instant::now() + delay,
+                        &self.frames_forwarded,
+                        &self.bytes_forwarded,
+                    );
                 }
             }
         }
     }
 
     /// Learn the sender's MAC, then pick the ports a frame goes to.
-    fn route(&self, from: u64, frame: &[u8]) -> Vec<Arc<OwnedFd>> {
+    #[allow(clippy::type_complexity)]
+    fn route(&self, from: u64, frame: &[u8]) -> (Option<Arc<Mutex<PortChaosState>>>, Vec<(Arc<OwnedFd>, Arc<Mutex<PortChaosState>>)>) {
         let dst: [u8; 6] = frame[0..6].try_into().unwrap();
         let src: [u8; 6] = frame[6..12].try_into().unwrap();
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
-        let Some(from_nets) = inner.ports.get(&from).map(|e| e.networks.clone()) else {
-            return vec![];
+        let Some((from_nets, from_chaos)) = inner.ports.get(&from).map(|e| (e.networks.clone(), Arc::clone(&e.chaos))) else {
+            return (None, vec![]);
         };
         if from_nets.is_empty() {
-            return vec![];
+            return (Some(from_chaos), vec![]);
         }
         if src[0] & 1 == 0 {
             inner.macs.insert(src, (from, now));
@@ -205,22 +385,23 @@ impl Switch {
         let known = (dst[0] & 1 == 0)
             .then(|| inner.macs.get(&dst).filter(|(_, seen)| now.duration_since(*seen) < MAC_TTL).map(|(port, _)| *port))
             .flatten();
-        match known {
+        let targets = match known {
             Some(port) if port == from => vec![],
             Some(port) => inner
                 .ports
                 .get(&port)
                 .filter(|entry| !from_nets.is_disjoint(&entry.networks))
-                .map(|entry| Arc::clone(&entry.fd))
+                .map(|entry| (Arc::clone(&entry.fd), Arc::clone(&entry.chaos)))
                 .into_iter()
                 .collect(),
             None => inner
                 .ports
                 .iter()
                 .filter(|(id, entry)| **id != from && !from_nets.is_disjoint(&entry.networks))
-                .map(|(_, entry)| Arc::clone(&entry.fd))
+                .map(|(_, entry)| (Arc::clone(&entry.fd), Arc::clone(&entry.chaos)))
                 .collect(),
-        }
+        };
+        (Some(from_chaos), targets)
     }
 }
 
@@ -284,6 +465,28 @@ mod tests {
         drop(b);
         send(a.vm_fd(), &frame(mb, ma, b"still there?"));
         assert!(recv(c.vm_fd()).is_some());
+    }
+
+    #[test]
+    fn chaos_loss_and_latency_shape_switch_traffic() {
+        let sw = Switch::new();
+        let a = sw.attach().unwrap();
+        let b = sw.attach().unwrap();
+        let (ma, mb) = ([2, 0, 0, 0, 0, 0x2a], [2, 0, 0, 0, 0, 0x2b]);
+        let bcast = [0xff; 6];
+
+        sw.set_port_chaos(a.id(), ChaosProfile { latency_ms: 0, jitter_ms: 0, loss_percent: 100, bandwidth_kbps: None });
+        send(a.vm_fd(), &frame(bcast, ma, b"dropped"));
+        assert!(recv(b.vm_fd()).is_none());
+
+        sw.set_port_chaos(a.id(), ChaosProfile { latency_ms: 40, jitter_ms: 0, loss_percent: 0, bandwidth_kbps: None });
+        let t0 = Instant::now();
+        send(a.vm_fd(), &frame(bcast, ma, b"delayed"));
+        assert_eq!(recv(b.vm_fd()).unwrap(), frame(bcast, ma, b"delayed"));
+        assert!(t0.elapsed() >= Duration::from_millis(30));
+
+        // Keep `mb` referenced to avoid unused warning.
+        let _ = mb;
     }
 
     #[test]

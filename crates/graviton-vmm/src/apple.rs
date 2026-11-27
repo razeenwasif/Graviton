@@ -404,13 +404,16 @@ unsafe fn build_configuration(
     unsafe {
         let boot = VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &file_url(&config.kernel));
         boot.setInitialRamdiskURL(Some(&file_url(&config.initrd)));
-        let cmdline = if config.cmdline.split_whitespace().any(|tok| tok.starts_with("nr_cpus=")) {
+        let mut cmdline = if config.cmdline.split_whitespace().any(|tok| tok.starts_with("nr_cpus=")) {
             config.cmdline.clone()
         } else if config.cmdline.is_empty() {
             format!("nr_cpus={}", config.cpus)
         } else {
             format!("{} nr_cpus={}", config.cmdline, config.cpus)
         };
+        if config.network == NetworkMode::None && !cmdline.split_whitespace().any(|tok| tok == "graviton.no_nat=1") {
+            cmdline.push_str(" graviton.no_nat=1");
+        }
         boot.setCommandLine(&NSString::from_str(&cmdline));
 
         let c = VZVirtualMachineConfiguration::new();

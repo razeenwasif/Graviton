@@ -138,6 +138,54 @@ enum Command {
     },
     /// Inspect overlay filesystem changes inside a running container.
     Diff { container: String },
+    /// Inspect or stream Hypervisor X-Ray telemetry (`dns`, `net`, `file`, `proc`).
+    #[command(name = "xray", alias = "x-ray")]
+    XRay {
+        container: String,
+        /// Stream live X-Ray events as they happen (auto-enables X-Ray).
+        #[arg(short, long)]
+        follow: bool,
+        /// Number of recent events to show initially.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Enable X-Ray collection on this container without streaming.
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        /// Disable X-Ray collection on this container.
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+    },
+    /// View or update a container's egress firewall & fault-injection chaos policy.
+    NetworkPolicy {
+        container: String,
+        /// Policy string (`unrestricted`, `offline`, or `allow:host1,*.host2,10.0.0.0/8`).
+        #[arg(long, conflicts_with_all = ["allow", "offline", "unrestricted"])]
+        egress: Option<String>,
+        /// Allow only these hosts/CIDRs (`--allow api.stripe.com --allow *.pypi.org`); repeatable.
+        #[arg(long = "allow", value_name = "HOST_OR_CIDR")]
+        allow: Vec<String>,
+        /// Set egress mode to air-gapped `offline`.
+        #[arg(long, conflicts_with_all = ["egress", "allow", "unrestricted"])]
+        offline: bool,
+        /// Reset egress mode to `unrestricted`.
+        #[arg(long, conflicts_with_all = ["egress", "allow", "offline"])]
+        unrestricted: bool,
+        /// Added base latency in milliseconds.
+        #[arg(long)]
+        latency: Option<u32>,
+        /// Added random jitter (+/- ms).
+        #[arg(long)]
+        jitter: Option<u32>,
+        /// Packet / dial drop percentage (`0..=100`).
+        #[arg(long)]
+        loss: Option<u8>,
+        /// Bandwidth ceiling in kbps.
+        #[arg(long)]
+        bandwidth: Option<u32>,
+        /// Remove all chaos fault-injection settings.
+        #[arg(long)]
+        clear_chaos: bool,
+    },
     /// Restart a container.
     Restart { container: String },
     /// Pull an image from its registry.
@@ -299,6 +347,21 @@ enum Command {
         /// Set POSIX resource limits (`NAME=SOFT[:HARD]`, e.g. `nofile=1024:4096`); repeatable.
         #[arg(long = "ulimit", value_name = "NAME=SOFT[:HARD]")]
         ulimit: Vec<String>,
+        /// Host-enforced egress firewall policy (`unrestricted`, `offline`, or `allow:host1,*.host2,10.0.0.0/8`).
+        #[arg(long, value_name = "POLICY")]
+        egress: Option<String>,
+        /// Inject constant outbound/switch latency (milliseconds).
+        #[arg(long, value_name = "MS")]
+        chaos_latency: Option<u32>,
+        /// Inject latency jitter (+/- milliseconds).
+        #[arg(long, value_name = "MS")]
+        chaos_jitter: Option<u32>,
+        /// Drop percentage (`0..=100`).
+        #[arg(long, value_name = "PERCENT")]
+        chaos_loss: Option<u8>,
+        /// Bandwidth ceiling in kbps.
+        #[arg(long, value_name = "KBPS")]
+        chaos_bandwidth: Option<u32>,
         image: String,
         /// Command (replaces the image's default command).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -855,6 +918,89 @@ fn run(cli: Cli) -> Result<()> {
             }
             other => unexpected(other)?,
         },
+        Command::XRay { container, follow, limit, enable, disable } => {
+            if enable || disable {
+                match client.call(&Request::SetXRay { id: container.clone(), enabled: enable })? {
+                    Response::XRayStatus { enabled } => {
+                        println!("X-Ray {} for {container}", if enabled { "enabled" } else { "disabled" });
+                    }
+                    other => unexpected(other)?,
+                }
+            } else if follow {
+                client.send(&Request::XRay { id: container, follow: true, limit: Some(limit) })?;
+                while let Some(resp) = client.recv()? {
+                    match resp {
+                        Response::XRayEvent(ev) => print_xray_event(&ev),
+                        Response::XRayEvents(list) => {
+                            for ev in &list {
+                                print_xray_event(ev);
+                            }
+                            break;
+                        }
+                        Response::Error { message } => bail!("{message}"),
+                        other => unexpected(other)?,
+                    }
+                }
+            } else {
+                match client.call(&Request::XRay { id: container, follow: false, limit: Some(limit) })? {
+                    Response::XRayEvents(list) => {
+                        if list.is_empty() {
+                            println!("No X-Ray events recorded yet (enable live capture with `grav xray --enable <id>` or `-f`).");
+                        } else {
+                            for ev in &list {
+                                print_xray_event(ev);
+                            }
+                        }
+                    }
+                    other => unexpected(other)?,
+                }
+            }
+        }
+        Command::NetworkPolicy { container, egress, allow, offline, unrestricted, latency, jitter, loss, bandwidth, clear_chaos } => {
+            let parsed_egress = if let Some(raw) = egress {
+                Some(graviton_proto::EgressPolicy::parse(&raw).map_err(anyhow::Error::msg)?)
+            } else if offline {
+                Some(graviton_proto::EgressPolicy::Offline)
+            } else if unrestricted {
+                Some(graviton_proto::EgressPolicy::Unrestricted)
+            } else if !allow.is_empty() {
+                Some(graviton_proto::EgressPolicy::parse(&format!("allow:{}", allow.join(","))).map_err(anyhow::Error::msg)?)
+            } else {
+                None
+            };
+            let has_chaos_update =
+                clear_chaos || latency.is_some() || jitter.is_some() || loss.is_some() || bandwidth.is_some();
+            if parsed_egress.is_none() && !has_chaos_update {
+                match client.call(&Request::GetNetworkPolicy { id: container })? {
+                    Response::NetworkPolicy(pol) => print_network_policy(&pol),
+                    other => unexpected(other)?,
+                }
+            } else {
+                let chaos = if clear_chaos {
+                    Some(graviton_proto::ChaosProfile::default())
+                } else if has_chaos_update {
+                    let current = match client.call(&Request::GetNetworkPolicy { id: container.clone() })? {
+                        Response::NetworkPolicy(pol) => pol.chaos,
+                        other => {
+                            unexpected(other)?;
+                            unreachable!()
+                        }
+                    };
+                    Some(graviton_proto::ChaosProfile {
+                        latency_ms: latency.unwrap_or(current.latency_ms),
+                        jitter_ms: jitter.unwrap_or(current.jitter_ms),
+                        loss_percent: loss.unwrap_or(current.loss_percent).min(100),
+                        bandwidth_kbps: bandwidth.or(current.bandwidth_kbps),
+                    })
+                } else {
+                    None
+                };
+                match client.call(&Request::SetNetworkPolicy { id: container, egress: parsed_egress, chaos })? {
+                    Response::NetworkPolicy(pol) => print_network_policy(&pol),
+                    other => unexpected(other)?,
+                }
+            }
+        }
         Command::Restart { container } => lifecycle(&mut client, Request::Restart { id: container }, "restarted")?,
         Command::Pull { platform, reference } => pull_image(&mut client, &reference, platform.as_deref())?,
         Command::Tag { source, target } => match client.call(&Request::TagImage { source: source.clone(), target: target.clone() })? {
@@ -949,6 +1095,11 @@ fn run(cli: Cli) -> Result<()> {
             network,
             shm_size,
             ulimit,
+            egress,
+            chaos_latency,
+            chaos_jitter,
+            chaos_loss,
+            chaos_bandwidth,
             image,
             command,
         } => {
@@ -1045,6 +1196,25 @@ fn run(cli: Cli) -> Result<()> {
                 .iter()
                 .map(|s| graviton_proto::parse_ulimit_spec(s).map_err(|e| anyhow::anyhow!(e)))
                 .collect::<Result<Vec<_>>>()?;
+            let egress = egress
+                .as_deref()
+                .map(graviton_proto::EgressPolicy::parse)
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
+            let chaos = if chaos_latency.is_some()
+                || chaos_jitter.is_some()
+                || chaos_loss.is_some()
+                || chaos_bandwidth.is_some()
+            {
+                Some(graviton_proto::ChaosProfile {
+                    latency_ms: chaos_latency.unwrap_or(0),
+                    jitter_ms: chaos_jitter.unwrap_or(0),
+                    loss_percent: chaos_loss.unwrap_or(0).min(100),
+                    bandwidth_kbps: chaos_bandwidth,
+                })
+            } else {
+                None
+            };
             let spec = RunSpec {
                 image,
                 name,
@@ -1077,6 +1247,8 @@ fn run(cli: Cli) -> Result<()> {
                 networks: network,
                 shm_size_bytes,
                 ulimits,
+                egress,
+                chaos,
             };
             if tty {
                 let code = run_tty(&target, spec, interactive)?;
@@ -2874,6 +3046,42 @@ fn network_delta_totals(samples: &[graviton_proto::StatSample]) -> (u64, u64) {
     (rx, tx)
 }
 
+fn print_xray_event(ev: &graviton_proto::XRayEvent) {
+    let kind = match ev.kind {
+        graviton_proto::XRayEventKind::Dns => "DNS ",
+        graviton_proto::XRayEventKind::Net => "NET ",
+        graviton_proto::XRayEventKind::File => "FILE",
+        graviton_proto::XRayEventKind::Proc => "PROC",
+    };
+    let status = if ev.allowed { "ALLOW" } else { "BLOCK" };
+    let latency = ev.latency_us.map_or_else(String::new, |us| format!(" {us}us"));
+    let detail = ev.detail.as_deref().map_or_else(String::new, |d| format!(" ({d})"));
+    println!("#{:>4} [{} {}] {:<8} {}{}{}", ev.seq, kind, status, ev.action, ev.target, detail, latency);
+}
+
+fn print_network_policy(pol: &graviton_proto::ContainerNetworkPolicy) {
+    match &pol.egress {
+        graviton_proto::EgressPolicy::Unrestricted => println!("Egress:   unrestricted"),
+        graviton_proto::EgressPolicy::Offline => println!("Egress:   offline (hardware_isolated={})", pol.hardware_isolated),
+        graviton_proto::EgressPolicy::Allowlist { hosts, cidrs } => {
+            println!("Egress:   allowlist (hardware_isolated={})", pol.hardware_isolated);
+            if !hosts.is_empty() {
+                println!("  Hosts:  {}", hosts.join(", "));
+            }
+            if !cidrs.is_empty() {
+                println!("  CIDRs:  {}", cidrs.join(", "));
+            }
+        }
+    }
+    println!(
+        "Chaos:    latency={}ms jitter={}ms loss={}% bandwidth={}kbps",
+        pol.chaos.latency_ms,
+        pol.chaos.jitter_ms,
+        pol.chaos.loss_percent,
+        pol.chaos.bandwidth_kbps.map_or_else(|| "unlimited".into(), |k| k.to_string())
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3249,5 +3457,36 @@ mod tests {
 
         let d = Cli::try_parse_from(["grav", "diff", "pg-test"]).unwrap();
         assert!(matches!(d.command, Command::Diff { ref container } if container == "pg-test"));
+    }
+
+    #[test]
+    fn parses_xray_and_network_policy_commands() {
+        let xr = Cli::try_parse_from(["grav", "xray", "-f", "--limit", "100", "api"]).unwrap();
+        assert!(matches!(
+            xr.command,
+            Command::XRay { ref container, follow: true, limit: 100, enable: false, disable: false }
+                if container == "api"
+        ));
+
+        let np = Cli::try_parse_from([
+            "grav", "network-policy", "api", "--allow", "api.stripe.com", "--allow", "*.pypi.org", "--latency", "120", "--loss", "5",
+        ])
+        .unwrap();
+        assert!(matches!(
+            np.command,
+            Command::NetworkPolicy {
+                ref container,
+                ref allow,
+                latency: Some(120),
+                loss: Some(5),
+                ..
+            } if container == "api" && allow == &["api.stripe.com", "*.pypi.org"]
+        ));
+
+        let run_iso = Cli::try_parse_from(["grav", "run", "--egress", "offline", "--chaos-latency", "50", "alpine", "sh"]).unwrap();
+        assert!(matches!(
+            run_iso.command,
+            Command::Run { ref egress, chaos_latency: Some(50), .. } if egress.as_deref() == Some("offline")
+        ));
     }
 }

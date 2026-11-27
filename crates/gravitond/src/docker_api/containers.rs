@@ -606,6 +606,8 @@ pub async fn create_container(
         networks: networks.clone(),
         shm_size_bytes,
         ulimits,
+        egress: None,
+        chaos: None,
     };
 
     let res = tokio::task::spawn_blocking(move || engine.create_container_local(spec)).await?;

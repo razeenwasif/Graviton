@@ -201,6 +201,20 @@ struct CommandPaletteView: View {
                     }
                 ))
                 list.append(Entry(
+                    id: "cnt-xray-\(c.id)",
+                    group: "Containers",
+                    title: "X-Ray: \(c.name)",
+                    subtitle: "Live DNS, egress firewall & chaos controls for \(c.name)",
+                    icon: "waveform.path.ecg",
+                    tint: G.indigo,
+                    badge: nil,
+                    shortcut: nil,
+                    perform: {
+                        selection = .containers
+                        onOpenContainer(c.id, .xray)
+                    }
+                ))
+                list.append(Entry(
                     id: "cnt-stop-\(c.id)",
                     group: "Containers",
                     title: "Stop \(c.name)",

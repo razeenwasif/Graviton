@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use graviton_core::Store;
 use graviton_image::{BlobStore, ImageIndex, LocalImage};
-use graviton_proto::{ContainerStatus, ContainerSummary, Mount, PortMapping, PortProtocol};
+use graviton_proto::{ChaosProfile, ContainerStatus, ContainerSummary, EgressPolicy, Mount, PortMapping, PortProtocol};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -110,6 +110,8 @@ fn filters_containers_with_label_and_semantics() {
         ulimits: vec![],
         forked_from: None,
         disk_source_id: None,
+        egress: EgressPolicy::default(),
+        chaos: ChaosProfile::default(),
     };
 
     // Go map filter style (AND across label keys)

@@ -2310,9 +2310,9 @@
         "note": "Completed in Wave 1A: added ForkSpec/DiffEntry/EventKind::Forked in graviton-proto, syncfs + quiesce + APFS clonefile(2) + overlayfs upperdir diff (grav fork / grav diff) across graviton-agent, gravitond, and grav, plus GravitonKit models/wire/DemoEngine, Mac ForkContainerSheet + DiffPanel + Command Palette + Fairy tools, and iOS Fork Container action. Verified via cargo test/clippy/musl, swift test (53/53), GravitonMac/GravitonIOS builds, and live VM E2E isolation/diff."
     },
     "hypervisor-xray-firewall": {
-        "status": "todo",
-        "updated": "2026-11-26T13:05:00+11:00",
-        "note": "Scheduled in Wave 1 of Graviton × Neutrino Breakthrough Plan."
+        "status": "done",
+        "updated": "2026-11-27T13:30:00+11:00",
+        "note": "Completed in Wave 1B: added opt-in hypervisor X-Ray telemetry (DNS/Net/File/Proc), zero-bypass hardware-isolated egress firewall (NetworkMode::None + vsock host EgressGateway proxy & DNS gateway + grav xray / grav network-policy), and per-port switch chaos (latency/jitter/loss/bandwidth) across graviton-proto, graviton-vmm, graviton-agent, gravitond, grav, GravitonKit (54/54 tests, 36 Fairy tools), GravitonMac XRayPanel, and GravitonIOS MobileXRayView. Verified via cargo test/clippy/musl, Release/Debug Xcode builds, and live VM E2E isolation/allowlist/chaos runs."
     },
     "cross-mac-teleport": {
         "status": "todo",

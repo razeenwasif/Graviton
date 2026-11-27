@@ -955,7 +955,38 @@ final class FairyController {
         case "diff_container":
             let c = try resolveContainer(try requireString(args, "container"))
             let entries = try await store.diff(id: c.id)
-            return try FairyJSON.fromEncodable(["container": c.name, "entries": entries])
+            return .object(["container": .string(c.name), "entries": try FairyJSON.fromEncodable(entries)])
+
+        case "xray_events":
+            let c = try resolveContainer(try requireString(args, "container"))
+            let limit = args["limit"]?.intValue.map { max(1, min(500, $0)) }
+            let events = try await store.xrayEvents(id: c.id, limit: limit)
+            return try FairyJSON.fromEncodable(events)
+
+        case "set_xray":
+            let c = try resolveContainer(try requireString(args, "container"))
+            let enable = args["enabled"]?.boolValue ?? true
+            let active = try await store.setXRay(id: c.id, enabled: enable)
+            return .object(["container": .string(c.name), "xray_enabled": .bool(active)])
+
+        case "set_network_policy":
+            let c = try resolveContainer(try requireString(args, "container"))
+            var egress: EgressPolicy?
+            if let raw = args["egress"]?.stringValue {
+                guard let parsed = EgressPolicy.parse(raw) else {
+                    throw EngineError.daemon("Invalid egress policy \"\(raw)\" (use unrestricted, offline, or allow:host1,host2).")
+                }
+                egress = parsed
+            }
+            let hasChaos = args["latency_ms"] != nil || args["jitter_ms"] != nil || args["loss_percent"] != nil || args["bandwidth_kbps"] != nil || args["clear_chaos"]?.boolValue == true
+            let chaos: ChaosProfile? = hasChaos ? ChaosProfile(
+                latencyMs: args["clear_chaos"]?.boolValue == true ? 0 : UInt32(max(0, args["latency_ms"]?.intValue ?? 0)),
+                jitterMs: args["clear_chaos"]?.boolValue == true ? 0 : UInt32(max(0, args["jitter_ms"]?.intValue ?? 0)),
+                lossPercent: args["clear_chaos"]?.boolValue == true ? 0 : UInt8(max(0, min(100, args["loss_percent"]?.intValue ?? 0))),
+                bandwidthKbps: args["clear_chaos"]?.boolValue == true ? nil : args["bandwidth_kbps"]?.intValue.map { UInt32(max(1, $0)) }
+            ) : nil
+            let updated = try await store.setNetworkPolicy(id: c.id, egress: egress, chaos: chaos)
+            return try FairyJSON.fromEncodable(updated)
 
         case "fork_container":
             let src = try resolveContainer(try requireString(args, "source"))

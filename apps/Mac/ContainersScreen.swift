@@ -537,6 +537,7 @@ private struct ContainerRowView: View {
                 .disabled(!store.canManage)
             Button("Show Logs") { onOpen(.logs) }
             Button("Inspect Filesystem Diff") { onOpen(.diff) }.disabled(!container.isRunning)
+            Button("Open X-Ray & Firewall") { onOpen(.xray) }
             Button("Open Terminal") { onOpen(.terminal) }.disabled(!container.isRunning)
         }
     }

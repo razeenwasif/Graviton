@@ -74,6 +74,15 @@ struct InspectPanel: View {
                         InspectRow("Networks", d.attachedNetworks.joined(separator: ", "))
                         InspectRow("IP address", d.container.ipAddress ?? "—")
                         InspectRow("Ports", d.container.ports.isEmpty ? "—" : d.container.ports.map(\.fullLabel).joined(separator: "\n"))
+                        if let policy = d.networkPolicy {
+                            InspectRow("Egress firewall", policy.egress.label + (policy.hardwareIsolated ? " · hardware isolated" : ""))
+                            if policy.chaos.isActive {
+                                InspectRow("Switch chaos", "\(policy.chaos.latencyMs)ms delay · ±\(policy.chaos.jitterMs)ms · \(policy.chaos.lossPercent)% loss")
+                            }
+                        }
+                        if let xray = d.xrayEnabled {
+                            InspectRow("X-Ray telemetry", xray ? "Recording" : "Off")
+                        }
                     }
                     InspectSection("Mounts") {
                         InspectRow("Volumes", d.container.mounts.isEmpty ? "—" : d.container.mounts.map { "\($0.source) → \($0.target)\($0.readOnly ? " (read-only)" : "")" }.joined(separator: "\n"))

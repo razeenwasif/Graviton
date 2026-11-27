@@ -20,6 +20,7 @@ pub const LOCAL_DOMAIN: &str = "graviton";
 /// Standard DNS record types we answer locally.
 const TYPE_A: u16 = 1;
 const TYPE_PTR: u16 = 12;
+pub const TYPE_AAAA: u16 = 28;
 const TYPE_ANY: u16 = 255;
 
 const CLASS_IN: u16 = 1;
@@ -28,6 +29,7 @@ const CLASS_ANY: u16 = 255;
 const RCODE_NOERROR: u16 = 0;
 const RCODE_SERVFAIL: u16 = 2;
 const RCODE_NXDOMAIN: u16 = 3;
+const RCODE_REFUSED: u16 = 5;
 
 /// Live container name/id ↔ IPv4 table used by the guest DNS responder.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -136,6 +138,15 @@ pub fn answer(pkt: &[u8], table: &HostTable) -> Option<Vec<u8>> {
 
 /// Build a `SERVFAIL` response for `pkt` when no upstream DNS server answered.
 pub fn servfail(pkt: &[u8]) -> Option<Vec<u8>> {
+    build_error_reply(pkt, RCODE_SERVFAIL)
+}
+
+/// Build a `REFUSED` response for `pkt` (used by the host egress firewall).
+pub fn refused(pkt: &[u8]) -> Option<Vec<u8>> {
+    build_error_reply(pkt, RCODE_REFUSED)
+}
+
+fn build_error_reply(pkt: &[u8], rcode: u16) -> Option<Vec<u8>> {
     if pkt.len() < 12 {
         return None;
     }
@@ -144,13 +155,54 @@ pub fn servfail(pkt: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     if let Some(q) = parse_query(pkt) {
-        return Some(build_reply(pkt, q.end, RCODE_SERVFAIL, false, None));
+        return Some(build_reply(pkt, q.end, rcode, false, None));
     }
-    let flags = 0x8080 | (req_flags & 0x0100) | RCODE_SERVFAIL;
+    let flags = 0x8080 | (req_flags & 0x0100) | (rcode & 0x000F);
     let mut out = Vec::with_capacity(12);
     out.extend_from_slice(&pkt[0..2]);
     out.extend_from_slice(&flags.to_be_bytes());
     out.extend_from_slice(&[0; 8]);
+    Some(out)
+}
+
+/// Extract the lowercased question name and DNS `qtype` from a standard query packet.
+pub fn parse_question(pkt: &[u8]) -> Option<(String, u16)> {
+    let q = parse_query(pkt)?;
+    Some((q.name, q.qtype))
+}
+
+/// Build an authoritative/recursive DNS response containing IPv4 (`A`) and/or IPv6 (`AAAA`) records.
+pub fn build_ip_reply(pkt: &[u8], ips: &[IpAddr]) -> Option<Vec<u8>> {
+    let q = parse_query(pkt)?;
+    let req_flags = u16::from_be_bytes([pkt[2], pkt[3]]);
+    let flags: u16 = 0x8080 | (req_flags & 0x0100) | RCODE_NOERROR;
+
+    let matching: Vec<(u16, Vec<u8>)> = ips
+        .iter()
+        .filter_map(|ip| match ip {
+            IpAddr::V4(v4) if q.qtype == TYPE_A || q.qtype == TYPE_ANY => Some((TYPE_A, v4.octets().to_vec())),
+            IpAddr::V6(v6) if q.qtype == TYPE_AAAA || q.qtype == TYPE_ANY => Some((TYPE_AAAA, v6.octets().to_vec())),
+            _ => None,
+        })
+        .collect();
+
+    let mut out = Vec::with_capacity(q.end + matching.len() * 32);
+    out.extend_from_slice(&pkt[0..2]);
+    out.extend_from_slice(&flags.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&(matching.len() as u16).to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&pkt[12..q.end]);
+
+    for (rtype, rdata) in matching {
+        out.extend_from_slice(&[0xC0, 0x0C]);
+        out.extend_from_slice(&rtype.to_be_bytes());
+        out.extend_from_slice(&CLASS_IN.to_be_bytes());
+        out.extend_from_slice(&CONTAINER_TTL.to_be_bytes());
+        out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        out.extend_from_slice(&rdata);
+    }
     Some(out)
 }
 

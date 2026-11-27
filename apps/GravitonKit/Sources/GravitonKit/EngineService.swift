@@ -43,6 +43,10 @@ public protocol EngineService: Sendable {
     func unpause(id: String) async throws -> Container
     func fork(_ spec: ForkSpec) async throws -> [Container]
     func diff(id: String) async throws -> [DiffEntry]
+    func getNetworkPolicy(id: String) async throws -> ContainerNetworkPolicy
+    func setNetworkPolicy(id: String, egress: EgressPolicy?, chaos: ChaosProfile?) async throws -> ContainerNetworkPolicy
+    func setXRay(id: String, enabled: Bool) async throws -> Bool
+    func xrayEvents(id: String, limit: Int?) async throws -> [XRayEvent]
     func restart(id: String) async throws -> Container
     /// Pull an image from its registry (may take minutes).
     func pull(reference: String) async throws -> ImageInfo
@@ -303,6 +307,106 @@ public final class SocketEngine: EngineService {
     public func diff(id: String) async throws -> [DiffEntry] {
         guard case let .diff(entries) = try await call(.diff(id: id), timeout: 30) else { throw EngineError.unexpectedResponse }
         return entries
+    }
+    public func getNetworkPolicy(id: String) async throws -> ContainerNetworkPolicy {
+        guard case let .networkPolicy(policy) = try await call(.getNetworkPolicy(id: id), timeout: 15) else {
+            throw EngineError.unexpectedResponse
+        }
+        return policy
+    }
+    public func setNetworkPolicy(id: String, egress: EgressPolicy?, chaos: ChaosProfile?) async throws -> ContainerNetworkPolicy {
+        guard case let .networkPolicy(policy) = try await call(.setNetworkPolicy(id: id, egress: egress, chaos: chaos), timeout: 30) else {
+            throw EngineError.unexpectedResponse
+        }
+        return policy
+    }
+    public func setXRay(id: String, enabled: Bool) async throws -> Bool {
+        guard case let .xrayStatus(active) = try await call(.setXRay(id: id, enabled: enabled), timeout: 15) else {
+            throw EngineError.unexpectedResponse
+        }
+        return active
+    }
+    public func xrayEvents(id: String, limit: Int?) async throws -> [XRayEvent] {
+        guard case let .xrayEvents(events) = try await call(.xray(id: id, follow: false, limit: limit), timeout: 30) else {
+            throw EngineError.unexpectedResponse
+        }
+        return events
+    }
+
+    public func xrayStream(id: String, limit: Int? = nil) -> AsyncThrowingStream<XRayEvent, Error> {
+        let path = self.path
+        let box = CancelableFD()
+        return AsyncThrowingStream { continuation in
+            continuation.onTermination = { _ in box.cancel() }
+            let thread = Thread {
+                var ownedFD: Int32?
+                defer {
+                    _ = box.detach()
+                    if let fd = ownedFD { close(fd) }
+                }
+                do {
+                    let fd = try Self.connect(path: path)
+                    ownedFD = fd
+                    guard box.attach(fd) else {
+                        continuation.finish()
+                        return
+                    }
+                    try Self.writeAll(fd, Array(try Wire.line(.xray(id: id, follow: true, limit: limit))))
+                    var buffer = Data()
+                    var chunk = [UInt8](repeating: 0, count: 64 * 1024)
+                    while true {
+                        if box.isCancelled {
+                            continuation.finish()
+                            return
+                        }
+                        var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                        let pr = Darwin.poll(&pfd, 1, 250)
+                        if pr == 0 { continue }
+                        if pr < 0 {
+                            if errno == EINTR { continue }
+                            if box.isCancelled { continuation.finish(); return }
+                            throw EngineError.io(String(cString: strerror(errno)))
+                        }
+                        let n = read(fd, &chunk, chunk.count)
+                        if n < 0 {
+                            if errno == EINTR || errno == EAGAIN { continue }
+                            if box.isCancelled { continuation.finish(); return }
+                            throw EngineError.io(String(cString: strerror(errno)))
+                        }
+                        if n == 0 {
+                            continuation.finish()
+                            return
+                        }
+                        buffer.append(contentsOf: chunk[0..<n])
+                        while let nl = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                            let line = Data(buffer[buffer.startIndex..<nl])
+                            buffer.removeSubrange(buffer.startIndex...nl)
+                            if line.isEmpty { continue }
+                            switch try Wire.decoder.decode(EngineResponse.self, from: line) {
+                            case let .xrayEvent(event):
+                                continuation.yield(event)
+                            case let .xrayEvents(list):
+                                for item in list { continuation.yield(item) }
+                                continuation.finish()
+                                return
+                            case let .error(message):
+                                throw EngineError.daemon(message)
+                            default:
+                                throw EngineError.unexpectedResponse
+                            }
+                        }
+                    }
+                } catch {
+                    if box.isCancelled {
+                        continuation.finish()
+                    } else {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+            thread.name = "graviton-xray"
+            thread.start()
+        }
     }
     public func restart(id: String) async throws -> Container { try await lifecycle(.restart(id: id)) }
 

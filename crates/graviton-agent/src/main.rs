@@ -27,11 +27,15 @@ mod container;
 #[cfg(target_os = "linux")]
 mod dns;
 #[cfg(target_os = "linux")]
+mod egress_proxy;
+#[cfg(target_os = "linux")]
 mod files;
 #[cfg(target_os = "linux")]
 mod reap;
 #[cfg(target_os = "linux")]
 mod tty;
+#[cfg(target_os = "linux")]
+mod xray;
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -355,6 +359,28 @@ pub(crate) mod linux {
                 Ok(AgentRequest::Diff { container }) => match crate::files::diff(&container) {
                     Ok(entries) => send(&writer, &AgentEvent::Diff { entries }),
                     Err(err) => send(&writer, &AgentEvent::Error { message: err.to_string() }),
+                },
+                Ok(AgentRequest::SetXRay { container, enabled }) => {
+                    crate::xray::set_enabled(&container, enabled);
+                    send(&writer, &AgentEvent::XRayStatus { enabled });
+                }
+                Ok(AgentRequest::WatchXRay { container }) => {
+                    drop(writer);
+                    return crate::xray::watch_stream(&container, reader.into_inner());
+                }
+                Ok(AgentRequest::EgressBridge) => {
+                    drop(writer);
+                    return crate::egress_proxy::serve_bridge(reader.into_inner());
+                }
+                Ok(AgentRequest::EgressStream { id }) => {
+                    let pending = reader.buffer().to_vec();
+                    drop(writer);
+                    crate::egress_proxy::attach_stream(id, reader.into_inner(), pending);
+                    return Ok(());
+                }
+                Ok(AgentRequest::DropDefaultRoute) => match crate::net::drop_default_route() {
+                    Ok(()) => send(&writer, &AgentEvent::Done),
+                    Err(err) => send(&writer, &AgentEvent::Error { message: err }),
                 },
                 Ok(AgentRequest::Shutdown) => power_off(),
                 Err(err) => send(&writer, &AgentEvent::Error { message: format!("bad request: {err}") }),

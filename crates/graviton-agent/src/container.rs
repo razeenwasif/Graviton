@@ -337,7 +337,10 @@ pub fn finish(
     let named = ip.unwrap_or("127.0.1.1");
     write("hosts", &format!("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n{named}\t{hostname}\n"))?;
 
-    let dns_active = if ip.is_some() && Path::new("/sys/class/net/eth1").exists() {
+    let dns_active = if (ip.is_some() && Path::new("/sys/class/net/eth1").exists())
+        || crate::egress_proxy::is_active()
+        || crate::net::is_no_nat_boot()
+    {
         match crate::dns::start() {
             Ok(()) => {
                 write("resolv.conf", &format!("nameserver {}\n", crate::dns::LISTEN_IP))?;
