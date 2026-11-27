@@ -42,6 +42,8 @@ public protocol EngineService: Sendable {
     func pause(id: String) async throws -> Container
     func unpause(id: String) async throws -> Container
     func fork(_ spec: ForkSpec) async throws -> [Container]
+    func freezeAndExport(id: String, destBundleDir: String, keepPaused: Bool, exitCode: Int32?, failedStep: String?) async throws -> FrozenBundleInfo
+    func restoreFrozen(bundleDir: String, name: String?, ephemeral: Bool) async throws -> FrozenRestoreInfo
     func diff(id: String) async throws -> [DiffEntry]
     func getNetworkPolicy(id: String) async throws -> ContainerNetworkPolicy
     func setNetworkPolicy(id: String, egress: EgressPolicy?, chaos: ChaosProfile?) async throws -> ContainerNetworkPolicy
@@ -303,6 +305,19 @@ public final class SocketEngine: EngineService {
     public func fork(_ spec: ForkSpec) async throws -> [Container] {
         guard case let .forked(created) = try await call(.fork(spec), timeout: 300) else { throw EngineError.unexpectedResponse }
         return created
+    }
+    public func freezeAndExport(id: String, destBundleDir: String, keepPaused: Bool = false, exitCode: Int32? = nil, failedStep: String? = nil) async throws -> FrozenBundleInfo {
+        guard case let .frozenExported(info) = try await call(
+            .freezeAndExport(id: id, destBundleDir: destBundleDir, keepPaused: keepPaused, exitCode: exitCode, failedStep: failedStep),
+            timeout: 300
+        ) else { throw EngineError.unexpectedResponse }
+        return info
+    }
+    public func restoreFrozen(bundleDir: String, name: String? = nil, ephemeral: Bool = true) async throws -> FrozenRestoreInfo {
+        guard case let .frozenRestored(info) = try await call(.restoreFrozen(bundleDir: bundleDir, name: name, ephemeral: ephemeral), timeout: 300) else {
+            throw EngineError.unexpectedResponse
+        }
+        return info
     }
     public func diff(id: String) async throws -> [DiffEntry] {
         guard case let .diff(entries) = try await call(.diff(id: id), timeout: 30) else { throw EngineError.unexpectedResponse }

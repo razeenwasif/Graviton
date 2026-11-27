@@ -1263,6 +1263,57 @@ public struct SnapshotInfo: Codable, Hashable, Sendable {
     }
 }
 
+/// Exported frozen failure snapshot bundle metadata (`grav freeze`).
+public struct FrozenBundleInfo: Codable, Hashable, Sendable {
+    public var bundleDir: String
+    public var sourceContainerId: String
+    public var sourceContainerName: String
+    public var image: String
+    public var sizeBytes: UInt64
+    public var hasVmState: Bool
+    public var hasWorkspace: Bool
+    public var workdir: String
+    public var exitCode: Int32?
+    public var failedStep: String?
+    public var createdAt: Int64
+
+    public init(bundleDir: String, sourceContainerId: String, sourceContainerName: String, image: String,
+                sizeBytes: UInt64, hasVmState: Bool, hasWorkspace: Bool, workdir: String,
+                exitCode: Int32? = nil, failedStep: String? = nil, createdAt: Int64) {
+        self.bundleDir = bundleDir
+        self.sourceContainerId = sourceContainerId
+        self.sourceContainerName = sourceContainerName
+        self.image = image
+        self.sizeBytes = sizeBytes
+        self.hasVmState = hasVmState
+        self.hasWorkspace = hasWorkspace
+        self.workdir = workdir
+        self.exitCode = exitCode
+        self.failedStep = failedStep
+        self.createdAt = createdAt
+    }
+}
+
+/// Result of restoring an exported frozen failure snapshot (`grav attach-frozen`).
+public struct FrozenRestoreInfo: Codable, Hashable, Sendable {
+    public var container: Container
+    public var workdir: String
+    public var exitCode: Int32?
+    public var failedStep: String?
+    public var sourceContainerName: String
+    public var hasVmState: Bool
+
+    public init(container: Container, workdir: String, exitCode: Int32? = nil, failedStep: String? = nil,
+                sourceContainerName: String, hasVmState: Bool) {
+        self.container = container
+        self.workdir = workdir
+        self.exitCode = exitCode
+        self.failedStep = failedStep
+        self.sourceContainerName = sourceContainerName
+        self.hasVmState = hasVmState
+    }
+}
+
 /// Result of pushing a local OCI image to a registry (`grav push IMAGE`).
 public struct ImagePushResult: Codable, Hashable, Sendable {
     public var reference: String

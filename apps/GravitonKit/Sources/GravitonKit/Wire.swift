@@ -45,6 +45,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case snapshotStatus
     case snapshotWarm(cpus: UInt32? = nil, memoryMib: UInt64? = nil, rosetta: Bool = false, slots: UInt32? = nil)
     case snapshotClear
+    case freezeAndExport(id: String, destBundleDir: String, keepPaused: Bool = false, exitCode: Int32? = nil, failedStep: String? = nil)
+    case restoreFrozen(bundleDir: String, name: String? = nil, ephemeral: Bool = true)
     case exec(ExecSpec)
     case stats(id: String)
     case listFiles(id: String, path: String)
@@ -107,6 +109,18 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         let rosetta: Bool?
         let slots: UInt32?
     }
+    private struct FreezeAndExportParams: Encodable {
+        let id: String
+        let destBundleDir: String
+        let keepPaused: Bool
+        let exitCode: Int32?
+        let failedStep: String?
+    }
+    private struct RestoreFrozenParams: Encodable {
+        let bundleDir: String
+        let name: String?
+        let ephemeral: Bool
+    }
 
     public var method: String {
         switch self {
@@ -153,6 +167,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .snapshotStatus: "snapshot_status"
         case .snapshotWarm: "snapshot_warm"
         case .snapshotClear: "snapshot_clear"
+        case .freezeAndExport: "freeze_and_export"
+        case .restoreFrozen: "restore_frozen"
         case .exec: "exec"
         case .stats: "stats"
         case .listFiles: "list_files"
@@ -196,6 +212,10 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case let .prune(spec): try c.encode(spec, forKey: .params)
         case let .snapshotWarm(cpus, memoryMib, rosetta, slots):
             try c.encode(SnapshotWarmParams(cpus: cpus, memoryMib: memoryMib, rosetta: rosetta ? true : nil, slots: slots), forKey: .params)
+        case let .freezeAndExport(id, destBundleDir, keepPaused, exitCode, failedStep):
+            try c.encode(FreezeAndExportParams(id: id, destBundleDir: destBundleDir, keepPaused: keepPaused, exitCode: exitCode, failedStep: failedStep), forKey: .params)
+        case let .restoreFrozen(bundleDir, name, ephemeral):
+            try c.encode(RestoreFrozenParams(bundleDir: bundleDir, name: name, ephemeral: ephemeral), forKey: .params)
         case let .start(id), let .stop(id), let .pause(id), let .unpause(id), let .restart(id), let .remove(id), let .stats(id), let .inspect(id), let .diff(id), let .getNetworkPolicy(id):
             try c.encode(IDParams(id: id), forKey: .params)
         case let .setNetworkPolicy(id, egress, chaos):
@@ -266,6 +286,8 @@ public enum EngineResponse: Decodable, Sendable {
     case imageRemoved(reference: String, freedBytes: UInt64, keptBytes: UInt64)
     case pruned(PruneReport)
     case snapshots(SnapshotInfo)
+    case frozenExported(FrozenBundleInfo)
+    case frozenRestored(FrozenRestoreInfo)
     case buildLog(String)
     case execOutput(stream: String, data: [UInt8])
     case execExited(code: Int32)
@@ -355,6 +377,8 @@ public enum EngineResponse: Decodable, Sendable {
             self = .imageRemoved(reference: r.reference, freedBytes: r.freedBytes, keptBytes: r.keptBytes)
         case "pruned": self = .pruned(try c.decode(PruneReport.self, forKey: .data))
         case "snapshots": self = .snapshots(try c.decode(SnapshotInfo.self, forKey: .data))
+        case "frozen_exported": self = .frozenExported(try c.decode(FrozenBundleInfo.self, forKey: .data))
+        case "frozen_restored": self = .frozenRestored(try c.decode(FrozenRestoreInfo.self, forKey: .data))
         case "attached": self = .attached
         case "exec_output":
             let o = try c.decode(ExecOutputData.self, forKey: .data)

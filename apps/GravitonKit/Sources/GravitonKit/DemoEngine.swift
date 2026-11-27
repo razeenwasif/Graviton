@@ -269,6 +269,30 @@ public actor DemoEngine: EngineService {
         return created
     }
 
+    public func freezeAndExport(id: String, destBundleDir: String, keepPaused: Bool = false, exitCode: Int32? = nil, failedStep: String? = nil) throws -> FrozenBundleInfo {
+        let src = list[try resolve(id)]
+        return FrozenBundleInfo(
+            bundleDir: destBundleDir,
+            sourceContainerId: src.id,
+            sourceContainerName: src.name,
+            image: src.image,
+            sizeBytes: 4096,
+            hasVmState: false,
+            hasWorkspace: true,
+            workdir: "/workspace",
+            exitCode: exitCode,
+            failedStep: failedStep,
+            createdAt: Int64(Date.now.timeIntervalSince1970)
+        )
+    }
+
+    public func restoreFrozen(bundleDir _: String, name: String? = nil, ephemeral _: Bool = true) throws -> FrozenRestoreInfo {
+        let containerName = name ?? "frozen-demo"
+        let c = try fork(ForkSpec(source: list.first?.id ?? "web", names: [containerName], start: true, autoRemove: true)).first
+            ?? Container(id: "frozen-demo", name: containerName, image: "alpine:3.22", status: .running, ports: [], mounts: [], createdAt: 0)
+        return FrozenRestoreInfo(container: c, workdir: "/workspace", exitCode: 1, failedStep: "test", sourceContainerName: "demo", hasVmState: false)
+    }
+
     public func diff(id: String) throws -> [DiffEntry] {
         _ = try resolve(id)
         return [

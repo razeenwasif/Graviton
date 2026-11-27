@@ -563,6 +563,18 @@ public actor RemoteEngine: EngineService {
         guard case let .forked(created) = try await separately(.fork(spec)) else { throw EngineError.unexpectedResponse }
         return created
     }
+    public func freezeAndExport(id: String, destBundleDir: String, keepPaused: Bool = false, exitCode: Int32? = nil, failedStep: String? = nil) async throws -> FrozenBundleInfo {
+        guard case let .frozenExported(info) = try await call(.freezeAndExport(id: id, destBundleDir: destBundleDir, keepPaused: keepPaused, exitCode: exitCode, failedStep: failedStep)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return info
+    }
+    public func restoreFrozen(bundleDir: String, name: String? = nil, ephemeral: Bool = true) async throws -> FrozenRestoreInfo {
+        guard case let .frozenRestored(info) = try await separately(.restoreFrozen(bundleDir: bundleDir, name: name, ephemeral: ephemeral)) else {
+            throw EngineError.unexpectedResponse
+        }
+        return info
+    }
     public func diff(id: String) async throws -> [DiffEntry] {
         guard case let .diff(entries) = try await call(.diff(id: id)) else { throw EngineError.unexpectedResponse }
         return entries

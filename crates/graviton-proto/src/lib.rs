@@ -10,6 +10,7 @@
 //!   [`AgentEvent`]).
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -1544,6 +1545,37 @@ pub struct SnapshotInfo {
     pub paused_reason: Option<String>,
 }
 
+/// Metadata for an exported frozen failure snapshot bundle (Wave 3 Time-Travel CI).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenBundleInfo {
+    pub bundle_dir: PathBuf,
+    pub source_container_id: String,
+    pub source_container_name: String,
+    pub image: String,
+    pub size_bytes: u64,
+    pub has_vm_state: bool,
+    pub has_workspace: bool,
+    pub workdir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_step: Option<String>,
+    pub created_at: i64,
+}
+
+/// Container created by restoring a frozen failure snapshot bundle.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FrozenRestoreInfo {
+    pub container: ContainerSummary,
+    pub workdir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_step: Option<String>,
+    pub source_container_name: String,
+    pub has_vm_state: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Control API
 // ---------------------------------------------------------------------------
@@ -1684,6 +1716,25 @@ pub enum Request {
     },
     /// Remove all idle cached VM snapshots from disk.
     SnapshotClear,
+    /// Export a container's frozen filesystem, optional VM state, and `/workspace` into `dest_bundle_dir`.
+    FreezeAndExport {
+        id: String,
+        dest_bundle_dir: PathBuf,
+        #[serde(default)]
+        keep_paused: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failed_step: Option<String>,
+    },
+    /// Restore a previously exported frozen bundle into a live debuggable container.
+    RestoreFrozen {
+        bundle_dir: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default)]
+        ephemeral: bool,
+    },
     /// Run a command in a running container. Without a TTY the daemon answers
     /// with `ExecOutput` lines and a final `ExecExited`; with one it answers
     /// `Attached` and the connection then carries terminal [`frame`]s.
@@ -1799,6 +1850,8 @@ pub enum Response {
     Copied { files: u64 },
     Details(Box<ContainerDetails>),
     Events(Vec<EngineEvent>),
+    FrozenExported(FrozenBundleInfo),
+    FrozenRestored(FrozenRestoreInfo),
     Push(PushInfo),
     Pairing(PairingInfo),
     Devices(Vec<PairedDevice>),
@@ -3053,5 +3106,39 @@ mod tests {
             assert_eq!(decode_line::<AgentRequest>(&encode_line(&agent_req)).unwrap(), agent_req);
         }
         assert_eq!(decode_line::<AgentEvent>(&encode_line(&AgentEvent::Synced)).unwrap(), AgentEvent::Synced);
+    }
+
+    #[test]
+    fn freeze_and_restore_round_trip() {
+        let req_freeze = Request::FreezeAndExport {
+            id: "ntr-12-build".into(),
+            dest_bundle_dir: PathBuf::from("/tmp/ci-snapshots/run-12-job-1"),
+            keep_paused: false,
+            exit_code: Some(101),
+            failed_step: Some("cargo test".into()),
+        };
+        assert_eq!(decode_line::<Request>(&encode_line(&req_freeze)).unwrap(), req_freeze);
+
+        let req_restore = Request::RestoreFrozen {
+            bundle_dir: PathBuf::from("/tmp/ci-snapshots/run-12-job-1"),
+            name: Some("debug-12".into()),
+            ephemeral: true,
+        };
+        assert_eq!(decode_line::<Request>(&encode_line(&req_restore)).unwrap(), req_restore);
+
+        let resp_export = Response::FrozenExported(FrozenBundleInfo {
+            bundle_dir: PathBuf::from("/tmp/ci-snapshots/run-12-job-1"),
+            source_container_id: "c1".into(),
+            source_container_name: "ntr-12-build".into(),
+            image: "rust:1.85".into(),
+            size_bytes: 4096,
+            has_vm_state: true,
+            has_workspace: true,
+            workdir: "/workspace".into(),
+            exit_code: Some(101),
+            failed_step: Some("cargo test".into()),
+            created_at: 1_700_000_000,
+        });
+        assert_eq!(decode_line::<Response>(&encode_line(&resp_export)).unwrap(), resp_export);
     }
 }

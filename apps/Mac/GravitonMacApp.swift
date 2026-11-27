@@ -44,7 +44,24 @@ struct GravitonMacApp: App {
         switch host {
         case "container":
             if let id = segments.first, !id.isEmpty {
-                router.pending = .container(id, .logs)
+                let tab: DetailTab = switch segments.dropFirst().first?.lowercased() {
+                case "terminal": .terminal
+                case "overview": .overview
+                case "files": .files
+                case "diff": .diff
+                case "xray": .xray
+                case "stats": .stats
+                case "inspect": .inspect
+                default: .logs
+                }
+                if store.container(id) == nil {
+                    Task {
+                        await store.refresh()
+                        router.pending = .container(id, tab)
+                    }
+                } else {
+                    router.pending = .container(id, tab)
+                }
             } else {
                 router.pending = .containers
             }

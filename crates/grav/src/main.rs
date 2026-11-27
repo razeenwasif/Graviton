@@ -138,6 +138,40 @@ enum Command {
     },
     /// Inspect overlay filesystem changes inside a running container.
     Diff { container: String },
+    /// Export a container's frozen filesystem, VM state, and `/workspace` to a debug bundle.
+    Freeze {
+        /// Container ID, prefix, or name.
+        container: String,
+        /// Destination directory for the frozen bundle.
+        dest: PathBuf,
+        /// Keep the source container paused after exporting.
+        #[arg(long)]
+        keep_paused: bool,
+        /// Exit code of the failed step (recorded in bundle metadata).
+        #[arg(long)]
+        exit_code: Option<i32>,
+        /// Name of the failed step (recorded in bundle metadata).
+        #[arg(long)]
+        failed_step: Option<String>,
+    },
+    /// Restore a frozen debug bundle into a live container and attach an interactive shell.
+    #[command(name = "attach-frozen")]
+    AttachFrozen {
+        /// Path to the frozen snapshot bundle directory.
+        bundle: PathBuf,
+        /// Optional container name for the restored VM.
+        #[arg(long)]
+        name: Option<String>,
+        /// Keep the restored container after the shell exits (default: ephemeral `--rm`).
+        #[arg(long)]
+        keep: bool,
+        /// Restore and print info without attaching an interactive terminal.
+        #[arg(long)]
+        no_attach: bool,
+        /// Shell to run inside the restored VM.
+        #[arg(long, default_value = "/bin/sh")]
+        shell: String,
+    },
     /// Inspect or stream Hypervisor X-Ray telemetry (`dns`, `net`, `file`, `proc`).
     #[command(name = "xray", alias = "x-ray")]
     XRay {
@@ -918,6 +952,57 @@ fn run(cli: Cli) -> Result<()> {
             }
             other => unexpected(other)?,
         },
+        Command::Freeze { container, dest, keep_paused, exit_code, failed_step } => {
+            match client.call(&Request::FreezeAndExport {
+                id: container,
+                dest_bundle_dir: dest,
+                keep_paused,
+                exit_code,
+                failed_step,
+            })? {
+                Response::FrozenExported(info) => {
+                    println!(
+                        "froze {} -> {} ({} KB, vm_state={}, workspace={})",
+                        info.source_container_name,
+                        info.bundle_dir.display(),
+                        info.size_bytes.div_ceil(1024),
+                        info.has_vm_state,
+                        info.has_workspace
+                    );
+                }
+                other => unexpected(other)?,
+            }
+        }
+        Command::AttachFrozen { bundle, name, keep, no_attach, shell } => {
+            match client.call(&Request::RestoreFrozen { bundle_dir: bundle, name, ephemeral: !keep })? {
+                Response::FrozenRestored(info) => {
+                    println!(
+                        "restored {} ({}) from {} [workdir: {}{}{}]",
+                        info.container.name,
+                        &info.container.id[..info.container.id.len().min(12)],
+                        info.source_container_name,
+                        info.workdir,
+                        info.failed_step.as_deref().map(|s| format!(", step: {s}")).unwrap_or_default(),
+                        info.exit_code.map(|c| format!(", exit: {c}")).unwrap_or_default()
+                    );
+                    if !no_attach {
+                        let spec = ExecSpec {
+                            id: info.container.id,
+                            command: vec![shell],
+                            tty: true,
+                            rows: 0,
+                            cols: 0,
+                            env: vec![],
+                            working_dir: Some(info.workdir),
+                            user: None,
+                        };
+                        let code = exec_tty(&target, spec, true)?;
+                        std::process::exit(code);
+                    }
+                }
+                other => unexpected(other)?,
+            }
+        }
         Command::XRay { container, follow, limit, enable, disable } => {
             if enable || disable {
                 match client.call(&Request::SetXRay { id: container.clone(), enabled: enable })? {
@@ -3487,6 +3572,22 @@ mod tests {
         assert!(matches!(
             run_iso.command,
             Command::Run { ref egress, chaos_latency: Some(50), .. } if egress.as_deref() == Some("offline")
+        ));
+
+        let fr = Cli::try_parse_from([
+            "grav", "freeze", "ntr-4-build", "/tmp/snap-4", "--exit-code", "101", "--failed-step", "cargo test",
+        ])
+        .unwrap();
+        assert!(matches!(
+            fr.command,
+            Command::Freeze { ref container, exit_code: Some(101), ref failed_step, .. }
+                if container == "ntr-4-build" && failed_step.as_deref() == Some("cargo test")
+        ));
+
+        let att = Cli::try_parse_from(["grav", "attach-frozen", "/tmp/snap-4", "--name", "dbg", "--no-attach"]).unwrap();
+        assert!(matches!(
+            att.command,
+            Command::AttachFrozen { ref name, no_attach: true, keep: false, .. } if name.as_deref() == Some("dbg")
         ));
     }
 }

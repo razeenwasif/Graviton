@@ -34,7 +34,7 @@ use graviton_image::{BlobStore, Credentials, HealthcheckConfig, ImageError, Imag
 use graviton_proto::{
     AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ChaosProfile, ContainerDetails, ContainerNetworkPolicy,
     ContainerStatRow, ContainerStats, ContainerStatus, ContainerSummary, DEFAULT_NETWORK_NAME, DiffEntry,
-    DirectoryListing, EgressPolicy, EngineInfo, ExecSpec, FileContents, ForkSpec, GuestMount, GuestStats, HealthLog,
+    DirectoryListing, EgressPolicy, EngineInfo, ExecSpec, FileContents, ForkSpec, FrozenBundleInfo, FrozenRestoreInfo, GuestMount, GuestStats, HealthLog,
     HealthState, HealthStatus, Healthcheck, HostEntry, ImageSummary, LogLevel, LogLine, LogStream, Mount,
     NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy,
     RunSpec, SnapshotInfo, StatSample, TmpfsMount, UlimitSpec, UserNetwork, VolumeMountRef, VolumeSummary,
@@ -1349,6 +1349,318 @@ impl Engine {
         }
     }
 
+    /// Quiesce a container, clone its root overlay (`disk.img`), optional `.vzsave` RAM state,
+    /// and `/workspace` bind mount into a self-contained frozen failure bundle.
+    pub fn freeze_and_export(
+        self: &Arc<Self>,
+        key: &str,
+        dest_bundle_dir: PathBuf,
+        keep_paused: bool,
+        exit_code: Option<i32>,
+        failed_step: Option<String>,
+    ) -> Result<FrozenBundleInfo> {
+        validate_bundle_dir(&dest_bundle_dir)?;
+        let (src, source_spec) = {
+            let store = self.store.lock().unwrap();
+            let src = store.container(key)?.clone();
+            let spec = self
+                .specs
+                .lock()
+                .unwrap()
+                .get(&src.id)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing spec for container `{}`", src.name))?;
+            (src, spec)
+        };
+
+        struct PauseGuard<'a> {
+            engine: &'a Engine,
+            id: String,
+            active: bool,
+        }
+        impl Drop for PauseGuard<'_> {
+            fn drop(&mut self) {
+                if self.active {
+                    let _ = self.engine.unpause(&self.id);
+                }
+            }
+        }
+
+        let was_running = src.status == ContainerStatus::Running;
+        let mut resume_guard = PauseGuard { engine: self, id: src.id.clone(), active: false };
+        if was_running {
+            match self.agent_call(&src.id, |_| AgentRequest::SyncFs)? {
+                AgentEvent::Synced => {}
+                AgentEvent::Error { message } => bail!("syncing `{}` before freeze: {message}", src.name),
+                other => bail!("unexpected sync response from `{}`: {other:?}", src.name),
+            }
+            self.pause(&src.id)?;
+            resume_guard.active = !keep_paused;
+        }
+
+        fs::create_dir_all(&dest_bundle_dir).with_context(|| format!("creating frozen bundle {}", dest_bundle_dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&dest_bundle_dir, fs::Permissions::from_mode(0o700));
+        }
+
+        let src_vm_dir = paths::vms_dir().join(&src.id);
+        let src_disk_path = src_vm_dir.join(SCRATCH_DISK);
+        let has_populated_disk = src_disk_path.is_file()
+            && (source_spec.disk_source_id.is_some()
+                || src.status != ContainerStatus::Created
+                || src.started_at.is_some()
+                || src.exit_code.is_some());
+        if has_populated_disk {
+            clone_sparse_file(&src_disk_path, &dest_bundle_dir.join(SCRATCH_DISK))
+                .with_context(|| format!("cloning root disk into {}", dest_bundle_dir.display()))?;
+        }
+
+        let workspace_vol = source_spec
+            .volumes
+            .iter()
+            .find(|v| v.name.is_none() && v.target == "/workspace" && v.source.is_dir())
+            .or_else(|| source_spec.volumes.iter().find(|v| v.name.is_none() && !v.read_only && v.source.is_dir()));
+        let mut workspace_rel = None;
+        let mut workspace_target = None;
+        if let Some(vol) = workspace_vol {
+            let ws_dst = dest_bundle_dir.join("workspace");
+            clone_dir_cow(&vol.source, &ws_dst)?;
+            workspace_rel = Some("workspace".to_string());
+            workspace_target = Some(vol.target.clone());
+        }
+
+        let mut has_vm_state = false;
+        if was_running && AppleHypervisor::session_unlocked() {
+            let vm_opt = {
+                let running = self.running.lock().unwrap();
+                running.get(&src.id).filter(|r| r._snapshot.is_some()).map(|r| Arc::clone(&r.vm))
+            };
+            if let Some(vm) = vm_opt {
+                let vz_path = dest_bundle_dir.join("state.vzsave");
+                match vm.save_state(&vz_path) {
+                    Ok(()) => has_vm_state = true,
+                    Err(e) => {
+                        let _ = fs::remove_file(&vz_path);
+                        self.log(&src.id, LogLevel::Warn, LogStream::System, format!("non-fatal: couldn't capture .vzsave memory state: {e}"));
+                    }
+                }
+            }
+        }
+
+        let mut sanitized_spec = source_spec.clone();
+        sanitized_spec.want_running = false;
+        sanitized_spec.ports.clear();
+        sanitized_spec.restart = RestartPolicy::No;
+        sanitized_spec.env = sanitize_frozen_env(&source_spec.env);
+        sanitized_spec.disk_source_id = if has_populated_disk {
+            Some(source_spec.disk_source_id.clone().unwrap_or_else(|| src.id.clone()))
+        } else {
+            None
+        };
+
+        let workdir = workspace_target
+            .clone()
+            .unwrap_or_else(|| if sanitized_spec.cwd.is_empty() { "/".into() } else { sanitized_spec.cwd.clone() });
+        let created_at = now_secs() as i64;
+        let manifest = FrozenBundleManifest {
+            version: 1,
+            source_container_id: src.id.clone(),
+            source_container_name: src.name.clone(),
+            image_ref: src.image.clone(),
+            spec: sanitized_spec,
+            created_at,
+            exit_code,
+            failed_step: failed_step.clone(),
+            has_vm_state,
+            workspace_rel: workspace_rel.clone(),
+            workspace_target,
+        };
+        let tmp_manifest = dest_bundle_dir.join("manifest.json.tmp");
+        let final_manifest = dest_bundle_dir.join("manifest.json");
+        let bytes = serde_json::to_vec_pretty(&manifest).context("serializing frozen bundle manifest")?;
+        fs::write(&tmp_manifest, &bytes).with_context(|| format!("writing {}", tmp_manifest.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp_manifest, fs::Permissions::from_mode(0o600));
+        }
+        fs::rename(&tmp_manifest, &final_manifest)?;
+
+        if was_running && !keep_paused {
+            resume_guard.active = false;
+            self.unpause(&src.id)?;
+        }
+
+        let size_bytes = dir_size_bytes(&dest_bundle_dir);
+        self.events.record(
+            graviton_proto::EventKind::Forked,
+            Some((&src.id, &src.name)),
+            Some(&src.image),
+            format!("{} frozen to {} ({} KB)", src.name, dest_bundle_dir.display(), size_bytes.div_ceil(1024)),
+        );
+
+        Ok(FrozenBundleInfo {
+            bundle_dir: dest_bundle_dir,
+            source_container_id: src.id,
+            source_container_name: src.name,
+            image: src.image,
+            size_bytes,
+            has_vm_state,
+            has_workspace: workspace_rel.is_some(),
+            workdir,
+            exit_code,
+            failed_step,
+            created_at,
+        })
+    }
+
+    /// Restore an exported frozen bundle into a live, non-destructive debuggable container.
+    pub fn restore_frozen(self: &Arc<Self>, bundle_dir: PathBuf, name: Option<String>, ephemeral: bool) -> Result<FrozenRestoreInfo> {
+        validate_bundle_dir(&bundle_dir)?;
+        let manifest_path = bundle_dir.join("manifest.json");
+        if !manifest_path.is_file() {
+            bail!("no frozen snapshot manifest at {}", manifest_path.display());
+        }
+        let raw = fs::read(&manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?;
+        let manifest: FrozenBundleManifest = serde_json::from_slice(&raw).with_context(|| format!("parsing {}", manifest_path.display()))?;
+
+        let restore_id = new_id();
+        let container_name = match name {
+            Some(n) => {
+                let n = n.trim().to_string();
+                if n.is_empty() || n.contains('/') || n.contains('\0') {
+                    bail!("invalid container name `{n}`");
+                }
+                n
+            }
+            None => format!("{}-frozen-{}", sanitize_frozen_name(&manifest.source_container_name), &restore_id[..6.min(restore_id.len())]),
+        };
+
+        {
+            let store = self.store.lock().unwrap();
+            if store.name_taken(&container_name) {
+                bail!("container name `{container_name}` is already in use");
+            }
+        }
+
+        let dst_vm_dir = paths::vms_dir().join(&restore_id);
+        fs::create_dir_all(&dst_vm_dir).with_context(|| format!("creating {}", dst_vm_dir.display()))?;
+
+        let cleanup_on_err = || {
+            let _ = fs::remove_dir_all(&dst_vm_dir);
+        };
+
+        let bundle_disk = bundle_dir.join(SCRATCH_DISK);
+        if bundle_disk.is_file() {
+            if let Err(err) = clone_sparse_file(&bundle_disk, &dst_vm_dir.join(SCRATCH_DISK)) {
+                cleanup_on_err();
+                return Err(err);
+            }
+        }
+
+        let mut cs = manifest.spec.clone();
+        cs.argv = vec!["sh".into(), "-c".into(), "while :; do sleep 3600; done".into()];
+        cs.ports.clear();
+        cs.auto_remove = ephemeral;
+        cs.want_running = true;
+        cs.restart = RestartPolicy::No;
+        cs.hostname = Some(container_name.clone());
+        cs.forked_from = Some(manifest.source_container_id.clone());
+        cs.disk_source_id = manifest
+            .spec
+            .disk_source_id
+            .clone()
+            .or_else(|| bundle_disk.is_file().then(|| manifest.source_container_id.clone()));
+
+        let ws_target = manifest.workspace_target.clone().unwrap_or_else(|| "/workspace".into());
+        let mut rewritten_vols: Vec<Volume> = cs
+            .volumes
+            .into_iter()
+            .filter(|v| v.name.is_some() || (v.target != ws_target && v.source.is_dir()))
+            .collect();
+        if let Some(rel) = &manifest.workspace_rel {
+            let ws_src = bundle_dir.join(rel);
+            if ws_src.is_dir() {
+                let ws_dst = dst_vm_dir.join("workspace");
+                if let Err(err) = clone_dir_cow(&ws_src, &ws_dst) {
+                    cleanup_on_err();
+                    return Err(err);
+                }
+                rewritten_vols.push(Volume {
+                    source: ws_dst,
+                    target: ws_target.clone(),
+                    read_only: false,
+                    name: None,
+                });
+            }
+        }
+        cs.volumes = rewritten_vols;
+
+        let summary = ContainerSummary {
+            id: restore_id.clone(),
+            name: container_name.clone(),
+            image: manifest.image_ref.clone(),
+            status: ContainerStatus::Created,
+            exit_code: None,
+            ports: vec![],
+            mounts: cs
+                .volumes
+                .iter()
+                .map(|v| Mount {
+                    source: v.name.clone().unwrap_or_else(|| v.source.display().to_string()),
+                    target: v.target.clone(),
+                    read_only: v.read_only,
+                })
+                .collect(),
+            ip_address: None,
+            cpu_percent: None,
+            memory_bytes: None,
+            memory_limit_bytes: Some(cs.memory_mib << 20),
+            created_at: now_secs(),
+            started_at: None,
+            project: cs.project.clone(),
+            service: cs.service.clone(),
+            health: None,
+            forked_from: Some(manifest.source_container_id.clone()),
+        };
+
+        {
+            let mut store = self.store.lock().unwrap();
+            if let Err(err) = store.insert(summary.clone()) {
+                cleanup_on_err();
+                return Err(err.into());
+            }
+            self.specs.lock().unwrap().insert(restore_id.clone(), cs);
+        }
+        self.save();
+        self.refresh_images();
+        self.events.record(
+            graviton_proto::EventKind::Forked,
+            Some((&summary.id, &summary.name)),
+            Some(&summary.image),
+            format!("{} restored from frozen snapshot", summary.name),
+        );
+
+        let launched = self.launch(&restore_id)?;
+        let workdir = if manifest.workspace_rel.is_some() {
+            ws_target
+        } else if manifest.spec.cwd.is_empty() {
+            "/".into()
+        } else {
+            manifest.spec.cwd
+        };
+        Ok(FrozenRestoreInfo {
+            container: launched,
+            workdir,
+            exit_code: manifest.exit_code,
+            failed_step: manifest.failed_step,
+            source_container_name: manifest.source_container_name,
+            has_vm_state: manifest.has_vm_state,
+        })
+    }
+
     /// Send a POSIX signal to a running container's main process.
     pub fn signal_container(&self, key: &str, signal: i32) -> Result<()> {
         let id = self.store.lock().unwrap().container(key)?.id.clone();
@@ -1384,6 +1696,7 @@ impl Engine {
         Ok(())
     }
 
+    /// Remove a stopped container.
     pub fn remove(&self, key: &str) -> Result<String> {
         let removed = self.store.lock().unwrap().remove(key)?;
         let _ = self.log_tx.send(LogEvent::Ended { container_id: removed.id.clone(), exit_code: removed.exit_code });
@@ -3917,6 +4230,112 @@ fn ensure_ext4_template() -> Result<Option<PathBuf>> {
     Ok(Some(tpl))
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct FrozenBundleManifest {
+    version: u32,
+    source_container_id: String,
+    source_container_name: String,
+    image_ref: String,
+    spec: ContainerSpec,
+    created_at: i64,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    failed_step: Option<String>,
+    #[serde(default)]
+    has_vm_state: bool,
+    #[serde(default)]
+    workspace_rel: Option<String>,
+    #[serde(default)]
+    workspace_target: Option<String>,
+}
+
+fn validate_bundle_dir(path: &Path) -> Result<()> {
+    let raw = path.to_string_lossy();
+    if raw.trim().is_empty() || raw.contains('\0') {
+        bail!("invalid frozen bundle path");
+    }
+    for c in path.components() {
+        if matches!(c, std::path::Component::ParentDir) {
+            bail!("frozen bundle path cannot contain '..': {}", path.display());
+        }
+    }
+    if matches!(
+        path.to_str(),
+        Some("/" | "/System" | "/usr" | "/bin" | "/sbin" | "/etc" | "/var" | "/private")
+    ) {
+        bail!("refusing system path as frozen bundle directory: {}", path.display());
+    }
+    Ok(())
+}
+
+fn sanitize_frozen_name(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let trimmed = clean.trim_matches('-');
+    if trimmed.is_empty() { "ci".into() } else { trimmed.to_string() }
+}
+
+fn sanitize_frozen_env(env: &[String]) -> Vec<String> {
+    env.iter()
+        .filter(|entry| {
+            let key = entry.split('=').next().unwrap_or(entry).to_ascii_uppercase();
+            !["SECRET", "TOKEN", "PASSWORD", "PASSWD", "PRIVATE_KEY", "API_KEY", "AWS_SECRET", "CREDENTIAL"]
+                .iter()
+                .any(|needle| key.contains(needle))
+        })
+        .cloned()
+        .collect()
+}
+
+fn clone_dir_cow(src: &Path, dst: &Path) -> Result<()> {
+    if dst.exists() {
+        let _ = fs::remove_dir_all(dst);
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("/bin/cp").args(["-c", "-R"]).arg(src).arg(dst).output() {
+            if out.status.success() {
+                return Ok(());
+            }
+        }
+    }
+    let out = std::process::Command::new("/bin/cp")
+        .arg("-R")
+        .arg(src)
+        .arg(dst)
+        .output()
+        .context("running cp -R")?;
+    if !out.status.success() {
+        bail!("cloning {} failed: {}", src.display(), String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+fn dir_size_bytes(path: &Path) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(path) else { return 0 };
+    if meta.is_file() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let blocks_bytes = meta.blocks().saturating_mul(512);
+            return blocks_bytes.min(meta.len()).max(meta.len().min(4096));
+        }
+        #[cfg(not(unix))]
+        return meta.len();
+    }
+    if !meta.is_dir() {
+        return 0;
+    }
+    let Ok(entries) = fs::read_dir(path) else { return 0 };
+    entries.flatten().map(|e| dir_size_bytes(&e.path())).sum()
+}
+
 fn clone_sparse_file(src: &Path, dst: &Path) -> Result<()> {
     let _ = fs::remove_file(dst);
     #[cfg(target_os = "macos")]
@@ -4636,5 +5055,24 @@ mod tests {
         assert!(buf[1082..65536].iter().all(|&b| b == 0));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn frozen_bundle_helpers_sanitize_and_validate() {
+        assert!(validate_bundle_dir(Path::new("/tmp/ci-snapshots/run-1")).is_ok());
+        assert!(validate_bundle_dir(Path::new("")).is_err());
+        assert!(validate_bundle_dir(Path::new("/tmp/../etc")).is_err());
+        assert!(validate_bundle_dir(Path::new("/System")).is_err());
+
+        let filtered = sanitize_frozen_env(&[
+            "CI=true".into(),
+            "PATH=/usr/bin".into(),
+            "DEPLOY_TOKEN=supersecret".into(),
+            "GITHUB_API_KEY=abc".into(),
+            "RUST_LOG=info".into(),
+            "DB_PASSWORD=pw".into(),
+        ]);
+        assert_eq!(filtered, vec!["CI=true", "PATH=/usr/bin", "RUST_LOG=info"]);
+        assert_eq!(sanitize_frozen_name("ntr/12 test!"), "ntr-12-test");
     }
 }

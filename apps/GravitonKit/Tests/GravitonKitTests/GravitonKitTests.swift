@@ -1213,6 +1213,24 @@ import Testing
         #expect(decodedPaused.pausedReason == "macOS console session is locked")
     }
 
+    @Test func frozenSnapshotWire() throws {
+        let line = { (r: EngineRequest) in String(decoding: try Wire.line(r), as: UTF8.self) }
+        #expect(
+            try line(.freezeAndExport(id: "ntr-9-test", destBundleDir: "/tmp/ci-snapshots/run-9-job-1", keepPaused: false, exitCode: 1, failedStep: "test"))
+                == #"{"method":"freeze_and_export","params":{"dest_bundle_dir":"/tmp/ci-snapshots/run-9-job-1","exit_code":1,"failed_step":"test","id":"ntr-9-test","keep_paused":false}}"# + "\n"
+        )
+        #expect(
+            try line(.restoreFrozen(bundleDir: "/tmp/ci-snapshots/run-9-job-1", name: "dbg-9", ephemeral: true))
+                == #"{"method":"restore_frozen","params":{"bundle_dir":"/tmp/ci-snapshots/run-9-job-1","ephemeral":true,"name":"dbg-9"}}"# + "\n"
+        )
+
+        let respJson = #"{"type":"frozen_exported","data":{"bundle_dir":"/tmp/ci-snapshots/run-9-job-1","source_container_id":"abc123","source_container_name":"ntr-9-test","image":"alpine:3.22","size_bytes":2048,"has_vm_state":false,"has_workspace":true,"workdir":"/workspace","exit_code":1,"failed_step":"test","created_at":1700000000}}"#
+        guard case let .frozenExported(info) = try Wire.decoder.decode(EngineResponse.self, from: Data(respJson.utf8)) else {
+            Issue.record("expected frozen_exported"); return
+        }
+        #expect(info.sourceContainerName == "ntr-9-test" && info.hasWorkspace && info.exitCode == 1)
+    }
+
     @Test func streamingLogsCommitAndArchivesWireAndHelpers() async throws {
         let line = { (r: EngineRequest) in String(decoding: try Wire.line(r), as: UTF8.self) }
 

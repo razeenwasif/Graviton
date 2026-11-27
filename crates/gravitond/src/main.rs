@@ -1230,6 +1230,12 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                         Response::Snapshots(engine.snapshot_warm(cpus, memory_mib, rosetta, slots)?)
                     }
                     Request::SnapshotClear => Response::Snapshots(engine.snapshot_clear()),
+                    Request::FreezeAndExport { id, dest_bundle_dir, keep_paused, exit_code, failed_step } => {
+                        Response::FrozenExported(engine.freeze_and_export(&id, dest_bundle_dir, keep_paused, exit_code, failed_step)?)
+                    }
+                    Request::RestoreFrozen { bundle_dir, name, ephemeral } => {
+                        Response::FrozenRestored(engine.restore_frozen(bundle_dir, name, ephemeral)?)
+                    }
                     Request::Stats { id } => Response::Stats(engine.stats(&id)?),
                     Request::ListFiles { id, path } => Response::Files(engine.list_files(&id, &path)?),
                     Request::ReadFile { id, path } => Response::File(engine.read_file(&id, &path)?),
