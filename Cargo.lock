@@ -558,7 +558,7 @@ dependencies = [
 name = "graviton-image"
 version = "0.3.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "graviton-core",
  "graviton-proto",
  "serde",
@@ -593,7 +593,7 @@ name = "gravitond"
 version = "0.3.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "flate2",
  "graviton-core",
