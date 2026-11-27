@@ -615,6 +615,15 @@ enum ServiceAction {
         /// Also accept paired Macs and phones (TLS on port 7843).
         #[arg(long)]
         remote: bool,
+        /// IP address for --remote to bind to (e.g. a Tailscale IP or 127.0.0.1).
+        #[arg(long)]
+        remote_bind: Option<std::net::IpAddr>,
+        /// Don't advertise the --remote endpoint over Bonjour (_graviton._tcp).
+        #[arg(long)]
+        no_bonjour: bool,
+        /// Override the host name shown to paired devices.
+        #[arg(long)]
+        remote_name: Option<String>,
     },
     /// Stop it and don't start it at login.
     Uninstall,
@@ -671,7 +680,9 @@ fn run(cli: Cli) -> Result<()> {
 
     match &cli.command {
         Command::Hosts { action } => return hosts(action.as_ref()),
-        Command::Service { action: ServiceAction::Install { remote } } => return service::install(*remote),
+        Command::Service {
+            action: ServiceAction::Install { remote, remote_bind, no_bonjour, remote_name },
+        } => return service::install(*remote, *remote_bind, *no_bonjour, remote_name.as_deref()),
         Command::Service { action: ServiceAction::Uninstall } => return service::uninstall(),
         Command::Service { action: ServiceAction::Status } => return service::status(),
         Command::DockerEnv { unset } => {

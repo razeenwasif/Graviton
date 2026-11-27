@@ -40,6 +40,7 @@ targets:
       path: Mac/Info.plist
       properties:
         CFBundleDisplayName: Graviton
+        GravitonWidgetGroupID: "$(TeamIdentifierPrefix)group.dev.graviton.shared"
         CFBundleURLTypes:
           - CFBundleURLName: dev.graviton.url
             CFBundleURLSchemes: [graviton]
@@ -73,9 +74,11 @@ targets:
       path: Widget/Info-macOS.plist
       properties:
         CFBundleDisplayName: Graviton Widget
+        GravitonWidgetGroupID: "$(TeamIdentifierPrefix)group.dev.graviton.shared"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     configFiles:
+      Debug: Config/iOS.xcconfig
       Release: Config/Release.xcconfig
     settings:
       base:
@@ -87,8 +90,7 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: ""
       configs:
         Debug:
-          CODE_SIGN_STYLE: Automatic
-          DEVELOPMENT_TEAM: YOUR_TEAM_ID
+          CODE_SIGN_IDENTITY: "-"
 
   GravitonIOS:
     type: application

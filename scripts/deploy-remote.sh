@@ -1,14 +1,14 @@
 #!/bin/bash
-# Update the engine of Graviton.app on another Mac (the mini, say) from this
+# Update the engine of Graviton.app on another Mac from this
 # checkout: gravitond, grav and, with --guest, the guest kernel and initramfs.
 # The app's own UI isn't touched, so this works on a Mac you only use as a
 # server, and it doesn't need the Mac app to build.
 #
-#   scripts/deploy-remote.sh [host]            default host: mini
+#   scripts/deploy-remote.sh <host>            or set GRAVITON_REMOTE_HOST
 #   scripts/deploy-remote.sh local --guest     this Mac, without ssh
-#   scripts/deploy-remote.sh mini --guest      also rebuild and install the guest
-#   scripts/deploy-remote.sh mini --force      even while containers are running
-#   scripts/deploy-remote.sh mini --app /Applications/Graviton.app
+#   scripts/deploy-remote.sh <host> --guest    also rebuild and install the guest
+#   scripts/deploy-remote.sh <host> --force    even while containers are running
+#   scripts/deploy-remote.sh <host> --app /Applications/Graviton.app
 #
 # What it gets right, each the lesson of a deploy that went wrong:
 #
@@ -27,7 +27,7 @@
 #   * Rolling back. If the new gravitond doesn't answer, the old files go back.
 set -euo pipefail
 
-host=mini
+host="${GRAVITON_REMOTE_HOST:-}"
 app=/Applications/Graviton.app
 guest=0
 force=0
@@ -41,10 +41,11 @@ while [ $# -gt 0 ]; do
         *) host="$1"; shift ;;
     esac
 done
+[ -n "$host" ] || { echo "usage: scripts/deploy-remote.sh <host|local> [--guest] [--force] [--app PATH]" >&2; exit 2; }
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo"
-ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10)
+ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes -o ForwardAgent=no -o ClearAllForwardings=yes -o PermitLocalCommand=no)
 
 # What's being deployed: the commit, and whether the engine's sources differ from it.
 echo "Deploying $(git rev-parse --short HEAD) ($(git log -1 --format=%s | cut -c1-60)) to $host"
@@ -58,9 +59,11 @@ if [ -z "$identity" ]; then
     exit 1
 fi
 
-# 1. Build and sign here.
+# 1. Build and sign here (strip local user/workspace paths from binaries).
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=/build --remap-path-prefix=$repo=/src --remap-path-prefix=$cargo_home=/cargo"
 cargo build -q --release -p gravitond -p grav
 target="$(cargo metadata --format-version 1 --no-deps | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/release"
 cp "$target/gravitond" "$target/grav" "$stage/"

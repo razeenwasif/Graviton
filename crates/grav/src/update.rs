@@ -264,12 +264,34 @@ fn feed_url() -> String {
 fn auth_token() -> Option<String> {
     std::env::var("GRAVITON_UPDATE_TOKEN")
         .ok()
-        .or_else(|| std::env::var("GITHUB_TOKEN").ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
+fn validate_update_url(raw: &str) -> std::result::Result<(), String> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("https://") {
+        return Err("Update feed URL must use https://.".into());
+    }
+    Ok(())
+}
+
+fn is_github_api_url(raw: &str) -> bool {
+    let Some(rest) = raw.trim().strip_prefix("https://") else {
+        return false;
+    };
+    let host_port = rest.split('/').next().unwrap_or("");
+    let host = host_port.split(':').next().unwrap_or("");
+    host.eq_ignore_ascii_case("api.github.com")
+}
+
 fn fetch_latest_release(url: &str, current_version: &str, token: Option<&str>) -> UpdateOutcome {
+    if let Err(reason) = validate_update_url(url) {
+        return UpdateOutcome::Unavailable {
+            current: current_version.to_string(),
+            reason,
+        };
+    }
     let curl = if Path::new("/usr/bin/curl").exists() {
         "/usr/bin/curl"
     } else {
@@ -279,6 +301,10 @@ fn fetch_latest_release(url: &str, current_version: &str, token: Option<&str>) -
     cmd.args([
         "-sS",
         "-L",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
         "-H",
         "Accept: application/vnd.github+json",
         "-H",
@@ -292,12 +318,31 @@ fn fetch_latest_release(url: &str, current_version: &str, token: Option<&str>) -
         "-w",
         "\n%{http_code}",
     ]);
-    if let Some(tok) = token {
-        cmd.arg("-H").arg(format!("Authorization: Bearer {tok}"));
+    let mut config_stdin: Option<String> = None;
+    if let Some(tok) = token.filter(|_| is_github_api_url(url)) {
+        // Pass Authorization via stdin config so `ps aux` never exposes the token.
+        let escaped = tok.replace('\\', "\\\\").replace('"', "\\\"").replace(['\r', '\n'], "");
+        cmd.args(["--config", "-"]);
+        config_stdin = Some(format!("header = \"Authorization: Bearer {escaped}\"\n"));
     }
     cmd.arg(url);
 
-    let out = match cmd.output() {
+    let out = if let Some(cfg) = config_stdin {
+        use std::io::Write;
+        use std::process::Stdio;
+        match cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(cfg.as_bytes());
+                }
+                child.wait_with_output()
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        cmd.output()
+    };
+    let out = match out {
         Ok(o) => o,
         Err(err) => {
             return UpdateOutcome::Unavailable {
@@ -450,5 +495,15 @@ mod tests {
 
         let bad_json = evaluate_release_response("0.1.0", 200, "not json");
         assert!(matches!(bad_json, UpdateOutcome::Unavailable { .. }));
+    }
+
+    #[test]
+    fn update_url_and_token_host_guards() {
+        assert!(validate_update_url("https://api.github.com/repos/razeenwasif/Graviton/releases/latest").is_ok());
+        assert!(validate_update_url("http://api.github.com/repos/razeenwasif/Graviton/releases/latest").is_err());
+        assert!(validate_update_url("file:///etc/passwd").is_err());
+        assert!(is_github_api_url("https://api.github.com/repos/a/b"));
+        assert!(!is_github_api_url("https://evil.example.com/api.github.com"));
+        assert!(!is_github_api_url("http://api.github.com/repos/a/b"));
     }
 }

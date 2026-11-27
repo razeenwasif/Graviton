@@ -6,7 +6,7 @@
 	<true/>
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>YOUR_TEAM_ID.group.dev.graviton.shared</string>
+		<string>$(TeamIdentifierPrefix)group.dev.graviton.shared</string>
 	</array>
 </dict>
 </plist>

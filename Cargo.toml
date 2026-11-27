@@ -7,6 +7,9 @@ version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 
+[profile.release]
+strip = "symbols"
+
 [profile.guest]
 inherits = "release"
 opt-level = "z"

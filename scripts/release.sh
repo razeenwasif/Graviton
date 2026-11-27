@@ -76,6 +76,8 @@ mkdir -p "$dist"
 
 # --- Build ------------------------------------------------------------------
 step "Building gravitond and grav (release)"
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=/build --remap-path-prefix=$repo=/src --remap-path-prefix=$cargo_home=/cargo"
 cargo build --quiet --release --manifest-path "$repo/Cargo.toml" -p gravitond -p grav
 target_dir=$(cargo metadata --format-version 1 --no-deps --manifest-path "$repo/Cargo.toml" |
   python3 -I -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
@@ -87,7 +89,9 @@ guest=$("$repo/scripts/build-guest.sh" | tail -1 | sed 's/^Guest written to //')
 step "Building Graviton.app (Release, signed below)"
 (cd "$repo/apps" && xcodegen generate --quiet </dev/null)
 xcodebuild -quiet -project "$repo/apps/Graviton.xcodeproj" -scheme GravitonMac -configuration Release \
-  -destination 'platform=macOS,arch=arm64' ARCHS=arm64 -derivedDataPath "$dist/build" -skipPackagePluginValidation CODE_SIGNING_ALLOWED=NO build
+  -destination 'platform=macOS,arch=arm64' ARCHS=arm64 -derivedDataPath "$dist/build" -skipPackagePluginValidation \
+  OTHER_SWIFT_FLAGS="-debug-prefix-map $repo=/src -debug-prefix-map $HOME=/build" \
+  OTHER_CFLAGS="-fdebug-prefix-map=$repo=/src -fdebug-prefix-map=$HOME=/build" CODE_SIGN_ALLOWED=NO build
 cp -R "$dist/build/Build/Products/Release/Graviton.app" "$dist/Graviton.app"
 app="$dist/Graviton.app"
 

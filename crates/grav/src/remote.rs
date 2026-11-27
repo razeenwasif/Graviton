@@ -842,10 +842,10 @@ mod tests {
     fn parses_targets() {
         let fp = "ab".repeat(32);
         let t = PairTarget::parse(&format!(
-            "graviton://pair?host=192.168.1.20&addrs=192.168.1.20,100.64.0.10&service=BuildHost&port=7843&fp={fp}&code=Z5VRBPZ3&name=Razeen%20Mac%20mini"
+            "graviton://pair?host=192.168.1.20&addrs=192.168.1.20,100.64.0.10&service=BuildHost&port=7843&fp={fp}&code=Z5VRBPZ3&name=My%20Mac%20mini"
         ))
         .unwrap();
-        assert_eq!((t.address.as_str(), t.port, t.code.as_deref(), t.name.as_deref()), ("192.168.1.20", 7843, Some("Z5VRBPZ3"), Some("Razeen Mac mini")));
+        assert_eq!((t.address.as_str(), t.port, t.code.as_deref(), t.name.as_deref()), ("192.168.1.20", 7843, Some("Z5VRBPZ3"), Some("My Mac mini")));
         assert_eq!(t.addresses, vec!["192.168.1.20", "100.64.0.10"]);
         assert_eq!(t.service_name.as_deref(), Some("BuildHost"));
         assert_eq!(t.fingerprint.as_deref(), Some(fp.as_str()));

@@ -40,13 +40,25 @@ fn xml(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-pub fn install(remote: bool) -> Result<()> {
+pub fn install(remote: bool, remote_bind: Option<std::net::IpAddr>, no_bonjour: bool, remote_name: Option<&str>) -> Result<()> {
     let daemon = bundled_daemon()?;
     let plist = plist_path()?;
     let log = log_path()?;
     fs::create_dir_all(plist.parent().unwrap())?;
     fs::create_dir_all(log.parent().unwrap())?;
-    let remote_arg = if remote { "<string>--remote</string>" } else { "" };
+    let mut extra_args = String::new();
+    if remote {
+        extra_args.push_str("<string>--remote</string>");
+        if let Some(ip) = remote_bind {
+            extra_args.push_str(&format!("<string>--remote-bind</string><string>{}</string>", xml(&ip.to_string())));
+        }
+        if no_bonjour {
+            extra_args.push_str("<string>--no-bonjour</string>");
+        }
+        if let Some(name) = remote_name.map(str::trim).filter(|s| !s.is_empty()) {
+            extra_args.push_str(&format!("<string>--remote-name</string><string>{}</string>", xml(name)));
+        }
+    }
     fs::write(
         &plist,
         format!(
@@ -55,7 +67,7 @@ pub fn install(remote: bool) -> Result<()> {
 <plist version="1.0">
 <dict>
   <key>Label</key><string>{LABEL}</string>
-  <key>ProgramArguments</key><array><string>{}</string>{remote_arg}</array>
+  <key>ProgramArguments</key><array><string>{}</string>{extra_args}</array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>

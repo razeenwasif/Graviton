@@ -116,7 +116,14 @@ public struct GravitonWidgetSnapshot: Codable, Sendable, Equatable {
 
 public enum GravitonWidgetStore {
     #if os(macOS)
-    public static let widgetGroupID = "YOUR_TEAM_ID.group.dev.graviton.shared"
+    public static let widgetGroupID: String = {
+        if let configured = Bundle.main.object(forInfoDictionaryKey: "GravitonWidgetGroupID") as? String,
+           !configured.isEmpty,
+           !configured.contains("$(") {
+            return configured
+        }
+        return "group.dev.graviton.shared"
+    }()
     #else
     public static let widgetGroupID = "group.dev.graviton.shared"
     #endif

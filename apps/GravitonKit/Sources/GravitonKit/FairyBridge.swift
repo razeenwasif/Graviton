@@ -400,7 +400,17 @@ public struct FairyToolResponse: Encodable, Sendable {
 // MARK: - Socket Paths & POSIX Helpers (macOS)
 
 public enum FairyPaths {
-    public static let bundleID = "dev.fairy.companion"
+    public static var bundleID: String {
+        if let override = ProcessInfo.processInfo.environment["GRAVITON_FAIRY_BUNDLE_ID"], !override.isEmpty {
+            return override
+        }
+        if let configured = Bundle.main.object(forInfoDictionaryKey: "GravitonFairyBundleID") as? String,
+           !configured.isEmpty,
+           !configured.contains("$(") {
+            return configured
+        }
+        return "dev.fairy.companion"
+    }
 
     public static var fairySocketPath: String {
         if let override = ProcessInfo.processInfo.environment["GRAVITON_FAIRY_SOCKET"], !override.isEmpty {

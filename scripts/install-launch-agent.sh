@@ -15,11 +15,14 @@ bin_dir="$HOME/Library/Application Support/Graviton/bin"
 log_dir="$HOME/Library/Logs/Graviton"
 domain="gui/$(id -u)"
 
-remote_arg=""
+remote_args=""
 app=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --remote) remote_arg="<string>--remote</string>" ;;
+    --remote) remote_args="$remote_args<string>--remote</string>" ;;
+    --remote-bind) ip=${2:?--remote-bind needs an IP address}; remote_args="$remote_args<string>--remote-bind</string><string>$ip</string>"; shift ;;
+    --no-bonjour) remote_args="$remote_args<string>--no-bonjour</string>" ;;
+    --remote-name) rname=${2:?--remote-name needs a host name}; remote_args="$remote_args<string>--remote-name</string><string>$rname</string>"; shift ;;
     --app) app=${2:?--app needs the path to Graviton.app}; shift ;;
     --uninstall) uninstall=1 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
@@ -40,12 +43,15 @@ if [ -n "$app" ]; then
   daemon="$app/Contents/MacOS/gravitond"
   [ -x "$daemon" ] || { echo "$daemon not found; build it with scripts/release.sh" >&2; exit 1; }
 else
+  cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=/build --remap-path-prefix=$repo=/src --remap-path-prefix=$cargo_home=/cargo"
   cargo build --quiet --release --manifest-path "$repo/Cargo.toml" -p gravitond
   target_dir=$(cargo metadata --format-version 1 --no-deps --manifest-path "$repo/Cargo.toml" |
     python3 -I -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
   mkdir -p "$bin_dir"
-  cp "$target_dir/release/gravitond" "$bin_dir/gravitond"
-  codesign --force --sign - --entitlements "$repo/crates/gravitond/gravitond.entitlements" "$bin_dir/gravitond"
+  cp "$target_dir/release/gravitond" "$bin_dir/gravitond.new"
+  codesign --force --sign - --entitlements "$repo/crates/gravitond/gravitond.entitlements" "$bin_dir/gravitond.new"
+  mv -f "$bin_dir/gravitond.new" "$bin_dir/gravitond"
   daemon="$bin_dir/gravitond"
 fi
 
@@ -55,7 +61,7 @@ cat > "$plist" <<PLIST
 <plist version="1.0">
 <dict>
   <key>Label</key><string>$label</string>
-  <key>ProgramArguments</key><array><string>$daemon</string>$remote_arg</array>
+  <key>ProgramArguments</key><array><string>$daemon</string>$remote_args</array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>

@@ -14,7 +14,9 @@
 //! revoke` forgets one. After [`MAX_FAILURES`] wrong codes every pending code
 //! is cancelled. The service is advertised over Bonjour as `_graviton._tcp`.
 
+use std::collections::HashMap;
 use std::fs;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,10 +26,18 @@ use graviton_core::paths;
 use graviton_proto::{PairedDevice, PairingInfo, Request, Response, decode_line, encode_line};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 const CODE_TTL: Duration = Duration::from_secs(300);
 const MAX_FAILURES: u32 = 5;
+const AUTH_WINDOW: Duration = Duration::from_secs(300);
+const AUTH_MAX_FAILURES: u32 = 5;
+const AUTH_LOCKOUT: Duration = Duration::from_secs(60);
+const MAX_TRACKED_IPS: usize = 1024;
+const MAX_PREAUTH_LINE: usize = 16 * 1024;
+const MAX_LINE: usize = 1 << 20;
+const MAX_CONCURRENT_PREAUTH: usize = 32;
+const MAX_CONCURRENT_SESSIONS: usize = 64;
 /// No 0/O, 1/I/L: easy to read off a screen and type on a phone.
 const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
@@ -58,11 +68,19 @@ struct PendingCode {
     expires: Instant,
 }
 
+#[derive(Clone, Copy)]
+struct AuthAttemptState {
+    failures: u32,
+    window_start: Instant,
+    locked_until: Option<Instant>,
+}
+
 #[derive(Default)]
 struct State {
     devices: Vec<Device>,
     codes: Vec<PendingCode>,
     failures: u32,
+    auth_limits: HashMap<IpAddr, AuthAttemptState>,
 }
 
 pub struct Remote {
@@ -71,7 +89,10 @@ pub struct Remote {
     state: Mutex<State>,
     devices_path: PathBuf,
     acceptor: tokio_rustls::TlsAcceptor,
+    preauth_sem: Arc<tokio::sync::Semaphore>,
+    session_sem: Arc<tokio::sync::Semaphore>,
     pub fingerprint: String,
+    pub bind: IpAddr,
     pub port: u16,
     pub host: String,
     rng: SystemRandom,
@@ -79,9 +100,11 @@ pub struct Remote {
 }
 
 impl Remote {
-    pub fn open(port: u16) -> Result<Arc<Self>> {
-        let dir = paths::support_dir().join("remote");
-        fs::create_dir_all(&dir)?;
+    pub fn open_with(port: u16, bind: IpAddr, advertise: bool, host_override: Option<String>) -> Result<Arc<Self>> {
+        let support = paths::support_dir();
+        ensure_private_dir(&support)?;
+        let dir = support.join("remote");
+        ensure_private_dir(&dir)?;
         let (cert, key) = identity(&dir)?;
         let fingerprint = hex(ring::digest::digest(&ring::digest::SHA256, &cert).as_ref());
 
@@ -100,14 +123,20 @@ impl Remote {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.into()),
         };
-        let host = computer_name();
-        let bonjour = Bonjour::register(&host, port, &fingerprint);
+        let host = host_override
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(computer_name);
+        let bonjour = if advertise { Bonjour::register(&host, port, &fingerprint) } else { None };
         Ok(Arc::new(Self {
             push: std::sync::OnceLock::new(),
             state: Mutex::new(State { devices, ..Default::default() }),
             devices_path,
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
+            preauth_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PREAUTH)),
+            session_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SESSIONS)),
             fingerprint,
+            bind,
             port,
             _bonjour: bonjour,
             host,
@@ -191,10 +220,19 @@ impl Remote {
         Ok(Response::Paired { token, device_id, host: self.host.clone() })
     }
 
-    /// The device a token belongs to.
-    fn authenticate(&self, token: &str) -> Option<String> {
+    fn authenticate_from(&self, peer_ip: Option<IpAddr>, token: &str) -> Result<Option<String>> {
+        let now = Instant::now();
         let hash = sha256_hex(token.as_bytes());
         let mut state = self.state.lock().unwrap();
+        if let Some(ip) = peer_ip {
+            if let Some(entry) = state.auth_limits.get(&ip) {
+                if let Some(until) = entry.locked_until {
+                    if now < until {
+                        bail!("too many failed authentication attempts; try again shortly");
+                    }
+                }
+            }
+        }
         let mut found = None;
         for d in state.devices.iter_mut() {
             if constant_time_eq(d.token_sha256.as_bytes(), hash.as_bytes()) {
@@ -202,12 +240,41 @@ impl Remote {
                 found = Some(d.id.clone());
             }
         }
+        if let Some(ip) = peer_ip {
+            if found.is_some() {
+                state.auth_limits.remove(&ip);
+            } else {
+                if state.auth_limits.len() >= MAX_TRACKED_IPS && !state.auth_limits.contains_key(&ip) {
+                    state.auth_limits.retain(|_, v| {
+                        v.locked_until.is_some_and(|u| now < u)
+                            || now.duration_since(v.window_start) < AUTH_WINDOW
+                    });
+                    if state.auth_limits.len() >= MAX_TRACKED_IPS {
+                        state.auth_limits.clear();
+                    }
+                }
+                let entry = state.auth_limits.entry(ip).or_insert(AuthAttemptState {
+                    failures: 0,
+                    window_start: now,
+                    locked_until: None,
+                });
+                if now.duration_since(entry.window_start) >= AUTH_WINDOW {
+                    entry.failures = 0;
+                    entry.window_start = now;
+                    entry.locked_until = None;
+                }
+                entry.failures += 1;
+                if entry.failures >= AUTH_MAX_FAILURES {
+                    entry.locked_until = Some(now + AUTH_LOCKOUT);
+                }
+            }
+        }
         if found.is_some() {
             let devices = state.devices.clone();
             drop(state);
             self.save(&devices);
         }
-        found
+        Ok(found)
     }
 
     /// Remember where to send a device's alerts.
@@ -253,10 +320,8 @@ impl Remote {
 
     fn save(&self, devices: &[Device]) {
         let tmp = self.devices_path.with_extension("json.tmp");
-        let ok = fs::write(&tmp, serde_json::to_vec_pretty(devices).expect("devices serialise")).and_then(|_| {
-            set_private(&tmp)?;
-            fs::rename(&tmp, &self.devices_path)
-        });
+        let ok = write_private(&tmp, &serde_json::to_vec_pretty(devices).expect("devices serialise"))
+            .and_then(|_| fs::rename(&tmp, &self.devices_path));
         if let Err(err) = ok {
             eprintln!("couldn't save paired devices: {err}");
         }
@@ -264,16 +329,25 @@ impl Remote {
 
     /// Accept remote connections forever.
     pub async fn serve(self: Arc<Self>, backend: crate::Backend) -> Result<()> {
-        let listener = tokio::net::TcpListener::bind(("0.0.0.0", self.port))
+        let listener = tokio::net::TcpListener::bind((self.bind, self.port))
             .await
-            .with_context(|| format!("listening on TCP port {}", self.port))?;
-        eprintln!("remote endpoint on port {} (fingerprint {})", self.port, short_fingerprint(&self.fingerprint));
+            .with_context(|| format!("listening on {}:{}", self.bind, self.port))?;
+        eprintln!("remote endpoint on {}:{} (fingerprint {})", self.bind, self.port, short_fingerprint(&self.fingerprint));
         loop {
             let (tcp, peer) = listener.accept().await?;
+            let Ok(session_permit) = Arc::clone(&self.session_sem).try_acquire_owned() else {
+                drop(tcp);
+                continue;
+            };
+            let Ok(preauth_permit) = Arc::clone(&self.preauth_sem).try_acquire_owned() else {
+                drop(tcp);
+                continue;
+            };
             let remote = Arc::clone(&self);
             let backend = backend.clone();
             tokio::spawn(async move {
-                if let Err(err) = remote.session(tcp, backend).await {
+                let _session_permit = session_permit;
+                if let Err(err) = remote.session(tcp, peer.ip(), preauth_permit, backend).await {
                     if !is_benign_disconnect(&err) {
                         eprintln!("remote {peer}: {err:#}");
                     }
@@ -282,15 +356,25 @@ impl Remote {
         }
     }
 
-    async fn session(&self, tcp: tokio::net::TcpStream, backend: crate::Backend) -> Result<()> {
+    async fn session(
+        &self,
+        tcp: tokio::net::TcpStream,
+        peer_ip: IpAddr,
+        preauth_permit: tokio::sync::OwnedSemaphorePermit,
+        backend: crate::Backend,
+    ) -> Result<()> {
         let tls = tokio::time::timeout(Duration::from_secs(10), self.acceptor.accept(tcp)).await.context("TLS handshake timed out")??;
         let (read, mut write) = tokio::io::split(tls);
-        let mut lines = BufReader::new(read).lines();
+        let mut lines = BufReader::new(read);
 
-        // The first message decides who this is.
-        let Some(first) = tokio::time::timeout(Duration::from_secs(15), lines.next_line()).await.context("no hello")?? else {
+        // The first message decides who this is; bound its length before allocating.
+        let Some(first) = tokio::time::timeout(Duration::from_secs(15), read_bounded_line(&mut lines, MAX_PREAUTH_LINE))
+            .await
+            .context("no hello")??
+        else {
             return Ok(());
         };
+        drop(preauth_permit);
         let mut device_id: Option<String> = None;
         let reply = match decode_line::<Request>(first.as_bytes()) {
             Ok(Request::Pair { code, device }) => match self.pair(&code, &device) {
@@ -302,12 +386,13 @@ impl Remote {
                 }
                 Err(e) => Response::Error { message: e.to_string() },
             },
-            Ok(Request::Auth { token }) => match self.authenticate(&token) {
-                Some(id) => {
+            Ok(Request::Auth { token }) => match self.authenticate_from(Some(peer_ip), &token) {
+                Ok(Some(id)) => {
                     device_id = Some(id);
                     Response::Authenticated { host: self.host.clone() }
                 }
-                None => Response::Error { message: "this device isn't paired with this Mac any more".into() },
+                Ok(None) => Response::Error { message: "this device isn't paired with this Mac any more".into() },
+                Err(e) => Response::Error { message: e.to_string() },
             },
             _ => Response::Error { message: "pair or authenticate first".into() },
         };
@@ -317,7 +402,7 @@ impl Remote {
             return Ok(());
         }
 
-        while let Some(line) = lines.next_line().await? {
+        while let Some(line) = read_bounded_line(&mut lines, MAX_LINE).await? {
             if line.trim().is_empty() {
                 continue;
             }
@@ -356,37 +441,37 @@ impl Remote {
                         write.write_all(&encode_line(&Response::Error { message: message.into() })).await?;
                         continue;
                     }
-                    crate::build_stream(Arc::clone(engine), spec.clone(), lines.get_mut(), &mut write).await?;
+                    crate::build_stream(Arc::clone(engine), spec.clone(), &mut lines, &mut write).await?;
                 }
                 (Request::Run(spec), crate::Backend::Engine(engine)) if spec.tty => {
-                    return crate::run_tty(Arc::clone(engine), spec.as_ref().clone(), lines.into_inner(), write).await;
+                    return crate::run_tty(Arc::clone(engine), spec.as_ref().clone(), lines, write).await;
                 }
                 (Request::GetArchive { id, path }, crate::Backend::Engine(engine)) => {
                     return crate::get_archive_stream(Arc::clone(engine), id.clone(), path.clone(), write).await;
                 }
                 (Request::PutArchive { id, path, size }, crate::Backend::Engine(engine)) => {
-                    crate::put_archive_stream(Arc::clone(engine), id.clone(), path.clone(), *size, lines.get_mut(), &mut write).await?;
+                    crate::put_archive_stream(Arc::clone(engine), id.clone(), path.clone(), *size, &mut lines, &mut write).await?;
                 }
                 (Request::SaveImage { references }, crate::Backend::Engine(engine)) => {
                     return crate::save_image_stream(Arc::clone(engine), references.clone(), write).await;
                 }
                 (Request::LoadImage { size }, crate::Backend::Engine(engine)) => {
-                    crate::load_image_stream(Arc::clone(engine), *size, lines.get_mut(), &mut write).await?;
+                    crate::load_image_stream(Arc::clone(engine), *size, &mut lines, &mut write).await?;
                 }
                 (Request::Exec(spec), crate::Backend::Engine(engine)) => {
                     if spec.tty {
                         // The connection becomes a terminal session.
-                        return crate::exec_tty(Arc::clone(engine), spec.clone(), lines.into_inner(), write).await;
+                        return crate::exec_tty(Arc::clone(engine), spec.clone(), lines, write).await;
                     }
                     crate::exec_stream(Arc::clone(engine), spec.clone(), &mut write).await?;
                 }
                 (Request::Logs { id, tail, follow: true, since_ms, until_ms }, _) => {
-                    if !crate::logs_stream(&backend, id.clone(), *tail, *since_ms, *until_ms, lines.get_mut(), &mut write).await? {
+                    if !crate::logs_stream(&backend, id.clone(), *tail, *since_ms, *until_ms, &mut lines, &mut write).await? {
                         return Ok(());
                     }
                 }
                 (Request::StatsStream { ids, all, follow }, _) => {
-                    if !crate::stats_stream(&backend, ids.clone(), *all, *follow, lines.get_mut(), &mut write).await? {
+                    if !crate::stats_stream(&backend, ids.clone(), *all, *follow, &mut lines, &mut write).await? {
                         return Ok(());
                     }
                 }
@@ -400,25 +485,62 @@ impl Remote {
     }
 }
 
+/// Read one newline-delimited JSON line capped at `max_bytes` so unauthenticated peers cannot OOM the daemon.
+async fn read_bounded_line<R: tokio::io::AsyncRead + Unpin>(reader: &mut BufReader<R>, max_bytes: usize) -> Result<Option<String>> {
+    let mut buf = String::new();
+    let n = reader.take(max_bytes as u64 + 1).read_line(&mut buf).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.len() > max_bytes {
+        bail!("message exceeded {max_bytes} bytes");
+    }
+    Ok(Some(buf.trim_end_matches(['\r', '\n']).to_string()))
+}
+
 /// The endpoint's certificate and PKCS#8 key (DER), made on first use.
+/// Uses a generic SAN (`graviton.local`) so unauthenticated TLS handshakes never leak the host's ComputerName.
 fn identity(dir: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>)> {
     let (cert_path, key_path) = (dir.join("cert.der"), dir.join("key.der"));
     if let (Ok(cert), Ok(key)) = (fs::read(&cert_path), fs::read(&key_path)) {
         return Ok((cert, key));
     }
-    let names = vec!["graviton.local".to_string(), format!("{}.local", computer_name().replace(' ', "-"))];
+    let names = vec!["graviton.local".to_string()];
     let certified = rcgen::generate_simple_self_signed(names).context("making the remote certificate")?;
     let cert = certified.cert.der().to_vec();
     let key = certified.signing_key.serialize_der();
-    fs::write(&key_path, &key)?;
-    set_private(&key_path)?;
+    write_private(&key_path, &key)?;
     fs::write(&cert_path, &cert)?;
     Ok((cert, key))
 }
 
-fn set_private(path: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+fn ensure_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+        f.write_all(data)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+        f.write_all(data)
+    }
 }
 
 fn computer_name() -> String {
@@ -590,6 +712,7 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn codes_and_comparisons() {
@@ -629,11 +752,11 @@ mod tests {
     fn encodes_txt_fp_and_orders_lan_before_tailscale() {
         use std::net::Ipv4Addr;
 
-        assert!(is_tailscale_ipv4(Ipv4Addr::new(100, 97, 247, 34)));
+        assert!(is_tailscale_ipv4(Ipv4Addr::new(100, 64, 0, 10)));
         assert!(is_tailscale_ipv4(Ipv4Addr::new(100, 64, 0, 1)));
         assert!(is_tailscale_ipv4(Ipv4Addr::new(100, 127, 255, 254)));
         assert!(!is_tailscale_ipv4(Ipv4Addr::new(100, 128, 0, 1)));
-        assert!(!is_tailscale_ipv4(Ipv4Addr::new(192, 168, 68, 61)));
+        assert!(!is_tailscale_ipv4(Ipv4Addr::new(192, 0, 2, 61)));
 
         let ordered = order_host_addresses(
             vec!["192.0.2.61".into(), "192.0.2.61".into()],
@@ -645,5 +768,76 @@ mod tests {
         let txt = encode_txt_record(&fp);
         assert_eq!(txt[0] as usize, 3 + 64);
         assert_eq!(&txt[1..], format!("fp={fp}").as_bytes());
+    }
+
+    #[test]
+    fn identity_uses_generic_san_and_private_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("graviton-id-test-{}-{nonce}", std::process::id()));
+        ensure_private_dir(&dir).unwrap();
+        let (cert, _key) = identity(&dir).unwrap();
+        let mode = fs::metadata(dir.join("key.der")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // Generic SAN contains "graviton.local" and not the local machine ComputerName.
+        let cert_str = String::from_utf8_lossy(&cert);
+        assert!(cert_str.contains("graviton.local"));
+        let host_label = computer_name().replace(' ', "-");
+        if host_label != "graviton" && host_label.len() > 2 {
+            assert!(!cert_str.contains(&format!("{host_label}.local")));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bounded_line_rejects_oversized_preauth() {
+        let big = format!("{}\n", "a".repeat(256));
+        let mut reader = BufReader::new(big.as_bytes());
+        assert!(read_bounded_line(&mut reader, 64).await.is_err());
+
+        let ok = "hello\n".to_string();
+        let mut reader = BufReader::new(ok.as_bytes());
+        assert_eq!(read_bounded_line(&mut reader, 64).await.unwrap().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn per_ip_auth_rate_limit_locks_out_after_five_failures() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("graviton-rl-test-{}-{nonce}", std::process::id()));
+        ensure_private_dir(&dir).unwrap();
+        let (cert, key) = identity(&dir).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let cfg = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(cert)],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key)),
+            )
+            .unwrap();
+        let remote = Remote {
+            push: std::sync::OnceLock::new(),
+            state: Mutex::new(State::default()),
+            devices_path: dir.join("devices.json"),
+            acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(cfg)),
+            preauth_sem: Arc::new(tokio::sync::Semaphore::new(4)),
+            session_sem: Arc::new(tokio::sync::Semaphore::new(4)),
+            fingerprint: "ab".repeat(32),
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            host: "test".into(),
+            rng: SystemRandom::new(),
+            _bonjour: None,
+        };
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        for _ in 0..AUTH_MAX_FAILURES {
+            assert_eq!(remote.authenticate_from(Some(ip), "wrong").unwrap(), None);
+        }
+        assert!(remote.authenticate_from(Some(ip), "wrong").is_err());
+        // Different IP is unaffected.
+        let other = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
+        assert_eq!(remote.authenticate_from(Some(other), "wrong").unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

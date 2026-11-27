@@ -96,8 +96,10 @@ print(f"Kernel: {len(image) / 2**20:.1f} MiB arm64 Image (Alpine linux-virt)")
 PY
 fi
 
-# 2. Agent, statically linked and size-optimized for the guest.
-cargo build --quiet --manifest-path "$repo/Cargo.toml" -p graviton-agent --profile guest --target aarch64-unknown-linux-musl
+# 2. Agent, statically linked and size-optimized for the guest (strip local paths).
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+RUSTFLAGS="-C target-feature=+crt-static --remap-path-prefix=$HOME=/build --remap-path-prefix=$repo=/src --remap-path-prefix=$cargo_home=/cargo" \
+  cargo build --quiet --manifest-path "$repo/Cargo.toml" -p graviton-agent --profile guest --target aarch64-unknown-linux-musl
 target_dir=$(cargo metadata --format-version 1 --no-deps --manifest-path "$repo/Cargo.toml" |
   python3 -I -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
 agent="$target_dir/aarch64-unknown-linux-musl/guest/graviton-agent"

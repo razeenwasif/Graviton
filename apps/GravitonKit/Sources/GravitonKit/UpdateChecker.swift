@@ -238,7 +238,7 @@ public final class UpdateChecker {
         self.fetcher = fetcher ?? Self.defaultFetch
         self.authTokenProvider = authTokenProvider ?? {
             let env = ProcessInfo.processInfo.environment
-            let raw = env["GRAVITON_UPDATE_TOKEN"] ?? env["GITHUB_TOKEN"]
+            let raw = env["GRAVITON_UPDATE_TOKEN"]
             let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines)
             return (trimmed?.isEmpty == false) ? trimmed : nil
         }
@@ -247,7 +247,7 @@ public final class UpdateChecker {
         }
 
         if defaults.object(forKey: Self.autoCheckKey) == nil {
-            self.autoCheckEnabled = true
+            self.autoCheckEnabled = false
         } else {
             self.autoCheckEnabled = defaults.bool(forKey: Self.autoCheckKey)
         }
@@ -314,6 +314,10 @@ public final class UpdateChecker {
     /// Perform an update check now. Never throws or presents blocking alerts.
     public func checkNow(userInitiated: Bool = true, now: Date = Date()) async {
         if case .checking = state { return }
+        guard feedURL.scheme?.lowercased() == "https" else {
+            state = .unavailable("Update feed URL must use https://.")
+            return
+        }
         state = .checking
 
         var request = URLRequest(url: feedURL)
@@ -321,7 +325,7 @@ public final class UpdateChecker {
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
         request.setValue("Graviton/\(currentVersion)", forHTTPHeaderField: "User-Agent")
-        if let token = authTokenProvider() {
+        if feedURL.host?.lowercased() == "api.github.com", let token = authTokenProvider() {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
 

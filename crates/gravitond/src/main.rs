@@ -60,6 +60,18 @@ struct Args {
     #[arg(long, default_value_t = graviton_proto::REMOTE_PORT)]
     remote_port: u16,
 
+    /// IP address for --remote to bind to (e.g. a Tailscale IP or 127.0.0.1).
+    #[arg(long, default_value = "0.0.0.0")]
+    remote_bind: std::net::IpAddr,
+
+    /// Don't advertise the --remote endpoint over Bonjour (_graviton._tcp).
+    #[arg(long)]
+    no_bonjour: bool,
+
+    /// Override the host name shown to paired devices instead of the Mac's ComputerName.
+    #[arg(long)]
+    remote_name: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -137,7 +149,7 @@ async fn serve_forever(args: Args) -> Result<()> {
     };
 
     let remote = if args.remote {
-        let remote = remote::Remote::open(args.remote_port)?;
+        let remote = remote::Remote::open_with(args.remote_port, args.remote_bind, !args.no_bonjour, args.remote_name.clone())?;
         // Push alerts for failures and builds, to phones that registered for them.
         let push = push::Push::new(Arc::clone(&remote), tokio::runtime::Handle::current());
         if let Backend::Engine(engine) = &backend {

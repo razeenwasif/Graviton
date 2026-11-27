@@ -21,7 +21,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
-      - name: Check shell scripts
+      - name: Check shell scripts and leaks
         run: |
           for s in scripts/*.sh design/*.sh; do
             case "$(head -n 1 "$s")" in
@@ -29,6 +29,7 @@ jobs:
               *) sh -n "$s" ;;
             esac
           done
+          sh scripts/check-leaks.sh
       - name: Workspace tests
         run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"

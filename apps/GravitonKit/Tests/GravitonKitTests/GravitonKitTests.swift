@@ -356,15 +356,15 @@ import Testing
         hosts.select("mini")
         #expect(SharedHosts(url: url).selected == "mini")
 
-        let result = PairingResult(host: RemoteHost(deviceID: "d2", name: "Razeen's MacBook", serviceName: nil, address: "10.0.0.9", port: 7843, fingerprint: "cd"), token: "t2")
+        let result = PairingResult(host: RemoteHost(deviceID: "d2", name: "My MacBook", serviceName: nil, address: "10.0.0.9", port: 7843, fingerprint: "cd"), token: "t2")
         try hosts.add(result)
-        #expect(hosts.hosts.map(\.name).sorted() == ["mini", "razeens-macbook"])
+        #expect(hosts.hosts.map(\.name).sorted() == ["mini", "my-macbook"])
         let raw = try String(contentsOf: url, encoding: .utf8)
         #expect(raw.contains(#""default" : "mini""#) && raw.contains(#""device_id" : "d2""#))
         let perms = try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber
         #expect(perms?.intValue == 0o600)
         try hosts.forget("mini")
-        #expect(hosts.hosts.map(\.name) == ["razeens-macbook"])
+        #expect(hosts.hosts.map(\.name) == ["my-macbook"])
         #expect(!(try String(contentsOf: url, encoding: .utf8)).contains(#""default" : "mini""#))
     }
 
@@ -1389,8 +1389,8 @@ import Testing
             demoModeProvider: { false }
         )
 
-        // 1. Auto-check disabled skips background check.
-        checker.autoCheckEnabled = false
+        // 1. Auto-check defaults to opt-in (false) and skips background check.
+        #expect(!checker.autoCheckEnabled)
         await checker.checkIfDue()
         #expect(mock.calls == 0)
         checker.autoCheckEnabled = true
@@ -1437,6 +1437,20 @@ import Testing
         await checker.checkNow(userInitiated: true)
         guard case .unavailable = checker.state else {
             Issue.record("expected .unavailable on 403"); return
+        }
+
+        // 7. Rejects non-HTTPS feed URLs and never sends token to non-GitHub hosts.
+        let httpChecker = UpdateChecker(
+            currentVersion: SemVer(major: 0, minor: 1, patch: 0),
+            feedURL: URL(string: "http://example.test/releases/latest")!,
+            defaults: defaults,
+            fetcher: { _ in Issue.record("HTTP URL must not be fetched"); throw URLError(.cancelled) },
+            authTokenProvider: { "secret-tok" },
+            demoModeProvider: { false }
+        )
+        await httpChecker.checkNow(userInitiated: true)
+        guard case .unavailable = httpChecker.state else {
+            Issue.record("expected .unavailable on http:// feed"); return
         }
     }
 
