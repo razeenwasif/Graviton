@@ -49,6 +49,50 @@ public struct PortMapping: Codable, Hashable, Sendable {
         let proto = `protocol` == .udp ? "/udp" : ""
         return "\(prefix)\(hostPort)→\(containerPort)\(proto)"
     }
+
+    /// Parse `[ip:]host:container[/tcp|udp]` or `port[/tcp|udp]`.
+    public static func parse(_ raw: String) -> PortMapping? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let parts = trimmed.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        let proto: PortProtocol
+        if parts.count == 2 {
+            switch parts[1].lowercased() {
+            case "tcp": proto = .tcp
+            case "udp": proto = .udp
+            default: return nil
+            }
+        } else {
+            proto = .tcp
+        }
+        let portSpec = String(parts[0])
+        func validPort(_ s: String) -> UInt16? {
+            guard let p = UInt16(s), p > 0 else { return nil }
+            return p
+        }
+        if portSpec.hasPrefix("[") {
+            guard let closeIdx = portSpec.range(of: "]:") else { return nil }
+            let ip = String(portSpec[portSpec.index(after: portSpec.startIndex)..<closeIdx.lowerBound])
+            let tail = portSpec[closeIdx.upperBound...].split(separator: ":", omittingEmptySubsequences: false)
+            guard tail.count == 2, let host = validPort(String(tail[0])), let cont = validPort(String(tail[1])) else { return nil }
+            return PortMapping(hostIp: ip, hostPort: host, containerPort: cont, protocol: proto)
+        }
+        let cols = portSpec.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        switch cols.count {
+        case 1:
+            guard let p = validPort(cols[0]) else { return nil }
+            return PortMapping(hostPort: p, containerPort: p, protocol: proto)
+        case 2:
+            guard let host = validPort(cols[0]), let cont = validPort(cols[1]) else { return nil }
+            return PortMapping(hostPort: host, containerPort: cont, protocol: proto)
+        case 3:
+            guard !cols[0].isEmpty, let host = validPort(cols[1]), let cont = validPort(cols[2]) else { return nil }
+            let hostIp = cols[0] == "127.0.0.1" ? nil : cols[0]
+            return PortMapping(hostIp: hostIp, hostPort: host, containerPort: cont, protocol: proto)
+        default:
+            return nil
+        }
+    }
 }
 
 public struct Mount: Codable, Hashable, Sendable {
@@ -133,6 +177,8 @@ public struct Container: Codable, Identifiable, Hashable, Sendable {
     public var service: String? = nil
     /// Container health status when running with an active `HEALTHCHECK`.
     public var health: HealthStatus? = nil
+    /// Container ID this container was forked from (`grav fork`), if any.
+    public var forkedFrom: String? = nil
 
     public var isRunning: Bool { status == .running }
     public var isPaused: Bool { status == .paused }
@@ -822,7 +868,7 @@ public struct NetworkRate: Identifiable, Sendable {
 /// Something that happened on the engine (`EngineEvent` in `graviton-proto`).
 public struct EngineEvent: Codable, Identifiable, Hashable, Sendable {
     public enum Kind: String, Codable, Sendable {
-        case started, stopped, paused, unpaused, failed, healthy, unhealthy, pulled, pushed, built, buildFailed = "build_failed", removed
+        case started, stopped, paused, unpaused, forked, failed, healthy, unhealthy, pulled, pushed, built, buildFailed = "build_failed", removed
     }
 
     public var seq: UInt64
@@ -1278,6 +1324,100 @@ public struct CommitSpec: Codable, Hashable, Sendable {
         if !changes.isEmpty {
             try c.encode(changes, forKey: .changes)
         }
+    }
+}
+
+/// Parameters for live-forking a container's overlay state and spec (`ForkSpec` in `graviton-proto`).
+public struct ForkSpec: Codable, Hashable, Sendable {
+    public var source: String
+    public var names: [String]
+    public var count: UInt32
+    public var start: Bool
+    public var autoRemove: Bool
+    public var ports: [PortMapping]
+    public var env: [String]
+    public var command: [String]?
+
+    public init(
+        source: String,
+        names: [String] = [],
+        count: UInt32 = 1,
+        start: Bool = true,
+        autoRemove: Bool = false,
+        ports: [PortMapping] = [],
+        env: [String] = [],
+        command: [String]? = nil
+    ) {
+        self.source = source
+        self.names = names
+        self.count = count
+        self.start = start
+        self.autoRemove = autoRemove
+        self.ports = ports
+        self.env = env
+        self.command = command
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case source, names, count, start, autoRemove, ports, env, command
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        source = try c.decode(String.self, forKey: .source)
+        names = try c.decodeIfPresent([String].self, forKey: .names) ?? []
+        count = try c.decodeIfPresent(UInt32.self, forKey: .count) ?? 1
+        start = try c.decodeIfPresent(Bool.self, forKey: .start) ?? true
+        autoRemove = try c.decodeIfPresent(Bool.self, forKey: .autoRemove) ?? false
+        ports = try c.decodeIfPresent([PortMapping].self, forKey: .ports) ?? []
+        env = try c.decodeIfPresent([String].self, forKey: .env) ?? []
+        command = try c.decodeIfPresent([String].self, forKey: .command)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(source, forKey: .source)
+        if !names.isEmpty { try c.encode(names, forKey: .names) }
+        try c.encode(count, forKey: .count)
+        try c.encode(start, forKey: .start)
+        if autoRemove { try c.encode(autoRemove, forKey: .autoRemove) }
+        if !ports.isEmpty { try c.encode(ports, forKey: .ports) }
+        if !env.isEmpty { try c.encode(env, forKey: .env) }
+        try c.encodeIfPresent(command, forKey: .command)
+    }
+}
+
+public enum DiffKind: String, Codable, Hashable, Sendable {
+    case added, modified, deleted
+
+    public var label: String {
+        switch self {
+        case .added: "Added"
+        case .modified: "Modified"
+        case .deleted: "Deleted"
+        }
+    }
+
+    public var marker: String {
+        switch self {
+        case .added: "A"
+        case .modified: "C"
+        case .deleted: "D"
+        }
+    }
+}
+
+public struct DiffEntry: Codable, Hashable, Sendable, Identifiable {
+    public var kind: DiffKind
+    public var path: String
+    public var sizeBytes: UInt64?
+
+    public var id: String { "\(kind.rawValue):\(path)" }
+
+    public init(kind: DiffKind, path: String, sizeBytes: UInt64? = nil) {
+        self.kind = kind
+        self.path = path
+        self.sizeBytes = sizeBytes
     }
 }
 

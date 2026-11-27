@@ -135,14 +135,14 @@ pub(crate) mod linux {
                 continue;
             }
             match decode_line::<AgentRequest>(line.as_bytes()) {
-                Ok(AgentRequest::Prepare { container, layers, mounts, tmpfs, hostname, now_secs }) => {
+                Ok(AgentRequest::Prepare { container, layers, mounts, tmpfs, hostname, now_secs, fork_from }) => {
                     let t0 = std::time::Instant::now();
                     if let Some(secs) = now_secs {
                         set_wall_clock(secs);
                     }
                     // Idempotent: starts DHCP now if this VM was restored from a snapshot.
                     crate::net::start();
-                    let result = crate::container::prepare(&container, &layers).and_then(|(files, reused)| {
+                    let result = crate::container::prepare(&container, &layers, fork_from.as_deref()).and_then(|(files, reused)| {
                         let ip = crate::net::wait(std::time::Duration::from_secs(8));
                         let dns = crate::container::finish(&container, &mounts, &tmpfs, hostname.as_deref().unwrap_or(&container), ip.as_deref())?;
                         Ok((files, reused, ip, dns))
@@ -348,6 +348,14 @@ pub(crate) mod linux {
                     set_wall_clock(now_secs);
                     send(&writer, &AgentEvent::Done);
                 }
+                Ok(AgentRequest::SyncFs) => {
+                    crate::container::sync_containers();
+                    send(&writer, &AgentEvent::Synced);
+                }
+                Ok(AgentRequest::Diff { container }) => match crate::files::diff(&container) {
+                    Ok(entries) => send(&writer, &AgentEvent::Diff { entries }),
+                    Err(err) => send(&writer, &AgentEvent::Error { message: err.to_string() }),
+                },
                 Ok(AgentRequest::Shutdown) => power_off(),
                 Err(err) => send(&writer, &AgentEvent::Error { message: format!("bad request: {err}") }),
             }

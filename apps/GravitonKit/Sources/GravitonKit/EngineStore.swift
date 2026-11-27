@@ -293,6 +293,19 @@ public final class EngineStore {
         return image
     }
 
+    /// Fork a container's overlay state and config into one or more isolated containers.
+    @discardableResult
+    public func fork(_ spec: ForkSpec) async throws -> [Container] {
+        let created = try await service.fork(spec)
+        await refresh()
+        return created
+    }
+
+    /// Inspect overlayfs filesystem changes inside a running container.
+    public func diff(id: String) async throws -> [DiffEntry] {
+        try await service.diff(id: id)
+    }
+
     /// Pull an image with streamed per-layer progress. Refreshes the image list when done.
     public func pullStream(_ reference: String, platform: String? = nil) -> AsyncThrowingStream<PullEvent, Error> {
         let upstream: AsyncThrowingStream<PullEvent, Error>

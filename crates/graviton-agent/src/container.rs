@@ -131,10 +131,20 @@ pub fn rootfs(id: &str) -> io::Result<PathBuf> {
 /// When a read-only EROFS image disk (`/dev/vdb`) is attached alongside `/dev/vda`,
 /// mounts `overlayfs` directly (`lowerdir` on `/dev/vdb`, `upperdir` on `/dev/vda`) with
 /// zero layer unpacking; otherwise falls back to unpacking blobs into `rootfs`.
-pub fn prepare(id: &str, layers: &[String]) -> io::Result<(u64, bool)> {
+pub fn prepare(id: &str, layers: &[String], fork_from: Option<&str>) -> io::Result<(u64, bool)> {
     let disk = on_disk()?;
     let root = rootfs(id)?;
     let base = root.parent().ok_or_else(|| io::Error::other("missing container base dir"))?;
+    if disk {
+        if let Some(src_id) = fork_from {
+            let src_root = rootfs(src_id)?;
+            let src_base = src_root.parent().ok_or_else(|| io::Error::other("missing source container base dir"))?;
+            if !base.exists() && src_base.is_dir() {
+                fs::rename(src_base, base)?;
+                let _ = fs::remove_dir_all(base.join("work"));
+            }
+        }
+    }
     let marker = base.join("image");
     let upper = base.join("upper");
     let wanted = layers.join("\n");
@@ -251,6 +261,20 @@ pub fn prepare(id: &str, layers: &[String]) -> io::Result<(u64, bool)> {
         let _ = fs::write("/proc/sys/vm/drop_caches", b"1\n");
     }
     Ok((files, false))
+}
+
+/// Flush dirty container filesystem pages and ext4 journals to `/dev/vda` before host APFS `clonefile`.
+pub fn sync_containers() {
+    if let Ok(dir) = File::open(CONTAINERS) {
+        // SAFETY: syncfs(2) on an open directory fd.
+        unsafe {
+            let _ = libc::syncfs(dir.as_raw_fd());
+        }
+    }
+    // SAFETY: sync(2) flushes remaining kernel block buffers.
+    unsafe {
+        libc::sync();
+    }
 }
 
 /// Mount the container's volumes, tmpfs mounts, and write its network files. Returns whether

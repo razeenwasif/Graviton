@@ -187,6 +187,20 @@ struct CommandPaletteView: View {
                     }
                 ))
                 list.append(Entry(
+                    id: "cnt-diff-\(c.id)",
+                    group: "Containers",
+                    title: "Diff: \(c.name)",
+                    subtitle: "Inspect overlay filesystem changes inside \(c.name)",
+                    icon: "doc.text.magnifyingglass",
+                    tint: G.amber,
+                    badge: nil,
+                    shortcut: nil,
+                    perform: {
+                        selection = .containers
+                        onOpenContainer(c.id, .diff)
+                    }
+                ))
+                list.append(Entry(
                     id: "cnt-stop-\(c.id)",
                     group: "Containers",
                     title: "Stop \(c.name)",
@@ -216,6 +230,28 @@ struct CommandPaletteView: View {
                         Task {
                             await store.start(c)
                             onToast("Started \(c.name)", false)
+                        }
+                    }
+                ))
+            }
+            if store.canManage {
+                list.append(Entry(
+                    id: "cnt-fork-\(c.id)",
+                    group: "Containers",
+                    title: "Fork \(c.name)",
+                    subtitle: "APFS copy-on-write clone of \(c.name)",
+                    icon: "arrow.triangle.branch",
+                    tint: G.mint,
+                    badge: nil,
+                    shortcut: nil,
+                    perform: {
+                        Task {
+                            do {
+                                let created = try await store.fork(ForkSpec(source: c.id))
+                                onToast("Forked \(created.map(\.name).joined(separator: ", "))", false)
+                            } catch {
+                                onToast(error.localizedDescription, true)
+                            }
                         }
                     }
                 ))

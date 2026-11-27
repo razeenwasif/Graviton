@@ -81,6 +81,7 @@ struct EventRow: View {
         case .stopped: ("stop.circle", G.muted)
         case .paused: ("pause.circle.fill", G.warning)
         case .unpaused: ("play.circle.fill", G.running)
+        case .forked: ("arrow.triangle.branch", G.mint)
         case .failed: ("exclamationmark.triangle.fill", G.danger)
         case .healthy: ("heart.circle.fill", G.running)
         case .unhealthy: ("heart.slash.circle.fill", G.danger)

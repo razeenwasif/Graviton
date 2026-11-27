@@ -83,6 +83,13 @@ import Testing
         #expect(started.isRunning)
         let tail = try await engine.logs(id: "api-gateway", tail: 3)
         #expect(tail.count == 3)
+
+        let forked = try await engine.fork(ForkSpec(source: "postgres", names: ["pg-pr-42"], env: ["POSTGRES_DB=staging"]))
+        #expect(forked.count == 1)
+        #expect(forked.first?.name == "pg-pr-42")
+        #expect(forked.first?.forkedFrom == "5d10e7b3c4aa")
+        let entries = try await engine.diff(id: "pg-pr-42")
+        #expect(entries.count == 2)
     }
 
     @Test func filters() async {
@@ -155,6 +162,18 @@ import Testing
 
         let removed = try Wire.decoder.decode(EngineResponse.self, from: Data(#"{"type":"removed","data":{"id":"abc"}}"#.utf8))
         guard case .removed("abc") = removed else { Issue.record("expected removed"); return }
+
+        let forkLine = String(decoding: try Wire.line(.fork(ForkSpec(source: "pg", names: ["pg-test"], count: 1, env: ["A=1"]))), as: UTF8.self)
+        #expect(forkLine == "{\"method\":\"fork\",\"params\":{\"count\":1,\"env\":[\"A=1\"],\"names\":[\"pg-test\"],\"source\":\"pg\",\"start\":true}}\n")
+
+        let diffLine = String(decoding: try Wire.line(.diff(id: "pg-test")), as: UTF8.self)
+        #expect(diffLine == "{\"method\":\"diff\",\"params\":{\"id\":\"pg-test\"}}\n")
+
+        let diffRespJSON = #"{"type":"diff","data":{"entries":[{"kind":"added","path":"/tmp/x","size_bytes":12},{"kind":"deleted","path":"/etc/old"}]}}"#
+        guard case let .diff(diffEntries) = try Wire.decoder.decode(EngineResponse.self, from: Data(diffRespJSON.utf8)) else {
+            Issue.record("expected diff response"); return
+        }
+        #expect(diffEntries.count == 2 && diffEntries[0].kind == .added && diffEntries[1].kind == .deleted)
     }
 
     @Test func splitsLists() {
@@ -613,7 +632,7 @@ import Testing
     }
 
     @Test func approvalPolicyMatchesTieredRules() {
-        #expect(FairyApprovalPolicy.supportedTools.count == 31)
+        #expect(FairyApprovalPolicy.supportedTools.count == 33)
 
         // Auto-run reads & reversible operations
         for readTool in ["status", "events", "containers", "inspect", "logs", "stats",
@@ -645,9 +664,10 @@ import Testing
         for gatedCompose in ["up", "down", "stop", "build"] {
             #expect(FairyApprovalPolicy.requiresTouchID(tool: "compose", args: ["action": .string(gatedCompose)]))
         }
-        for gatedTool in ["run", "exec", "commit_container", "build", "push_image", "save_image", "load_image", "remove_image", "copy_files", "unknown_future_tool"] {
+        for gatedTool in ["run", "exec", "fork_container", "commit_container", "build", "push_image", "save_image", "load_image", "remove_image", "copy_files", "unknown_future_tool"] {
             #expect(FairyApprovalPolicy.requiresTouchID(tool: gatedTool, args: [:]), "\(gatedTool) must require Touch ID")
         }
+        #expect(!FairyApprovalPolicy.requiresTouchID(tool: "diff_container", args: ["container": .string("api")]))
 
         let commitSummary = FairyApprovalPolicy.summarize(
             tool: "commit_container",

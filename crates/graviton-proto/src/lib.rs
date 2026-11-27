@@ -105,6 +105,41 @@ impl PortMapping {
     pub fn bind_ip(&self) -> &str {
         self.host_ip.as_deref().unwrap_or("127.0.0.1")
     }
+
+    /// Parse `[ip:]host:container[/tcp|udp]` or `port[/tcp|udp]` into a [`PortMapping`].
+    /// IPv6 bind addresses use brackets, e.g. `[::]:8080:80` or `[::1]:5353:53/udp`.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let (ports, proto_raw) = spec.rsplit_once('/').unwrap_or((spec, "tcp"));
+        let protocol = match proto_raw.trim().to_ascii_lowercase().as_str() {
+            "tcp" => PortProtocol::Tcp,
+            "udp" => PortProtocol::Udp,
+            other => return Err(format!("`{spec}`: unknown protocol `{other}` (use tcp or udp)")),
+        };
+        let bad = || format!("`{spec}` isn't a valid port mapping (try 8080:80, 0.0.0.0:8080:80 or 5353:53/udp)");
+        let parse_num = |s: &str| s.trim().parse::<u16>().ok().filter(|p| *p > 0).ok_or_else(bad);
+
+        let ports = ports.trim();
+        let (host_ip, host_port, container_port) = if let Some(rest) = ports.strip_prefix('[') {
+            let (ip_str, tail) = rest.split_once("]:").ok_or_else(bad)?;
+            let ip: std::net::Ipv6Addr =
+                ip_str.parse().map_err(|_| format!("`{spec}`: `{ip_str}` isn't a valid IPv6 address"))?;
+            let (host, container) = tail.split_once(':').ok_or_else(bad)?;
+            (Some(ip.to_string()), parse_num(host)?, parse_num(container)?)
+        } else {
+            match ports.split(':').collect::<Vec<_>>()[..] {
+                [one] => (None, parse_num(one)?, parse_num(one)?),
+                [host, container] => (None, parse_num(host)?, parse_num(container)?),
+                [ip_str, host, container] => {
+                    let ip: std::net::Ipv4Addr =
+                        ip_str.parse().map_err(|_| format!("`{spec}`: `{ip_str}` isn't a valid IPv4 address"))?;
+                    let host_ip = (ip != std::net::Ipv4Addr::LOCALHOST).then(|| ip.to_string());
+                    (host_ip, parse_num(host)?, parse_num(container)?)
+                }
+                _ => return Err(bad()),
+            }
+        };
+        Ok(Self { host_ip, host_port, container_port, protocol })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -607,6 +642,61 @@ pub struct ContainerSummary {
     /// Current healthcheck status, when a healthcheck is configured and the container is running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<HealthStatus>,
+    /// Container ID this container was forked from (`grav fork`), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
+}
+
+/// Parameters for `grav fork` (`Request::Fork`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkSpec {
+    /// Source container ID, prefix, or name.
+    pub source: String,
+    /// Optional explicit names for each fork; when omitted, `<source>-fork-<n>` is generated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
+    /// Number of forks to create (defaults to 1 or `names.len()`).
+    #[serde(default = "default_fork_count")]
+    pub count: u32,
+    /// Start forked containers immediately (`true` unless `--no-start` / paused requested).
+    #[serde(default = "default_true")]
+    pub start: bool,
+    /// Automatically remove forked containers when they stop (`--rm`).
+    #[serde(default)]
+    pub auto_remove: bool,
+    /// Override published ports (only allowed when creating 1 fork).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PortMapping>,
+    /// Override or append environment variables (`KEY=VAL`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
+    /// Override command executed inside the fork(s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+}
+
+fn default_fork_count() -> u32 {
+    1
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffKind {
+    Added,
+    Modified,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffEntry {
+    pub kind: DiffKind,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -878,6 +968,7 @@ pub enum EventKind {
     Built,
     BuildFailed,
     Removed,
+    Forked,
 }
 
 impl EventKind {
@@ -1338,6 +1429,10 @@ pub enum Request {
     Build(BuildSpec),
     /// Create a container and start it in its own VM; answers `Container` once started.
     Run(Box<RunSpec>),
+    /// Fork a container's disk (and flushed live state if running) into one or more new containers.
+    Fork(Box<ForkSpec>),
+    /// Inspect overlay filesystem changes (`Added`, `Modified`, `Deleted`) inside a container.
+    Diff { id: String },
     /// Remove a stopped container.
     Remove { id: String },
     /// Where the disk space goes.
@@ -1441,6 +1536,8 @@ pub enum Response {
         exit_code: Option<i32>,
     },
     Container(ContainerSummary),
+    Forked { containers: Vec<ContainerSummary> },
+    Diff { entries: Vec<DiffEntry> },
     Image(ImageSummary),
     PullProgress(PullProgress),
     ImagePushProgress(ImagePushProgress),
@@ -1571,6 +1668,9 @@ pub enum AgentRequest {
         /// Host Unix wall-clock time in seconds (used after VM snapshot restore so guest clock matches host UTC).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         now_secs: Option<u64>,
+        /// When booting a forked container whose cloned ext4 still holds `/run/containers/<fork_from>`, rename it to `<container>`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fork_from: Option<String>,
     },
     /// Run a process. With `container`, it runs chrooted into that container's
     /// root filesystem in new mount, UTS and IPC namespaces.
@@ -1685,6 +1785,10 @@ pub enum AgentRequest {
     DialTcp { port: u16 },
     /// Sync guest wall clock (`CLOCK_REALTIME`) to host UTC seconds (e.g. after VM unpause).
     SetClock { now_secs: u64 },
+    /// Flush dirty ext4 pages and journals on `/run/containers` before host APFS `clonefile`.
+    SyncFs,
+    /// Collect overlayfs upperdir diff entries (`Added`, `Modified`, `Deleted`) for `container`.
+    Diff { container: String },
     Shutdown,
 }
 
@@ -1723,6 +1827,10 @@ pub enum AgentEvent {
     Copied { files: u64 },
     /// `commit`'s layer; `file` is `None` when nothing changed.
     Committed(LayerInfo),
+    /// Reply to `AgentRequest::SyncFs`.
+    Synced,
+    /// Reply to `AgentRequest::Diff`.
+    Diff { entries: Vec<DiffEntry> },
     Error { message: String },
 }
 
@@ -2570,5 +2678,54 @@ mod tests {
             ulimits: vec![UlimitSpec { name: "nofile".into(), soft: 2048, hard: 4096 }],
         }));
         assert_eq!(decode_line::<Request>(&encode_line(&run)).unwrap(), run);
+    }
+
+    #[test]
+    fn fork_and_diff_round_trip() {
+        let req = Request::Fork(Box::new(ForkSpec {
+            source: "pg-main".into(),
+            names: vec!["pg-test".into()],
+            count: 1,
+            start: true,
+            auto_remove: true,
+            ports: vec![PortMapping {
+                host_ip: None,
+                host_port: 5433,
+                container_port: 5432,
+                protocol: PortProtocol::Tcp,
+            }],
+            env: vec!["FOO=bar".into()],
+            command: Some(vec!["sh".into(), "-c".into(), "echo ok".into()]),
+        }));
+        assert_eq!(decode_line::<Request>(&encode_line(&req)).unwrap(), req);
+
+        let diff_req = Request::Diff { id: "pg-test".into() };
+        assert_eq!(decode_line::<Request>(&encode_line(&diff_req)).unwrap(), diff_req);
+
+        let diff_resp = Response::Diff {
+            entries: vec![
+                DiffEntry { kind: DiffKind::Added, path: "/etc/forked".into(), size_bytes: Some(12) },
+                DiffEntry { kind: DiffKind::Modified, path: "/etc/hosts".into(), size_bytes: Some(64) },
+                DiffEntry { kind: DiffKind::Deleted, path: "/etc/motd".into(), size_bytes: None },
+            ],
+        };
+        assert_eq!(decode_line::<Response>(&encode_line(&diff_resp)).unwrap(), diff_resp);
+
+        for agent_req in [
+            AgentRequest::SyncFs,
+            AgentRequest::Diff { container: "c1".into() },
+            AgentRequest::Prepare {
+                container: "c2".into(),
+                layers: vec!["sha256:aa".into()],
+                mounts: vec![],
+                tmpfs: vec![],
+                hostname: Some("c2".into()),
+                now_secs: None,
+                fork_from: Some("c1".into()),
+            },
+        ] {
+            assert_eq!(decode_line::<AgentRequest>(&encode_line(&agent_req)).unwrap(), agent_req);
+        }
+        assert_eq!(decode_line::<AgentEvent>(&encode_line(&AgentEvent::Synced)).unwrap(), AgentEvent::Synced);
     }
 }

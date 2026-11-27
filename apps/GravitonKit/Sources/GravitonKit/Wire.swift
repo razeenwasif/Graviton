@@ -20,6 +20,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
     case stop(id: String)
     case pause(id: String)
     case unpause(id: String)
+    case fork(ForkSpec)
+    case diff(id: String)
     case restart(id: String)
     case pull(reference: String, progress: Bool = false, platform: String? = nil)
     case tagImage(source: String, target: String)
@@ -119,6 +121,8 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case .stop: "stop"
         case .pause: "pause"
         case .unpause: "unpause"
+        case .fork: "fork"
+        case .diff: "diff"
         case .restart: "restart"
         case .pull: "pull"
         case .tagImage: "tag_image"
@@ -181,8 +185,9 @@ public enum EngineRequest: Encodable, Sendable, Equatable {
         case let .prune(spec): try c.encode(spec, forKey: .params)
         case let .snapshotWarm(cpus, memoryMib, rosetta, slots):
             try c.encode(SnapshotWarmParams(cpus: cpus, memoryMib: memoryMib, rosetta: rosetta ? true : nil, slots: slots), forKey: .params)
-        case let .start(id), let .stop(id), let .pause(id), let .unpause(id), let .restart(id), let .remove(id), let .stats(id), let .inspect(id):
+        case let .start(id), let .stop(id), let .pause(id), let .unpause(id), let .restart(id), let .remove(id), let .stats(id), let .inspect(id), let .diff(id):
             try c.encode(IDParams(id: id), forKey: .params)
+        case let .fork(spec): try c.encode(spec, forKey: .params)
         case let .listFiles(id, path), let .readFile(id, path), let .getArchive(id, path):
             try c.encode(PathParams(id: id, path: path), forKey: .params)
         case let .putArchive(id, path, size):
@@ -226,6 +231,8 @@ public enum EngineResponse: Decodable, Sendable {
     case log(LogLine)
     case logEnd(exitCode: Int32?)
     case container(Container)
+    case forked([Container])
+    case diff([DiffEntry])
     case image(ImageInfo)
     case imageArchive
     case pullProgress(PullProgress)
@@ -275,6 +282,8 @@ public enum EngineResponse: Decodable, Sendable {
     private struct LoggedOutData: Decodable { let registry: String }
     private struct NetworkRemovedData: Decodable { let name: String }
     private struct NetworkUpdatedData: Decodable { let network: String; let container: String; let connected: Bool }
+    private struct ForkedData: Decodable { let containers: [Container] }
+    private struct DiffData: Decodable { let entries: [DiffEntry] }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
@@ -300,6 +309,8 @@ public enum EngineResponse: Decodable, Sendable {
         case "log": self = .log(try c.decode(LogLine.self, forKey: .data))
         case "log_end": self = .logEnd(exitCode: try c.decode(LogEndData.self, forKey: .data).exitCode)
         case "container": self = .container(try c.decode(Container.self, forKey: .data))
+        case "forked": self = .forked(try c.decode(ForkedData.self, forKey: .data).containers)
+        case "diff": self = .diff(try c.decode(DiffData.self, forKey: .data).entries)
         case "image": self = .image(try c.decode(ImageInfo.self, forKey: .data))
         case "image_archive": self = .imageArchive
         case "pull_progress": self = .pullProgress(try c.decode(PullProgress.self, forKey: .data))

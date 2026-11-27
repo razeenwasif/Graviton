@@ -237,6 +237,44 @@ public actor DemoEngine: EngineService {
         return list[i]
     }
 
+    public func fork(_ spec: ForkSpec) throws -> [Container] {
+        let src = list[try resolve(spec.source)]
+        let names: [String] = if !spec.names.isEmpty {
+            spec.names
+        } else {
+            (1...max(1, min(16, Int(spec.count)))).map { "\(src.name)-fork-\($0)" }
+        }
+        for name in names {
+            if list.contains(where: { $0.name == name }) {
+                throw EngineError.daemon("container name `\(name)` is already in use")
+            }
+        }
+        let now = UInt64(Date.now.timeIntervalSince1970)
+        var created: [Container] = []
+        for (idx, name) in names.enumerated() {
+            var copy = src
+            copy.id = String(format: "%012llx", (UInt64.random(in: 1...UInt64.max) ^ UInt64(idx + 1)) & 0xffff_ffff_ffff)
+            copy.name = name
+            copy.ports = spec.ports
+            copy.status = spec.start ? .running : .created
+            copy.exitCode = nil
+            copy.createdAt = now
+            copy.startedAt = spec.start ? now : nil
+            copy.forkedFrom = src.id
+            list.append(copy)
+            created.append(copy)
+        }
+        return created
+    }
+
+    public func diff(id: String) throws -> [DiffEntry] {
+        _ = try resolve(id)
+        return [
+            DiffEntry(kind: .modified, path: "/etc/hosts", sizeBytes: 184),
+            DiffEntry(kind: .added, path: "/tmp/session.lock", sizeBytes: 32),
+        ]
+    }
+
     public func restart(id: String) throws -> Container {
         if try list[resolve(id)].isActive { _ = try stop(id: id) }
         return try start(id: id)

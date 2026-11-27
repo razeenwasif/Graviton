@@ -13,9 +13,10 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 
 use flate2::read::GzDecoder;
-use graviton_proto::{AgentEvent, DirectoryListing, FileContents, FileEntry, FileKind, encode_line};
+use graviton_proto::{AgentEvent, DiffEntry, DiffKind, DirectoryListing, FileContents, FileEntry, FileKind, encode_line};
 
 const MAX_ENTRIES: usize = 5000;
+const MAX_DIFF_ENTRIES: usize = 4096;
 
 #[repr(C)]
 struct OpenHow {
@@ -268,4 +269,55 @@ fn open_in_root(container: &str, path: &str, flags: libc::c_int) -> io::Result<O
 fn normalise(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty() && *p != ".").collect();
     format!("/{}", parts.join("/"))
+}
+
+/// Return added, modified, and deleted entries in an EROFS+overlayfs container's upper layer.
+pub fn diff(container: &str) -> io::Result<Vec<DiffEntry>> {
+    let root = crate::container::rootfs(container)?;
+    let base = root.parent().ok_or_else(|| io::Error::other("missing container base dir"))?;
+    let upper = base.join("upper");
+    let lower = base.join("lower");
+    if !upper.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = Vec::new();
+    let mut stack = vec![PathBuf::new()];
+    while let Some(rel) = stack.pop() {
+        let dir = if rel.as_os_str().is_empty() { upper.clone() } else { upper.join(&rel) };
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        let mut children: Vec<PathBuf> = rd.flatten().map(|e| rel.join(e.file_name())).collect();
+        children.sort();
+        for child_rel in children {
+            if entries.len() >= MAX_DIFF_ENTRIES {
+                break;
+            }
+            let abs_upper = upper.join(&child_rel);
+            let Ok(meta) = fs::symlink_metadata(&abs_upper) else { continue };
+            let ft = meta.file_type();
+            let path = format!("/{}", child_rel.to_string_lossy());
+            if ft.is_char_device() && meta.rdev() == 0 {
+                entries.push(DiffEntry { kind: DiffKind::Deleted, path, size_bytes: None });
+                continue;
+            }
+            let in_lower = fs::symlink_metadata(lower.join(&child_rel)).is_ok();
+            if ft.is_dir() {
+                if !in_lower {
+                    entries.push(DiffEntry { kind: DiffKind::Added, path, size_bytes: None });
+                }
+                stack.push(child_rel);
+            } else {
+                entries.push(DiffEntry {
+                    kind: if in_lower { DiffKind::Modified } else { DiffKind::Added },
+                    path,
+                    size_bytes: ft.is_file().then_some(meta.len()),
+                });
+            }
+        }
+        if entries.len() >= MAX_DIFF_ENTRIES {
+            break;
+        }
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(entries)
 }

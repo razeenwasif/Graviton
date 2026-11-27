@@ -110,7 +110,7 @@ public enum FairyApprovalPolicy {
     public static let supportedTools: Set<String> = [
         "status", "events", "switch_host", "navigate",
         "containers", "inspect", "logs", "stats",
-        "container_action", "run", "exec", "commit_container", "stack_action", "compose",
+        "container_action", "run", "exec", "fork_container", "diff_container", "commit_container", "stack_action", "compose",
         "list_files", "read_file", "copy_files",
         "images", "pull", "build", "tag_image", "push_image", "save_image", "load_image", "remove_image",
         "volumes", "volume_action", "network", "disk_and_prune", "snapshots", "list_logins",
@@ -124,7 +124,7 @@ public enum FairyApprovalPolicy {
         let action = args["action"]?.stringValue ?? ""
         switch tool {
         case "status", "events", "containers", "inspect", "logs", "stats",
-             "list_files", "read_file", "images", "volumes", "network", "list_logins",
+             "list_files", "read_file", "diff_container", "images", "volumes", "network", "list_logins",
              "navigate", "switch_host", "pull", "tag_image":
             return false
         case "container_action":
@@ -139,7 +139,7 @@ public enum FairyApprovalPolicy {
             return action != "status"
         case "compose":
             return !["config", "ps", "logs", "start", "restart"].contains(action)
-        case "run", "exec", "commit_container", "build", "push_image", "save_image", "load_image", "remove_image", "copy_files":
+        case "run", "exec", "fork_container", "commit_container", "build", "push_image", "save_image", "load_image", "remove_image", "copy_files":
             return true
         default:
             return true
@@ -293,6 +293,18 @@ public enum FairyApprovalPolicy {
             title = "Push image \(ref)"
             detail = reasonArg.isEmpty ? ref : "\(ref) — \(reasonArg)"
             macReason = "let Fairy push image \(ref) to its registry\(suffix)"
+        case "fork_container":
+            let source = str("source")
+            let count = args["count"]?.intValue ?? 1
+            let name = str("name")
+            destructive = false
+            title = count > 1 ? "Fork \(source) ×\(count)" : "Fork \(source)" + (name.isEmpty ? "" : " → \(name)")
+            var parts = ["Source: \(source)"]
+            if !name.isEmpty { parts.append("Name: \(name)") }
+            if count > 1 { parts.append("Count: \(count)") }
+            if !reasonArg.isEmpty { parts.append(reasonArg) }
+            detail = parts.joined(separator: "\n")
+            macReason = "let Fairy fork container \(source)\(suffix)"
         case "commit_container":
             let target = str("container")
             let ref = str("reference")

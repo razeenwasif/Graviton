@@ -3,7 +3,7 @@ import GravitonKit
 import SwiftUI
 
 enum DetailTab: String, CaseIterable, Identifiable {
-    case overview = "Overview", logs = "Logs", terminal = "Terminal", files = "Files", stats = "Stats", inspect = "Inspect"
+    case overview = "Overview", logs = "Logs", terminal = "Terminal", files = "Files", diff = "Diff", stats = "Stats", inspect = "Inspect"
     var id: String { rawValue }
 }
 
@@ -13,6 +13,7 @@ struct ContainerDetailScreen: View {
     var onBack: () -> Void
     @State private var tab: DetailTab
     @State private var showCommit = false
+    @State private var showFork = false
 
     init(containerID: String, initialTab: DetailTab = .logs, onBack: @escaping () -> Void) {
         self.containerID = containerID
@@ -32,6 +33,15 @@ struct ContainerDetailScreen: View {
                     }
                     .buttonStyle(.gSecondary)
                     .disabled(!c.isRunning)
+
+                    Button {
+                        showFork = true
+                    } label: {
+                        Label("Fork", systemImage: "arrow.triangle.branch")
+                    }
+                    .buttonStyle(.gSecondary)
+                    .disabled(!store.canManage)
+                    .help(store.canManage ? "Clone this container’s live state into isolated forks" : "Start gravitond to fork containers")
 
                     Button {
                         showCommit = true
@@ -100,6 +110,7 @@ struct ContainerDetailScreen: View {
                     case .overview: OverviewPanel(container: c)
                     case .terminal: TerminalPanel(container: c)
                     case .files: FilesPanel(container: c)
+                    case .diff: DiffPanel(container: c)
                     case .stats: StatsPanel(container: c)
                     case .inspect: InspectPanel(container: c)
                     }
@@ -109,6 +120,9 @@ struct ContainerDetailScreen: View {
             .background(G.bg)
             .sheet(isPresented: $showCommit) {
                 CommitContainerSheet(container: c)
+            }
+            .sheet(isPresented: $showFork) {
+                ForkContainerSheet(container: c)
             }
         } else {
             VStack(spacing: 0) {
@@ -415,6 +429,10 @@ struct OverviewPanel: View {
                 GKeyValueCard("Configuration & Networking") {
                     GKeyValueRow("Container ID", container.id)
                     GKeyValueRow("Image", container.image)
+                    if let parentId = container.forkedFrom {
+                        let parentName = store.container(parentId)?.name
+                        GKeyValueRow("Forked From", parentName.map { "\($0) (\(String(parentId.prefix(12))))" } ?? String(parentId.prefix(12)))
+                    }
                     if let project = container.project {
                         GKeyValueRow("Compose Stack", container.service.map { "\(project) / \($0)" } ?? project)
                     }

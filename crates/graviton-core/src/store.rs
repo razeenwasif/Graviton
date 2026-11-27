@@ -286,6 +286,7 @@ impl Store {
                 project: project.map(Into::into),
                 service: service.map(Into::into),
                 health: None,
+                forked_from: None,
             });
         };
         add("a3f9c2e81b07", "api-gateway", "storefront/api:0.4.2", Some((11_520, 12.4, 412)), None, vec![tcp(8080, 80)],

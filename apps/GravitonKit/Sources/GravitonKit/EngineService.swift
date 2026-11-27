@@ -41,6 +41,8 @@ public protocol EngineService: Sendable {
     func stop(id: String) async throws -> Container
     func pause(id: String) async throws -> Container
     func unpause(id: String) async throws -> Container
+    func fork(_ spec: ForkSpec) async throws -> [Container]
+    func diff(id: String) async throws -> [DiffEntry]
     func restart(id: String) async throws -> Container
     /// Pull an image from its registry (may take minutes).
     func pull(reference: String) async throws -> ImageInfo
@@ -294,6 +296,14 @@ public final class SocketEngine: EngineService {
     public func stop(id: String) async throws -> Container { try await lifecycle(.stop(id: id)) }
     public func pause(id: String) async throws -> Container { try await lifecycle(.pause(id: id)) }
     public func unpause(id: String) async throws -> Container { try await lifecycle(.unpause(id: id)) }
+    public func fork(_ spec: ForkSpec) async throws -> [Container] {
+        guard case let .forked(created) = try await call(.fork(spec), timeout: 300) else { throw EngineError.unexpectedResponse }
+        return created
+    }
+    public func diff(id: String) async throws -> [DiffEntry] {
+        guard case let .diff(entries) = try await call(.diff(id: id), timeout: 30) else { throw EngineError.unexpectedResponse }
+        return entries
+    }
     public func restart(id: String) async throws -> Container { try await lifecycle(.restart(id: id)) }
 
     public func pull(reference: String) async throws -> ImageInfo {

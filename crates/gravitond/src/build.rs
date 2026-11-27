@@ -1204,6 +1204,7 @@ fn prepare(b: &mut Builder, container: &str, layers: &[BuiltLayer]) -> Result<()
         tmpfs: vec![],
         hostname: Some("graviton-build".into()),
         now_secs: None,
+        fork_from: None,
     })? {
         AgentEvent::Prepared { .. } => {
             b.prepared.insert(container.into());

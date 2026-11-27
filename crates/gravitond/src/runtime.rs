@@ -33,11 +33,11 @@ use graviton_core::{ImageReference, Store, paths};
 use graviton_image::{BlobStore, Credentials, HealthcheckConfig, ImageError, ImageIndex, LocalImage, Progress, PullOptions, PushProgress, Registry};
 use graviton_proto::{
     AGENT_VSOCK_PORT, AgentEvent, AgentRequest, ContainerDetails, ContainerStatRow, ContainerStats, ContainerStatus,
-    ContainerSummary, DEFAULT_NETWORK_NAME, DirectoryListing, EngineInfo, ExecSpec, FileContents, GuestMount, GuestStats,
-    HealthLog, HealthState, HealthStatus, Healthcheck, HostEntry, ImageSummary, LogLevel, LogLine, LogStream, Mount,
-    NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo, Response, RestartPolicy,
-    RunSpec, SnapshotInfo, StatSample, TmpfsMount, UlimitSpec, UserNetwork, VolumeMountRef, VolumeSummary, caps,
-    decode_line, encode_line, parse_tmpfs_spec, validate_ulimit,
+    ContainerSummary, DEFAULT_NETWORK_NAME, DiffEntry, DirectoryListing, EngineInfo, ExecSpec, FileContents, ForkSpec,
+    GuestMount, GuestStats, HealthLog, HealthState, HealthStatus, Healthcheck, HostEntry, ImageSummary, LogLevel,
+    LogLine, LogStream, Mount, NetworkEndpoint, NetworkInfo, PROTOCOL_VERSION, PortMapping, PortProtocol, ProcessInfo,
+    Response, RestartPolicy, RunSpec, SnapshotInfo, StatSample, TmpfsMount, UlimitSpec, UserNetwork, VolumeMountRef,
+    VolumeSummary, caps, decode_line, encode_line, parse_tmpfs_spec, validate_ulimit,
 };
 use graviton_vmm::apple::{AppleHypervisor, AppleVm};
 use graviton_vmm::{NetworkMode, SharedDirectory, VmConfig, VmHandle};
@@ -124,6 +124,11 @@ pub(crate) struct ContainerSpec {
     pub(crate) shm_size_bytes: Option<u64>,
     #[serde(default)]
     pub(crate) ulimits: Vec<UlimitSpec>,
+    #[serde(default)]
+    pub(crate) forked_from: Option<String>,
+    /// Container folder name inside `/run/containers/` on a cloned ext4 disk before first boot renames it.
+    #[serde(default)]
+    pub(crate) disk_source_id: Option<String>,
 }
 
 /// Interactive `grav run -it` handle returned to the control connection.
@@ -867,6 +872,8 @@ impl Engine {
             networks,
             shm_size_bytes: spec.shm_size_bytes,
             ulimits,
+            forked_from: None,
+            disk_source_id: None,
         };
 
         let id = new_id();
@@ -895,6 +902,7 @@ impl Engine {
             project: cs.project.clone(),
             service: cs.service.clone(),
             health: None,
+            forked_from: None,
         };
         self.store.lock().unwrap().insert(summary)?;
         self.specs.lock().unwrap().insert(id.clone(), cs);
@@ -1123,6 +1131,191 @@ impl Engine {
         }
         self.save();
         self.launch(&id)
+    }
+
+    /// Fork a container's overlay state and spec into one or more isolated containers
+    /// using APFS copy-on-write cloning (`clonefile`) after quiescing a running VM.
+    pub fn fork(self: &Arc<Self>, spec: ForkSpec) -> Result<Vec<ContainerSummary>> {
+        let (src, source_spec, target_names) = {
+            let store = self.store.lock().unwrap();
+            let src = store.container(&spec.source)?.clone();
+            let names = resolve_fork_names(&src.name, &spec.names, spec.count)?;
+            for name in &names {
+                if store.name_taken(name) {
+                    bail!("container name `{name}` is already in use");
+                }
+            }
+            drop(store);
+            let source_spec = self
+                .specs
+                .lock()
+                .unwrap()
+                .get(&src.id)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing spec for container `{}`", src.name))?;
+            (src, source_spec, names)
+        };
+
+        if !spec.ports.is_empty() && target_names.len() > 1 {
+            bail!("cannot override published ports when creating multiple forks");
+        }
+
+        let merged_env = merge_env_vars(&source_spec.env, &spec.env)?;
+        let merged_argv = spec.command.clone().unwrap_or_else(|| source_spec.argv.clone());
+
+        struct PauseGuard<'a> {
+            engine: &'a Engine,
+            id: String,
+            active: bool,
+        }
+        impl Drop for PauseGuard<'_> {
+            fn drop(&mut self) {
+                if self.active {
+                    let _ = self.engine.unpause(&self.id);
+                }
+            }
+        }
+
+        let was_running = src.status == ContainerStatus::Running;
+        let mut resume_guard = PauseGuard { engine: self, id: src.id.clone(), active: false };
+        if was_running {
+            match self.agent_call(&src.id, |_| AgentRequest::SyncFs)? {
+                AgentEvent::Synced => {}
+                AgentEvent::Error { message } => bail!("syncing `{}` before fork: {message}", src.name),
+                other => bail!("unexpected sync response from `{}`: {other:?}", src.name),
+            }
+            self.pause(&src.id)?;
+            resume_guard.active = true;
+        }
+
+        let src_vm_dir = paths::vms_dir().join(&src.id);
+        let src_disk_path = src_vm_dir.join(SCRATCH_DISK);
+        let has_populated_disk = src_disk_path.is_file()
+            && (source_spec.disk_source_id.is_some()
+                || src.status != ContainerStatus::Created
+                || src.started_at.is_some()
+                || src.exit_code.is_some());
+        let inherited_disk_source = if has_populated_disk {
+            Some(source_spec.disk_source_id.clone().unwrap_or_else(|| src.id.clone()))
+        } else {
+            None
+        };
+
+        let mut prepared = Vec::with_capacity(target_names.len());
+        let mut created_dirs = Vec::with_capacity(target_names.len());
+        for name in target_names {
+            let fork_id = new_id();
+            let dst_vm_dir = paths::vms_dir().join(&fork_id);
+            if let Err(err) = fs::create_dir_all(&dst_vm_dir) {
+                for dir in &created_dirs {
+                    let _ = fs::remove_dir_all(dir);
+                }
+                return Err(err.into());
+            }
+            created_dirs.push(dst_vm_dir.clone());
+            if has_populated_disk {
+                if let Err(err) = clone_sparse_file(&src_disk_path, &dst_vm_dir.join(SCRATCH_DISK)) {
+                    for dir in &created_dirs {
+                        let _ = fs::remove_dir_all(dir);
+                    }
+                    return Err(err);
+                }
+            }
+            let mut cs = source_spec.clone();
+            cs.argv = merged_argv.clone();
+            cs.env = merged_env.clone();
+            cs.ports = if !spec.ports.is_empty() { spec.ports.clone() } else { Vec::new() };
+            cs.auto_remove = spec.auto_remove;
+            cs.want_running = spec.start;
+            cs.hostname = Some(name.clone());
+            cs.forked_from = Some(src.id.clone());
+            cs.disk_source_id = inherited_disk_source.clone();
+
+            let summary = ContainerSummary {
+                id: fork_id.clone(),
+                name,
+                image: src.image.clone(),
+                status: ContainerStatus::Created,
+                exit_code: None,
+                ports: cs.ports.clone(),
+                mounts: cs
+                    .volumes
+                    .iter()
+                    .map(|v| Mount {
+                        source: v.name.clone().unwrap_or_else(|| v.source.display().to_string()),
+                        target: v.target.clone(),
+                        read_only: v.read_only,
+                    })
+                    .collect(),
+                ip_address: None,
+                cpu_percent: None,
+                memory_bytes: None,
+                memory_limit_bytes: Some(cs.memory_mib << 20),
+                created_at: now_secs(),
+                started_at: None,
+                project: cs.project.clone(),
+                service: cs.service.clone(),
+                health: None,
+                forked_from: Some(src.id.clone()),
+            };
+            prepared.push((fork_id, cs, summary));
+        }
+
+        if was_running {
+            resume_guard.active = false;
+            self.unpause(&src.id)?;
+        }
+
+        let mut inserted_ids: Vec<String> = Vec::with_capacity(prepared.len());
+        {
+            let mut store = self.store.lock().unwrap();
+            let mut specs = self.specs.lock().unwrap();
+            for (fork_id, cs, summary) in &prepared {
+                if let Err(err) = store.insert(summary.clone()) {
+                    for prev_id in &inserted_ids {
+                        let _ = store.remove(prev_id);
+                        specs.remove(prev_id);
+                    }
+                    for dir in &created_dirs {
+                        let _ = fs::remove_dir_all(dir);
+                    }
+                    return Err(err.into());
+                }
+                specs.insert(fork_id.clone(), cs.clone());
+                inserted_ids.push(fork_id.clone());
+            }
+        }
+        self.save();
+        self.refresh_images();
+
+        let mut summaries = Vec::with_capacity(prepared.len());
+        for (fork_id, _, summary) in prepared {
+            self.events.record(
+                graviton_proto::EventKind::Forked,
+                Some((&summary.id, &summary.name)),
+                Some(&summary.image),
+                format!("{} forked from {}", summary.name, src.name),
+            );
+            if spec.start {
+                summaries.push(self.launch(&fork_id)?);
+            } else {
+                summaries.push(summary);
+            }
+        }
+        Ok(summaries)
+    }
+
+    /// Inspect overlayfs upperdir filesystem changes inside a running container.
+    pub fn diff(&self, key: &str) -> Result<Vec<DiffEntry>> {
+        let c = self.store.lock().unwrap().container(key)?.clone();
+        if c.status != ContainerStatus::Running {
+            bail!("container `{}` is not running (start it first to inspect overlay diff)", c.name);
+        }
+        match self.agent_call(&c.id, |id| AgentRequest::Diff { container: id })? {
+            AgentEvent::Diff { entries } => Ok(entries),
+            AgentEvent::Error { message } => bail!("diffing `{}`: {message}", c.name),
+            other => bail!("unexpected diff response from `{}`: {other:?}", c.name),
+        }
     }
 
     /// Send a POSIX signal to a running container's main process.
@@ -1499,6 +1692,7 @@ impl Engine {
         let booted = t0.elapsed();
         let host_name = spec.hostname.clone().unwrap_or_else(|| name.clone());
 
+        let fork_from = spec.disk_source_id.clone();
         send(&agent, &AgentRequest::Prepare {
             container: id.into(),
             layers: spec.image.layers.iter().map(|l| l.digest.clone()).collect(),
@@ -1506,12 +1700,19 @@ impl Engine {
             tmpfs: spec.tmpfs.clone(),
             hostname: Some(host_name.clone()),
             now_secs: from_snapshot.then(now_secs),
+            fork_from: fork_from.clone(),
         })?;
         let (files, unpack_ms, ip, reused, dns) = match events.next()? {
             AgentEvent::Prepared { files, ms, ip, reused, dns, .. } => (files, ms, ip, reused, dns),
             AgentEvent::Error { message } => bail!("{message}"),
             other => bail!("expected prepared from the agent, got {other:?}"),
         };
+        if fork_from.is_some() {
+            if let Some(saved) = self.specs.lock().unwrap().get_mut(id) {
+                saved.disk_source_id = None;
+            }
+            self.save();
+        }
         if ip.is_some() {
             if let Some(r) = self.running.lock().unwrap().get_mut(id) {
                 r.ip = ip.clone();
@@ -2921,6 +3122,66 @@ fn spawn_udp_forward(rt: &tokio::runtime::Handle, socket: UdpSocket, target: Soc
 }
 
 /// `[IP:]HOST:CONTAINER[/tcp|udp]` or `PORT[/tcp|udp]` (default bind IP: `127.0.0.1`).
+const MAX_FORKS_PER_CALL: usize = 16;
+
+fn is_valid_fork_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\0')
+        && !name.chars().any(char::is_whitespace)
+}
+
+fn resolve_fork_names(source_name: &str, names: &[String], count: u32) -> Result<Vec<String>> {
+    if count == 0 {
+        bail!("fork count must be at least 1");
+    }
+    let resolved = if !names.is_empty() {
+        if count > 1 && names.len() != count as usize {
+            bail!("--count ({count}) doesn't match supplied fork names ({})", names.len());
+        }
+        if names.len() > MAX_FORKS_PER_CALL {
+            bail!("at most {MAX_FORKS_PER_CALL} forks per call");
+        }
+        names.to_vec()
+    } else {
+        let count = count as usize;
+        if count > MAX_FORKS_PER_CALL {
+            bail!("at most {MAX_FORKS_PER_CALL} forks per call");
+        }
+        (1..=count).map(|i| format!("{source_name}-fork-{i}")).collect()
+    };
+
+    let mut seen = std::collections::HashSet::with_capacity(resolved.len());
+    for name in &resolved {
+        if !is_valid_fork_name(name) {
+            bail!("invalid fork container name `{name}`");
+        }
+        if !seen.insert(name.as_str()) {
+            bail!("duplicate fork container name `{name}`");
+        }
+    }
+    Ok(resolved)
+}
+
+fn merge_env_vars(base: &[String], overrides: &[String]) -> Result<Vec<String>> {
+    let mut merged = base.to_vec();
+    for item in overrides {
+        let key = match item.split_once('=') {
+            Some((k, _)) => k,
+            None => item.as_str(),
+        };
+        if key.is_empty() || key.contains('\0') {
+            bail!("invalid environment variable `{item}`");
+        }
+        merged.retain(|existing| {
+            let existing_key = existing.split_once('=').map_or(existing.as_str(), |(k, _)| k);
+            existing_key != key
+        });
+        merged.push(item.clone());
+    }
+    Ok(merged)
+}
+
 /// IPv6 bind addresses use brackets, e.g. `[::]:8080:80` or `[::1]:5353:53/udp`.
 fn parse_port(spec: &str) -> Result<PortMapping> {
     let (ports, proto_raw) = spec.rsplit_once('/').unwrap_or((spec, "tcp"));
@@ -3940,6 +4201,7 @@ mod tests {
             project: None,
             service: None,
             health: None,
+            forked_from: None,
         }).unwrap();
         engine.specs.lock().unwrap().insert(cid.clone(), ContainerSpec {
             argv: vec!["sh".into()],
@@ -3976,6 +4238,8 @@ mod tests {
             networks: vec![DEFAULT_NETWORK_NAME.into()],
             shm_size_bytes: None,
             ulimits: vec![],
+            forked_from: None,
+            disk_source_id: None,
         });
 
         engine.connect_network("frontend", "web").unwrap();
@@ -3992,6 +4256,31 @@ mod tests {
         engine.disconnect_network("frontend", "web").unwrap();
         assert_eq!(engine.remove_network("frontend").unwrap(), "frontend");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fork_helpers_validate_names_and_merge_env() {
+        assert_eq!(resolve_fork_names("pg", &[], 2).unwrap(), vec!["pg-fork-1", "pg-fork-2"]);
+        assert_eq!(
+            resolve_fork_names("pg", &["pg-pr-42".into()], 1).unwrap(),
+            vec!["pg-pr-42"]
+        );
+        assert!(resolve_fork_names("pg", &[], 0).is_err());
+        assert!(resolve_fork_names("pg", &[], (MAX_FORKS_PER_CALL + 1) as u32).is_err());
+        assert!(resolve_fork_names("pg", &["dup".into(), "dup".into()], 2).is_err());
+        assert!(resolve_fork_names("pg", &["bad/name".into()], 1).is_err());
+        assert!(resolve_fork_names("pg", &["a".into()], 2).is_err());
+
+        let merged = merge_env_vars(
+            &["POSTGRES_USER=app".into(), "POSTGRES_DB=prod".into(), "KEEP_ONLY".into()],
+            &["POSTGRES_DB=staging".into(), "NEW_VAR=1".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            merged,
+            vec!["POSTGRES_USER=app", "KEEP_ONLY", "POSTGRES_DB=staging", "NEW_VAR=1"]
+        );
+        assert!(merge_env_vars(&[], &["=bad".into()]).is_err());
     }
 
     #[test]

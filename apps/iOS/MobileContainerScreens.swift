@@ -365,6 +365,10 @@ struct MobileInspectView: View {
                         }
                     }
                     section("Virtual machine") {
+                        if let parentId = d.container.forkedFrom {
+                            let parentName = store.container(parentId)?.name
+                            row("Forked from", parentName ?? String(parentId.prefix(12)))
+                        }
                         row("vCPUs", "\(d.cpus)")
                         row("Memory", Format.bytes(d.memoryMib << 20))
                         row("Kernel", d.kernel)

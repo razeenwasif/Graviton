@@ -1142,6 +1142,8 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                 Request::Restart { id } => result(store.restart(&id).map(Response::Container)),
                 Request::Pause { id } => result(store.pause(&id).map(Response::Container)),
                 Request::Unpause { id } => result(store.unpause(&id).map(Response::Container)),
+                Request::Fork(spec) => demo_fork(&mut store, *spec),
+                Request::Diff { id } => demo_diff(&store, &id),
                 Request::ListVolumes => Response::Volumes(demo_volumes(&store)),
                 Request::NetworkInfo => Response::Network(demo_network(&store)),
                 Request::ListNetworks => Response::Networks(demo_network(&store).networks),
@@ -1189,6 +1191,8 @@ pub(crate) async fn handle(request: Request, backend: &Backend) -> Response {
                     }
                     Request::ListLogins => Response::Logins(engine.auth.list()),
                     Request::Run(spec) => Response::Container(engine.run(*spec)?),
+                    Request::Fork(spec) => Response::Forked { containers: engine.fork(*spec)? },
+                    Request::Diff { id } => Response::Diff { entries: engine.diff(&id)? },
                     Request::Start { id } => Response::Container(engine.start(&id)?),
                     Request::Stop { id } => Response::Container(engine.stop(&id)?),
                     Request::Restart { id } => Response::Container(engine.restart(&id)?),
@@ -1316,6 +1320,52 @@ fn demo_network(store: &Store) -> graviton_proto::NetworkInfo {
     }
 }
 
+fn demo_fork(store: &mut Store, spec: graviton_proto::ForkSpec) -> Response {
+    let Ok(src) = store.container(&spec.source).cloned() else {
+        return Response::Error { message: format!("no such container `{}`", spec.source) };
+    };
+    let count = if !spec.names.is_empty() { spec.names.len() } else { spec.count.clamp(1, 16) as usize };
+    let mut created = Vec::with_capacity(count);
+    for i in 0..count {
+        let name = spec.names.get(i).cloned().unwrap_or_else(|| format!("{}-fork-{}", src.name, i + 1));
+        if store.container(&name).is_ok() {
+            return Response::Error { message: format!("container name `{name}` is already in use") };
+        }
+        let mut copy = src.clone();
+        copy.id = format!("{:012x}", rand_u64() ^ (i as u64 + 1));
+        copy.name = name;
+        copy.ports = spec.ports.clone();
+        copy.status = if spec.start { graviton_proto::ContainerStatus::Running } else { graviton_proto::ContainerStatus::Created };
+        copy.started_at = spec.start.then(now_demo_secs);
+        copy.forked_from = Some(src.id.clone());
+        if let Err(e) = store.insert(copy.clone()) {
+            return Response::Error { message: e.to_string() };
+        }
+        created.push(copy);
+    }
+    Response::Forked { containers: created }
+}
+
+fn demo_diff(store: &Store, id: &str) -> Response {
+    if store.container(id).is_err() {
+        return Response::Error { message: format!("no such container `{id}`") };
+    }
+    Response::Diff {
+        entries: vec![
+            graviton_proto::DiffEntry { kind: graviton_proto::DiffKind::Modified, path: "/etc/hosts".into(), size_bytes: Some(184) },
+            graviton_proto::DiffEntry { kind: graviton_proto::DiffKind::Added, path: "/tmp/session.lock".into(), size_bytes: Some(32) },
+        ],
+    }
+}
+
+fn rand_u64() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
+}
+
+fn now_demo_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1342,6 +1392,27 @@ mod tests {
         }
         match handle(Request::Pull { reference: "alpine".into(), progress: false, platform: None }, &backend).await {
             Response::Error { message } => assert!(message.contains("demo")),
+            other => panic!("unexpected {other:?}"),
+        }
+        match handle(
+            Request::Fork(Box::new(graviton_proto::ForkSpec {
+                source: "web".into(),
+                names: vec!["web-clone".into()],
+                ..Default::default()
+            })),
+            &backend,
+        )
+        .await
+        {
+            Response::Forked { containers } => {
+                assert_eq!(containers.len(), 1);
+                assert_eq!(containers[0].name, "web-clone");
+                assert!(containers[0].forked_from.is_some());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match handle(Request::Diff { id: "web-clone".into() }, &backend).await {
+            Response::Diff { entries } => assert!(!entries.is_empty()),
             other => panic!("unexpected {other:?}"),
         }
     }

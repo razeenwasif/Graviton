@@ -559,6 +559,14 @@ public actor RemoteEngine: EngineService {
     public func stop(id: String) async throws -> Container { try await container(.stop(id: id)) }
     public func pause(id: String) async throws -> Container { try await container(.pause(id: id)) }
     public func unpause(id: String) async throws -> Container { try await container(.unpause(id: id)) }
+    public func fork(_ spec: ForkSpec) async throws -> [Container] {
+        guard case let .forked(created) = try await separately(.fork(spec)) else { throw EngineError.unexpectedResponse }
+        return created
+    }
+    public func diff(id: String) async throws -> [DiffEntry] {
+        guard case let .diff(entries) = try await call(.diff(id: id)) else { throw EngineError.unexpectedResponse }
+        return entries
+    }
     public func restart(id: String) async throws -> Container { try await container(.restart(id: id)) }
     /// Runs and pulls can take minutes (a pull, a VM boot): they get a connection
     /// of their own so the shared one keeps answering the list and logs meanwhile.

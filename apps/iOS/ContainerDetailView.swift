@@ -98,6 +98,11 @@ struct ContainerDetailView: View {
                         RowDivider()
                         InfoRow(label: "Mount", value: c.mounts.first?.source ?? "—")
                         RowDivider()
+                        if let parentId = c.forkedFrom {
+                            let parentName = store.container(parentId)?.name
+                            InfoRow(label: "Forked from", value: parentName ?? String(parentId.prefix(12)))
+                            RowDivider()
+                        }
                         InfoRow(label: "ID", value: c.id)
                     }
                     .mobileCard()
@@ -108,6 +113,10 @@ struct ContainerDetailView: View {
             .safeAreaInset(edge: .top, spacing: 0) {
                 MobileHeader("", actions: {
                     Menu {
+                        Button("Fork Container", systemImage: "arrow.triangle.branch") {
+                            Task { try? await store.fork(ForkSpec(source: c.id)) }
+                        }
+                        .disabled(!store.canManage)
                         Button("Commit to Image…", systemImage: "camera.aperture") { showCommit = true }
                             .disabled(!store.canManage)
                         Divider()

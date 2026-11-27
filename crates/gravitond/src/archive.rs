@@ -573,6 +573,7 @@ fn commit_stopped_container(blobs: &BlobStore, id: &str, base_img: &LocalImage, 
             tmpfs: vec![],
             hostname: Some("commit".into()),
             now_secs: None,
+            fork_from: None,
         }))?;
         match read_event_unbuffered(&mut conn)? {
             AgentEvent::Prepared { .. } => {}

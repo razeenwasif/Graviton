@@ -16,6 +16,7 @@ struct ContainersScreen: View {
     @State private var route: ContainerRoute?
     @State private var showRun = false
     @State private var commitContainer: Container?
+    @State private var forkContainer: Container?
     @State private var width: CGFloat = 1200
 
     private var rows: [Container] { filter.apply(store.containers, search: search) }
@@ -42,6 +43,9 @@ struct ContainersScreen: View {
         }
         .sheet(item: $commitContainer) { container in
             CommitContainerSheet(container: container)
+        }
+        .sheet(item: $forkContainer) { container in
+            ForkContainerSheet(container: container)
         }
         .onChange(of: router.pending, initial: true) { _, request in
             switch request {
@@ -124,6 +128,7 @@ struct ContainersScreen: View {
                         ContainerTable(
                             rows: rows,
                             selection: $selection,
+                            onFork: { forkContainer = $0 },
                             onCommit: { commitContainer = $0 },
                             openTab: { id, tab in route = ContainerRoute(id: id, tab: tab) }
                         )
@@ -196,6 +201,7 @@ struct ContainerTable: View {
     @Environment(EngineStore.self) private var store
     var rows: [Container]
     @Binding var selection: Container.ID?
+    var onFork: (Container) -> Void = { _ in }
     var onCommit: (Container) -> Void = { _ in }
     var openTab: (Container.ID, DetailTab) -> Void
     @State private var sort: Column = .name
@@ -257,6 +263,7 @@ struct ContainerTable: View {
                                 selected: selection == c.id,
                                 onSelect: { selection = c.id; focused = true },
                                 onOpen: { tab in openTab(c.id, tab) },
+                                onFork: { onFork(c) },
                                 onCommit: { onCommit(c) }
                             )
                         }
@@ -283,6 +290,7 @@ struct ContainerTable: View {
                                         selected: selection == c.id,
                                         onSelect: { selection = c.id; focused = true },
                                         onOpen: { tab in openTab(c.id, tab) },
+                                        onFork: { onFork(c) },
                                         onCommit: { onCommit(c) }
                                     )
                                 }
@@ -310,6 +318,7 @@ struct ContainerTable: View {
                                     selected: selection == c.id,
                                     onSelect: { selection = c.id; focused = true },
                                     onOpen: { tab in openTab(c.id, tab) },
+                                    onFork: { onFork(c) },
                                     onCommit: { onCommit(c) }
                                 )
                             }
@@ -422,6 +431,7 @@ private struct ContainerRowView: View {
     var selected: Bool
     var onSelect: () -> Void
     var onOpen: (DetailTab) -> Void
+    var onFork: () -> Void
     var onCommit: () -> Void
     @State private var hovering = false
 
@@ -504,7 +514,7 @@ private struct ContainerRowView: View {
                         iconPill("doc.text", help: "View Logs", tint: G.textSecondary) { onOpen(.logs) }
                     }
                 }
-                RowMenu(container: container, open: { onOpen(.logs) }, onCommit: onCommit)
+                RowMenu(container: container, open: { onOpen(.logs) }, onFork: onFork, onCommit: onCommit)
             }
             .frame(width: 108, alignment: .trailing)
         }
@@ -521,9 +531,12 @@ private struct ContainerRowView: View {
         .contextMenu {
             LifecycleButtons(container: container)
             Divider()
+            Button("Fork…") { onFork() }
+                .disabled(!store.canManage)
             Button("Commit to Image…") { onCommit() }
                 .disabled(!store.canManage)
             Button("Show Logs") { onOpen(.logs) }
+            Button("Inspect Filesystem Diff") { onOpen(.diff) }.disabled(!container.isRunning)
             Button("Open Terminal") { onOpen(.terminal) }.disabled(!container.isRunning)
         }
     }
@@ -586,12 +599,15 @@ struct RowMenu: View {
     @Environment(EngineStore.self) private var store
     var container: Container
     var open: () -> Void
+    var onFork: () -> Void
     var onCommit: () -> Void
 
     var body: some View {
         Menu {
             LifecycleButtons(container: container)
             Divider()
+            Button("Fork…", action: onFork)
+                .disabled(!store.canManage)
             Button("Commit to Image…", action: onCommit)
                 .disabled(!store.canManage)
             Button("Show Logs", action: open)

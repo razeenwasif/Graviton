@@ -111,6 +111,33 @@ enum Command {
     Pause { container: String },
     /// Unpause a paused container's VM.
     Unpause { container: String },
+    /// Fork a container's disk (and flushed live state if running) into one or more new containers.
+    Fork {
+        /// Source container ID, prefix, or name.
+        container: String,
+        /// Optional name for the fork (when creating one fork).
+        name: Option<String>,
+        /// Number of forks to create.
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+        /// Create the fork(s) stopped instead of booting immediately.
+        #[arg(long = "no-start")]
+        no_start: bool,
+        /// Automatically remove forked containers when they stop.
+        #[arg(long)]
+        rm: bool,
+        /// Publish a port (`[HOST_IP:]HOST:CONTAINER[/tcp|udp]`); repeatable (single fork only).
+        #[arg(short, long, value_name = "[HOST_IP:]HOST:CONTAINER[/PROTO]")]
+        publish: Vec<String>,
+        /// Override/set an environment variable (`KEY=value`); repeatable.
+        #[arg(short, long)]
+        env: Vec<String>,
+        /// Override command inside the fork(s).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Inspect overlay filesystem changes inside a running container.
+    Diff { container: String },
     /// Restart a container.
     Restart { container: String },
     /// Pull an image from its registry.
@@ -790,6 +817,44 @@ fn run(cli: Cli) -> Result<()> {
         Command::Stop { container } => lifecycle(&mut client, Request::Stop { id: container }, "stopped")?,
         Command::Pause { container } => lifecycle(&mut client, Request::Pause { id: container }, "paused")?,
         Command::Unpause { container } => lifecycle(&mut client, Request::Unpause { id: container }, "unpaused")?,
+        Command::Fork { container, name, count, no_start, rm, publish, env, command } => {
+            let ports = publish
+                .into_iter()
+                .map(|p| graviton_proto::PortMapping::parse(&p).map_err(anyhow::Error::msg))
+                .collect::<Result<Vec<_>>>()?;
+            let spec = graviton_proto::ForkSpec {
+                source: container,
+                names: name.into_iter().collect(),
+                count,
+                start: !no_start,
+                auto_remove: rm,
+                ports,
+                env,
+                command: (!command.is_empty()).then_some(command),
+            };
+            match client.call(&Request::Fork(Box::new(spec)))? {
+                Response::Forked { containers } => {
+                    for c in containers {
+                        let short = &c.id[..c.id.len().min(12)];
+                        println!("{} ({short}) forked", c.name);
+                    }
+                }
+                other => unexpected(other)?,
+            }
+        }
+        Command::Diff { container } => match client.call(&Request::Diff { id: container })? {
+            Response::Diff { entries } => {
+                for e in entries {
+                    let marker = match e.kind {
+                        graviton_proto::DiffKind::Added => 'A',
+                        graviton_proto::DiffKind::Modified => 'C',
+                        graviton_proto::DiffKind::Deleted => 'D',
+                    };
+                    println!("{marker} {}", e.path);
+                }
+            }
+            other => unexpected(other)?,
+        },
         Command::Restart { container } => lifecycle(&mut client, Request::Restart { id: container }, "restarted")?,
         Command::Pull { platform, reference } => pull_image(&mut client, &reference, platform.as_deref())?,
         Command::Tag { source, target } => match client.call(&Request::TagImage { source: source.clone(), target: target.clone() })? {
@@ -1289,7 +1354,8 @@ fn run(cli: Cli) -> Result<()> {
                                 | graviton_proto::EventKind::Healthy
                                 | graviton_proto::EventKind::Built
                                 | graviton_proto::EventKind::Pulled
-                                | graviton_proto::EventKind::Pushed => "✓",
+                                | graviton_proto::EventKind::Pushed
+                                | graviton_proto::EventKind::Forked => "✓",
                                 _ => "·",
                             };
                             println!("{}  {marker} {}", clock(e.timestamp_ms), e.message);
@@ -3152,5 +3218,36 @@ mod tests {
             Command::Network { action: Some(NetworkAction::Disconnect { ref network, ref container }) }
                 if network == "backend" && container == "api"
         ));
+    }
+
+    #[test]
+    fn parses_fork_and_diff_commands() {
+        let f = Cli::try_parse_from([
+            "grav", "fork", "pg", "pg-test", "--rm", "--no-start", "-p", "5433:5432", "-e", "MODE=test", "--", "sh", "-c", "id",
+        ])
+        .unwrap();
+        assert!(matches!(
+            f.command,
+            Command::Fork {
+                ref container,
+                ref name,
+                count: 1,
+                no_start: true,
+                rm: true,
+                ref publish,
+                ref env,
+                ref command,
+            } if container == "pg"
+                && name.as_deref() == Some("pg-test")
+                && publish == &["5433:5432"]
+                && env == &["MODE=test"]
+                && command == &["sh", "-c", "id"]
+        ));
+
+        let multi = Cli::try_parse_from(["grav", "fork", "pg", "--count", "3"]).unwrap();
+        assert!(matches!(multi.command, Command::Fork { ref container, name: None, count: 3, .. } if container == "pg"));
+
+        let d = Cli::try_parse_from(["grav", "diff", "pg-test"]).unwrap();
+        assert!(matches!(d.command, Command::Diff { ref container } if container == "pg-test"));
     }
 }

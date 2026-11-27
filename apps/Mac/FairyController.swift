@@ -952,6 +952,32 @@ final class FairyController {
             let pushed = try await store.pushImage(reference: ref)
             return try FairyJSON.fromEncodable(pushed)
 
+        case "diff_container":
+            let c = try resolveContainer(try requireString(args, "container"))
+            let entries = try await store.diff(id: c.id)
+            return try FairyJSON.fromEncodable(["container": c.name, "entries": entries])
+
+        case "fork_container":
+            let src = try resolveContainer(try requireString(args, "source"))
+            let count = UInt32(max(1, min(16, args["count"]?.intValue ?? 1)))
+            let names: [String] = if let explicit = args["name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !explicit.isEmpty {
+                [explicit]
+            } else {
+                args["names"]?.stringArrayValue ?? []
+            }
+            let spec = ForkSpec(
+                source: src.id,
+                names: names,
+                count: count,
+                start: args["start"]?.boolValue ?? true,
+                autoRemove: args["auto_remove"]?.boolValue ?? false,
+                ports: [],
+                env: args["env"]?.stringArrayValue ?? [],
+                command: args["command"]?.stringArrayValue
+            )
+            let created = try await store.fork(spec)
+            return try FairyJSON.fromEncodable(created)
+
         case "commit_container":
             let c = try resolveContainer(try requireString(args, "container"))
             let spec = CommitSpec(

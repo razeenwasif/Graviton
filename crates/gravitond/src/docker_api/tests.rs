@@ -68,6 +68,7 @@ fn filters_containers_with_label_and_semantics() {
         project: None,
         service: None,
         health: None,
+        forked_from: None,
     };
     let spec = ContainerSpec {
         image: LocalImage {
@@ -107,6 +108,8 @@ fn filters_containers_with_label_and_semantics() {
         networks: vec![],
         shm_size_bytes: None,
         ulimits: vec![],
+        forked_from: None,
+        disk_source_id: None,
     };
 
     // Go map filter style (AND across label keys)

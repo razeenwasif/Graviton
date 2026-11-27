@@ -61,6 +61,10 @@ struct InspectPanel: View {
                         }
                     }
                     InspectSection("Virtual machine") {
+                        if let parentId = d.container.forkedFrom {
+                            let parentName = store.container(parentId)?.name
+                            InspectRow("Forked from", parentName.map { "\($0) (\(String(parentId.prefix(12))))" } ?? parentId)
+                        }
                         InspectRow("vCPUs", "\(d.cpus)")
                         InspectRow("Memory", Format.bytes(d.memoryMib << 20))
                         InspectRow("Kernel", d.kernel)
